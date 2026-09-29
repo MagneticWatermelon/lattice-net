@@ -40,7 +40,8 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   2. per-connection bandwidth budget (token bucket)
   3. fragmentation for >1.2 KB messages
   4. serialize-once fan-out without copying bodies
-  5. syscall batching
+  5. syscall batching (now the biggest phase at 10k)
+- **Done:** connection sharding. `Server` is N `Shard`s routed by a keyed address hash, and the sim drives them from rayon.
 
 ## Milestones
 

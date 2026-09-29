@@ -20,6 +20,9 @@ struct Swarm {
     /// Probability that any datagram (either direction) is dropped.
     loss: f32,
     to_server: Vec<(SocketAddr, Vec<u8>)>,
+    /// Probability that a bot->server datagram arrives one tick late (jitter).
+    delay: f32,
+    delayed: Vec<(SocketAddr, Vec<u8>)>,
     /// Bot 0 doesn't run at all (a client hitch).
     stall_bot0: bool,
     /// Bot 0's outgoing packets are held back instead of sent (a lag switch).
@@ -37,10 +40,12 @@ impl Swarm {
                 (addr, Client::new(Config::default(), server_addr, now), BotBrain::new(i as u64))
             })
             .collect();
-        Self { server: SimServer::new(cfg, now), bots, now, rng: Rng::new(7), loss: 0.0, to_server: Vec::new(), stall_bot0: false, hold_bot0: None }
+        Self { server: SimServer::new(cfg, now), bots, now, rng: Rng::new(7), loss: 0.0, to_server: Vec::new(), delay: 0.0, delayed: Vec::new(), stall_bot0: false, hold_bot0: None }
     }
 
     fn step(&mut self) {
+        // Held back last step: they reach the server this step, a tick late.
+        self.to_server.append(&mut self.delayed);
         let server_addr: SocketAddr = SERVER.parse().unwrap();
         for (i, (addr, client, brain)) in self.bots.iter_mut().enumerate() {
             if i == 0 && self.stall_bot0 {
@@ -60,14 +65,20 @@ impl Swarm {
                 match &mut self.hold_bot0 {
                     Some(held) if i == 0 => held.push((*addr, pkt)),
                     _ if self.rng.chance(self.loss) => {}
+                    _ if self.rng.chance(self.delay) => self.delayed.push((*addr, pkt)),
                     _ => self.to_server.push((*addr, pkt)),
                 }
             }
         }
 
-        let mut out = Vec::new();
-        self.server.tick(&mut self.to_server, self.now, &mut out);
-        for (to, pkt) in out {
+        let router = self.server.router();
+        let mut inbound = vec![Vec::new(); router.shard_count()];
+        for (from, pkt) in self.to_server.drain(..) {
+            inbound[router.shard(&from)].push((from, pkt));
+        }
+        let mut out = vec![Vec::new(); router.shard_count()];
+        self.server.tick(&mut inbound, self.now, &mut out);
+        for (to, pkt) in out.into_iter().flatten() {
             if self.rng.chance(self.loss) {
                 continue;
             }
@@ -230,3 +241,19 @@ fn lag_switch_buys_no_movement() {
     assert_eq!(s.corrections(), corrections);
 }
 
+
+#[test]
+fn one_tick_of_jitter_is_absorbed_from_the_start() {
+    // Half of all input packets arrive a tick late. Bots start with a spare
+    // input queued, so the server never has to stand in for one.
+    let mut s = Swarm::new(20, SpawnMode::Blob);
+    s.delay = 0.5;
+    for _ in 0..10 * TICK_HZ {
+        s.step();
+    }
+    assert_eq!(stand_ins(&s), 0);
+    assert_eq!(s.corrections(), 0);
+    for (_, _, b) in &s.bots {
+        assert_eq!(b.stats.resyncs, 0);
+    }
+}

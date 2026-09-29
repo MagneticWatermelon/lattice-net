@@ -1,14 +1,27 @@
 //! Sans-IO server: feed it datagrams, drain events and outgoing datagrams.
+//!
+//! Connections are partitioned into `Shard`s by a keyed hash of the peer
+//! address. A shard owns everything about its connections (address map,
+//! handshake, events, outgoing datagrams), so shards can run on different
+//! threads with no locking. The only cross-shard state is read-only config and
+//! keys plus an atomic client count that enforces `max_clients`.
+//!
+//! This crate spawns no threads: callers that want parallelism route datagrams
+//! with `Router::shard`, then drive `shards_mut()` from their own thread pool.
+//! `Server`'s own methods do the same work serially, routing internally.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::connection::{Channel, Config, Connection, SendError, Stats};
 use crate::packet::{self, session_from_cookie, DenyReason, Packet};
 
+/// Encodes its shard: `id % shard_count == shard index`.
 pub type ClientId = u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,48 +38,93 @@ pub enum ServerEvent {
     Message { client: ClientId, channel: Channel, data: Vec<u8> },
 }
 
+/// Cookies are valid for the current and previous bucket (10-20 s).
+const COOKIE_BUCKET_SECS: u64 = 10;
+
+/// Maps a peer address to its shard. Cheap to clone; hand one to the thread
+/// that receives datagrams so it can bucket them per shard.
+#[derive(Clone)]
+pub struct Router {
+    /// Keyed, so remote peers can't aim many addresses at one shard.
+    key: RandomState,
+    shards: u32,
+}
+
+impl Router {
+    pub fn shard(&self, addr: &SocketAddr) -> usize {
+        if self.shards == 1 {
+            0
+        } else {
+            (self.key.hash_one(addr) % self.shards as u64) as usize
+        }
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shards as usize
+    }
+}
+
+struct Shared {
+    cfg: Config,
+    max_clients: usize,
+    /// Randomly keyed SipHash: the server secret for handshake cookies.
+    cookie_key: RandomState,
+    epoch: Instant,
+    router: Router,
+    /// Connected clients across all shards.
+    clients: AtomicUsize,
+}
+
+impl Shared {
+    fn bucket(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_secs() / COOKIE_BUCKET_SECS
+    }
+
+    fn cookie(&self, addr: &SocketAddr, salt: u64, bucket: u64) -> u64 {
+        let mut h = self.cookie_key.build_hasher();
+        addr.hash(&mut h);
+        salt.hash(&mut h);
+        bucket.hash(&mut h);
+        h.finish()
+    }
+
+    /// Takes a slot if one is free.
+    fn reserve_slot(&self) -> bool {
+        self.clients
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.max_clients).then_some(n + 1))
+            .is_ok()
+    }
+}
+
 struct Slot {
     addr: SocketAddr,
     salt: u64,
     conn: Connection,
 }
 
-/// Cookies are valid for the current and previous bucket (10-20 s).
-const COOKIE_BUCKET_SECS: u64 = 10;
-
-pub struct Server {
-    cfg: Config,
-    max_clients: usize,
-    /// Randomly keyed SipHash: the server secret for handshake cookies.
-    key: RandomState,
-    epoch: Instant,
+/// The connections whose addresses route to one shard. `Send`; independent of
+/// every other shard.
+pub struct Shard {
+    shared: Arc<Shared>,
+    index: u32,
     by_addr: HashMap<SocketAddr, ClientId>,
     clients: HashMap<ClientId, Slot>,
-    next_id: ClientId,
+    next_local: u32,
     events: VecDeque<ServerEvent>,
     outgoing: Vec<(SocketAddr, Vec<u8>)>,
-    /// Datagrams dropped for bad CRC, bad cookie, wrong session, etc.
-    pub dropped_packets: u64,
+    dropped_packets: u64,
 }
 
-impl Server {
-    pub fn new(cfg: Config, max_clients: usize, now: Instant) -> Self {
-        Self {
-            cfg,
-            max_clients,
-            key: RandomState::new(),
-            epoch: now,
-            by_addr: HashMap::new(),
-            clients: HashMap::new(),
-            next_id: 0,
-            events: VecDeque::new(),
-            outgoing: Vec::new(),
-            dropped_packets: 0,
-        }
+impl Shard {
+    pub fn index(&self) -> usize {
+        self.index as usize
     }
 
+    /// `from` must route to this shard (`Router::shard`). Handshakes from an
+    /// address routed elsewhere are dropped, so a routing bug can't create a
+    /// connection in the wrong shard.
     pub fn receive(&mut self, from: SocketAddr, data: &[u8], now: Instant) {
-        let Ok(pkt) = packet::decode(self.cfg.protocol_id, data) else {
+        let Ok(pkt) = packet::decode(self.shared.cfg.protocol_id, data) else {
             self.dropped_packets += 1;
             return;
         };
@@ -75,12 +133,16 @@ impl Server {
                 if self.by_addr.contains_key(&from) {
                     return;
                 }
-                if self.clients.len() >= self.max_clients {
+                if !self.owns(&from) {
+                    self.dropped_packets += 1;
+                    return;
+                }
+                if self.shared.clients.load(Ordering::Relaxed) >= self.shared.max_clients {
                     self.push(from, Packet::Denied { client_salt, reason: DenyReason::ServerFull });
                     return;
                 }
                 // Stateless: nothing is allocated until the cookie comes back.
-                let cookie = self.cookie(&from, client_salt, self.bucket(now));
+                let cookie = self.shared.cookie(&from, client_salt, self.shared.bucket(now));
                 self.push(from, Packet::Challenge { client_salt, cookie });
             }
 
@@ -92,20 +154,20 @@ impl Server {
                     }
                     return;
                 }
-                let b = self.bucket(now);
-                let valid = cookie == self.cookie(&from, client_salt, b)
-                    || (b > 0 && cookie == self.cookie(&from, client_salt, b - 1));
-                if !valid {
+                let b = self.shared.bucket(now);
+                let valid = cookie == self.shared.cookie(&from, client_salt, b)
+                    || (b > 0 && cookie == self.shared.cookie(&from, client_salt, b - 1));
+                if !valid || !self.owns(&from) {
                     self.dropped_packets += 1;
                     return;
                 }
-                if self.clients.len() >= self.max_clients {
+                if !self.shared.reserve_slot() {
                     self.push(from, Packet::Denied { client_salt, reason: DenyReason::ServerFull });
                     return;
                 }
-                let id = self.next_id;
-                self.next_id = self.next_id.wrapping_add(1);
-                let conn = Connection::new(self.cfg.clone(), session_from_cookie(cookie), now);
+                let id = self.next_local.wrapping_mul(self.shared.router.shards).wrapping_add(self.index);
+                self.next_local = self.next_local.wrapping_add(1);
+                let conn = Connection::new(self.shared.cfg.clone(), session_from_cookie(cookie), now);
                 self.by_addr.insert(from, id);
                 self.clients.insert(id, Slot { addr: from, salt: client_salt, conn });
                 self.push(from, Packet::Accepted { client_salt, client_id: id });
@@ -152,7 +214,7 @@ impl Server {
         }
     }
 
-    /// Build packets for every client. Call once per tick after queuing sends.
+    /// Build packets for every client in this shard. Call once per tick after queuing sends.
     pub fn flush(&mut self, now: Instant) {
         let mut pkts = Vec::new();
         for slot in self.clients.values_mut() {
@@ -183,6 +245,7 @@ impl Server {
         self.outgoing.drain(..)
     }
 
+    /// Clients in this shard.
     pub fn client_count(&self) -> usize {
         self.clients.len()
     }
@@ -199,9 +262,19 @@ impl Server {
         self.clients.get(&client).map(|s| s.addr)
     }
 
+    /// Datagrams dropped for bad CRC, bad cookie, wrong session, misrouting, etc.
+    pub fn dropped_packets(&self) -> u64 {
+        self.dropped_packets
+    }
+
+    fn owns(&self, addr: &SocketAddr) -> bool {
+        self.shared.router.shard(addr) == self.index as usize
+    }
+
     fn remove(&mut self, id: ClientId, reason: DisconnectReason, notify: bool) {
         let Some(slot) = self.clients.remove(&id) else { return };
         self.by_addr.remove(&slot.addr);
+        self.shared.clients.fetch_sub(1, Ordering::AcqRel);
         if notify {
             // Redundant: this is fire-and-forget over UDP.
             for _ in 0..3 {
@@ -212,18 +285,117 @@ impl Server {
     }
 
     fn push(&mut self, to: SocketAddr, p: Packet<'_>) {
-        self.outgoing.push((to, packet::encode(self.cfg.protocol_id, &p)));
+        self.outgoing.push((to, packet::encode(self.shared.cfg.protocol_id, &p)));
+    }
+}
+
+pub struct Server {
+    shared: Arc<Shared>,
+    shards: Vec<Shard>,
+}
+
+impl Server {
+    /// A single-shard server.
+    pub fn new(cfg: Config, max_clients: usize, now: Instant) -> Self {
+        Self::with_shards(cfg, max_clients, 1, now)
     }
 
-    fn bucket(&self, now: Instant) -> u64 {
-        now.saturating_duration_since(self.epoch).as_secs() / COOKIE_BUCKET_SECS
+    /// `shards` independent partitions of the connections. More shards than
+    /// threads lets a work-stealing pool balance uneven shards.
+    pub fn with_shards(cfg: Config, max_clients: usize, shards: usize, now: Instant) -> Self {
+        assert!((1..=u16::MAX as usize).contains(&shards), "shards must be 1..=65535");
+        let shared = Arc::new(Shared {
+            cfg,
+            max_clients,
+            cookie_key: RandomState::new(),
+            epoch: now,
+            router: Router { key: RandomState::new(), shards: shards as u32 },
+            clients: AtomicUsize::new(0),
+        });
+        let shards = (0..shards as u32)
+            .map(|index| Shard {
+                shared: shared.clone(),
+                index,
+                by_addr: HashMap::new(),
+                clients: HashMap::new(),
+                next_local: 0,
+                events: VecDeque::new(),
+                outgoing: Vec::new(),
+                dropped_packets: 0,
+            })
+            .collect();
+        Self { shared, shards }
     }
 
-    fn cookie(&self, addr: &SocketAddr, salt: u64, bucket: u64) -> u64 {
-        let mut h = self.key.build_hasher();
-        addr.hash(&mut h);
-        salt.hash(&mut h);
-        bucket.hash(&mut h);
-        h.finish()
+    pub fn router(&self) -> Router {
+        self.shared.router.clone()
+    }
+
+    pub fn shards(&self) -> &[Shard] {
+        &self.shards
+    }
+
+    pub fn shards_mut(&mut self) -> &mut [Shard] {
+        &mut self.shards
+    }
+
+    pub fn shard_of_client(&self, client: ClientId) -> usize {
+        client as usize % self.shards.len()
+    }
+
+    pub fn receive(&mut self, from: SocketAddr, data: &[u8], now: Instant) {
+        let s = self.shared.router.shard(&from);
+        self.shards[s].receive(from, data, now);
+    }
+
+    /// Detect timeouts in every shard. Call once per tick.
+    pub fn update(&mut self, now: Instant) {
+        self.shards.iter_mut().for_each(|s| s.update(now));
+    }
+
+    /// Build packets for every client. Call once per tick after queuing sends.
+    pub fn flush(&mut self, now: Instant) {
+        self.shards.iter_mut().for_each(|s| s.flush(now));
+    }
+
+    pub fn send(&mut self, client: ClientId, channel: Channel, data: Vec<u8>) -> Result<(), SendError> {
+        let s = self.shard_of_client(client);
+        self.shards[s].send(client, channel, data)
+    }
+
+    pub fn disconnect(&mut self, client: ClientId) {
+        let s = self.shard_of_client(client);
+        self.shards[s].disconnect(client);
+    }
+
+    /// Events of one client stay in order; events of different shards don't
+    /// interleave in any particular order.
+    pub fn poll_event(&mut self) -> Option<ServerEvent> {
+        self.shards.iter_mut().find_map(|s| s.poll_event())
+    }
+
+    pub fn drain_outgoing(&mut self) -> impl Iterator<Item = (SocketAddr, Vec<u8>)> + '_ {
+        self.shards.iter_mut().flat_map(|s| s.drain_outgoing())
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.shared.clients.load(Ordering::Acquire)
+    }
+
+    pub fn client_ids(&self) -> impl Iterator<Item = ClientId> + '_ {
+        self.shards.iter().flat_map(|s| s.client_ids())
+    }
+
+    pub fn client_stats(&self, client: ClientId) -> Option<&Stats> {
+        self.shards[self.shard_of_client(client)].client_stats(client)
+    }
+
+    pub fn client_addr(&self, client: ClientId) -> Option<SocketAddr> {
+        self.shards[self.shard_of_client(client)].client_addr(client)
+    }
+
+    /// Datagrams dropped for bad CRC, bad cookie, wrong session, etc.
+    pub fn dropped_packets(&self) -> u64 {
+        self.shards.iter().map(|s| s.dropped_packets).sum()
     }
 }

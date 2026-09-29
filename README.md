@@ -3,7 +3,7 @@
 The custom UDP transport for a PlanetSide-style MMOFPS, where each continent runs as one server process targeting up to 10k players. Written in Rust with zero dependencies. It's sans-IO: the protocol code never touches a socket, so you feed it datagrams and a timestamp and drain the datagrams it wants sent.
 
 ```
-cargo test --release                                   # workspace: 18 transport tests incl. 25%-loss/jitter/dup sim, + sim/
+cargo test --release                                   # workspace: 22 transport tests incl. 25%-loss/jitter/dup sim, + sim/
 cargo run --release --example server                   # real UDP, 30 Hz tick, echo
 cargo run --release --example client 127.0.0.1:40000 5
 ```
@@ -69,6 +69,19 @@ S→C  Accepted           { salt, client_id }            ← slot allocated here
 
 **Unreliable** messages are packed after reliable ones. Anything that doesn't fit in this flush's packets (max 4 per connection per flush by default) is dropped and counted in `Stats::unreliable_dropped`. That's deliberate: next tick's snapshot is fresher.
 
+## Sharding
+
+`Server::with_shards(cfg, max_clients, n, now)` partitions connections into `n` independent `Shard`s. The crate still spawns no threads: the caller drives the shards from its own pool.
+
+- **Routing.** `Router::shard(addr)` is a keyed hash of the peer address. A given address always lands in the same shard, so the "already connected?" check never leaves the shard. The key is random per server, so remote peers can't aim many addresses at one shard. Hand a cloned `Router` to the receive thread so it buckets datagrams per shard.
+- **Ids encode their shard.** `id % n == shard`, so `send`, `stats` and `disconnect` for an id need no lookup table.
+- **Shared state.** Shards share only read-only config and keys plus an atomic client count, which enforces `max_clients` with a CAS. The whole handshake, including accepting a client, runs inside the shard.
+- **Misrouting.** A shard drops handshake packets from addresses that don't route to it. Handshakes are the only packets that create state.
+- `Shard` is `Send`. For each shard, in parallel: `receive` its bucket, `update`, `poll_event`, `send`, `flush`, `drain_outgoing`.
+- `Server`'s own methods do the same work serially and route internally. `Server::new` is simply one shard.
+
+In the M1 sim, 64 shards on 8 threads cut the 10k-client ingress from 9.6 ms to 2.4 ms and transport from 9.1 ms to 2.2 ms (see `sim/README.md`).
+
 ## Stats per connection
 
 The per-connection stats are packets and bytes sent and received, acked packets, lost packets, duplicates, dropped unreliable messages, smoothed RTT (EWMA 0.1), and smoothed loss (EWMA 0.05).
@@ -84,7 +97,7 @@ The per-connection stats are packets and bytes sent and received, acked packets,
 | `packet.rs` | packet types, encode/decode, padding rules |
 | `channel.rs` | `ReliableSender` / `ReliableReceiver` |
 | `connection.rs` | seq/ack/RTT/loss, `flush()` packs reliable then unreliable |
-| `server.rs` | handshake, client table, events, timeouts |
+| `server.rs` | `Server` → `Shard`s + `Router`: handshake, client tables, events, timeouts |
 | `client.rs` | handshake state machine, resends every 100 ms |
 | `bitpack.rs` | bit writer/reader + quantization, e.g. a far-tier player in 8 bytes |
 
@@ -98,6 +111,7 @@ The simulated link does loss, duplication, and base delay + jitter (which causes
 - **Unreliable doesn't block.** 3 × 500 B unreliable messages per tick keep streaming, with no head-of-line blocking.
 - **Timeouts.** Both sides time out when the cable is cut.
 - **Server full.** A client over the limit gets Denied.
+- **Sharding.** Across 8 shards, 300 clients connect through the lossy link and echo reliably, and each id's shard matches its address route. `max_clients` holds across 16 shards (exactly 25 of 40 accepted). Shards run on real threads via `std::thread::scope`. A misrouted handshake is dropped.
 - **Bad input.** Garbage packets, forged cookies, and payloads with a spoofed address but wrong session are all dropped.
 
 ## What's deliberately missing (next steps, roughly in order)
@@ -106,5 +120,6 @@ The simulated link does loss, duplication, and base delay + jitter (which causes
 2. **Bandwidth budget per connection.** A token bucket (e.g. 1.5 Mbps down) that `flush` respects, with prioritized content filling the budget. This is where the interest-management layer plugs in: it decides *what* goes in the unreliable stream, and the budget decides *how much*.
 3. **Fragmentation** for messages > ~1.2 KB (initial world state, loadouts). Split them into a sliced reliable "block" channel, one block in flight at a time.
 4. **Serialize-once fan-out.** Right now `flush` copies the body into the packet. For 10k clients, write headers in place and assemble per-client packets from shared, pre-encoded entity blobs.
-5. **Syscall batching.** Use `recvmmsg`/`sendmmsg` (or `UDP_SEGMENT` GSO), `SO_REUSEPORT` with N network threads, and hand datagrams to the sim via SPSC rings. Move to AF_XDP only if pps becomes the bottleneck. Because the protocol is sans-IO, none of this touches protocol code.
-6. **Sharding connections across threads.** `Connection` is `Send` and self-contained. Partition clients by id across worker threads for the flush/assembly phase.
+5. **Syscall batching.** Use `recvmmsg`/`sendmmsg` (or `UDP_SEGMENT` GSO), `SO_REUSEPORT` with N network threads (a natural fit: one socket per group of shards), and hand datagrams to the sim via SPSC rings. After sharding, one `send_to` per packet is the biggest phase at 10k (~11 ms). Move to AF_XDP only if pps becomes the bottleneck. Because the protocol is sans-IO, none of this touches protocol code.
+
+Done: **sharding connections across threads** (see Sharding above).

@@ -4,23 +4,25 @@
 //!
 //! | phase     | work                                                            |
 //! |-----------|-----------------------------------------------------------------|
-//! | ingress   | feed datagrams to `lattice_net::Server`, timeouts, spawn/despawn, queue inputs |
+//! | ingress   | each transport shard decodes its datagrams, acks, handshakes, timeouts (parallel) |
+//! | events    | spawn/despawn, queue inputs into per-entity queues (serial) |
 //! | movement  | one input seq per entity per tick, real or stand-in (parallel)  |
 //! | grid      | rebuild the shared spatial grid                                 |
 //! | history   | store positions for lag compensation (unused until M3)          |
 //! | serialize | encode each entity once into an 11-byte blob (parallel)         |
-//! | assembly  | per client: K nearest via grid, memcpy blobs into a snapshot (parallel) |
-//! | transport | hand snapshots to the transport and build packets (serial for now) |
+//! | assembly  | per client: K nearest via grid, memcpy blobs into a snapshot (parallel by shard) |
+//! | transport | each shard queues its clients' snapshots and builds packets (parallel) |
 //!
 //! Shots and event application (phases 3 and 4) come with M3. Egress (the socket
-//! writes) happens in the binary.
+//! writes) happens in the binary. Datagrams move in per-shard buckets both ways:
+//! route inbound ones with `router()`.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use lattice_net::wire::Writer;
-use lattice_net::{Channel, ClientId, Config, Server, ServerEvent};
+use lattice_net::{Channel, ClientId, Config, Router, Server, ServerEvent};
 use rayon::prelude::*;
 
 use crate::grid::Grid;
@@ -28,7 +30,8 @@ use crate::movement::{step, Input, MoveState, TICK_HZ, WORLD_SIZE};
 use crate::msg::{self, Blob, SnapshotHeader, Welcome, ENTITY_BLOB, SNAPSHOT_HEADER};
 use crate::rng::Rng;
 
-pub const PHASES: [&str; 7] = ["ingress", "movement", "grid", "history", "serialize", "assembly", "transport"];
+pub const PHASES: [&str; 8] = ["ingress", "events", "movement", "grid", "history", "serialize", "assembly", "transport"];
+pub type Datagram = (SocketAddr, Vec<u8>);
 pub type PhaseTimes = [Duration; PHASES.len()];
 
 /// Lag-compensation window: 200 ms.
@@ -71,6 +74,8 @@ pub struct SimConfig {
     /// nearest entities within `near_radius`, every tick.
     pub near_radius: f32,
     pub near_max: usize,
+    /// Transport shards. More than the thread count lets rayon balance them.
+    pub shards: usize,
     pub seed: u64,
 }
 
@@ -82,6 +87,7 @@ impl Default for SimConfig {
             spawn: SpawnMode::Uniform,
             near_radius: 150.0,
             near_max: 64,
+            shards: 64,
             seed: 1,
         }
     }
@@ -221,6 +227,10 @@ pub struct SimServer {
     history: Vec<Vec<[f32; 2]>>,
     free: Vec<u16>,
     by_client: HashMap<ClientId, u16>,
+    /// Clients (and their entities) grouped by transport shard.
+    shard_clients: Vec<Vec<(ClientId, u16)>>,
+    /// Per-shard snapshot buffers, reused every tick.
+    snapshots: Vec<Vec<(ClientId, Vec<u8>)>>,
     grid: Grid,
     rng: Rng,
     counters: Counters,
@@ -232,7 +242,9 @@ impl SimServer {
         cfg.near_max = cfg.near_max.min(max_fit).min(u8::MAX as usize);
         assert!(cfg.max_clients <= u16::MAX as usize, "entity ids are u16");
         Self {
-            net: Server::new(cfg.net.clone(), cfg.max_clients, now),
+            net: Server::with_shards(cfg.net.clone(), cfg.max_clients, cfg.shards, now),
+            shard_clients: vec![Vec::new(); cfg.shards],
+            snapshots: vec![Vec::new(); cfg.shards],
             rng: Rng::new(cfg.seed),
             cfg,
             tick: 0,
@@ -263,17 +275,25 @@ impl SimServer {
         &self.net
     }
 
+    /// Routes an inbound datagram's source address to its bucket index.
+    pub fn router(&self) -> Router {
+        self.net.router()
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shard_clients.len()
+    }
+
     pub fn entity_state(&self, entity: u16) -> Option<MoveState> {
         self.bodies.get(entity as usize).filter(|b| b.alive).map(|b| b.state)
     }
 
-    /// Run one tick. Consumes `inbound`, appends datagrams to send to `out`.
-    pub fn tick(
-        &mut self,
-        inbound: &mut Vec<(SocketAddr, Vec<u8>)>,
-        now: Instant,
-        out: &mut Vec<(SocketAddr, Vec<u8>)>,
-    ) -> PhaseTimes {
+    /// Run one tick. `inbound` and `out` have one bucket per shard: inbound
+    /// datagrams must be bucketed by `router()`, and are consumed; outgoing ones
+    /// are appended to their shard's bucket.
+    pub fn tick(&mut self, inbound: &mut [Vec<Datagram>], now: Instant, out: &mut [Vec<Datagram>]) -> PhaseTimes {
+        assert_eq!(inbound.len(), self.shard_count(), "one inbound bucket per shard");
+        assert_eq!(out.len(), self.shard_count(), "one outgoing bucket per shard");
         let mut times = PhaseTimes::default();
         let mut t = Instant::now();
         let mut lap = |i: usize| {
@@ -282,20 +302,27 @@ impl SimServer {
             t = n;
         };
 
-        // 1. ingress
-        for (from, data) in inbound.drain(..) {
-            self.net.receive(from, &data, now);
-        }
-        self.net.update(now);
-        while let Some(ev) = self.net.poll_event() {
-            match ev {
-                ServerEvent::Connected { client, .. } => self.spawn(client),
-                ServerEvent::Disconnected { client, .. } => self.despawn(client),
-                ServerEvent::Message { client, channel: Channel::Unreliable, data } => self.on_input(client, &data),
-                ServerEvent::Message { .. } => self.counters.bad_messages += 1,
+        // 1. ingress: the per-packet transport work, one task per shard
+        self.net.shards_mut().par_iter_mut().zip(inbound.par_iter_mut()).for_each(|(shard, bucket)| {
+            for (from, data) in bucket.drain(..) {
+                shard.receive(from, &data, now);
+            }
+            shard.update(now);
+        });
+        lap(0);
+
+        // 1b. events: these touch the world, so they're applied on one thread
+        for k in 0..self.shard_count() {
+            while let Some(ev) = self.net.shards_mut()[k].poll_event() {
+                match ev {
+                    ServerEvent::Connected { client, .. } => self.spawn(client),
+                    ServerEvent::Disconnected { client, .. } => self.despawn(client),
+                    ServerEvent::Message { client, channel: Channel::Unreliable, data } => self.on_input(client, &data),
+                    ServerEvent::Message { .. } => self.counters.bad_messages += 1,
+                }
             }
         }
-        lap(0);
+        lap(1);
 
         // 2. movement
         let [applied, repeated, frozen] = self
@@ -314,20 +341,20 @@ impl SimServer {
         self.counters.inputs_applied += applied;
         self.counters.repeated += repeated;
         self.counters.frozen += frozen;
-        lap(1);
+        lap(2);
 
         // 5. spatial grid
         let bodies = &self.bodies;
         self.grid.rebuild(
             bodies.iter().enumerate().filter(|(_, b)| b.alive).map(|(i, b)| (i as u32, b.state.pos)),
         );
-        lap(2);
+        lap(3);
 
         // 6. lag-comp history
         let slot = &mut self.history[self.tick as usize % HISTORY_TICKS];
         slot.clear();
         slot.extend(self.bodies.iter().map(|b| b.state.pos));
-        lap(3);
+        lap(4);
 
         // 7. serialize each entity once
         self.blobs
@@ -337,16 +364,15 @@ impl SimServer {
             .with_min_len(512)
             .filter(|(_, (_, b))| b.alive)
             .for_each(|(i, (blob, b))| *blob = msg::encode_blob(i as u16, b.state.pos, b.yaw));
-        lap(4);
+        lap(5);
 
-        // 8. per-client assembly
-        let clients: Vec<(ClientId, u16)> = self.by_client.iter().map(|(&c, &e)| (c, e)).collect();
+        // 8. per-client assembly, grouped by shard so each shard's snapshots
+        // are ready for its transport task
         let (radius, k, tick) = (self.cfg.near_radius, self.cfg.near_max, self.tick);
         let (bodies, inputs, blobs, grid) = (&self.bodies, &self.inputs, &self.blobs, &self.grid);
-        let snapshots: Vec<(ClientId, Vec<u8>)> = clients
-            .par_iter()
-            .with_min_len(64)
-            .map_init(Vec::new, |near: &mut Vec<(f32, u32)>, &(client, e)| {
+        self.shard_clients.par_iter().zip(self.snapshots.par_iter_mut()).for_each(|(clients, snaps)| {
+            let mut near: Vec<(f32, u32)> = Vec::new();
+            for &(client, e) in clients {
                 let me = bodies[e as usize].state;
                 near.clear();
                 grid.for_each_near(me.pos, radius, |j| {
@@ -374,20 +400,30 @@ impl SimServer {
                 for &(_, j) in near.iter() {
                     w.bytes(&blobs[j as usize]);
                 }
-                (client, w.into_inner())
-            })
-            .collect();
-        lap(5);
-
-        // 8b. transport: this is lattice_net::Server, one thread for now
-        for (client, snap) in snapshots {
-            self.counters.snapshots += 1;
-            self.counters.snapshot_entities += ((snap.len() - SNAPSHOT_HEADER) / ENTITY_BLOB) as u64;
-            let _ = self.net.send(client, Channel::Unreliable, snap);
+                snaps.push((client, w.into_inner()));
+            }
+        });
+        for snaps in &self.snapshots {
+            self.counters.snapshots += snaps.len() as u64;
+            self.counters.snapshot_entities +=
+                snaps.iter().map(|(_, s)| ((s.len() - SNAPSHOT_HEADER) / ENTITY_BLOB) as u64).sum::<u64>();
         }
-        self.net.flush(now);
-        out.extend(self.net.drain_outgoing());
         lap(6);
+
+        // 8b. transport: queue, frame, ack and checksum, one task per shard
+        self.net
+            .shards_mut()
+            .par_iter_mut()
+            .zip(self.snapshots.par_iter_mut())
+            .zip(out.par_iter_mut())
+            .for_each(|((shard, snaps), out)| {
+                for (client, snap) in snaps.drain(..) {
+                    let _ = shard.send(client, Channel::Unreliable, snap);
+                }
+                shard.flush(now);
+                out.extend(shard.drain_outgoing());
+            });
+        lap(7);
 
         self.tick = self.tick.wrapping_add(1);
         self.counters.ticks += 1;
@@ -409,6 +445,7 @@ impl SimServer {
         self.bodies[i] = Body { alive: true, state: MoveState { pos: spawn, vel: [0.0; 2] }, yaw: 0 };
         self.inputs[i] = InputQueue::default();
         self.by_client.insert(client, e);
+        self.shard_clients[self.net.shard_of_client(client)].push((client, e));
         self.counters.spawns += 1;
         let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius });
         let _ = self.net.send(client, Channel::Reliable, welcome);
@@ -416,6 +453,10 @@ impl SimServer {
 
     fn despawn(&mut self, client: ClientId) {
         if let Some(e) = self.by_client.remove(&client) {
+            let list = &mut self.shard_clients[self.net.shard_of_client(client)];
+            if let Some(i) = list.iter().position(|&(c, _)| c == client) {
+                list.swap_remove(i);
+            }
             self.bodies[e as usize].alive = false;
             self.free.push(e);
             self.counters.despawns += 1;

@@ -20,6 +20,10 @@ const DEAD_BAND: f32 = 0.25;
 /// Input clock speed change per input of depth error, capped at ±5 %.
 const CLOCK_GAIN: f32 = 0.03;
 const MAX_CLOCK_ADJUST: f32 = 0.05;
+/// After the server reports a stand-in, one extra input goes out at once rather
+/// than waiting ~20 ticks for the nudge; then this many ticks pass before the
+/// next such bump, so reports still in flight don't stack up bumps.
+const BUMP_COOLDOWN: u32 = 10;
 
 #[derive(Debug, Clone, Default)]
 pub struct BotStats {
@@ -62,6 +66,7 @@ pub struct BotBrain {
     /// Input clock: `rate` inputs per tick, accumulated in `clock`.
     rate: f32,
     clock: f32,
+    bump_cooldown: u32,
     buffer_avg: f32,
     resyncing: bool,
     last_server_tick: Option<u32>,
@@ -83,6 +88,7 @@ impl BotBrain {
             // Mid-phase: a rate a hair off 1.0 must drift half a tick before it
             // adds or skips an input, instead of flipping at the edge every tick.
             clock: 0.5,
+            bump_cooldown: 0,
             buffer_avg: (TARGET_DEPTH.0 + TARGET_DEPTH.1) / 2.0,
             resyncing: false,
             last_server_tick: None,
@@ -108,6 +114,9 @@ impl BotBrain {
             Ok(ServerMsg::Welcome(w)) if self.welcome.is_none() => {
                 self.state = MoveState { pos: w.spawn, vel: [0.0; 2] };
                 self.welcome = Some(w);
+                // Start with the spare already queued: at depth 1 every input
+                // arrives just in time and any jitter makes it late.
+                self.clock += TARGET_DEPTH.0 - 1.0;
             }
             Ok(ServerMsg::Snapshot(h, _)) if self.welcome.is_some() => self.on_snapshot(&h),
             Ok(_) => {}
@@ -137,12 +146,21 @@ impl BotBrain {
             0.0
         };
         self.rate = 1.0 + (CLOCK_GAIN * error).clamp(-MAX_CLOCK_ADJUST, MAX_CLOCK_ADJUST);
+        if h.buffered == 0 && self.bump_cooldown == 0 {
+            self.clock += 1.0;
+            self.bump_cooldown = BUMP_COOLDOWN;
+        }
 
         if h.ack_seq > self.seq {
             // We fell behind (stalled) and the server filled our seqs with
             // stand-ins. Adopt its state and continue after its newest seq;
             // otherwise every input we send would arrive late and be dropped.
             self.stats.resyncs += !self.resyncing as u64;
+            if !self.resyncing {
+                // Landing exactly on the server's seq leaves no lead: the next
+                // input would be late too. Rebuild the spare right away.
+                self.clock += TARGET_DEPTH.0;
+            }
             self.resyncing = true;
             self.seq = h.ack_seq;
             self.state = h.own;
@@ -182,8 +200,10 @@ impl BotBrain {
     pub fn tick_inputs(&mut self) -> Option<Vec<u8>> {
         let w = self.welcome?;
         self.clock += self.rate;
+        self.bump_cooldown = self.bump_cooldown.saturating_sub(1);
         let mut made = 0;
-        while self.clock >= 1.0 {
+        // Never more than one batch carries, or the oldest new input would be lost.
+        while self.clock >= 1.0 && made < INPUT_REDUNDANCY {
             self.clock -= 1.0;
             let input = self.think(&w);
             self.seq += 1;

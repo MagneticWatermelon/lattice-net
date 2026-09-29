@@ -86,6 +86,9 @@ struct Shared {
 struct Bot {
     start_at: Instant,
     seed: u64,
+    /// Bound up front, before the clock starts: creating thousands of sockets
+    /// inside the first tick overran the swarm and delivered its inputs late.
+    sock: Option<UdpSocket>,
     net: Option<(UdpSocket, Client)>,
     brain: Option<BotBrain>,
     joined_ms: Option<u32>,
@@ -100,9 +103,10 @@ impl Bot {
             return Ok(None);
         }
         if self.net.is_none() {
-            let sock = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
-            sock.connect(server)?;
-            sock.set_nonblocking(true)?;
+            let sock = match self.sock.take() {
+                Some(s) => s,
+                None => bot_socket(server)?,
+            };
             self.net = Some((sock, Client::new(Config::default(), server, now)));
             self.brain = Some(BotBrain::new(self.seed));
         }
@@ -175,6 +179,13 @@ impl Bot {
     }
 }
 
+fn bot_socket(server: SocketAddr) -> std::io::Result<UdpSocket> {
+    let sock = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
+    sock.connect(server)?;
+    sock.set_nonblocking(true)?;
+    Ok(sock)
+}
+
 fn main() -> std::io::Result<()> {
     let mut a = Args::parse(USAGE);
     let server: SocketAddr = a.get("server", "127.0.0.1:40000".parse().unwrap());
@@ -188,6 +199,8 @@ fn main() -> std::io::Result<()> {
     a.finish();
 
     println!("{count} bots -> {server} on {threads} threads, ramp {ramp}/s, {duration:?}");
+    let sockets = (0..count).map(|_| bot_socket(server)).collect::<std::io::Result<Vec<_>>>()?;
+    let mut sockets = sockets.into_iter().map(Some).collect::<Vec<_>>();
     let start = Instant::now();
     let end = start + duration;
     let shared = Arc::new(Mutex::new(Shared { threads: vec![Totals::default(); threads], joins: Vec::new() }));
@@ -200,6 +213,7 @@ fn main() -> std::io::Result<()> {
             .map(|i| Bot {
                 start_at: start + if ramp > 0.0 { Duration::from_secs_f64(i as f64 / ramp) } else { Duration::ZERO },
                 seed: seed.wrapping_mul(1_000_003).wrapping_add(i as u64),
+                sock: sockets[i].take(),
                 net: None,
                 brain: None,
                 joined_ms: None,

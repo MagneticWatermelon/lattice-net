@@ -1,9 +1,10 @@
 //! M1 headless server: `SimServer` on a real UDP socket at 30 Hz, reporting
 //! per-phase tick times, bandwidth and pps.
 //!
-//! A dedicated thread blocks on `recv_from` and queues datagrams, so arrivals
-//! spread across the tick don't have to fit in the kernel buffer. Egress is
-//! plain `send_to` spread over the rayon pool (`sendmmsg`/GSO come later).
+//! A dedicated thread blocks on `recv_from` and queues datagrams into per-shard
+//! buckets, so arrivals spread across the tick don't have to fit in the kernel
+//! buffer and routing costs no tick time. Egress is plain `send_to`, one rayon
+//! task per shard (`sendmmsg`/GSO come later).
 
 use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use lattice_sim::cli::Args;
 use lattice_sim::movement::TICK_HZ;
-use lattice_sim::server::{Counters, SimConfig, SimServer, SpawnMode, PHASES};
+use lattice_sim::server::{Counters, Datagram, SimConfig, SimServer, SpawnMode, PHASES};
 use lattice_sim::stats::summarize;
 use rayon::prelude::*;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -28,6 +29,7 @@ lattice-server: M1 movement-only authoritative server
   --near-radius M      interest stand-in radius, meters [150]
   --near-max N         max entities per snapshot [64]
   --threads N          rayon threads [all cores]
+  --shards N           transport shards [64]
   --duration S         stop after S seconds (0 = run forever) [0]
   --until-empty        stop once clients connected and then all left
   --report S           report interval, seconds [5]
@@ -38,7 +40,6 @@ lattice-server: M1 movement-only authoritative server
 /// Columns of per-tick timing samples: the sim phases, then egress and total.
 const COLS: usize = PHASES.len() + 2;
 type Row = [u32; COLS];
-type Datagrams = Vec<(SocketAddr, Vec<u8>)>;
 
 fn col_name(i: usize) -> &'static str {
     match i {
@@ -64,6 +65,7 @@ fn main() -> std::io::Result<()> {
         max_clients: a.get("max-clients", 10_000),
         near_radius: a.get("near-radius", 150.0),
         near_max: a.get("near-max", 64),
+        shards: a.get("shards", 64),
         seed: a.get("seed", 1),
         ..Default::default()
     };
@@ -89,8 +91,13 @@ fn main() -> std::io::Result<()> {
     sock.set_read_timeout(Some(Duration::from_millis(50)))?;
     let sock = Arc::new(sock);
 
+    let start = Instant::now();
+    let period = Duration::from_secs(1) / TICK_HZ;
+    let mut sim = SimServer::new(cfg.clone(), start);
+    let shards = sim.shard_count();
+
     println!(
-        "listening on {bind} | spawn {:?}, near {} within {} m, {} rayon threads | socket buffers rcv {} KiB snd {} KiB",
+        "listening on {bind} | spawn {:?}, near {} within {} m, {} rayon threads, {shards} shards | socket buffers rcv {} KiB snd {} KiB",
         cfg.spawn,
         cfg.near_max,
         cfg.near_radius,
@@ -100,10 +107,11 @@ fn main() -> std::io::Result<()> {
     );
 
     let net = Arc::new(NetCounters::default());
-    let inbox: Arc<Mutex<Datagrams>> = Arc::default();
+    let inbox: Arc<Mutex<Vec<Vec<Datagram>>>> = Arc::new(Mutex::new(vec![Vec::new(); shards]));
     let stop = Arc::new(AtomicBool::new(false));
     let receiver = {
         let (sock, net, inbox, stop) = (sock.clone(), net.clone(), inbox.clone(), stop.clone());
+        let router = sim.router();
         std::thread::Builder::new().name("ingress".into()).spawn(move || {
             let mut buf = [0u8; 1500];
             while !stop.load(Relaxed) {
@@ -111,7 +119,8 @@ fn main() -> std::io::Result<()> {
                     Ok((n, from)) => {
                         net.in_pkts.fetch_add(1, Relaxed);
                         net.in_bytes.fetch_add(n as u64, Relaxed);
-                        inbox.lock().unwrap().push((from, buf[..n].to_vec()));
+                        let shard = router.shard(&from);
+                        inbox.lock().unwrap()[shard].push((from, buf[..n].to_vec()));
                     }
                     Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                     Err(_) => {
@@ -122,16 +131,15 @@ fn main() -> std::io::Result<()> {
         })?
     };
 
-    let start = Instant::now();
-    let period = Duration::from_secs(1) / TICK_HZ;
-    let mut sim = SimServer::new(cfg, start);
     let mut csv = csv_path.map(open_csv).transpose()?;
 
-    let mut inbound = Vec::new();
-    let mut out = Vec::new();
+    let mut inbound: Vec<Vec<Datagram>> = vec![Vec::new(); shards];
+    let mut out: Vec<Vec<Datagram>> = vec![Vec::new(); shards];
     let mut window = Window::new(start, sim.counters(), &net);
     let mut kept: Vec<Row> = Vec::new();
     let mut first_client: Option<Instant> = None;
+    // Counters as of the end of warmup, so the summary can separate the join burst.
+    let mut warm: Option<Counters> = None;
     let mut peak_clients = 0;
     let mut next_tick = start;
 
@@ -142,17 +150,21 @@ fn main() -> std::io::Result<()> {
         let times = sim.tick(&mut inbound, now, &mut out);
 
         let t_egress = Instant::now();
-        let bytes: usize = out.iter().map(|(_, p)| p.len()).sum();
-        out.par_chunks(128).for_each(|chunk| {
-            for (addr, pkt) in chunk {
-                if sock.send_to(pkt, addr).is_err() {
-                    net.send_errors.fetch_add(1, Relaxed);
+        let (pkts, bytes) = out
+            .par_iter_mut()
+            .map(|bucket| {
+                let (n, mut bytes) = (bucket.len(), 0);
+                for (addr, pkt) in bucket.drain(..) {
+                    bytes += pkt.len();
+                    if sock.send_to(&pkt, addr).is_err() {
+                        net.send_errors.fetch_add(1, Relaxed);
+                    }
                 }
-            }
-        });
-        window.out_pkts += out.len() as u64;
+                (n, bytes)
+            })
+            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        window.out_pkts += pkts as u64;
         window.out_bytes += bytes as u64;
-        out.clear();
 
         let done = Instant::now();
         let mut row = [0u32; COLS];
@@ -173,6 +185,7 @@ fn main() -> std::io::Result<()> {
             let first = *first_client.get_or_insert(now);
             if now - first >= warmup {
                 kept.push(row);
+                warm.get_or_insert_with(|| sim.counters().clone());
             }
         }
 
@@ -200,7 +213,7 @@ fn main() -> std::io::Result<()> {
     }
     stop.store(true, Relaxed);
     let _ = receiver.join();
-    print_summary(&mut kept, peak_clients, sim.counters(), &net);
+    print_summary(&mut kept, peak_clients, sim.counters(), warm.as_ref(), &net);
     Ok(())
 }
 
@@ -321,7 +334,7 @@ fn open_csv(path: String) -> std::io::Result<BufWriter<File>> {
     Ok(w)
 }
 
-fn print_summary(kept: &mut [Row], peak: usize, c: &Counters, net: &NetCounters) {
+fn print_summary(kept: &mut [Row], peak: usize, c: &Counters, warm: Option<&Counters>, net: &NetCounters) {
     println!("\n== summary: {} ticks after warmup, peak {peak} clients ==", kept.len());
     if kept.is_empty() {
         return;
@@ -344,6 +357,15 @@ fn print_summary(kept: &mut [Row], peak: usize, c: &Counters, net: &NetCounters)
         net.recv_errors.load(Relaxed),
         net.send_errors.load(Relaxed)
     );
+    if let Some(w) = warm {
+        println!(
+            "  after warmup: stand-ins repeated {} frozen {} | late inputs {} discarded {}",
+            c.repeated - w.repeated,
+            c.frozen - w.frozen,
+            c.late_inputs - w.late_inputs,
+            c.discarded_inputs - w.discarded_inputs
+        );
+    }
 }
 
 fn ms(us: u32) -> String {

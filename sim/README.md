@@ -17,14 +17,17 @@ cargo run --release --bin lattice-bots -- --help
 
 | phase | work | parallel |
 |---|---|---|
-| ingress | datagrams into `lattice_net::Server`, timeouts, spawn/despawn, queue inputs | no |
+| ingress | each transport shard decodes its datagrams: CRC, acks, handshakes, timeouts | per shard |
+| events | spawn/despawn, and push inputs into per-entity queues (touches the world) | no |
 | movement | consume exactly one input seq per entity: the real input, or a stand-in if it hasn't arrived | rayon |
 | grid | counting-sort rebuild of the one shared 32 m grid | no |
 | history | positions into a 200 ms lag-comp ring (unused until M3) | no |
 | serialize | each entity once into an 11-byte far-tier blob | rayon |
-| assembly | per client: K nearest via the grid, memcpy blobs into a snapshot | rayon |
-| transport | `Server::send` + `flush`: framing, acks, CRC | no |
-| egress | `send_to` per packet (in the binary) | rayon |
+| assembly | per client: K nearest via the grid, memcpy blobs into a snapshot | per shard |
+| transport | each shard's `send` + `flush`: framing, acks, CRC | per shard |
+| egress | `send_to` per packet (in the binary) | per shard |
+
+The transport is 64 `lattice_net::Shard`s by default (`--shards`). The binary's receive thread buckets each datagram by `Router::shard`, so routing costs no tick time.
 
 Shots and event application (phases 3–4) arrive with M3.
 
@@ -38,9 +41,12 @@ Movement is deterministic f32 code shared by both sides, so prediction matches t
 - If the next input is missing, a stand-in takes its seq: the last input for 2 ticks (`GRACE_TICKS`), then a frozen input (no movement, facing kept).
 - The real input is dropped if it shows up later (`late_inputs`). Holding packets back (a lag switch) therefore buys no movement.
 - There's no 2-per-tick catch-up. Instead, each snapshot carries the server's queue depth for that client (`buffered`), and the bot nudges its input clock by up to ±5% to keep the input due now plus 1–2 spare queued. Inside that band the clock is left alone.
-- A client that stalls past the server's seq jumps ahead to it (`resyncs`) instead of staying late forever.
+- The spare is there from the start: the first tick after Welcome sends 2 inputs. Starting at depth 1 left every input arriving just in time, and jitter kept bots one tick late.
+- When a snapshot reports a stand-in (depth 0), the bot sends one extra input at once, at most once per 10 ticks. The nudge handles slow drift.
+- A client that stalls past the server's seq jumps ahead to it (`resyncs`) and rebuilds its spare, instead of staying late forever.
+- At most 3 inputs go out per tick, the most one redundant batch carries.
 
-With this policy, stand-ins exceed bot corrections in some runs (110 against 15 at uniform 5k). The likely cause, not yet confirmed, is stand-ins during swarm shutdown that no bot ever sees.
+Stand-ins can exceed bot corrections: a stand-in whose input matches what the bot sent (for example, a repeat of an unchanged input) costs no correction.
 
 **Scenarios:**
 - `uniform`: all bots spread over the 8×8 km continent.
@@ -56,27 +62,22 @@ The bots report snapshots, entities per snapshot, corrections, kbps per bot, RTT
 
 ## Baseline: WSL2 dev box (behavior, not capacity)
 
-The table below predates the input policy above: it used repeat-forever plus a 2-per-tick catch-up. Rerun under the new policy:
+Test box: 16 cores, WSL2 on Windows 10, with the server (8 rayon threads, 64 shards) and the bots (8 threads) on the same machine over loopback. Only bare-metal numbers count; these runs show where the time goes. Phase columns are p50 in ms; "before" is the single-shard server.
 
-| scenario | stand-ins before → after | corrections before → after |
-|---|---|---|
-| blob 3,000 | 55 → 0 | 55 → 0 |
-| uniform 5,000 | 418 → 110 | 273 → 15 |
+| scenario | clients | tick p50 / p99 (ms) | before | ingress | events | assembly | transport | egress | stand-ins after warmup | down kbps/client |
+|---|---|---|---|---|---|---|---|---|---|---|
+| uniform | 1,000 | 2.8 / 3.4 | 3.0 / 3.8 | 0.35 | 0.09 | 0.30 | 0.31 | 1.4 | 0 | ~15 |
+| blob | 3,000 | 11.9 / **14.1** | 16.7 / 19.7 | 0.56 | 0.25 | 4.5 | 1.6 | 4.1 | 0 | ~180 |
+| joins | 3,000 + 500 | 7.0 / 8.6 | 8.7 / 13.9 | 0.63 | 0.26 | 0.35 | 0.66 | 4.0 | 0 | ~21 |
+| hotspots | 5,000 | 11.4 / 13.5 | 17.8 / 23.7 | 1.1 | 0.38 | 1.7 | 1.6 | 5.5 | 0 | ~98 |
+| uniform | 5,000 | 10.0 / 12.1 | 14.3 / 17.6 | 1.2 | 0.39 | 0.44 | 1.1 | 5.8 | 0 | ~28 |
+| uniform | 10,000 | 19.0 / 22.4, 1 overrun | 31.1 / 39.6, 180 overruns | 2.4 | 1.2 | 1.2 | 2.2 | 11.0 | 0 | ~45 |
 
-Test box: 16 cores, WSL2 on Windows 10, with the server (8 rayon threads) and the bots (8 threads) on the same machine over loopback. Only bare-metal numbers count; these runs show where the time goes.
+Findings:
 
-| scenario | clients | tick p50 / p99 (ms) | ingress | assembly | transport | egress | corrections | down kbps/client |
-|---|---|---|---|---|---|---|---|---|
-| uniform | 1,000 | 3.0 / 3.8 | 0.45 | 0.56 | 0.45 | 1.3 | 0 | ~14 |
-| blob | 3,000 | 16.7 / **19.7** | 1.7 | 4.3 | 5.7 | 3.9 | 55 (= starved) | ~180 |
-| joins | 3,000 + 500 | 8.7 / 13.9 | 1.9 | 0.6 | 2.2 | 2.6 | 0 | ~22 |
-| hotspots | 5,000 | 17.8 / 23.7 | 3.5 | 1.8 | 6.1 | 5.4 | 58 (96 starved) | ~100 |
-| uniform | 10,000 | 31.1 / 39.6, 180 overruns | 9.6 | 1.1 | 9.1 | 10.1 | 19,950 (= starved) | ~40 |
-
-Phase columns are p50 in ms. Findings:
-
-1. **The blob passes the bar on WSL** (p99 19.7 ms against 25 ms), though with less headroom than you'd want.
-2. **The per-packet serial path dominates, not the game phases.** At 10k, movement, grid, serialize and assembly total about 2 ms. Ingress, transport and egress together take about 29 ms, which is roughly 1 µs per packet per phase on one thread (plus a syscall each for egress). That points at transport steps 4–6 in the root README: serialize-once fan-out, `sendmmsg`/GSO, and sharding `Connection`s across threads.
-3. **Assembly scales with density, as expected:** 4.3 ms for the blob (every client scans about 3,000 candidates) versus 1.1 ms for 10k uniform. This is where M2's tiers and budgets land.
-4. **Corrections come only from starvation, and starvation appeared only in runs where the server or the swarm overran.** Neither jitter nor loss is simulated yet; run under `netem` for that.
-5. **Joins don't spike the tick yet,** because a spawn here is just a Welcome. Zone-entry cost (the initial world state, which needs fragmentation) isn't modeled.
+1. **The blob passes with room to spare** (p99 14.1 ms against the 25 ms bar), and **10k now fits the 33 ms tick**: 1 overrun, down from 180.
+2. **Sharding removed the serial transport cost.** At 10k, ingress fell from 9.6 to 2.4 ms and transport from 9.1 to 2.2 ms. What's left serial is the events phase (1.2 ms at 10k), where inputs are pushed into the world's queues.
+3. **Egress is now the biggest phase:** about 11 ms at 10k, one `send_to` per packet. That's transport step 5: `sendmmsg`/GSO, and `SO_REUSEPORT` sockets per group of shards.
+4. **Assembly scales with density, as expected:** 4.5 ms for the blob (every client scans about 3,000 candidates) versus 1.2 ms for 10k uniform. This is where M2's tiers and budgets land.
+5. **Steady state has no stand-ins and no corrections in any scenario.** All stand-ins happen during a thundering-herd join: 10,000 bots connecting within about 0.5 s pushed the tick to ~150 ms once. The summary's "after warmup" line separates that burst out. No jitter or loss is simulated over the sockets yet; run under `netem` for that.
+6. **Joins don't spike the tick yet,** because a spawn here is just a Welcome. Zone-entry cost (the initial world state, which needs fragmentation) isn't modeled.

@@ -85,10 +85,14 @@ struct World {
 
 impl World {
     fn new(n_clients: usize, profile: LinkProfile, seed: u64) -> Self {
+        Self::sharded(n_clients, 1, 10_000, profile, seed)
+    }
+
+    fn sharded(n_clients: usize, shards: usize, max_clients: usize, profile: LinkProfile, seed: u64) -> Self {
         let now = Instant::now();
         let server_addr: SocketAddr = SERVER.parse().unwrap();
         let cfg = Config::default();
-        let server = Server::new(cfg.clone(), 10_000, now);
+        let server = Server::with_shards(cfg.clone(), max_clients, shards, now);
         let clients = (0..n_clients)
             .map(|i| (client_addr(i), Client::new(cfg.clone(), server_addr, now)))
             .collect();
@@ -123,6 +127,17 @@ impl World {
             }
         }
         events
+    }
+
+    /// Steps until every client is past the handshake (connected or denied).
+    fn settle(&mut self, max_ticks: usize) {
+        for _ in 0..max_ticks {
+            self.step();
+            if self.clients.iter().all(|(_, c)| c.state() != ClientState::Connecting) {
+                return;
+            }
+        }
+        panic!("handshakes didn't settle");
     }
 
     fn connect_all(&mut self, max_ticks: usize) {
@@ -331,7 +346,7 @@ fn server_full_is_denied() {
 fn spoofed_and_garbage_packets_are_ignored() {
     let mut w = World::new(1, LinkProfile { loss: 0.0, dup: 0.0, base_ms: 5, jitter_ms: 0 }, 3);
     w.connect_all(100);
-    let before = w.server.dropped_packets;
+    let before = w.server.dropped_packets();
     let attacker: SocketAddr = "66.66.66.66:6666".parse().unwrap();
 
     // 1) random garbage
@@ -354,7 +369,135 @@ fn spoofed_and_garbage_packets_are_ignored() {
     let victim = w.clients[0].0;
     w.server.receive(victim, &spoof, w.now);
 
-    assert_eq!(w.server.dropped_packets - before, 3);
+    assert_eq!(w.server.dropped_packets() - before, 3);
     assert_eq!(w.server.client_count(), 1);
     assert!(w.server.poll_event().is_none());
+}
+
+#[test]
+fn sharded_server_routes_ids_and_echoes() {
+    let mut w = World::sharded(300, 8, 10_000, NASTY, 11);
+    w.connect_all(2000);
+    assert_eq!(w.server.client_count(), 300);
+    let router = w.server.router();
+    let mut ids = Vec::new();
+    for (addr, c) in &w.clients {
+        let id = c.client_id().unwrap();
+        // The id encodes the shard its address routes to, and that shard owns it.
+        let shard = router.shard(addr);
+        assert_eq!(w.server.shard_of_client(id), shard);
+        assert_eq!(w.server.shards()[shard].client_addr(id), Some(*addr));
+        ids.push(id);
+    }
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 300);
+    let per_shard: Vec<usize> = w.server.shards().iter().map(|s| s.client_count()).collect();
+    assert!(per_shard.iter().all(|&n| n > 15), "keyed hash spreads clients: {per_shard:?}");
+
+    // Reliable echo through every shard.
+    for (_, c) in &mut w.clients {
+        c.send(Channel::Reliable, b"ping".to_vec()).unwrap();
+    }
+    let mut echoed = 0;
+    for _ in 0..500 {
+        for e in w.step() {
+            if let ServerEvent::Message { client, data, .. } = e {
+                w.server.send(client, Channel::Reliable, data).unwrap();
+            }
+        }
+        for (_, c) in &mut w.clients {
+            while let Some((_, d)) = c.recv() {
+                assert_eq!(d, b"ping");
+                echoed += 1;
+            }
+        }
+        if echoed == 300 {
+            break;
+        }
+    }
+    assert_eq!(echoed, 300);
+}
+
+#[test]
+fn max_clients_holds_across_shards() {
+    let clean = LinkProfile { loss: 0.0, dup: 0.0, base_ms: 5, jitter_ms: 0 };
+    let mut w = World::sharded(40, 16, 25, clean, 5);
+    w.settle(200);
+    let connected = w.clients.iter().filter(|(_, c)| c.state() == ClientState::Connected).count();
+    let denied = w
+        .clients
+        .iter()
+        .filter(|(_, c)| c.state() == ClientState::Denied(lattice_net::DenyReason::ServerFull))
+        .count();
+    assert_eq!((connected, denied), (25, 15));
+    assert_eq!(w.server.client_count(), 25);
+    let in_shards: usize = w.server.shards().iter().map(|s| s.client_count()).sum();
+    assert_eq!(in_shards, 25);
+}
+
+#[test]
+fn shards_run_on_separate_threads() {
+    let clean = LinkProfile { loss: 0.0, dup: 0.0, base_ms: 5, jitter_ms: 0 };
+    let mut w = World::sharded(64, 4, 10_000, clean, 9);
+    w.connect_all(200);
+    let router = w.server.router();
+    for (_, c) in &mut w.clients {
+        c.send(Channel::Unreliable, vec![7; 32]).unwrap();
+        c.flush(w.now);
+    }
+    // Bucket every client's datagram by shard, then process each shard on its own thread.
+    let mut buckets: Vec<Vec<(SocketAddr, Vec<u8>)>> = vec![Vec::new(); router.shard_count()];
+    for (addr, c) in &mut w.clients {
+        for pkt in c.drain_outgoing() {
+            buckets[router.shard(addr)].push((*addr, pkt));
+        }
+    }
+    let now = w.now;
+    let counts: Vec<usize> = std::thread::scope(|scope| {
+        let handles: Vec<_> = w
+            .server
+            .shards_mut()
+            .iter_mut()
+            .zip(buckets)
+            .map(|(shard, bucket)| {
+                scope.spawn(move || {
+                    for (from, data) in bucket {
+                        shard.receive(from, &data, now);
+                    }
+                    let mut msgs = 0;
+                    while let Some(e) = shard.poll_event() {
+                        if let ServerEvent::Message { client, data, .. } = e {
+                            shard.send(client, Channel::Unreliable, data).unwrap();
+                            msgs += 1;
+                        }
+                    }
+                    shard.flush(now);
+                    msgs
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(counts.iter().sum::<usize>(), 64);
+    assert_eq!(w.server.drain_outgoing().count(), 64);
+    assert_eq!(w.server.dropped_packets(), 0);
+}
+
+#[test]
+fn misrouted_handshake_is_dropped() {
+    let now = Instant::now();
+    let mut server = Server::with_shards(Config::default(), 100, 4, now);
+    let router = server.router();
+    let addr = client_addr(3);
+    let wrong = (router.shard(&addr) + 1) % 4;
+    let req = lattice_net::packet::encode(
+        Config::default().protocol_id,
+        &lattice_net::packet::Packet::ConnectionRequest { client_salt: 1 },
+    );
+    server.shards_mut()[wrong].receive(addr, &req, now);
+    assert_eq!(server.shards()[wrong].dropped_packets(), 1);
+    assert_eq!(server.drain_outgoing().count(), 0, "no challenge from the wrong shard");
+    server.receive(addr, &req, now);
+    assert_eq!(server.drain_outgoing().count(), 1, "routed correctly, it gets a challenge");
 }

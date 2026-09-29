@@ -12,6 +12,9 @@
 //!   Acks are redundant, so reliability doesn't need separate ack packets.
 //! - **Two channels:** `Unreliable` (latest-wins state, dropped if it doesn't fit this
 //!   tick) and `Reliable` (ordered, exactly-once, resent until acked).
+//! - **Sharded server.** Connections are partitioned by a keyed hash of the peer
+//!   address into `Shard`s that share nothing mutable but an atomic client count,
+//!   so a caller's thread pool can receive and flush them in parallel.
 //! - **Stateless, amplification-safe handshake.** Client->server handshake packets are
 //!   padded larger than the server's replies. The server keeps no state until the client
 //!   echoes a keyed cookie bound to its address.
@@ -31,4 +34,4 @@ pub mod wire;
 pub use client::{Client, ClientState};
 pub use connection::{Channel, Config, Connection, SendError, Stats};
 pub use packet::DenyReason;
-pub use server::{ClientId, DisconnectReason, Server, ServerEvent};
+pub use server::{ClientId, DisconnectReason, Router, Server, ServerEvent, Shard};
