@@ -74,9 +74,15 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - A lower tick rate keeps inputs as 1/30 s movement steps (1.5 per 20 Hz tick), so prediction stays bit-exact.
     - Snapshots carry `pace` (dilation ÷ how far the server is behind schedule), and clients send inputs at pace × 30/s. Without this, a server below 30 Hz overflows input queues.
     - A per-client bandwidth ladder shrinks a starving client's mid/far radii, and its probes back up back off exponentially.
+  - **M2b (near-tier deltas) is built:** `sim/src/delta.rs`.
+    - The transport tags unreliable messages (`send_tagged`, `take_acked`).
+    - The near message of each tick is tagged with that tick; acked ticks become per-entity baselines. Deltas are taken against a 32-tick, tick-major state history on both sides.
+    - Near bytes in the blob fell 63% (967 → 357 B per client-tick). The blob stays at 2 packets, which was decided: mid alone is ~950 B.
+    - The cost: ~3.5 µs of assembly per client per tick (encoding + ack bookkeeping).
+  - **Sink bots don't isolate server cost on one box:** the swarm is ~52% busy either way. Judging 10k's ladder level needs bots on a second machine.
   - **Next:**
-    - M2b: near-tier deltas vs. last acked state (needs unreliable-ack notifications from the transport);
-    - M2c: the web debug map.
+    - M2c: the web debug map;
+    - GSO, together with fixed-size packets or fragmentation (`UDP_SEGMENT` needs equal-size segments).
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.

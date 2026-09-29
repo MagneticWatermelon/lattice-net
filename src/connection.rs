@@ -117,6 +117,34 @@ struct SentPacket {
     time: Instant,
     acked: bool,
     reliable: PacketIds,
+    tags: PacketTags,
+}
+
+/// Most tagged unreliable messages one packet carries (their tags are stored
+/// inline with the sent packet, so this bounds its size).
+pub const MAX_TAGS_PER_PACKET: usize = 8;
+/// Acked tags kept for the application; beyond this the oldest are dropped.
+const MAX_ACKED_TAGS: usize = 4096;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PacketTags {
+    len: u8,
+    tags: [u32; MAX_TAGS_PER_PACKET],
+}
+
+impl PacketTags {
+    fn is_full(&self) -> bool {
+        self.len as usize == MAX_TAGS_PER_PACKET
+    }
+
+    fn push(&mut self, tag: u32) {
+        self.tags[self.len as usize] = tag;
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        &self.tags[..self.len as usize]
+    }
 }
 
 pub struct Connection {
@@ -128,7 +156,11 @@ pub struct Connection {
     received: SequenceBuffer<Instant>,
     reliable_tx: ReliableSender,
     reliable_rx: ReliableReceiver,
-    unreliable_tx: VecDeque<Vec<u8>>,
+    /// Queued unreliable messages, with the application's tag if it asked to
+    /// hear about their delivery.
+    unreliable_tx: VecDeque<(Vec<u8>, Option<u32>)>,
+    /// Tags of delivered (acked) messages, until `take_acked`.
+    acked_tags: Vec<u32>,
     inbox: VecDeque<(Channel, Vec<u8>)>,
     last_recv: Instant,
     last_send: Option<Instant>,
@@ -147,6 +179,7 @@ impl Connection {
             reliable_tx: ReliableSender::new(),
             reliable_rx: ReliableReceiver::new(),
             unreliable_tx: VecDeque::new(),
+            acked_tags: Vec::new(),
             inbox: VecDeque::new(),
             last_recv: now,
             last_send: None,
@@ -169,6 +202,7 @@ impl Connection {
             reliable_tx,
             reliable_rx,
             unreliable_tx,
+            acked_tags,
             inbox,
             last_recv,
             last_send,
@@ -182,6 +216,7 @@ impl Connection {
         reliable_tx.reset();
         reliable_rx.reset();
         unreliable_tx.clear();
+        acked_tags.clear();
         inbox.clear();
         *last_recv = now;
         *last_send = None;
@@ -196,9 +231,27 @@ impl Connection {
         }
         match channel {
             Channel::Reliable => self.reliable_tx.push(data),
-            Channel::Unreliable => self.unreliable_tx.push_back(data),
+            Channel::Unreliable => self.unreliable_tx.push_back((data, None)),
         }
         Ok(())
+    }
+
+    /// An unreliable message whose delivery the application wants to hear
+    /// about: once a packet carrying it is acked, `tag` shows up in
+    /// `take_acked`. Loss is never reported; a tag just doesn't come back.
+    /// The transport doesn't interpret tags.
+    pub fn send_tagged(&mut self, data: Vec<u8>, tag: u32) -> Result<(), SendError> {
+        let max = self.cfg.max_message_size();
+        if data.len() > max {
+            return Err(SendError::MessageTooLarge { size: data.len(), max });
+        }
+        self.unreliable_tx.push_back((data, Some(tag)));
+        Ok(())
+    }
+
+    /// Moves the tags of messages acked since the last call into `out`.
+    pub fn take_acked(&mut self, out: &mut Vec<u32>) {
+        out.append(&mut self.acked_tags);
     }
 
     pub fn recv(&mut self) -> Option<(Channel, Vec<u8>)> {
@@ -287,6 +340,12 @@ impl Connection {
             }
             sp.acked = true;
             let ids = std::mem::take(&mut sp.reliable);
+            let tags = std::mem::take(&mut sp.tags);
+            self.acked_tags.extend_from_slice(tags.as_slice());
+            if self.acked_tags.len() > MAX_ACKED_TAGS {
+                let excess = self.acked_tags.len() - MAX_ACKED_TAGS;
+                self.acked_tags.drain(..excess);
+            }
             self.stats.packets_acked += 1;
 
             // Only the newest ack carries the peer's hold time (as in QUIC). A packet
@@ -332,13 +391,17 @@ impl Connection {
         while produced < self.cfg.max_packets_per_flush {
             let mut body = Writer::with_capacity(budget);
             let mut ids = PacketIds::default();
+            let mut tags = PacketTags::default();
             self.reliable_tx.write(&mut body, budget, now, resend, &mut ids);
 
-            while let Some(front) = self.unreliable_tx.front() {
-                if body.len() + channel::wire_size(false, front.len()) > budget {
+            while let Some((front, tag)) = self.unreliable_tx.front() {
+                if body.len() + channel::wire_size(false, front.len()) > budget || (tag.is_some() && tags.is_full()) {
                     break;
                 }
-                let msg = self.unreliable_tx.pop_front().unwrap();
+                let (msg, tag) = self.unreliable_tx.pop_front().unwrap();
+                if let Some(t) = tag {
+                    tags.push(t);
+                }
                 channel::write_message(&mut body, None, &msg);
             }
 
@@ -367,7 +430,7 @@ impl Connection {
                     body: body.as_slice(),
                 },
             );
-            self.sent.insert(seq, SentPacket { time: now, acked: false, reliable: ids });
+            self.sent.insert(seq, SentPacket { time: now, acked: false, reliable: ids, tags });
             self.local_seq = seq.wrapping_add(1);
             self.last_send = Some(now);
             self.stats.packets_sent += 1;
@@ -390,6 +453,35 @@ mod tests {
             Packet::Payload { header, body, .. } => (header, body.to_vec()),
             p => panic!("not a payload: {p:?}"),
         }
+    }
+
+    #[test]
+    fn tags_come_back_when_their_packet_is_acked_and_never_when_lost() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let cfg = Config { max_packets_per_flush: 8, ..Config::default() };
+        let (mut a, mut b) = (Connection::new(cfg.clone(), 1, t0), Connection::new(cfg, 1, t0));
+        let mut out = Vec::new();
+
+        // 12 small tagged messages: at most 8 tags per packet, so two packets.
+        for tag in 0..12 {
+            a.send_tagged(vec![tag as u8; 10], tag).unwrap();
+        }
+        a.flush(ms(0), &mut out);
+        assert_eq!(out.len(), 2);
+        // The first packet is lost; the second arrives and b acks it.
+        let (h, body) = payload(&out[1]);
+        b.on_payload(h, &body, ms(5)).unwrap();
+        let mut back = Vec::new();
+        b.flush(ms(10), &mut back);
+        let (h, body) = payload(&back[0]);
+        a.on_payload(h, &body, ms(15)).unwrap();
+
+        let mut acked = Vec::new();
+        a.take_acked(&mut acked);
+        assert_eq!(acked, (8..12).collect::<Vec<u32>>(), "only the delivered packet's tags");
+        a.take_acked(&mut acked);
+        assert_eq!(acked.len(), 4, "each tag is reported once");
     }
 
     #[test]

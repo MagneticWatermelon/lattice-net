@@ -29,6 +29,11 @@ impl BitWriter {
         Self::default()
     }
 
+    /// With room for `bytes` bytes, so writing that much never reallocates.
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self { out: Vec::with_capacity(bytes), ..Self::default() }
+    }
+
     /// Write the low `n` bits of `value` (n <= 32).
     #[inline]
     pub fn write(&mut self, value: u32, n: u32) {

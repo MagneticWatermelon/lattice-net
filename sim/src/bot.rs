@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::movement::{step, Input, MoveState, BUTTON_SPRINT};
+use crate::delta::{self, NearHistory, NearQ};
 use crate::interest::Tier;
 use crate::msg::{self, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
 use crate::rng::Rng;
@@ -65,6 +66,10 @@ pub struct BotStats {
     pub wait_sum_ms: f64,
     /// Inputs skipped to drain a backlog at the server.
     pub backlog_skips: u64,
+    /// Near messages a tracked bot couldn't decode (a delta against a
+    /// baseline it doesn't have). The server only uses acked baselines, so
+    /// this should stay 0.
+    pub near_decode_errors: u64,
     /// From the latest snapshot: the server's pace (per mille) and levels.
     pub pace: u16,
     pub level: u8,
@@ -196,6 +201,16 @@ impl BotBrain {
     }
 
     pub fn on_message(&mut self, data: &[u8], now: Instant) {
+        if data.first() == Some(&delta::MSG_NEAR) {
+            // tag:1 | server_tick:4 | n:1 | bits: only tracked bots decode it.
+            self.stats.tier_seen[Tier::Near as usize] += data.get(5).copied().unwrap_or(0) as u64;
+            if let Some(t) = &mut self.tracker {
+                if t.on_near(data).is_err() {
+                    self.stats.near_decode_errors += 1;
+                }
+            }
+            return;
+        }
         if self.sink && data.first() == Some(&msg::MSG_ENTITIES) {
             // tag:1 | server_tick:4 | tier:1 | n:1 | blobs
             if let (Some(&tier), Some(&n)) = (data.get(5), data.get(6)) {
@@ -384,6 +399,8 @@ impl BotBrain {
 #[derive(Debug, Default)]
 pub struct Tracker {
     known: HashMap<u16, Known>,
+    /// Near states by entity and tick: the baselines near deltas refer to.
+    near: NearHistory,
     /// Update intervals per tier in server ticks, until drained.
     pub intervals: [Vec<u16>; 3],
     pub bad_blobs: u64,
@@ -398,22 +415,36 @@ pub struct Known {
 }
 
 impl Tracker {
+    fn on_near(&mut self, data: &[u8]) -> Result<(), lattice_net::wire::DecodeError> {
+        let mut got = Vec::new();
+        let tick = delta::decode_near(data, &mut self.near, |e, q| got.push((e, q)))?;
+        for (e, q) in got {
+            self.record(e, Known { tick, tier: Tier::Near, pos: q.pos() });
+        }
+        Ok(())
+    }
+
     fn on_update(&mut self, server_tick: u32, tier: Tier, blob: &[u8]) {
-        let decoded = match tier {
-            Tier::Near => msg::decode_near_blob(blob).map(|(e, pos, _, _)| (e, pos)),
-            Tier::Mid | Tier::Far => msg::decode_blob(blob).map(|(e, pos, _)| (e, pos)),
-        };
-        let Ok((entity, pos)) = decoded else {
+        let Ok((entity, pos, _)) = msg::decode_blob(blob) else {
             self.bad_blobs += 1;
             return;
         };
-        let now = Known { tick: server_tick, tier, pos };
+        self.record(entity, Known { tick: server_tick, tier, pos });
+    }
+
+    fn record(&mut self, entity: u16, now: Known) {
+        let (server_tick, tier) = (now.tick, now.tier);
         if let Some(prev) = self.known.insert(entity, now) {
             let gap = server_tick.wrapping_sub(prev.tick);
             if gap > 0 && gap < u16::MAX as u32 {
                 self.intervals[tier as usize].push(gap as u16);
             }
         }
+    }
+
+    /// The near state received for `entity` at `tick`, if still in history.
+    pub fn near_state(&self, entity: u16, tick: u32) -> Option<NearQ> {
+        self.near.get(entity, tick)
     }
 
     pub fn get(&self, entity: u16) -> Option<Known> {

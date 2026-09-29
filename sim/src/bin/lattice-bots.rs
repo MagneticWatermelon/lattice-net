@@ -52,6 +52,7 @@ struct Totals {
     level_max: u8,
     client_degraded: u64,
     backlog_skips: u64,
+    near_decode_errors: u64,
     corrections: u64,
     correction_err_sum: f64,
     correction_err_max: f32,
@@ -84,6 +85,7 @@ impl Totals {
         self.level_max = self.level_max.max(o.level_max);
         self.client_degraded += o.client_degraded;
         self.backlog_skips += o.backlog_skips;
+        self.near_decode_errors += o.near_decode_errors;
         self.corrections += o.corrections;
         self.correction_err_sum += o.correction_err_sum;
         self.correction_err_max = self.correction_err_max.max(o.correction_err_max);
@@ -275,6 +277,7 @@ impl Bot {
             *a += b;
         }
         t.backlog_skips += s.backlog_skips;
+        t.near_decode_errors += s.near_decode_errors;
         t.corrections += s.corrections;
         t.correction_err_sum += s.correction_error_sum;
         t.correction_err_max = t.correction_err_max.max(s.correction_error_max);
@@ -644,8 +647,8 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
         line(&format!("{name} entity update interval (tracked bots)"), h, 1.0);
     }
     println!(
-        "  input clock: {} extra inputs, {} skipped ticks, {} backlog skips",
-        t.clock_extra, t.clock_skipped, t.backlog_skips
+        "  input clock: {} extra inputs, {} skipped ticks, {} backlog skips | near decode errors (tracked bots) {}",
+        t.clock_extra, t.clock_skipped, t.backlog_skips, t.near_decode_errors
     );
     println!(
         "  bytes down {:.1} MB up {:.1} MB | swarm busy {:.0}% of its threads' time, tick overruns {}",

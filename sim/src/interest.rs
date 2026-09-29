@@ -139,6 +139,7 @@ pub struct NearCandidate {
 #[derive(Debug, Default)]
 pub struct SelectScratch {
     sent: Vec<u32>,
+    base: Vec<u32>,
     mark: Vec<u32>,
     epoch: u32,
     rank: Vec<(f32, usize)>,
@@ -147,10 +148,10 @@ pub struct SelectScratch {
 /// One client's near-tier accumulator: its near set and when each was last sent.
 #[derive(Debug, Default, Clone)]
 pub struct NearState {
-    /// In candidate order (unsorted).
-    entries: Vec<(u16, u32)>,
+    /// (entity, last sent tick, acked baseline tick or 0), in candidate order.
+    entries: Vec<(u16, u32, u32)>,
     /// Last tick's entries, reused as the next buffer (no allocation per tick).
-    spare: Vec<(u16, u32)>,
+    spare: Vec<(u16, u32, u32)>,
     started: bool,
 }
 
@@ -172,30 +173,50 @@ impl NearState {
         self.entries.iter().find(|e| e.0 == entity).map(|e| e.1)
     }
 
-    /// Makes `cands` the near set and appends the up-to-`per_tick` entities to
-    /// send this tick to `out` (in no particular order).
-    pub fn select(&mut self, cands: &[NearCandidate], tick: u32, per_tick: usize, sc: &mut SelectScratch, out: &mut Vec<u16>) {
-        sc.epoch = sc.epoch.wrapping_add(1);
-        if sc.epoch == 0 {
-            sc.mark.fill(0);
-            sc.epoch = 1;
+    /// The newest tick of `entity`'s state the client is known to have (0 = none).
+    pub fn baseline(&self, entity: u16) -> Option<u32> {
+        self.entries.iter().find(|e| e.0 == entity).map(|e| e.2)
+    }
+
+    /// The client acked these (entity, tick) states: they become baselines
+    /// for entities still in the near set (a newer one wins).
+    pub fn apply_acks(&mut self, acks: &[(u16, u32)], sc: &mut SelectScratch) {
+        if acks.is_empty() {
+            return;
         }
-        for &(e, sent) in &self.entries {
-            let i = e as usize;
-            if sc.mark.len() <= i {
-                sc.mark.resize(i + 1, 0);
-                sc.sent.resize(i + 1, 0);
+        sc.begin();
+        for (i, &(e, _, _)) in self.entries.iter().enumerate() {
+            sc.index(e, i as u32, 0);
+        }
+        for &(e, tick) in acks {
+            if let Some(i) = sc.lookup(e) {
+                let b = &mut self.entries[i.0 as usize].2;
+                *b = (*b).max(tick);
             }
-            sc.mark[i] = sc.epoch;
-            sc.sent[i] = sent;
+        }
+    }
+
+    /// Makes `cands` the near set and appends the up-to-`per_tick` entities to
+    /// send this tick to `out` (in no particular order), each with its acked
+    /// baseline tick (0 = none: send it whole).
+    pub fn select(
+        &mut self,
+        cands: &[NearCandidate],
+        tick: u32,
+        per_tick: usize,
+        sc: &mut SelectScratch,
+        out: &mut Vec<(u16, u32)>,
+    ) {
+        sc.begin();
+        for &(e, sent, base) in &self.entries {
+            sc.index(e, sent, base);
         }
         let mut next = std::mem::take(&mut self.spare);
         next.clear();
         sc.rank.clear();
         for (i, c) in cands.iter().enumerate() {
-            let e = c.entity as usize;
-            let sent = if sc.mark.get(e) == Some(&sc.epoch) { sc.sent[e] } else { tick.saturating_sub(c.seed_age) };
-            next.push((c.entity, sent));
+            let (sent, base) = sc.lookup(c.entity).unwrap_or((tick.saturating_sub(c.seed_age), 0));
+            next.push((c.entity, sent, base));
             let age = tick.saturating_sub(sent).max(1);
             sc.rank.push((c.base * age as f32, i));
         }
@@ -205,10 +226,37 @@ impl NearState {
         }
         for &(_, i) in &sc.rank[..n] {
             next[i].1 = tick;
-            out.push(cands[i].entity);
+            out.push((next[i].0, next[i].2));
         }
         self.spare = std::mem::replace(&mut self.entries, next);
         self.started = true;
+    }
+}
+
+impl SelectScratch {
+    fn begin(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.mark.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    fn index(&mut self, e: u16, a: u32, b: u32) {
+        let i = e as usize;
+        if self.mark.len() <= i {
+            self.mark.resize(i + 1, 0);
+            self.sent.resize(i + 1, 0);
+            self.base.resize(i + 1, 0);
+        }
+        self.mark[i] = self.epoch;
+        self.sent[i] = a;
+        self.base[i] = b;
+    }
+
+    fn lookup(&self, e: u16) -> Option<(u32, u32)> {
+        let i = e as usize;
+        (self.mark.get(i) == Some(&self.epoch)).then(|| (self.sent[i], self.base[i]))
     }
 }
 
@@ -260,7 +308,7 @@ mod tests {
             out.clear();
             s.select(&c, tick, 64, &mut sc, &mut out);
             assert_eq!(out.len(), 64);
-            out.iter().for_each(|&e| sends[e as usize] += 1);
+            out.iter().for_each(|&(e, _)| sends[e as usize] += 1);
         }
         assert!(sends.iter().all(|&n| n > 0), "the accumulator starves no one: {sends:?}");
         assert!(sends[0] > 2 * sends[99], "nearest {} vs farthest {}", sends[0], sends[99]);
@@ -284,9 +332,32 @@ mod tests {
         c.push(NearCandidate { entity: 500, base: near_base(149.0, false), seed_age: 14 });
         out.clear();
         s.select(&c, 1006, 64, &mut sc, &mut out);
-        assert!(out.contains(&500), "the stale newcomer outranks a fresh member");
+        assert!(out.iter().any(|o| o.0 == 500), "the stale newcomer outranks a fresh member");
         assert_eq!(s.last_sent(500), Some(1006));
         assert_eq!(s.len(), 65);
+    }
+
+    #[test]
+    fn acks_become_baselines_and_survive_reselection() {
+        let mut s = NearState::default();
+        let (mut sc, mut out) = (SelectScratch::default(), Vec::new());
+        let c: Vec<_> = (0..10).map(|e| cand(e, 5.0)).collect();
+        s.select(&c, 100, 64, &mut sc, &mut out);
+        assert!(out.iter().all(|&(_, b)| b == 0), "no baselines yet: {out:?}");
+        // The client acked tick 100's message, which carried entities 0..5.
+        s.apply_acks(&(0..5).map(|e| (e, 100)).collect::<Vec<_>>(), &mut sc);
+        s.apply_acks(&[(3, 90), (77, 100)], &mut sc); // older ack and a stranger: ignored
+        out.clear();
+        s.select(&c, 101, 64, &mut sc, &mut out);
+        for &(e, b) in &out {
+            assert_eq!(b, if e < 5 { 100 } else { 0 }, "entity {e}");
+        }
+        // An entity that leaves the near set loses its baseline.
+        out.clear();
+        s.select(&c[1..], 102, 64, &mut sc, &mut out);
+        s.select(&c, 103, 64, &mut sc, &mut out);
+        assert_eq!(s.baseline(0), Some(0));
+        assert_eq!(s.baseline(1), Some(100));
     }
 
     #[test]

@@ -27,9 +27,10 @@ use rayon::prelude::*;
 
 use crate::grid::{Grid, Ring};
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
-use crate::ladder::{self, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
+use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{step, Input, MoveState, TICK_HZ, WORLD_SIZE};
-use crate::msg::{self, Blob, NearBlob, SnapshotHeader, Welcome, FAR_BLOB, NEAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
+use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
+use crate::msg::{self, Blob, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
 use crate::rng::Rng;
 use crate::stats::Histogram;
 
@@ -53,17 +54,12 @@ const GRID_CELL: f32 = 32.0;
 const MID_GRID_CELL: f32 = 64.0;
 const FAR_GRID_CELL: f32 = 512.0;
 const NO_SQUAD: u32 = u32::MAX;
-/// Per-client bandwidth ladder: mid and far radius scales by level. A client
-/// whose carried far entities starve steps down (at most every
-/// `CLIENT_HOLD` ticks) and steps back up after `CLIENT_CALM` starve-free
-/// ticks. The near tier is never cut.
-const CLIENT_MID: [f32; 4] = [1.0, 0.9, 0.8, 0.7];
-const CLIENT_FAR: [f32; 4] = [1.0, 0.8, 0.6, 0.45];
-const CLIENT_HOLD: u16 = 15;
-const CLIENT_CALM: u16 = 90;
-/// A probe (step back up) that starves again within `CLIENT_HOLD` ticks
-/// doubles the calm stretch needed before the next probe, up to this.
-const CLIENT_CALM_MAX: u16 = 30 * 30;
+/// Ticks of sent near messages a client's acks can refer to. An ack for an
+/// older message is ignored; the baseline just stays older.
+const SENT_RING: usize = 16;
+
+/// A message for one client, and its delivery tag if it wants acks.
+type Snap = (ClientId, Vec<u8>, Option<u32>);
 /// Input waits above 1 s land in the histogram's last bucket (0.1 ms units).
 const INPUT_WAIT_CAP: u32 = 10_000;
 
@@ -155,6 +151,11 @@ pub struct Counters {
     pub far_skipped: u64,
     /// Carried far entities that didn't fit again: the degrade signal.
     pub far_starved: u64,
+    /// Near-tier bytes (the whole near messages), and entities sent as a
+    /// delta against an acked baseline vs. in full.
+    pub near_bytes: u64,
+    pub near_deltas: u64,
+    pub near_full: u64,
     /// Ticks spent at each degradation level.
     pub level_ticks: [u64; MAX_LEVEL as usize + 1],
     /// Client-ticks with the client's own bandwidth level above 0.
@@ -167,11 +168,13 @@ struct Body {
     state: MoveState,
     yaw: u16,
     squad: u32,
+    /// Tick this entity (slot) spawned: an older baseline belongs to a previous occupant.
+    spawned: u32,
 }
 
 impl Default for Body {
     fn default() -> Self {
-        Self { alive: false, state: MoveState::default(), yaw: 0, squad: NO_SQUAD }
+        Self { alive: false, state: MoveState::default(), yaw: 0, squad: NO_SQUAD, spawned: 0 }
     }
 }
 
@@ -182,13 +185,10 @@ struct ClientSlot {
     near: NearState,
     /// Far entities that were due but didn't fit the budget: sent first next tick.
     far_carry: Vec<u16>,
-    /// Per-client bandwidth ladder (see `CLIENT_FAR`).
-    level: u8,
-    hold: u16,
-    calm: u16,
-    /// Calm ticks needed before the next step up: doubles when a probe fails.
-    calm_needed: u16,
-    probing: bool,
+    /// Per-client bandwidth ladder.
+    ladder: ClientLadder,
+    /// Which entities each recent near message carried, by tick (its tag).
+    sent_ring: Vec<(u32, Vec<u16>)>,
 }
 
 /// Per-shard scratch for assembly, reused every tick.
@@ -202,7 +202,11 @@ struct Scratch {
     near_raw: Vec<(f32, f32, u16)>,
     near: Vec<NearCandidate>,
     select: SelectScratch,
-    picked: Vec<u16>,
+    /// This tick's near entities and their acked baselines.
+    picked: Vec<(u16, u32)>,
+    acked: Vec<u32>,
+    ack_pairs: Vec<(u16, u32)>,
+    near_entries: Vec<NearEntry>,
     mid: Vec<(f32, u16)>,
     far: Vec<(f32, u16)>,
     tally: Tally,
@@ -218,6 +222,9 @@ struct Tally {
     far_skipped: u64,
     far_starved: u64,
     degraded: u64,
+    near_bytes: u64,
+    near_deltas: u64,
+    near_full: u64,
 }
 
 /// Per-entity input stream. Every tick consumes exactly one input seq, so each
@@ -329,9 +336,13 @@ pub struct SimServer {
     tick: u32,
     bodies: Vec<Body>,
     inputs: Vec<InputQueue>,
-    /// Serialized once per tick: near blobs for every entity, mid/far blobs for
-    /// the entities due this tick (and last tick's far-due, for carries).
-    near_blobs: Vec<NearBlob>,
+    /// Serialized once per tick: every entity's quantized near state, kept
+    /// for `NEAR_HISTORY` ticks as delta baselines, and mid/far blobs for the
+    /// entities due this tick (and last tick's far-due, for carries). Near
+    /// history is tick-major: baselines are mostly 2-4 ticks back, so the
+    /// arrays in use stay in cache.
+    near_hist: Vec<Vec<NearQ>>,
+    near_hist_tick: [u32; NEAR_HISTORY],
     far_blobs: Vec<Blob>,
     history: Vec<Vec<[f32; 2]>>,
     free: Vec<u16>,
@@ -342,7 +353,7 @@ pub struct SimServer {
     squads: HashMap<u32, Vec<u16>>,
     squad_anchor: HashMap<u32, [f32; 2]>,
     /// Per-shard snapshot buffers, reused every tick.
-    snapshots: Vec<Vec<(ClientId, Vec<u8>)>>,
+    snapshots: Vec<Vec<Snap>>,
     /// Per-shard transport events, each with the arrival time of the datagram
     /// that caused it.
     shard_events: Vec<Vec<(Instant, ServerEvent)>>,
@@ -387,7 +398,8 @@ impl SimServer {
             tick: 0,
             bodies: Vec::new(),
             inputs: Vec::new(),
-            near_blobs: Vec::new(),
+            near_hist: vec![Vec::new(); NEAR_HISTORY],
+            near_hist_tick: [u32::MAX; NEAR_HISTORY],
             far_blobs: Vec::new(),
             history: vec![Vec::new(); HISTORY_TICKS],
             free: Vec::new(),
@@ -460,6 +472,17 @@ impl SimServer {
     /// Input waits recorded since the last call, arrival -> applied, in 0.1 ms.
     pub fn take_input_wait(&mut self) -> Histogram {
         std::mem::replace(&mut self.input_wait, Histogram::new(INPUT_WAIT_CAP))
+    }
+
+    /// The quantized near state `entity` had at `tick`, if still in history.
+    pub fn near_state_at(&self, entity: u16, tick: u32) -> Option<NearQ> {
+        let slot = tick as usize % NEAR_HISTORY;
+        let b = self.bodies.get(entity as usize)?;
+        (self.near_hist_tick[slot] == tick && tick >= b.spawned).then(|| self.near_hist[slot][entity as usize])
+    }
+
+    pub fn tick_number(&self) -> u32 {
+        self.tick
     }
 
     pub fn entity_state(&self, entity: u16) -> Option<MoveState> {
@@ -576,7 +599,10 @@ impl SimServer {
 
         // 7. serialize each entity once per tier. Far blobs are needed for this
         // tick's due entities and last tick's far-due ones (budget carries).
-        self.near_blobs
+        let hist_slot = tick as usize % NEAR_HISTORY;
+        self.near_hist[hist_slot].resize(self.bodies.len(), NearQ::default());
+        self.near_hist_tick[hist_slot] = tick;
+        self.near_hist[hist_slot]
             .par_iter_mut()
             .zip(self.far_blobs.par_iter_mut())
             .zip(self.bodies.par_iter())
@@ -585,7 +611,7 @@ impl SimServer {
             .filter(|(_, (_, b))| b.alive)
             .for_each(|(i, ((near, far), b))| {
                 let e = i as u16;
-                *near = msg::encode_near_blob(e, b.state.pos, b.state.vel, b.yaw);
+                *near = NearQ::new(b.state.pos, b.state.vel, b.yaw);
                 let prev = tick.wrapping_sub(1);
                 if due(e, tick, mid_period) || due(e, tick, far_period) || due(e, prev, far_period) {
                     *far = msg::encode_blob(e, b.state.pos, b.yaw);
@@ -603,7 +629,8 @@ impl SimServer {
             level: self.ladder.level(),
             bodies: &self.bodies,
             inputs: &self.inputs,
-            near_blobs: &self.near_blobs,
+            near_hist: &self.near_hist,
+            near_hist_tick: &self.near_hist_tick,
             far_blobs: &self.far_blobs,
             grid: &self.grid,
             mid_grid: &self.mid_grid,
@@ -615,12 +642,16 @@ impl SimServer {
             .par_iter_mut()
             .zip(self.snapshots.par_iter_mut())
             .zip(self.scratch.par_iter_mut())
-            .for_each(|((clients, snaps), scratch)| {
+            .zip(self.net.shards_mut().par_iter_mut())
+            .for_each(|(((clients, snaps), scratch), shard)| {
                 scratch.tally = Tally::default();
                 if scratch.stamp.len() < view.bodies.len() {
                     scratch.stamp.resize(view.bodies.len(), 0);
                 }
                 for slot in clients.iter_mut() {
+                    // Which near messages this client has acked since last tick.
+                    scratch.acked.clear();
+                    shard.take_acked(slot.client, &mut scratch.acked);
                     view.assemble(slot, scratch, snaps);
                 }
             });
@@ -636,6 +667,9 @@ impl SimServer {
             c.far_skipped += t.far_skipped;
             c.far_starved += t.far_starved;
             c.degraded_clients += t.degraded;
+            c.near_bytes += t.near_bytes;
+            c.near_deltas += t.near_deltas;
+            c.near_full += t.near_full;
         }
         lap(6);
 
@@ -646,8 +680,11 @@ impl SimServer {
             .zip(self.snapshots.par_iter_mut())
             .zip(out.par_iter_mut())
             .for_each(|((shard, snaps), out)| {
-                for (client, snap) in snaps.drain(..) {
-                    let _ = shard.send(client, Channel::Unreliable, snap);
+                for (client, snap, tag) in snaps.drain(..) {
+                    let _ = match tag {
+                        Some(tag) => shard.send_tagged(client, snap, tag),
+                        None => shard.send(client, Channel::Unreliable, snap),
+                    };
                 }
                 shard.flush(now);
                 out.extend(shard.drain_outgoing());
@@ -670,13 +707,13 @@ impl SimServer {
             None => {
                 self.bodies.push(Body::default());
                 self.inputs.push(InputQueue::default());
-                self.near_blobs.push([0; NEAR_BLOB]);
                 self.far_blobs.push([0; FAR_BLOB]);
                 (self.bodies.len() - 1) as u16
             }
         };
         let i = e as usize;
-        self.bodies[i] = Body { alive: true, state: MoveState { pos: spawn, vel: [0.0; 2] }, yaw: 0, squad };
+        self.bodies[i] =
+            Body { alive: true, state: MoveState { pos: spawn, vel: [0.0; 2] }, yaw: 0, squad, spawned: self.tick };
         self.inputs[i] = InputQueue::default();
         if squad != NO_SQUAD {
             self.squads.entry(squad).or_default().push(e);
@@ -687,11 +724,8 @@ impl SimServer {
             entity: e,
             near: NearState::default(),
             far_carry: Vec::new(),
-            level: 0,
-            hold: 0,
-            calm: 0,
-            calm_needed: CLIENT_CALM,
-            probing: false,
+            ladder: ClientLadder::default(),
+            sent_ring: (0..SENT_RING).map(|_| (u32::MAX, Vec::new())).collect(),
         };
         self.shard_clients[self.net.shard_of_client(client)].push(slot);
         self.counters.spawns += 1;
@@ -763,7 +797,8 @@ struct View<'a> {
     tick: u32,
     bodies: &'a [Body],
     inputs: &'a [InputQueue],
-    near_blobs: &'a [NearBlob],
+    near_hist: &'a [Vec<NearQ>],
+    near_hist_tick: &'a [u32; NEAR_HISTORY],
     far_blobs: &'a [Blob],
     grid: &'a Grid,
     mid_grid: &'a Grid,
@@ -783,10 +818,22 @@ impl View<'_> {
 
     /// Picks this tick's near, mid and far entities for one client (see
     /// `interest.rs`), fits them to the byte budget and appends the messages.
-    fn assemble(&self, slot: &mut ClientSlot, sc: &mut Scratch, snaps: &mut Vec<(ClientId, Vec<u8>)>) {
+    /// `sc.acked` holds the tags (ticks) of this client's near messages that
+    /// were acked since last tick.
+    fn assemble(&self, slot: &mut ClientSlot, sc: &mut Scratch, snaps: &mut Vec<Snap>) {
         let (cfg, tick, e) = (self.cfg, self.tick, slot.entity);
         let me = self.bodies[e as usize];
         let fresh = !slot.near.started();
+
+        // Acked near messages: the states they carried become baselines.
+        sc.ack_pairs.clear();
+        for &t in &sc.acked {
+            let (sent_tick, entities) = &slot.sent_ring[t as usize % SENT_RING];
+            if *sent_tick == t {
+                sc.ack_pairs.extend(entities.iter().map(|&j| (j, t)));
+            }
+        }
+        slot.near.apply_acks(&sc.ack_pairs, &mut sc.select);
         sc.epoch = sc.epoch.wrapping_add(1);
         if sc.epoch == 0 {
             sc.stamp.fill(0);
@@ -798,8 +845,7 @@ impl View<'_> {
         // Near: distance or interaction (squad), ranked by the accumulator. The
         // scan only computes squared distances; priorities and seeded ages are
         // computed for the <= near_candidates that make the cut.
-        let (mid_radius, far_radius) =
-            (cfg.mid_radius * CLIENT_MID[slot.level as usize], cfg.far_radius * CLIENT_FAR[slot.level as usize]);
+        let (mid_radius, far_radius) = (cfg.mid_radius * slot.ladder.mid_scale(), cfg.far_radius * slot.ladder.far_scale());
         let (r_near2, r_mid2, r_far2) = (cfg.near_radius.powi(2), mid_radius.powi(2), far_radius.powi(2));
         // Non-squad candidates: a k-nearest ring walk, so a dense crowd costs
         // a few cells instead of every entity within the radius.
@@ -901,13 +947,45 @@ impl View<'_> {
         slot.far_carry = carried; // reuse the allocation
         slot.far_carry.clear();
 
+        // Near message: each entity as a delta against its acked baseline if
+        // the server still has that state (and it's this entity's, not a
+        // previous occupant's of the slot), else in full.
+        sc.near_entries.clear();
+        let (mut deltas, mut full) = (0, 0);
+        let now = &self.near_hist[tick as usize % NEAR_HISTORY];
+        // Sorting these small pairs is cheaper than sorting the entries later
+        // (the encoder's own sort then finds them in order).
+        sc.picked.sort_unstable_by_key(|p| p.0);
+        for &(j, b) in &sc.picked {
+            let state = now[j as usize];
+            let bs = b as usize % NEAR_HISTORY;
+            let usable = b > 0 && self.near_hist_tick[bs] == b && b >= self.bodies[j as usize].spawned && tick - b <= MAX_BASE_AGE;
+            let base = usable.then(|| ((tick - b) as u8, self.near_hist[bs][j as usize]));
+            if usable {
+                deltas += 1;
+            } else {
+                full += 1;
+            }
+            sc.near_entries.push(NearEntry { entity: j, state, base });
+        }
+        let near_msg = (!sc.near_entries.is_empty()).then(|| {
+            let mut w = Writer::with_capacity(delta::NEAR_HEADER + sc.near_entries.len() * 8);
+            delta::encode_near(tick, &mut sc.near_entries, &mut w);
+            w.into_inner()
+        });
+        let near_bytes = near_msg.as_ref().map_or(0, |m| m.len());
+        let (ring_tick, ring) = &mut slot.sent_ring[tick as usize % SENT_RING];
+        *ring_tick = tick;
+        ring.clear();
+        ring.extend(sc.picked.iter().map(|&(j, _)| j));
+
         // Budget: own state, then near, then mid, then far. What doesn't fit of
         // far is carried; a carried entity that doesn't fit again is starving.
         let cost = |tier: Tier, n: usize| {
             let per = msg::blobs_per_message(tier, self.max_message);
             n.div_ceil(per) * msg::ENTITIES_HEADER + n * msg::blob_size(tier)
         };
-        let mut left = cfg.budget_bytes.saturating_sub(SNAPSHOT_LEN + cost(Tier::Near, sc.picked.len()));
+        let mut left = cfg.budget_bytes.saturating_sub(SNAPSHOT_LEN + near_bytes);
         let mut n_mid = sc.mid.len();
         while n_mid > 0 && cost(Tier::Mid, n_mid) > left {
             n_mid -= 1;
@@ -929,36 +1007,9 @@ impl View<'_> {
         }
         sc.tally.far_starved += starved;
 
-        // This client's bandwidth ladder: starving shrinks its mid/far radii,
-        // a long starve-free stretch grows them back.
-        // Probes back up back off exponentially while they keep failing, so a
-        // client that can't afford more doesn't starve every few seconds.
-        let probe_failed = slot.probing && slot.hold > 0;
-        slot.hold = slot.hold.saturating_sub(1);
-        if starved > 0 {
-            slot.calm = 0;
-            if probe_failed {
-                slot.calm_needed = slot.calm_needed.saturating_mul(2).min(CLIENT_CALM_MAX);
-            }
-            slot.probing = false;
-            if slot.hold == 0 && (slot.level as usize) < CLIENT_FAR.len() - 1 || probe_failed {
-                slot.level = (slot.level + 1).min(CLIENT_FAR.len() as u8 - 1);
-                slot.hold = CLIENT_HOLD;
-            }
-        } else {
-            slot.calm = slot.calm.saturating_add(1);
-            if slot.probing && slot.hold == 0 {
-                slot.probing = false;
-                slot.calm_needed = CLIENT_CALM; // the probe held
-            }
-            if slot.calm >= slot.calm_needed && slot.hold == 0 && slot.level > 0 {
-                slot.level -= 1;
-                slot.calm = 0;
-                slot.hold = CLIENT_HOLD;
-                slot.probing = true;
-            }
-        }
-        sc.tally.degraded += (slot.level > 0) as u64;
+        // This client's bandwidth ladder: starving shrinks its mid/far radii.
+        slot.ladder.update(starved);
+        sc.tally.degraded += (slot.ladder.level() > 0) as u64;
 
         // Messages.
         let inp = &self.inputs[e as usize];
@@ -972,14 +1023,15 @@ impl View<'_> {
                 wait: inp.wait,
                 pace: self.pace,
                 level: self.level,
-                client_level: slot.level,
+                client_level: slot.ladder.level(),
                 own: me.state,
             },
         );
-        let mut bytes = w.len();
-        snaps.push((slot.client, w.into_inner()));
-        let near_blobs = sc.picked.iter().map(|&j| &self.near_blobs[j as usize][..]);
-        bytes += self.write_tier(Tier::Near, near_blobs, slot.client, snaps);
+        let mut bytes = w.len() + near_bytes;
+        snaps.push((slot.client, w.into_inner(), None));
+        if let Some(m) = near_msg {
+            snaps.push((slot.client, m, Some(tick))); // tagged: its ack sets baselines
+        }
         let mid_blobs = sc.mid[..n_mid].iter().map(|&(_, j)| &self.far_blobs[j as usize][..]);
         bytes += self.write_tier(Tier::Mid, mid_blobs, slot.client, snaps);
         let far_blobs = sc.far[..n_far].iter().map(|&(_, j)| &self.far_blobs[j as usize][..]);
@@ -988,6 +1040,9 @@ impl View<'_> {
         let t = &mut sc.tally;
         t.snapshots += 1;
         t.tier_sent[0] += sc.picked.len() as u64;
+        t.near_bytes += near_bytes as u64;
+        t.near_deltas += deltas;
+        t.near_full += full;
         t.tier_sent[1] += n_mid as u64;
         t.tier_sent[2] += n_far as u64;
         t.bytes += bytes as u64;
@@ -999,7 +1054,7 @@ impl View<'_> {
         tier: Tier,
         blobs: impl ExactSizeIterator<Item = &'b [u8]>,
         client: ClientId,
-        snaps: &mut Vec<(ClientId, Vec<u8>)>,
+        snaps: &mut Vec<Snap>,
     ) -> usize {
         let (per, total, size) = (msg::blobs_per_message(tier, self.max_message), blobs.len(), msg::blob_size(tier));
         let mut blobs = blobs;
@@ -1012,7 +1067,7 @@ impl View<'_> {
                 w.bytes(b);
             }
             bytes += w.len();
-            snaps.push((client, w.into_inner()));
+            snaps.push((client, w.into_inner(), None));
             left -= n;
         }
         bytes

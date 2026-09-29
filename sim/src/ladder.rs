@@ -207,6 +207,81 @@ impl Ladder {
     }
 }
 
+/// Per-client bandwidth ladder: mid and far radius scales by level.
+pub const CLIENT_MID: [f32; 4] = [1.0, 0.9, 0.8, 0.7];
+pub const CLIENT_FAR: [f32; 4] = [1.0, 0.8, 0.6, 0.45];
+/// Ticks between steps down, and the window a step up must survive.
+const CLIENT_HOLD: u16 = 15;
+/// Starve-free ticks before a step back up (a probe).
+const CLIENT_CALM: u16 = 90;
+/// A probe that starves again within `CLIENT_HOLD` ticks doubles the calm
+/// stretch needed before the next one, up to this.
+const CLIENT_CALM_MAX: u16 = 30 * 30;
+
+/// One client's bandwidth ladder. A client whose carried far entities starve
+/// (they didn't fit its byte budget two ticks running) steps down, shrinking
+/// its own mid/far radii; after a calm stretch it probes one level back up.
+/// Probes that fail at once back off exponentially, so a client that can't
+/// afford more doesn't starve every few seconds. The near tier is never cut.
+#[derive(Debug, Clone)]
+pub struct ClientLadder {
+    level: u8,
+    hold: u16,
+    calm: u16,
+    calm_needed: u16,
+    probing: bool,
+}
+
+impl Default for ClientLadder {
+    fn default() -> Self {
+        Self { level: 0, hold: 0, calm: 0, calm_needed: CLIENT_CALM, probing: false }
+    }
+}
+
+impl ClientLadder {
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+
+    pub fn mid_scale(&self) -> f32 {
+        CLIENT_MID[self.level as usize]
+    }
+
+    pub fn far_scale(&self) -> f32 {
+        CLIENT_FAR[self.level as usize]
+    }
+
+    /// Feed one tick: how many carried far entities starved.
+    pub fn update(&mut self, starved: u64) {
+        let max = CLIENT_FAR.len() as u8 - 1;
+        let probe_failed = self.probing && self.hold > 0;
+        self.hold = self.hold.saturating_sub(1);
+        if starved > 0 {
+            self.calm = 0;
+            if probe_failed {
+                self.calm_needed = self.calm_needed.saturating_mul(2).min(CLIENT_CALM_MAX);
+            }
+            self.probing = false;
+            if (self.hold == 0 || probe_failed) && self.level < max {
+                self.level += 1;
+                self.hold = CLIENT_HOLD;
+            }
+        } else {
+            self.calm = self.calm.saturating_add(1);
+            if self.probing && self.hold == 0 {
+                self.probing = false;
+                self.calm_needed = CLIENT_CALM; // the probe held
+            }
+            if self.calm >= self.calm_needed && self.hold == 0 && self.level > 0 {
+                self.level -= 1;
+                self.calm = 0;
+                self.hold = CLIENT_HOLD;
+                self.probing = true;
+            }
+        }
+    }
+}
+
 /// How far behind its own schedule the server runs: actual tick intervals
 /// over the intended ones, across the last `WINDOW` ticks. Each interval is
 /// judged against its own tick's period, so a planned change of tick rate or
@@ -309,6 +384,48 @@ mod tests {
             }
         }
         assert_eq!((l.level(), ups), (0, MAX_LEVEL as usize));
+    }
+
+    #[test]
+    fn client_ladder_steps_down_on_starvation_and_backs_off_failed_probes() {
+        let mut c = ClientLadder::default();
+        // Starving every tick: one level per hold, down to the floor.
+        let mut levels = Vec::new();
+        for _ in 0..100 {
+            c.update(1);
+            levels.push(c.level());
+        }
+        assert_eq!(levels[0], 1);
+        assert_eq!(levels[CLIENT_HOLD as usize - 1], 1, "held");
+        assert_eq!(levels[CLIENT_HOLD as usize], 2);
+        assert_eq!(c.level(), 3, "floor");
+        assert!((c.far_scale() - 0.45).abs() < 1e-6);
+
+        // Calm: probes back up after CLIENT_CALM ticks.
+        let ticks_to_probe = |c: &mut ClientLadder, starve_after_probe: bool| {
+            let before = c.level();
+            for i in 1..=CLIENT_CALM_MAX as u32 + 1 {
+                c.update(0);
+                if c.level() < before {
+                    if starve_after_probe {
+                        c.update(1); // the probe fails at once
+                    }
+                    return i;
+                }
+            }
+            panic!("never probed")
+        };
+        assert_eq!(ticks_to_probe(&mut c, true), CLIENT_CALM as u32);
+        assert_eq!(c.level(), 3, "a failed probe steps straight back down");
+        assert_eq!(ticks_to_probe(&mut c, true), 2 * CLIENT_CALM as u32, "and the next waits twice as long");
+        assert_eq!(ticks_to_probe(&mut c, true), 4 * CLIENT_CALM as u32);
+        // A probe that holds resets the wait.
+        assert_eq!(ticks_to_probe(&mut c, false), 8 * CLIENT_CALM as u32);
+        for _ in 0..CLIENT_HOLD {
+            c.update(0);
+        }
+        assert_eq!(c.level(), 2);
+        assert_eq!(ticks_to_probe(&mut c, false), CLIENT_CALM as u32 - CLIENT_HOLD as u32);
     }
 
     #[test]

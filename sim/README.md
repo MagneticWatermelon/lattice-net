@@ -130,6 +130,32 @@ Findings:
     - bare metal.
 4. **A server that couldn't hold 30 Hz broke the input clock (fixed by M2d, below).** At ~21 Hz, the bots still sent 30 inputs per second. The queues overflowed (2.9M inputs discarded, each a correction) and input → applied reached ~550 ms, because the ±5% nudge can't follow a server at 70% speed.
 
+## M2b: near-tier deltas on the WSL2 dev box
+
+**How it works** (`delta.rs`):
+- **History.** Every entity's quantized near state (~8 mm position, velocity, yaw) is kept for 32 ticks. The history is tick-major and shared by all clients, since the state is serialize-once.
+- **Tags.** Each client-tick's near message is sent with `send_tagged(.., tag = tick)`. The client-slot remembers, for 16 ticks, which entities each message carried. When the transport reports a tag acked, those entities' baselines advance.
+- **Encoding.** Each near entity goes as a delta against its newest acked baseline (≤31 ticks back, and from this entity's lifetime, not a previous occupant's of the slot), or in full if there is none.
+    - Deltas are variable-length bit codes: id gaps, zigzag position and velocity deltas, and yaw and the rest as "changed" bits.
+    - A moving entity costs ~5 B, against 15 B for a full near blob.
+- **Decoding.** The client keeps the same 32-tick history per near entity. Baselines are only ever ones it acked, so a delta never refers to a state it lacks.
+
+**Results:**
+
+| scenario | bytes per client-tick | near bytes | deltas | packets/s out | assembly p50 |
+|---|---|---|---|---|---|
+| blob 3,000 | 1,342 B (was 1,948) | 357 B (was ~967, −63%) | 99% | 180k (unchanged: 2 per client-tick) | 10.1 ms (was ~7.5) |
+| hotspots 5,000 | 759 B (was 1,087) | 194 B | 100% | 190k (was 241k, −21%) | 8.5 ms (was 5.5) |
+| uniform 10,000 (level 6, 20 Hz) | 331 B (was 477) | 96 B | 100% | 200k (unchanged: 1 per client-tick) | 10.0 ms (was 6.2) |
+
+- **The pass bar (near bytes at least halved) is met.** The blob stays at two packets, as decided: its mid tier alone is ~950 B.
+- **Correctness.** Decoded near states match the server's exactly in in-process tests, including under 30% loss both ways, and tracked bots over UDP saw zero decode errors.
+- **The cost is ~3.5 µs of assembly per client per tick.**
+    - About 1 µs is ack bookkeeping: `take_acked`, the sent ring, baseline updates.
+    - The rest is encoding (~30 ns per entity for the codec itself), plus building the entries and a message per client.
+    - At 10k that's ~4 ms. The level-6 tick still fits (p50 33 ms of its 50 ms period).
+- **Candidates if it matters:** writing the bits directly into the message buffer, and a flat per-shard index for acks.
+
 ## M2d: the degradation ladder on the WSL2 dev box
 
 | scenario | levels used | tick p50 / p99 (ms) | discarded inputs | corrections | input → applied (mean) | bytes per client-tick |

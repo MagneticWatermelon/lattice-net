@@ -3,7 +3,7 @@
 The custom UDP transport for a PlanetSide-style MMOFPS, where each continent runs as one server process targeting up to 10k players. Written in Rust with zero dependencies. It's sans-IO: the protocol code never touches a socket, so you feed it datagrams and a timestamp and drain the datagrams it wants sent.
 
 ```
-cargo test --release                                   # workspace: 26 transport tests incl. 25%-loss/jitter/dup sim, + sim/
+cargo test --release                                   # workspace: 27 transport tests incl. 25%-loss/jitter/dup sim, + sim/
 cargo run --release --example server                   # real UDP, 30 Hz tick, echo
 cargo run --release --example client 127.0.0.1:40000 5
 ```
@@ -72,6 +72,8 @@ S→C  Accepted           { salt, client_id }            ← slot allocated here
 
 **Unreliable** messages are packed after reliable ones. Anything that doesn't fit in this flush's packets (max 4 per connection per flush by default) is dropped and counted in `Stats::unreliable_dropped`. That's deliberate: next tick's snapshot is fresher.
 
+**Delivery tags.** `send_tagged(client, data, tag)` sends an unreliable message with a `u32` tag of the application's choosing. Each sent packet keeps up to 8 tags inline. When a packet is acked, its tags come back through `take_acked(client, &mut out)`. Loss is never reported; a tag just doesn't come back. That's what delta compression needs (the sim's near tier uses its tick as the tag), and the transport stays agnostic about what the tags mean.
+
 ## Sharding
 
 `Server::with_shards(cfg, max_clients, n, now)` partitions connections into `n` independent `Shard`s. The crate still spawns no threads: the caller drives the shards from its own pool.
@@ -120,6 +122,7 @@ The simulated link does loss, duplication, and base delay + jitter (which causes
 - **Sharding.** Across 8 shards, 300 clients connect through the lossy link and echo reliably, and each id's shard matches its address route. `max_clients` holds across 16 shards (exactly 25 of 40 accepted). Shards run on real threads via `std::thread::scope`. A misrouted handshake is dropped. With an accept budget of 8 per tick, 200 simultaneous joins all get in, and no tick accepts more than 8.
 - **Recycled connections start clean.** A client that leaves unacked reliable messages behind hands its pooled connection to the next client. The next client gets none of the old messages, and its first reliable id isn't mistaken for a duplicate. (Skipping either reset fails this test.)
 - **RTT excludes the peer's hold.** On a 20 ms round trip where the peer held the ack for 30 ms, the sample reads 20 ms, not 50 ms.
+- **Delivery tags.** Of two packets carrying 12 tagged messages (8 tags per packet at most), only the delivered one's tags come back, each once.
 - **Bad input.** Garbage packets, forged cookies, and payloads with a spoofed address but wrong session are all dropped.
 
 ## What's deliberately missing (next steps, roughly in order)

@@ -254,6 +254,18 @@ impl Shard {
             .send(channel, data)
     }
 
+    /// An unreliable message whose delivery comes back through `take_acked`.
+    pub fn send_tagged(&mut self, client: ClientId, data: Vec<u8>, tag: u32) -> Result<(), SendError> {
+        self.clients.get_mut(&client).ok_or(SendError::UnknownClient)?.conn.send_tagged(data, tag)
+    }
+
+    /// Moves the tags of `client`'s acked tagged messages into `out`.
+    pub fn take_acked(&mut self, client: ClientId, out: &mut Vec<u32>) {
+        if let Some(slot) = self.clients.get_mut(&client) {
+            slot.conn.take_acked(out);
+        }
+    }
+
     pub fn disconnect(&mut self, client: ClientId) {
         self.remove(client, DisconnectReason::Kicked, true);
     }
@@ -417,6 +429,16 @@ impl Server {
     pub fn disconnect(&mut self, client: ClientId) {
         let s = self.shard_of_client(client);
         self.shards[s].disconnect(client);
+    }
+
+    pub fn send_tagged(&mut self, client: ClientId, data: Vec<u8>, tag: u32) -> Result<(), SendError> {
+        let s = self.shard_of_client(client);
+        self.shards[s].send_tagged(client, data, tag)
+    }
+
+    pub fn take_acked(&mut self, client: ClientId, out: &mut Vec<u32>) {
+        let s = self.shard_of_client(client);
+        self.shards[s].take_acked(client, out);
     }
 
     /// Events of one client stay in order; events of different shards don't

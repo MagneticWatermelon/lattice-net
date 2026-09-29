@@ -437,6 +437,9 @@ impl Window {
         let far_skipped = c.far_skipped - self.counters.far_skipped;
         let far_starved = c.far_starved - self.counters.far_starved;
         let degraded = (c.degraded_clients - self.counters.degraded_clients) as f64 / snaps;
+        let near_bytes = (c.near_bytes - self.counters.near_bytes) as f64 / snaps;
+        let (nd, nf) = (c.near_deltas - self.counters.near_deltas, c.near_full - self.counters.near_full);
+        let delta_share = 100.0 * nd as f64 / (nd + nf).max(1) as f64;
         let rung = sim.rung();
         let kernel = kernel_udp_drops();
         let deferred = sim.net().deferred_accepts() - self.deferred;
@@ -449,7 +452,7 @@ impl Window {
             .collect();
         let tick = sums[COLS - 1];
         println!(
-            "[{:>5.0}s] clients {} | level {} ({}-{} in window: {} Hz, dilation {:.1}), pace {:.2}, {:.1}% clients bandwidth-degraded | tick p50 {} p99 {} max {} ms, {} overruns | out {:.1}k pps {:.0} kbps/client, {:.0} Mbps | in {:.1}k pps {:.0} kbps/client | stand-ins: repeated {:.2}% frozen {:.2}%, {} late inputs | per client-tick: {:.0} B, near {:.1} mid {:.1} far {:.1}, far skipped {} starved {} | input wait p50 {:.1} p99 {:.1} ms | {} joins deferred | kernel drops rcv {} snd {}",
+            "[{:>5.0}s] clients {} | level {} ({}-{} in window: {} Hz, dilation {:.1}), pace {:.2}, {:.1}% clients bandwidth-degraded | tick p50 {} p99 {} max {} ms, {} overruns | out {:.1}k pps {:.0} kbps/client, {:.0} Mbps | in {:.1}k pps {:.0} kbps/client | stand-ins: repeated {:.2}% frozen {:.2}%, {} late inputs | per client-tick: {:.0} B (near {:.0} B, {:.0}% deltas), near {:.1} mid {:.1} far {:.1}, far skipped {} starved {} | input wait p50 {:.1} p99 {:.1} ms | {} joins deferred | kernel drops rcv {} snd {}",
             t.as_secs_f64(),
             sim.client_count(),
             sim.level(),
@@ -472,6 +475,8 @@ impl Window {
             frozen_pct,
             late,
             snap_bytes,
+            near_bytes,
+            delta_share,
             tier(0),
             tier(1),
             tier(2),
