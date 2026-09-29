@@ -113,6 +113,9 @@ pub struct BotBrain {
     /// Timings not yet taken by `drain_latency`.
     latency: Vec<InputTiming>,
     tracker: Option<Tracker>,
+    /// Sink mode: entity messages are only counted, and no latency samples
+    /// are kept. Inputs, prediction and pacing still run.
+    sink: bool,
     pub stats: BotStats,
 }
 
@@ -139,6 +142,7 @@ impl BotBrain {
             last_acked: 0,
             latency: Vec::new(),
             tracker: None,
+            sink: false,
             stats: BotStats::default(),
         }
     }
@@ -157,6 +161,16 @@ impl BotBrain {
     }
 
     /// Moves input timings recorded since the last call into `out`.
+    /// Sink mode, for most of a large swarm: the bot keeps playing (inputs,
+    /// prediction, pace) but spends nothing on what it's sent beyond counting
+    /// it, so a load test measures the server, not the swarm.
+    pub fn set_sink(&mut self, sink: bool) {
+        self.sink = sink;
+        if sink {
+            self.tracker = None;
+        }
+    }
+
     /// Starts remembering every entity it hears about (a map per bot, so the
     /// swarm enables it on a sample) to measure update intervals per tier.
     pub fn enable_tracking(&mut self) {
@@ -182,6 +196,15 @@ impl BotBrain {
     }
 
     pub fn on_message(&mut self, data: &[u8], now: Instant) {
+        if self.sink && data.first() == Some(&msg::MSG_ENTITIES) {
+            // tag:1 | server_tick:4 | tier:1 | n:1 | blobs
+            if let (Some(&tier), Some(&n)) = (data.get(5), data.get(6)) {
+                if let Some(t) = self.stats.tier_seen.get_mut(tier as usize) {
+                    *t += n as u64;
+                }
+            }
+            return;
+        }
         match msg::decode_server_msg(data) {
             Ok(ServerMsg::Welcome(w)) if self.welcome.is_none() => {
                 self.state = MoveState { pos: w.spawn, vel: [0.0; 2] };
@@ -263,7 +286,9 @@ impl BotBrain {
             if let Some(sent) = slot.sent_at {
                 let ms = (now.saturating_duration_since(sent).as_secs_f64() * 1000.0).round();
                 let server_wait = (h.wait != WAIT_STAND_IN).then_some(h.wait);
-                self.latency.push(InputTiming { seen_ms: ms.min(u16::MAX as f64) as u16, server_wait });
+                if !self.sink {
+                    self.latency.push(InputTiming { seen_ms: ms.min(u16::MAX as f64) as u16, server_wait });
+                }
                 self.stats.latency_samples += 1;
                 self.stats.latency_sum_ms += ms;
                 if let Some(w) = server_wait {

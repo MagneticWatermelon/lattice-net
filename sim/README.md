@@ -103,6 +103,8 @@ The server preallocates `max-clients` connections at startup (`--no-prealloc` to
   - **Input → applied on the server ≈ RTT/2 + server wait.** This is the number to tune the spare against: it's how late other players see you and when your shots resolve. The wait comes back in each snapshot, and needs no clock sync.
   - **Server wait** alone. The spare input is one tick of it.
   - **Round trip:** input → acked in a snapshot the bot has read. This bounds reconciliation replay. It's quantized to whole bot ticks, so its median jumps between 67 and 100 ms from run to run.
+- **Swarm busy %**: how much of the bot threads' time went to work. The harness shares the box with the server, so this shows how much it competes.
+- **Sink bots** (`--full-every K`; `BOT_ARGS="--full-every 30"` in `scripts/m1.sh`). All but every Kth bot keep playing (inputs, prediction, pace) but only count the entity messages they get. Every bot receives with `recvmmsg`, one syscall per bot per tick.
 - The bots' RTT is a network RTT. The server reports its hold as `ack_delay`, and the bots stamp arrivals with `SO_TIMESTAMPNS` instead of their tick time. It reads 1.7–1.9 ms on loopback.
 
 ## M2a: tiered interest on the WSL2 dev box
@@ -139,6 +141,7 @@ Findings:
 - **The ladder leaves healthy scenarios alone.** The blob and hotspots run at a load of ~0.65, below the 0.85 step-down threshold.
 - **At 10k it settles where the tick fits.** Level 6 (20 Hz, shrunk radii, slower staggers) runs at a load of ~0.6, between the thresholds, so it doesn't flap.
 - **Stand-ins at 10k are 0.003% of input steps**: arrival jitter at 1.5 steps per tick with one spare input.
+- **Sink bots don't separate the swarm's cost from the server's.** With 29 of 30 bots as sinks, the swarm is still 51% busy (53% with all bots full), and the server still settles at level 6 with the same tick. A bot's cost is what every client pays to stay connected: receive syscalls, and the transport's CRC, acks and parsing, for 2.3 Gbps of loopback. On one box that can't be split off, so whether 10k truly needs level 6 takes bots on a second machine.
 - **The in-process tests cover every rung, both ways.** Sustained forced load walks the server down all nine levels (20 Hz, dilation 0.8) and back up, with zero discarded inputs, stand-ins or corrections throughout. A server that ticks at 20 Hz while meaning to tick at 30 advertises a pace of 2/3, and the bots follow it with zero discards. With the bots' pacing disabled, that test reproduces the 10k failure (720 discards).
 
 ## M1 baseline: WSL2 dev box (behavior, not capacity)

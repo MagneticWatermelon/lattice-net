@@ -534,3 +534,22 @@ fn clients_follow_a_server_that_falls_behind() {
     assert_eq!(s.corrections(), 0);
 }
 
+
+#[test]
+fn sink_bots_keep_playing_and_only_count_what_they_get() {
+    let mut s = Swarm::new(10, SpawnMode::Blob);
+    for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
+        b.set_sink(i % 2 == 1);
+    }
+    for _ in 0..5 * TICK_HZ {
+        s.step();
+    }
+    assert_eq!((stand_ins_and_discards(&s), s.corrections()), ((0, 0), 0));
+    for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
+        let mut samples = Vec::new();
+        b.drain_latency(&mut samples);
+        assert!(b.stats.tier_seen[0] > 0, "bot {i} counts near entities");
+        assert_eq!(b.stats.pace, 1000, "and follows the pace");
+        assert_eq!(samples.is_empty(), i % 2 == 1, "only full bots keep latency samples");
+    }
+}

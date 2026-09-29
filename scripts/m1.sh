@@ -8,7 +8,8 @@
 #   blob      3,000 bots in a 200 m disk, the rest uniform
 #   joins     <bots> uniform, then 500 more join at 50/s starting at t=15 s
 #
-# Env: SERVER_THREADS (rayon threads, default nproc/2), BOT_THREADS (default nproc/2, max 8).
+# Env: SERVER_THREADS (rayon threads, default nproc/2), BOT_THREADS (default nproc/2, max 8),
+#      BOT_ARGS (extra lattice-bots flags, e.g. "--full-every 30").
 # Only bare-metal Linux numbers count; on WSL2 this checks behavior, not capacity.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -36,7 +37,8 @@ srv=$!
 trap 'kill $srv 2>/dev/null || true' EXIT
 sleep 0.5
 
-bots() { "$bin/lattice-bots" --threads "$bot_threads" "$@"; }
+# BOT_ARGS: extra lattice-bots flags, e.g. BOT_ARGS="--full-every 30" for sink bots.
+bots() { "$bin/lattice-bots" --threads "$bot_threads" ${BOT_ARGS:-} "$@"; }
 if [ "$scenario" = joins ]; then
   bots --count "$count" --duration "$secs" > "$out/bots.log" &
   base=$!

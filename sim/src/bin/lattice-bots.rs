@@ -27,6 +27,8 @@ lattice-bots: M1 bot swarm
   --duration S         seconds from start until every bot disconnects [60]
   --report S           report interval, seconds [5]
   --track-every N      every Nth bot tracks entities to measure update intervals per tier [20]
+  --full-every K       only every Kth bot measures (prediction, latency, tracking); the
+                       rest are sink bots that play but only count what they're sent [1]
   --seed N             [1]";
 
 /// Cumulative per-thread totals; the main thread sums threads and diffs windows.
@@ -58,6 +60,9 @@ struct Totals {
     rtt_sum: f64,
     loss_sum: f64,
     tick_overruns: u64,
+    /// Bot threads' time spent working vs. elapsed, summed over threads.
+    busy_us: u64,
+    wall_us: u64,
 }
 
 impl Totals {
@@ -87,6 +92,8 @@ impl Totals {
         self.rtt_sum += o.rtt_sum;
         self.loss_sum += o.loss_sum;
         self.tick_overruns += o.tick_overruns;
+        self.busy_us += o.busy_us;
+        self.wall_us += o.wall_us;
     }
 }
 
@@ -159,6 +166,7 @@ struct Bot {
     start_at: Instant,
     seed: u64,
     track: bool,
+    sink: bool,
     /// Bound up front, before the clock starts: creating thousands of sockets
     /// inside the first tick overran the swarm and delivered its inputs late.
     sock: Option<UdpSocket>,
@@ -171,7 +179,7 @@ struct Bot {
 }
 
 impl Bot {
-    fn tick(&mut self, server: SocketAddr, clocks: &Clocks, buf: &mut [u8]) -> std::io::Result<Option<u32>> {
+    fn tick(&mut self, server: SocketAddr, clocks: &Clocks, rx: &mut RecvBatch) -> std::io::Result<Option<u32>> {
         let now = clocks.instant;
         if self.failed || now < self.start_at {
             return Ok(None);
@@ -186,16 +194,25 @@ impl Bot {
             if self.track {
                 brain.enable_tracking();
             }
+            brain.set_sink(self.sink);
             self.brain = Some(brain);
         }
         let (sock, client) = self.net.as_mut().unwrap();
         let brain = self.brain.as_mut().unwrap();
         loop {
-            match recv_stamped(sock, buf) {
-                // Pass the arrival time, not the tick: the transport's RTT (and
-                // the input -> applied estimate built on it) must not include
-                // the up-to-a-tick wait for our own tick.
-                Ok((n, stamp)) => client.receive(server, &buf[..n], stamp.map_or(now, |t| clocks.instant_of(t))),
+            match rx.recv(sock) {
+                Ok(n) => {
+                    for i in 0..n {
+                        // Pass the arrival time, not the tick: the transport's RTT
+                        // (and the input -> applied estimate built on it) must not
+                        // include the up-to-a-tick wait for our own tick.
+                        let (data, stamp) = rx.get(i);
+                        client.receive(server, data, stamp.map_or(now, |t| clocks.instant_of(t)));
+                    }
+                    if n < RX_BATCH {
+                        break;
+                    }
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 // ICMP port unreachable (server not up yet) surfaces here; keep going.
                 Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset) => {}
@@ -299,41 +316,84 @@ fn enable_rx_timestamps(sock: &UdpSocket) -> std::io::Result<()> {
     }
 }
 
-/// `recv` plus the kernel's arrival timestamp (`SO_TIMESTAMPNS`), if any.
-#[cfg(target_os = "linux")]
-fn recv_stamped(sock: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, Option<SystemTime>)> {
-    use std::os::fd::AsRawFd;
-    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
-    let mut control = [0u64; 8]; // u64s for cmsghdr alignment
-    // SAFETY: msghdr is plain data; all-zero is a valid empty header.
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = std::mem::size_of_val(&control) as _;
-    // SAFETY: msg points at `iov` (into `buf`) and `control`, both alive for the call.
-    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
-    if n < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut stamp = None;
-    // SAFETY: walking the control messages the kernel just wrote into `control`.
-    unsafe {
-        let mut c = libc::CMSG_FIRSTHDR(&msg);
-        while !c.is_null() {
-            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_TIMESTAMPNS {
-                let ts: libc::timespec = std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::timespec);
-                stamp = Some(SystemTime::UNIX_EPOCH + Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
-            }
-            c = libc::CMSG_NXTHDR(&msg, c);
-        }
-    }
-    Ok((n as usize, stamp))
+/// Datagrams received per `recvmmsg` call. A bot gets 2-3 per tick, so one
+/// call drains its socket without the extra empty `recv` that ends a loop.
+const RX_BATCH: usize = 8;
+
+/// Batched receive with the kernel's arrival timestamps (`SO_TIMESTAMPNS`).
+/// One per bot thread, reused for every bot.
+struct RecvBatch {
+    bufs: Vec<[u8; 1500]>,
+    lens: [usize; RX_BATCH],
+    stamps: [Option<SystemTime>; RX_BATCH],
+    #[cfg(target_os = "linux")]
+    control: Vec<[u64; 8]>,
 }
 
-#[cfg(not(target_os = "linux"))]
-fn recv_stamped(sock: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, Option<SystemTime>)> {
-    sock.recv(buf).map(|n| (n, None))
+impl RecvBatch {
+    fn new() -> Self {
+        Self {
+            bufs: vec![[0; 1500]; RX_BATCH],
+            lens: [0; RX_BATCH],
+            stamps: [None; RX_BATCH],
+            #[cfg(target_os = "linux")]
+            control: vec![[0; 8]; RX_BATCH],
+        }
+    }
+
+    fn get(&self, i: usize) -> (&[u8], Option<SystemTime>) {
+        (&self.bufs[i][..self.lens[i]], self.stamps[i])
+    }
+
+    /// Receives whatever is waiting, up to `RX_BATCH`, without blocking.
+    #[cfg(target_os = "linux")]
+    fn recv(&mut self, sock: &UdpSocket) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let mut iovs: [libc::iovec; RX_BATCH] = std::array::from_fn(|i| libc::iovec {
+            iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
+            iov_len: self.bufs[i].len(),
+        });
+        let mut msgs: [libc::mmsghdr; RX_BATCH] = std::array::from_fn(|i| {
+            // SAFETY: msghdr is plain data; all-zero is a valid empty header.
+            let mut h: libc::msghdr = unsafe { std::mem::zeroed() };
+            h.msg_iov = &mut iovs[i];
+            h.msg_iovlen = 1;
+            h.msg_control = self.control[i].as_mut_ptr() as *mut libc::c_void;
+            h.msg_controllen = std::mem::size_of::<[u64; 8]>() as _;
+            libc::mmsghdr { msg_hdr: h, msg_len: 0 }
+        });
+        // SAFETY: every header points into `iovs` (into `self.bufs`) and
+        // `self.control`, all alive and unmoved for the duration of the call.
+        let n = unsafe {
+            libc::recvmmsg(sock.as_raw_fd(), msgs.as_mut_ptr(), RX_BATCH as u32, libc::MSG_DONTWAIT, std::ptr::null_mut())
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for (i, m) in msgs.iter().enumerate().take(n as usize) {
+            self.lens[i] = m.msg_len as usize;
+            self.stamps[i] = None;
+            // SAFETY: walking the control messages the kernel just wrote.
+            unsafe {
+                let mut c = libc::CMSG_FIRSTHDR(&m.msg_hdr);
+                while !c.is_null() {
+                    if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_TIMESTAMPNS {
+                        let ts: libc::timespec = std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::timespec);
+                        self.stamps[i] = Some(SystemTime::UNIX_EPOCH + Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
+                    }
+                    c = libc::CMSG_NXTHDR(&m.msg_hdr, c);
+                }
+            }
+        }
+        Ok(n as usize)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn recv(&mut self, sock: &UdpSocket) -> std::io::Result<usize> {
+        let n = sock.recv(&mut self.bufs[0])?;
+        (self.lens[0], self.stamps[0]) = (n, None);
+        Ok(1)
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -347,9 +407,14 @@ fn main() -> std::io::Result<()> {
     let report = Duration::from_secs_f64(a.get("report", 5.0));
     let seed: u64 = a.get("seed", 1);
     let track_every: usize = a.get("track-every", 20);
+    let full_every: usize = a.get::<usize>("full-every", 1).max(1);
     a.finish();
 
-    println!("{count} bots -> {server} on {threads} threads, ramp {ramp}/s, {duration:?}");
+    println!(
+        "{count} bots -> {server} on {threads} threads, ramp {ramp}/s, {duration:?}, {} full + {} sink bots",
+        count.div_ceil(full_every),
+        count - count.div_ceil(full_every)
+    );
     let sockets = (0..count).map(|_| bot_socket(server)).collect::<std::io::Result<Vec<_>>>()?;
     let mut sockets = sockets.into_iter().map(Some).collect::<Vec<_>>();
     let start = Instant::now();
@@ -368,7 +433,8 @@ fn main() -> std::io::Result<()> {
             .map(|i| Bot {
                 start_at: start + if ramp > 0.0 { Duration::from_secs_f64(i as f64 / ramp) } else { Duration::ZERO },
                 seed: seed.wrapping_mul(1_000_003).wrapping_add(i as u64),
-                track: track_every > 0 && i % track_every == 0,
+                track: track_every > 0 && i % track_every == 0 && i % full_every == 0,
+                sink: i % full_every != 0,
                 sock: sockets[i].take(),
                 net: None,
                 brain: None,
@@ -381,7 +447,8 @@ fn main() -> std::io::Result<()> {
             let period = Duration::from_secs(1) / TICK_HZ;
             // Spread the threads' ticks across the period, like real clients.
             let mut next = start + period * t as u32 / threads as u32;
-            let mut buf = [0u8; 1500];
+            let mut rx = RecvBatch::new();
+            let (mut busy, thread_start) = (Duration::ZERO, Instant::now());
             let mut overruns = 0;
             let mut joins = Vec::new();
             let mut latency = Latency::new();
@@ -398,8 +465,12 @@ fn main() -> std::io::Result<()> {
                 if now >= end {
                     break;
                 }
+                let work = Instant::now();
                 for bot in &mut bots {
-                    joins.extend(bot.tick(server, &clocks, &mut buf)?);
+                    joins.extend(bot.tick(server, &clocks, &mut rx)?);
+                    if bot.sink {
+                        continue;
+                    }
                     if let (Some(brain), Some((_, client))) = (&mut bot.brain, &bot.net) {
                         brain.drain_latency(&mut samples);
                         let rtt = client.stats().map_or(0.0, |s| s.rtt_ms);
@@ -412,6 +483,7 @@ fn main() -> std::io::Result<()> {
                         }
                     }
                 }
+                busy += work.elapsed();
                 next += period;
                 if Instant::now() > next {
                     overruns += 1;
@@ -419,7 +491,12 @@ fn main() -> std::io::Result<()> {
                 }
                 if now - last_publish >= Duration::from_millis(500) {
                     last_publish = now;
-                    let mut tot = Totals { tick_overruns: overruns, ..Default::default() };
+                    let mut tot = Totals {
+                        tick_overruns: overruns,
+                        busy_us: busy.as_micros() as u64,
+                        wall_us: thread_start.elapsed().as_micros() as u64,
+                        ..Default::default()
+                    };
                     bots.iter().for_each(|b| b.add_to(&mut tot));
                     let mut s = shared.lock().unwrap();
                     s.threads[t] = tot;
@@ -427,7 +504,12 @@ fn main() -> std::io::Result<()> {
                     s.latency.merge(&std::mem::replace(&mut latency, Latency::new()));
                 }
             }
-            let mut tot = Totals { tick_overruns: overruns, ..Default::default() };
+            let mut tot = Totals {
+                        tick_overruns: overruns,
+                        busy_us: busy.as_micros() as u64,
+                        wall_us: thread_start.elapsed().as_micros() as u64,
+                        ..Default::default()
+                    };
             bots.iter().for_each(|b| b.add_to(&mut tot));
             for bot in &mut bots {
                 if let Some((sock, client)) = &mut bot.net {
@@ -485,7 +567,7 @@ fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut
     let j = summarize(joins);
     let (applied, seen) = (latency.applied.summary(), latency.seen.summary());
     println!(
-        "[{:>5.0}s] bots {}/{} connected, {} welcomed, {} failed | {:.1} snaps/s/bot, entities/snap near {:.1} mid {:.1} far {:.1} | corrections {:.3}/s/bot | down {:.0} up {:.0} kbps/bot | rtt {:.1} ms loss {:.2}% | input->applied ~ p50 {} p99 {} ms, round trip p50 {} p99 {} ms | joins {} (p50 {} p99 {} ms) | server pace {:.2} level {}, {} bots bandwidth-degraded | swarm overruns {}",
+        "[{:>5.0}s] bots {}/{} connected, {} welcomed, {} failed | {:.1} snaps/s/bot, entities/snap near {:.1} mid {:.1} far {:.1} | corrections {:.3}/s/bot | down {:.0} up {:.0} kbps/bot | rtt {:.1} ms loss {:.2}% | input->applied ~ p50 {} p99 {} ms, round trip p50 {} p99 {} ms | joins {} (p50 {} p99 {} ms) | server pace {:.2} level {}, {} bots bandwidth-degraded | swarm busy {:.0}%, overruns {}",
         t.as_secs_f64(),
         cur.connected,
         cur.started,
@@ -510,6 +592,7 @@ fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut
         cur.pace_sum / 1000.0 / bots,
         cur.level_max,
         cur.client_degraded,
+        100.0 * d(cur.busy_us, prev.busy_us) / d(cur.wall_us, prev.wall_us).max(1.0),
         cur.tick_overruns - prev.tick_overruns,
     );
 }
@@ -565,9 +648,10 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
         t.clock_extra, t.clock_skipped, t.backlog_skips
     );
     println!(
-        "  bytes down {:.1} MB up {:.1} MB | swarm tick overruns {}",
+        "  bytes down {:.1} MB up {:.1} MB | swarm busy {:.0}% of its threads' time, tick overruns {}",
         t.bytes_down as f64 / 1e6,
         t.bytes_up as f64 / 1e6,
+        100.0 * t.busy_us as f64 / t.wall_us.max(1) as f64,
         t.tick_overruns
     );
 }
