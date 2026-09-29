@@ -1,0 +1,12 @@
+[package]
+name = "lattice-sim"
+version = "0.1.0"
+edition = "2021"
+description = "M1 headless scale test: movement-only authoritative server, bot swarm, per-phase tick metrics."
+license = "MIT"
+publish = false
+
+[dependencies]
+lattice-net = { path = ".." }
+rayon = "1"
+socket2 = "0.5"

@@ -3,10 +3,12 @@
 The custom UDP transport for a PlanetSide-style MMOFPS, where each continent runs as one server process targeting up to 10k players. Written in Rust with zero dependencies. It's sans-IO: the protocol code never touches a socket, so you feed it datagrams and a timestamp and drain the datagrams it wants sent.
 
 ```
-cargo test --release                                   # 18 tests incl. 25%-loss/jitter/dup sim
+cargo test --release                                   # workspace: 18 transport tests incl. 25%-loss/jitter/dup sim, + sim/
 cargo run --release --example server                   # real UDP, 30 Hz tick, echo
 cargo run --release --example client 127.0.0.1:40000 5
 ```
+
+The M1 headless scale test (a movement-only server, a bot swarm and per-phase tick metrics) lives in [`sim/`](sim/README.md): `scripts/m1.sh blob 3000 60`.
 
 ## Wire format
 

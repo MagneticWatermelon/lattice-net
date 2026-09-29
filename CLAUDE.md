@@ -45,8 +45,8 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 ## Milestones
 
 - **M0: protocol.** Done: this crate, 18 tests.
-- **M1 (next): headless scale test.**
-  - Server does movement only. A Go bot swarm, one goroutine per bot, drives it at 1k, 5k and 10k.
+- **M1 (in progress): headless scale test.** Lives in `sim/` (`lattice-sim`, which may have deps: rayon, socket2). See `sim/README.md` for the WSL baseline.
+  - Server does movement only. A Rust bot swarm (`lattice-bots`, real `lattice_net::Client`s, one socket per bot, ≤8 threads) drives it at 1k, 5k and 10k. It's Rust, not Go, so there's one protocol implementation to change when crypto lands.
   - Measure p50/p99 per-phase tick time, bytes per client, pps, and prediction corrections.
   - Scenarios: uniform spread; 3 hotspots of ~800; a 3,000-player blob within 200 m; 500 joins within 10 s.
   - Pass bar: p99 tick under ~25 ms on the blob.
@@ -65,5 +65,5 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 
 ## Conventions
 
-- `cargo test --release` and `cargo clippy --all-targets` must stay clean.
+- `cargo test --release` (runs the whole workspace) and `cargo clippy --workspace --all-targets` must stay clean.
 - Zero dependencies in the core crate unless there's a strong reason. Crypto uses audited crates, never hand-rolled.

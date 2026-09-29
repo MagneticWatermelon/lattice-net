@@ -9,3 +9,7 @@ license = "MIT"
 
 [profile.release]
 debug = 1
+
+[workspace]
+members = [".", "sim"]
+default-members = [".", "sim"]
