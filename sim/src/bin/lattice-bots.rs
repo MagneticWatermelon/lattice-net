@@ -26,6 +26,7 @@ lattice-bots: M1 bot swarm
   --ramp R             bots joining per second (0 = all at once) [0]
   --duration S         seconds from start until every bot disconnects [60]
   --report S           report interval, seconds [5]
+  --track-every N      every Nth bot tracks entities to measure update intervals per tier [20]
   --seed N             [1]";
 
 /// Cumulative per-thread totals; the main thread sums threads and diffs windows.
@@ -41,7 +42,8 @@ struct Totals {
     resyncs: u64,
     clock_extra: u64,
     clock_skipped: u64,
-    entities: u64,
+    /// Entity updates received per tier.
+    tiers: [u64; 3],
     corrections: u64,
     correction_err_sum: f64,
     correction_err_max: f32,
@@ -64,7 +66,9 @@ impl Totals {
         self.resyncs += o.resyncs;
         self.clock_extra += o.clock_extra;
         self.clock_skipped += o.clock_skipped;
-        self.entities += o.entities;
+        for (a, b) in self.tiers.iter_mut().zip(o.tiers) {
+            *a += b;
+        }
         self.corrections += o.corrections;
         self.correction_err_sum += o.correction_err_sum;
         self.correction_err_max = self.correction_err_max.max(o.correction_err_max);
@@ -92,11 +96,18 @@ struct Latency {
     wait: Histogram,
     /// Estimated input generated -> applied on the server: RTT / 2 + wait, ms.
     applied: Histogram,
+    /// Update interval per entity, in server ticks, per tier (tracked bots only).
+    intervals: [Histogram; 3],
 }
 
 impl Latency {
     fn new() -> Self {
-        Self { seen: Histogram::new(LATENCY_CAP_MS), wait: Histogram::new(LATENCY_CAP_MS * 10), applied: Histogram::new(LATENCY_CAP_MS) }
+        Self {
+            seen: Histogram::new(LATENCY_CAP_MS),
+            wait: Histogram::new(LATENCY_CAP_MS * 10),
+            applied: Histogram::new(LATENCY_CAP_MS),
+            intervals: std::array::from_fn(|_| Histogram::new(300)),
+        }
     }
 
     fn record(&mut self, t: InputTiming, rtt_ms: f32) {
@@ -111,6 +122,9 @@ impl Latency {
         self.seen.merge(&o.seen);
         self.wait.merge(&o.wait);
         self.applied.merge(&o.applied);
+        for (a, b) in self.intervals.iter_mut().zip(&o.intervals) {
+            a.merge(b);
+        }
     }
 }
 
@@ -134,6 +148,7 @@ impl Clocks {
 struct Bot {
     start_at: Instant,
     seed: u64,
+    track: bool,
     /// Bound up front, before the clock starts: creating thousands of sockets
     /// inside the first tick overran the swarm and delivered its inputs late.
     sock: Option<UdpSocket>,
@@ -157,7 +172,11 @@ impl Bot {
                 None => bot_socket(server)?,
             };
             self.net = Some((sock, Client::new(Config::default(), server, now)));
-            self.brain = Some(BotBrain::new(self.seed));
+            let mut brain = BotBrain::new(self.seed);
+            if self.track {
+                brain.enable_tracking();
+            }
+            self.brain = Some(brain);
         }
         let (sock, client) = self.net.as_mut().unwrap();
         let brain = self.brain.as_mut().unwrap();
@@ -222,7 +241,9 @@ impl Bot {
         t.resyncs += s.resyncs;
         t.clock_extra += s.clock_extra;
         t.clock_skipped += s.clock_skipped;
-        t.entities += s.entities_seen;
+        for (a, b) in t.tiers.iter_mut().zip(s.tier_seen) {
+            *a += b;
+        }
         t.corrections += s.corrections;
         t.correction_err_sum += s.correction_error_sum;
         t.correction_err_max = t.correction_err_max.max(s.correction_error_max);
@@ -311,6 +332,7 @@ fn main() -> std::io::Result<()> {
     let duration = Duration::from_secs_f64(a.get("duration", 60.0));
     let report = Duration::from_secs_f64(a.get("report", 5.0));
     let seed: u64 = a.get("seed", 1);
+    let track_every: usize = a.get("track-every", 20);
     a.finish();
 
     println!("{count} bots -> {server} on {threads} threads, ramp {ramp}/s, {duration:?}");
@@ -332,6 +354,7 @@ fn main() -> std::io::Result<()> {
             .map(|i| Bot {
                 start_at: start + if ramp > 0.0 { Duration::from_secs_f64(i as f64 / ramp) } else { Duration::ZERO },
                 seed: seed.wrapping_mul(1_000_003).wrapping_add(i as u64),
+                track: track_every > 0 && i % track_every == 0,
                 sock: sockets[i].take(),
                 net: None,
                 brain: None,
@@ -349,6 +372,7 @@ fn main() -> std::io::Result<()> {
             let mut joins = Vec::new();
             let mut latency = Latency::new();
             let mut samples = Vec::new();
+            let mut intervals: [Vec<u16>; 3] = Default::default();
             let mut last_publish = start;
             loop {
                 let now = Instant::now();
@@ -366,6 +390,10 @@ fn main() -> std::io::Result<()> {
                         brain.drain_latency(&mut samples);
                         let rtt = client.stats().map_or(0.0, |s| s.rtt_ms);
                         samples.drain(..).for_each(|t| latency.record(t, rtt));
+                        brain.drain_intervals(&mut intervals);
+                        for (h, v) in latency.intervals.iter_mut().zip(&mut intervals) {
+                            v.drain(..).for_each(|g| h.record(g as u32));
+                        }
                     }
                 }
                 next += period;
@@ -441,14 +469,16 @@ fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut
     let j = summarize(joins);
     let (applied, seen) = (latency.applied.summary(), latency.seen.summary());
     println!(
-        "[{:>5.0}s] bots {}/{} connected, {} welcomed, {} failed | {:.1} snaps/s/bot, {:.1} entities/snap | corrections {:.3}/s/bot | down {:.0} up {:.0} kbps/bot | rtt {:.1} ms loss {:.2}% | input->applied ~ p50 {} p99 {} ms, round trip p50 {} p99 {} ms | joins {} (p50 {} p99 {} ms) | swarm overruns {}",
+        "[{:>5.0}s] bots {}/{} connected, {} welcomed, {} failed | {:.1} snaps/s/bot, entities/snap near {:.1} mid {:.1} far {:.1} | corrections {:.3}/s/bot | down {:.0} up {:.0} kbps/bot | rtt {:.1} ms loss {:.2}% | input->applied ~ p50 {} p99 {} ms, round trip p50 {} p99 {} ms | joins {} (p50 {} p99 {} ms) | swarm overruns {}",
         t.as_secs_f64(),
         cur.connected,
         cur.started,
         cur.welcomed,
         cur.failed,
         snaps / secs / bots,
-        d(cur.entities, prev.entities) / snaps.max(1.0),
+        d(cur.tiers[0], prev.tiers[0]) / snaps.max(1.0),
+        d(cur.tiers[1], prev.tiers[1]) / snaps.max(1.0),
+        d(cur.tiers[2], prev.tiers[2]) / snaps.max(1.0),
         d(cur.corrections, prev.corrections) / secs / bots,
         d(cur.bytes_down, prev.bytes_down) * 8.0 / 1000.0 / secs / bots,
         d(cur.bytes_up, prev.bytes_up) * 8.0 / 1000.0 / secs / bots,
@@ -485,9 +515,11 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
         t.correction_err_max
     );
     println!(
-        "  snapshots {} ({:.1} entities avg), stale {}, unmatched acks {}, resyncs {}",
+        "  snapshots {} (entities per snapshot: near {:.1} mid {:.1} far {:.1}), stale {}, unmatched acks {}, resyncs {}",
         t.snapshots,
-        t.entities as f64 / t.snapshots.max(1) as f64,
+        t.tiers[0] as f64 / t.snapshots.max(1) as f64,
+        t.tiers[1] as f64 / t.snapshots.max(1) as f64,
+        t.tiers[2] as f64 / t.snapshots.max(1) as f64,
         t.stale_snapshots,
         t.unmatched_acks,
         t.resyncs
@@ -506,6 +538,10 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
     line("input -> applied on server (est. RTT/2 + server wait)", &latency.applied, 1.0);
     line("  of which server wait (arrival -> applied)", &latency.wait, 0.1);
     line("input -> seen acked (round trip)", &latency.seen, 1.0);
+    let tick_ms = 1000.0 / TICK_HZ as f64;
+    for (name, h) in ["near", "mid", "far"].iter().zip(&latency.intervals) {
+        line(&format!("{name} entity update interval (tracked bots)"), h, tick_ms);
+    }
     println!("  input clock: {} extra inputs, {} skipped ticks", t.clock_extra, t.clock_skipped);
     println!(
         "  bytes down {:.1} MB up {:.1} MB | swarm tick overruns {}",

@@ -8,6 +8,7 @@ use lattice_net::{Channel, Client, ClientState, Config};
 use lattice_sim::bot::BotBrain;
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::rng::Rng;
+use lattice_sim::interest::{InterestConfig, Tier, FAR_PERIOD, MID_PERIOD};
 use lattice_sim::server::{SimConfig, SimServer, SpawnMode};
 
 const SERVER: &str = "10.0.0.1:40000";
@@ -31,9 +32,12 @@ struct Swarm {
 
 impl Swarm {
     fn new(n: usize, spawn: SpawnMode) -> Self {
+        Self::with_config(n, SimConfig { spawn, ..Default::default() })
+    }
+
+    fn with_config(n: usize, cfg: SimConfig) -> Self {
         let now = Instant::now();
         let server_addr: SocketAddr = SERVER.parse().unwrap();
-        let cfg = SimConfig { spawn, ..Default::default() };
         let bots = (0..n)
             .map(|i| {
                 let addr: SocketAddr = format!("10.1.{}.{}:5000", i / 250, i % 250 + 1).parse().unwrap();
@@ -116,13 +120,14 @@ fn clean_link_predicts_bit_exactly() {
         assert!(b.welcome().is_some());
         let st = &b.stats;
         assert_eq!((st.unmatched_acks, st.bad_messages, st.stale_snapshots), (0, 0, 0));
-        let avg = st.entities_seen as f64 / st.snapshots as f64;
-        assert!(avg > 2.0, "avg entities per snapshot {avg}");
+        let near = st.tier_seen[Tier::Near as usize] as f64 / st.snapshots as f64;
+        assert!(near > 2.0, "near entities per snapshot {near}");
+        assert_eq!(st.tier_seen[Tier::Far as usize], 0, "nobody is 500 m away");
     }
-    // All 40 spawn in a 200 m disk; a 150 m view covers a good part of it.
-    let (seen, snaps) = s.bots.iter().fold((0, 0), |a, (_, _, b)| (a.0 + b.stats.entities_seen, a.1 + b.stats.snapshots));
+    // All 40 spawn in a 200 m disk; a 150 m near radius covers a good part of it.
+    let (seen, snaps) = s.bots.iter().fold((0, 0), |a, (_, _, b)| (a.0 + b.stats.tier_seen[0], a.1 + b.stats.snapshots));
     let avg = seen as f64 / snaps as f64;
-    assert!(avg > 8.0, "swarm avg entities per snapshot {avg}");
+    assert!(avg > 8.0, "swarm avg near entities per snapshot {avg}");
 }
 
 #[test]
@@ -297,4 +302,114 @@ fn input_clock_drains_back_to_one_spare_after_jitter() {
         let last = samples.last().unwrap();
         assert_eq!(last.server_wait, Some(333), "server wait back to one tick");
     }
+}
+
+/// A line of still players 26 m apart: none within 6 m of a tier boundary.
+fn line_swarm(n: usize, interest: InterestConfig) -> Swarm {
+    let cfg = SimConfig { spawn: SpawnMode::Line(26.0), interest, ..Default::default() };
+    let mut s = Swarm::with_config(n, cfg);
+    s.bots[0].2.enable_tracking();
+    s
+}
+
+/// A bot's entity and its index on the line (spawn order, not bot order).
+fn line_index(s: &Swarm, bot: usize, spacing: f32) -> (u16, i32) {
+    let entity = s.bots[bot].2.welcome().unwrap().entity;
+    let x = s.server.entity_state(entity).unwrap().pos[0];
+    (entity, ((x - 1000.0) / spacing).round() as i32)
+}
+
+fn expected_tier(d: f32, cfg: &InterestConfig) -> Option<Tier> {
+    if d <= cfg.near_radius {
+        Some(Tier::Near)
+    } else if d <= cfg.mid_radius {
+        Some(Tier::Mid)
+    } else if d <= cfg.far_radius {
+        Some(Tier::Far)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn tiers_follow_distance_and_update_at_their_rates() {
+    let cfg = InterestConfig::default();
+    let mut s = line_swarm(62, cfg.clone());
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    let mut warm = Default::default();
+    s.bots[0].2.drain_intervals(&mut warm);
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    let t = s.bots[0].2.tracker().unwrap();
+    let (_, k0) = line_index(&s, 0, 26.0);
+    for i in 1..s.bots.len() {
+        let (entity, k) = line_index(&s, i, 26.0);
+        let d = (k - k0).abs() as f32 * 26.0;
+        let known = t.get(entity);
+        assert_eq!(known.map(|k| k.tier), expected_tier(d, &cfg), "bot {i} at {d} m");
+        if let Some(known) = known {
+            let truth = s.server.entity_state(entity).unwrap().pos;
+            let err = ((known.pos[0] - truth[0]).powi(2) + (known.pos[1] - truth[1]).powi(2)).sqrt();
+            // Far entities are up to 15 ticks stale; a bot wanders ~2 m around its anchor.
+            assert!(err < 5.0, "bot {i}: known position {err} m off");
+        }
+    }
+    let mut iv: [Vec<u16>; 3] = Default::default();
+    let mut me = s.bots.remove(0).2;
+    me.drain_intervals(&mut iv);
+    assert!(iv[0].iter().all(|&g| g == 1), "near every tick: {:?}", &iv[0][..10]);
+    assert!(iv[1].iter().all(|&g| g == MID_PERIOD as u16), "mid every 3rd tick");
+    assert!(iv[2].iter().all(|&g| g == FAR_PERIOD as u16), "far every 15th tick");
+    assert!(!iv[2].is_empty());
+    let c = s.server.counters();
+    assert_eq!((c.far_skipped, c.far_starved, c.mid_truncated), (0, 0, 0), "the default budget doesn't bind");
+}
+
+#[test]
+fn squadmates_are_near_tier_at_any_distance() {
+    // Squads of 2 in a line 300 m apart: bot 1 is 300 m from bot 0 (mid band)
+    // but in its squad; bot 2 is 600 m away (far band) and isn't.
+    let interest = InterestConfig { squad_size: 2, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Line(300.0), interest, ..Default::default() };
+    let mut s = Swarm::with_config(3, cfg);
+    s.bots[0].2.enable_tracking();
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    // Squads are by spawn order: line index k is in squad k / 2.
+    let t = s.bots[0].2.tracker().unwrap();
+    let (_, k0) = line_index(&s, 0, 300.0);
+    for i in 1..3 {
+        let (entity, k) = line_index(&s, i, 300.0);
+        let want = if k / 2 == k0 / 2 {
+            Tier::Near // squadmate, 300 m away
+        } else if (k - k0).abs() == 1 {
+            Tier::Mid
+        } else {
+            Tier::Far
+        };
+        assert_eq!(t.get(entity).map(|k| k.tier), Some(want), "line index {k} vs {k0}");
+    }
+}
+
+#[test]
+fn a_tight_budget_never_cuts_the_near_tier() {
+    // Room for own state, near and mid, and about one far entity per tick,
+    // while ~2.5 are due: far falls behind and the server flags it.
+    let interest = InterestConfig { budget_bytes: 190, ..Default::default() };
+    let mut s = line_swarm(62, interest);
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    let mut iv: [Vec<u16>; 3] = Default::default();
+    s.bots[0].2.drain_intervals(&mut iv);
+    assert!(iv[0].iter().all(|&g| g == 1), "near still every tick");
+    let c = s.server.counters();
+    assert!(c.far_skipped > 0 && c.far_starved > 0, "skips and starvation are counted: {c:?}");
+    // Every client stayed within its budget (the client at the end of the line
+    // sees less, so the average is below 190).
+    assert!(c.snapshot_bytes <= 190 * c.snapshots, "{} B over {} client-ticks", c.snapshot_bytes, c.snapshots);
 }

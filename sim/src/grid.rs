@@ -71,6 +71,55 @@ impl Grid {
     }
 }
 
+/// What `Grid::walk_rings` reports to its visitor.
+pub enum Ring {
+    /// An item in a cell of the current ring.
+    Item(u32),
+    /// A ring is done: every item not visited yet is at least this far from `p`.
+    /// Return true to stop.
+    Done(f32),
+}
+
+impl Grid {
+    /// Visits the cells around `p` in rings of growing Chebyshev distance, out
+    /// to radius `r`, so a k-nearest search can stop as soon as its k-th
+    /// candidate is closer than anything unvisited. In a dense crowd that is a
+    /// handful of cells instead of every cell in `r`.
+    pub fn walk_rings<F: FnMut(Ring) -> bool>(&self, p: [f32; 2], r: f32, mut visit: F) {
+        let (cx, cy) = (self.coord(p[0]) as i32, self.coord(p[1]) as i32);
+        let rings = (r / self.cell).ceil() as i32 + 1;
+        for k in 0..=rings {
+            if k == 0 {
+                self.visit_cell(cx, cy, &mut visit);
+            } else {
+                for x in cx - k..=cx + k {
+                    self.visit_cell(x, cy - k, &mut visit);
+                    self.visit_cell(x, cy + k, &mut visit);
+                }
+                for y in cy - k + 1..cy + k {
+                    self.visit_cell(cx - k, y, &mut visit);
+                    self.visit_cell(cx + k, y, &mut visit);
+                }
+            }
+            // p sits anywhere in its cell, so ring k+1 is at least k cells away.
+            if visit(Ring::Done(k as f32 * self.cell)) {
+                return;
+            }
+        }
+    }
+
+    #[inline]
+    fn visit_cell<F: FnMut(Ring) -> bool>(&self, x: i32, y: i32, visit: &mut F) {
+        let dim = self.dim as i32;
+        if x >= 0 && y >= 0 && x < dim && y < dim {
+            let c = (y * dim + x) as usize;
+            for &id in &self.items[self.start[c] as usize..self.start[c + 1] as usize] {
+                visit(Ring::Item(id));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +149,52 @@ mod tests {
             got.sort_unstable();
             let want: Vec<u32> = (0..pts.len() as u32).filter(|&i| d2(pts[i as usize]) <= r * r).collect();
             assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn ring_walk_finds_the_k_nearest_and_stops_early() {
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 40) as f32 / (1u64 << 24) as f32
+        };
+        // A dense 200 m blob in the middle of a sparse world.
+        let pts: Vec<[f32; 2]> = (0..6000)
+            .map(|i| if i < 3000 { [4000.0 + next() * 200.0, 4000.0 + next() * 200.0] } else { [next() * WORLD_SIZE, next() * WORLD_SIZE] })
+            .collect();
+        let mut g = Grid::new(32.0);
+        g.rebuild(pts.iter().enumerate().map(|(i, &p)| (i as u32, p)));
+
+        for (q, r, k) in [([4100.0, 4100.0], 150.0, 100), ([100.0, 100.0], 150.0, 100), ([4000.0, 4000.0], 150.0, 10)] {
+            let d2 = |i: u32| (pts[i as usize][0] - q[0]).powi(2) + (pts[i as usize][1] - q[1]).powi(2);
+            let mut found: Vec<(f32, u32)> = Vec::new();
+            let mut visited = 0;
+            g.walk_rings(q, r, |v| match v {
+                Ring::Item(i) => {
+                    visited += 1;
+                    if d2(i) <= r * r {
+                        found.push((d2(i), i));
+                    }
+                    false
+                }
+                Ring::Done(bound) if found.len() >= k => {
+                    found.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
+                    found[k - 1].0 <= bound * bound
+                }
+                Ring::Done(_) => false,
+            });
+            found.sort_by(|a, b| a.0.total_cmp(&b.0));
+            found.truncate(k);
+            let mut want: Vec<(f32, u32)> = (0..pts.len() as u32).map(|i| (d2(i), i)).filter(|x| x.0 <= r * r).collect();
+            want.sort_by(|a, b| a.0.total_cmp(&b.0));
+            want.truncate(k);
+            assert_eq!(found, want, "query at {q:?}");
+            if q == [4100.0, 4100.0] {
+                assert!(visited < 800, "a dense query stops early: visited {visited} of ~3000");
+            }
         }
     }
 }

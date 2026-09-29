@@ -8,6 +8,7 @@
 pub mod bot;
 pub mod cli;
 pub mod grid;
+pub mod interest;
 pub mod movement;
 pub mod msg;
 pub mod rng;

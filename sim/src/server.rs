@@ -7,10 +7,10 @@
 //! | ingress   | each transport shard decodes its datagrams, acks, handshakes, timeouts (parallel) |
 //! | events    | spawn/despawn, queue inputs into per-entity queues (serial) |
 //! | movement  | one input seq per entity per tick, real or stand-in (parallel)  |
-//! | grid      | rebuild the shared spatial grid                                 |
+//! | grid      | rebuild the shared spatial grid, plus the mid/far due-set views |
 //! | history   | store positions for lag compensation (unused until M3)          |
-//! | serialize | encode each entity once into an 11-byte blob (parallel)         |
-//! | assembly  | per client: K nearest via grid, memcpy blobs into a snapshot (parallel by shard) |
+//! | serialize | encode each entity once per tier: near blob for all, mid/far blob for due ones (parallel) |
+//! | assembly  | per client: pick near/mid/far per `interest.rs`, fit the byte budget, memcpy blobs into messages (parallel by shard) |
 //! | transport | each shard queues its clients' snapshots and builds packets (parallel) |
 //!
 //! Shots and event application (phases 3 and 4) come with M3. Egress (the socket
@@ -25,9 +25,10 @@ use lattice_net::wire::Writer;
 use lattice_net::{Channel, ClientId, Config, Router, Server, ServerEvent};
 use rayon::prelude::*;
 
-use crate::grid::Grid;
+use crate::grid::{Grid, Ring};
+use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier, FAR_PERIOD, MID_PERIOD};
 use crate::movement::{step, Input, MoveState, TICK_HZ, WORLD_SIZE};
-use crate::msg::{self, Blob, SnapshotHeader, Welcome, ENTITY_BLOB, SNAPSHOT_HEADER, WAIT_STAND_IN};
+use crate::msg::{self, Blob, NearBlob, SnapshotHeader, Welcome, FAR_BLOB, NEAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
 use crate::rng::Rng;
 use crate::stats::Histogram;
 
@@ -45,10 +46,16 @@ pub const GRACE_TICKS: u32 = 2;
 /// are discarded unapplied rather than letting latency grow.
 const MAX_QUEUED_INPUTS: usize = 16;
 const GRID_CELL: f32 = 32.0;
+/// Cells of the mid- and far-tier due-set grids, sized to their query radii.
+/// Mid is a k-nearest ring walk: fine enough to stop early in a crowd, coarse
+/// enough that a sparse 500 m query stays under ~300 cells.
+const MID_GRID_CELL: f32 = 64.0;
+const FAR_GRID_CELL: f32 = 512.0;
+const NO_SQUAD: u32 = u32::MAX;
 /// Input waits above 1 s land in the histogram's last bucket (0.1 ms units).
 const INPUT_WAIT_CAP: u32 = 10_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SpawnMode {
     /// Everyone spread over the whole continent.
     Uniform,
@@ -56,6 +63,9 @@ pub enum SpawnMode {
     Hotspots,
     /// The first 3,000 players in a 200 m disk, the rest uniform.
     Blob,
+    /// Player k stands still at (1000 + k * spacing, 4096): known distances,
+    /// for checking tiers.
+    Line(f32),
 }
 
 impl std::str::FromStr for SpawnMode {
@@ -65,7 +75,10 @@ impl std::str::FromStr for SpawnMode {
             "uniform" => Ok(Self::Uniform),
             "hotspots" => Ok(Self::Hotspots),
             "blob" => Ok(Self::Blob),
-            _ => Err(format!("unknown spawn mode {s:?} (uniform|hotspots|blob)")),
+            _ => match s.strip_prefix("line:").map(str::parse) {
+                Some(Ok(spacing)) => Ok(Self::Line(spacing)),
+                _ => Err(format!("unknown spawn mode {s:?} (uniform|hotspots|blob|line:<meters>)")),
+            },
         }
     }
 }
@@ -75,10 +88,7 @@ pub struct SimConfig {
     pub net: Config,
     pub max_clients: usize,
     pub spawn: SpawnMode,
-    /// Stand-in for M2's interest management: every client gets the `near_max`
-    /// nearest entities within `near_radius`, every tick.
-    pub near_radius: f32,
-    pub near_max: usize,
+    pub interest: InterestConfig,
     /// Transport shards. More than the thread count lets rayon balance them.
     pub shards: usize,
     /// Allocate `max_clients` connections at startup so accepts reuse them.
@@ -89,11 +99,11 @@ pub struct SimConfig {
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
-            net: Config::default(),
+            // A snapshot spans ~3 packets; room for 6 covers the default budget.
+            net: Config { max_packets_per_flush: 6, ..Config::default() },
             max_clients: 10_000,
             spawn: SpawnMode::Uniform,
-            near_radius: 150.0,
-            near_max: 64,
+            interest: InterestConfig::default(),
             shards: 64,
             preallocate: false,
             seed: 1,
@@ -117,15 +127,71 @@ pub struct Counters {
     /// Inputs dropped unapplied because the client queued too many.
     pub discarded_inputs: u64,
     pub bad_messages: u64,
+    /// Client-ticks served.
     pub snapshots: u64,
-    pub snapshot_entities: u64,
+    /// Entities sent per tier (near, mid, far).
+    pub tier_sent: [u64; 3],
+    /// Bytes of snapshot messages sent (own state + entities).
+    pub snapshot_bytes: u64,
+    /// Client-ticks whose near candidates exceeded `near_candidates`.
+    pub near_capped: u64,
+    /// Mid entities cut because near + mid overran the byte budget.
+    pub mid_truncated: u64,
+    /// Due far entities that didn't fit the budget (carried to the next tick).
+    pub far_skipped: u64,
+    /// Carried far entities that didn't fit again: the degrade signal.
+    pub far_starved: u64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Body {
     alive: bool,
     state: MoveState,
     yaw: u16,
+    squad: u32,
+}
+
+impl Default for Body {
+    fn default() -> Self {
+        Self { alive: false, state: MoveState::default(), yaw: 0, squad: NO_SQUAD }
+    }
+}
+
+/// A connected client, kept in its transport shard's list with its interest state.
+struct ClientSlot {
+    client: ClientId,
+    entity: u16,
+    near: NearState,
+    /// Far entities that were due but didn't fit the budget: sent first next tick.
+    far_carry: Vec<u16>,
+}
+
+/// Per-shard scratch for assembly, reused every tick.
+#[derive(Default)]
+struct Scratch {
+    /// `stamp[e] == epoch` marks entity e as already taken for this client.
+    stamp: Vec<u32>,
+    epoch: u32,
+    /// (rank key, squared distance, entity): key is the squared distance, or -1
+    /// for squadmates so they always make the cut.
+    near_raw: Vec<(f32, f32, u16)>,
+    near: Vec<NearCandidate>,
+    select: SelectScratch,
+    picked: Vec<u16>,
+    mid: Vec<(f32, u16)>,
+    far: Vec<(f32, u16)>,
+    tally: Tally,
+}
+
+#[derive(Default, Clone, Copy)]
+struct Tally {
+    snapshots: u64,
+    tier_sent: [u64; 3],
+    bytes: u64,
+    near_capped: u64,
+    mid_truncated: u64,
+    far_skipped: u64,
+    far_starved: u64,
 }
 
 /// Per-entity input stream. Every tick consumes exactly one input seq, so each
@@ -237,12 +303,18 @@ pub struct SimServer {
     tick: u32,
     bodies: Vec<Body>,
     inputs: Vec<InputQueue>,
-    blobs: Vec<Blob>,
+    /// Serialized once per tick: near blobs for every entity, mid/far blobs for
+    /// the entities due this tick (and last tick's far-due, for carries).
+    near_blobs: Vec<NearBlob>,
+    far_blobs: Vec<Blob>,
     history: Vec<Vec<[f32; 2]>>,
     free: Vec<u16>,
     by_client: HashMap<ClientId, u16>,
-    /// Clients (and their entities) grouped by transport shard.
-    shard_clients: Vec<Vec<(ClientId, u16)>>,
+    /// Clients grouped by transport shard, with their interest state.
+    shard_clients: Vec<Vec<ClientSlot>>,
+    scratch: Vec<Scratch>,
+    squads: HashMap<u32, Vec<u16>>,
+    squad_anchor: HashMap<u32, [f32; 2]>,
     /// Per-shard snapshot buffers, reused every tick.
     snapshots: Vec<Vec<(ClientId, Vec<u8>)>>,
     /// Per-shard transport events, each with the arrival time of the datagram
@@ -250,15 +322,17 @@ pub struct SimServer {
     shard_events: Vec<Vec<(Instant, ServerEvent)>>,
     /// Input waits (arrival -> applied) since the last `take_input_wait`, in 0.1 ms.
     input_wait: Histogram,
+    /// The shared spatial index (all entities).
     grid: Grid,
+    /// Networking's views of it: entities due this tick for mid and for far.
+    mid_grid: Grid,
+    far_grid: Grid,
     rng: Rng,
     counters: Counters,
 }
 
 impl SimServer {
-    pub fn new(mut cfg: SimConfig, now: Instant) -> Self {
-        let max_fit = (cfg.net.max_message_size() - SNAPSHOT_HEADER) / ENTITY_BLOB;
-        cfg.near_max = cfg.near_max.min(max_fit).min(u8::MAX as usize);
+    pub fn new(cfg: SimConfig, now: Instant) -> Self {
         assert!(cfg.max_clients <= u16::MAX as usize, "entity ids are u16");
         let mut net = Server::with_shards(cfg.net.clone(), cfg.max_clients, cfg.shards, now);
         if cfg.preallocate {
@@ -266,7 +340,10 @@ impl SimServer {
         }
         Self {
             net,
-            shard_clients: vec![Vec::new(); cfg.shards],
+            shard_clients: (0..cfg.shards).map(|_| Vec::new()).collect(),
+            scratch: (0..cfg.shards).map(|_| Scratch::default()).collect(),
+            squads: HashMap::new(),
+            squad_anchor: HashMap::new(),
             snapshots: vec![Vec::new(); cfg.shards],
             shard_events: (0..cfg.shards).map(|_| Vec::new()).collect(),
             input_wait: Histogram::new(INPUT_WAIT_CAP),
@@ -275,11 +352,14 @@ impl SimServer {
             tick: 0,
             bodies: Vec::new(),
             inputs: Vec::new(),
-            blobs: Vec::new(),
+            near_blobs: Vec::new(),
+            far_blobs: Vec::new(),
             history: vec![Vec::new(); HISTORY_TICKS],
             free: Vec::new(),
             by_client: HashMap::new(),
             grid: Grid::new(GRID_CELL),
+            mid_grid: Grid::new(MID_GRID_CELL),
+            far_grid: Grid::new(FAR_GRID_CELL),
             counters: Counters::default(),
         }
     }
@@ -393,11 +473,12 @@ impl SimServer {
         }
         lap(2);
 
-        // 5. spatial grid
-        let bodies = &self.bodies;
-        self.grid.rebuild(
-            bodies.iter().enumerate().filter(|(_, b)| b.alive).map(|(i, b)| (i as u32, b.state.pos)),
-        );
+        // 5. spatial grid, and the due-set views networking queries
+        let (bodies, tick) = (&self.bodies, self.tick);
+        let alive = || bodies.iter().enumerate().filter(|(_, b)| b.alive).map(|(i, b)| (i as u32, b.state.pos));
+        self.grid.rebuild(alive());
+        self.mid_grid.rebuild(alive().filter(|&(i, _)| due(i as u16, tick, MID_PERIOD)));
+        self.far_grid.rebuild(alive().filter(|&(i, _)| due(i as u16, tick, FAR_PERIOD)));
         lap(3);
 
         // 6. lag-comp history
@@ -406,58 +487,65 @@ impl SimServer {
         slot.extend(self.bodies.iter().map(|b| b.state.pos));
         lap(4);
 
-        // 7. serialize each entity once
-        self.blobs
+        // 7. serialize each entity once per tier. Far blobs are needed for this
+        // tick's due entities and last tick's far-due ones (budget carries).
+        self.near_blobs
             .par_iter_mut()
+            .zip(self.far_blobs.par_iter_mut())
             .zip(self.bodies.par_iter())
             .enumerate()
             .with_min_len(512)
             .filter(|(_, (_, b))| b.alive)
-            .for_each(|(i, (blob, b))| *blob = msg::encode_blob(i as u16, b.state.pos, b.yaw));
+            .for_each(|(i, ((near, far), b))| {
+                let e = i as u16;
+                *near = msg::encode_near_blob(e, b.state.pos, b.state.vel, b.yaw);
+                let prev = tick.wrapping_sub(1);
+                if due(e, tick, MID_PERIOD) || due(e, tick, FAR_PERIOD) || due(e, prev, FAR_PERIOD) {
+                    *far = msg::encode_blob(e, b.state.pos, b.yaw);
+                }
+            });
         lap(5);
 
         // 8. per-client assembly, grouped by shard so each shard's snapshots
         // are ready for its transport task
-        let (radius, k, tick) = (self.cfg.near_radius, self.cfg.near_max, self.tick);
-        let (bodies, inputs, blobs, grid) = (&self.bodies, &self.inputs, &self.blobs, &self.grid);
-        self.shard_clients.par_iter().zip(self.snapshots.par_iter_mut()).for_each(|(clients, snaps)| {
-            let mut near: Vec<(f32, u32)> = Vec::new();
-            for &(client, e) in clients {
-                let me = bodies[e as usize].state;
-                near.clear();
-                grid.for_each_near(me.pos, radius, |j| {
-                    if j != e as u32 {
-                        let p = bodies[j as usize].state.pos;
-                        let d2 = (p[0] - me.pos[0]).powi(2) + (p[1] - me.pos[1]).powi(2);
-                        if d2 <= radius * radius {
-                            near.push((d2, j));
-                        }
-                    }
-                });
-                if near.len() > k {
-                    near.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
-                    near.truncate(k);
+        let max_message = self.cfg.net.max_message_size();
+        let view = View {
+            cfg: &self.cfg.interest,
+            tick,
+            bodies: &self.bodies,
+            inputs: &self.inputs,
+            near_blobs: &self.near_blobs,
+            far_blobs: &self.far_blobs,
+            grid: &self.grid,
+            mid_grid: &self.mid_grid,
+            far_grid: &self.far_grid,
+            squads: &self.squads,
+            max_message,
+        };
+        self.shard_clients
+            .par_iter_mut()
+            .zip(self.snapshots.par_iter_mut())
+            .zip(self.scratch.par_iter_mut())
+            .for_each(|((clients, snaps), scratch)| {
+                scratch.tally = Tally::default();
+                if scratch.stamp.len() < view.bodies.len() {
+                    scratch.stamp.resize(view.bodies.len(), 0);
                 }
-                let mut w = Writer::with_capacity(SNAPSHOT_HEADER + near.len() * ENTITY_BLOB);
-                let header = SnapshotHeader {
-                    server_tick: tick,
-                    ack_seq: inputs[e as usize].last_seq,
-                    buffered: inputs[e as usize].depth,
-                    wait: inputs[e as usize].wait,
-                    own: me,
-                    count: near.len() as u8,
-                };
-                msg::write_snapshot_header(&mut w, &header);
-                for &(_, j) in near.iter() {
-                    w.bytes(&blobs[j as usize]);
+                for slot in clients.iter_mut() {
+                    view.assemble(slot, scratch, snaps);
                 }
-                snaps.push((client, w.into_inner()));
+            });
+        for sc in &self.scratch {
+            let (c, t) = (&mut self.counters, &sc.tally);
+            c.snapshots += t.snapshots;
+            for (a, b) in c.tier_sent.iter_mut().zip(t.tier_sent) {
+                *a += b;
             }
-        });
-        for snaps in &self.snapshots {
-            self.counters.snapshots += snaps.len() as u64;
-            self.counters.snapshot_entities +=
-                snaps.iter().map(|(_, s)| ((s.len() - SNAPSHOT_HEADER) / ENTITY_BLOB) as u64).sum::<u64>();
+            c.snapshot_bytes += t.bytes;
+            c.near_capped += t.near_capped;
+            c.mid_truncated += t.mid_truncated;
+            c.far_skipped += t.far_skipped;
+            c.far_starved += t.far_starved;
         }
         lap(6);
 
@@ -482,21 +570,30 @@ impl SimServer {
     }
 
     fn spawn(&mut self, client: ClientId) {
-        let (spawn, anchor, radius) = self.pick_spawn();
+        let squad = match self.cfg.interest.squad_size {
+            0 => NO_SQUAD,
+            n => (self.counters.spawns / n as u64) as u32,
+        };
+        let (spawn, anchor, radius) = self.pick_spawn(squad);
         let e = match self.free.pop() {
             Some(e) => e,
             None => {
                 self.bodies.push(Body::default());
                 self.inputs.push(InputQueue::default());
-                self.blobs.push([0; ENTITY_BLOB]);
+                self.near_blobs.push([0; NEAR_BLOB]);
+                self.far_blobs.push([0; FAR_BLOB]);
                 (self.bodies.len() - 1) as u16
             }
         };
         let i = e as usize;
-        self.bodies[i] = Body { alive: true, state: MoveState { pos: spawn, vel: [0.0; 2] }, yaw: 0 };
+        self.bodies[i] = Body { alive: true, state: MoveState { pos: spawn, vel: [0.0; 2] }, yaw: 0, squad };
         self.inputs[i] = InputQueue::default();
+        if squad != NO_SQUAD {
+            self.squads.entry(squad).or_default().push(e);
+        }
         self.by_client.insert(client, e);
-        self.shard_clients[self.net.shard_of_client(client)].push((client, e));
+        let slot = ClientSlot { client, entity: e, near: NearState::default(), far_carry: Vec::new() };
+        self.shard_clients[self.net.shard_of_client(client)].push(slot);
         self.counters.spawns += 1;
         let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius });
         let _ = self.net.send(client, Channel::Reliable, welcome);
@@ -505,10 +602,19 @@ impl SimServer {
     fn despawn(&mut self, client: ClientId) {
         if let Some(e) = self.by_client.remove(&client) {
             let list = &mut self.shard_clients[self.net.shard_of_client(client)];
-            if let Some(i) = list.iter().position(|&(c, _)| c == client) {
+            if let Some(i) = list.iter().position(|s| s.client == client) {
                 list.swap_remove(i);
             }
-            self.bodies[e as usize].alive = false;
+            let body = &mut self.bodies[e as usize];
+            body.alive = false;
+            if let Some(members) = self.squads.get_mut(&body.squad) {
+                members.retain(|&m| m != e);
+                if members.is_empty() {
+                    self.squads.remove(&body.squad);
+                    self.squad_anchor.remove(&body.squad);
+                }
+            }
+            body.squad = NO_SQUAD;
             self.free.push(e);
             self.counters.despawns += 1;
         }
@@ -528,20 +634,250 @@ impl SimServer {
     }
 
     /// Returns (spawn point, wander anchor, wander radius).
-    fn pick_spawn(&mut self) -> ([f32; 2], [f32; 2], f32) {
+    fn pick_spawn(&mut self, squad: u32) -> ([f32; 2], [f32; 2], f32) {
         const HOTSPOTS: [[f32; 2]; 3] = [[2048.0, 2048.0], [6144.0, 2048.0], [4096.0, 6144.0]];
         const CENTER: [f32; 2] = [WORLD_SIZE / 2.0, WORLD_SIZE / 2.0];
         let k = self.counters.spawns;
         let (anchor, radius) = match self.cfg.spawn {
             SpawnMode::Hotspots if k < 2400 => (HOTSPOTS[k as usize % 3], 150.0),
             SpawnMode::Blob if k < 3000 => (CENTER, 200.0),
+            SpawnMode::Line(spacing) => {
+                let p = [(1000.0 + k as f32 * spacing).min(WORLD_SIZE), WORLD_SIZE / 2.0];
+                return (p, p, 1.0);
+            }
             _ => {
+                // A squad spawns and roams together around its first member's anchor.
                 let margin = 500.0;
-                let p = [self.rng.range(margin, WORLD_SIZE - margin), self.rng.range(margin, WORLD_SIZE - margin)];
+                let fresh = [self.rng.range(margin, WORLD_SIZE - margin), self.rng.range(margin, WORLD_SIZE - margin)];
+                let p = if squad == NO_SQUAD { fresh } else { *self.squad_anchor.entry(squad).or_insert(fresh) };
                 (p, 400.0)
             }
         };
         (self.rng.in_disk(anchor, radius), anchor, radius)
+    }
+}
+
+/// Everything assembly reads, shared by all shard tasks.
+struct View<'a> {
+    cfg: &'a InterestConfig,
+    tick: u32,
+    bodies: &'a [Body],
+    inputs: &'a [InputQueue],
+    near_blobs: &'a [NearBlob],
+    far_blobs: &'a [Blob],
+    grid: &'a Grid,
+    mid_grid: &'a Grid,
+    far_grid: &'a Grid,
+    squads: &'a HashMap<u32, Vec<u16>>,
+    max_message: usize,
+}
+
+impl View<'_> {
+    #[inline]
+    fn dist2(&self, a: [f32; 2], j: u16) -> f32 {
+        let p = self.bodies[j as usize].state.pos;
+        (p[0] - a[0]).powi(2) + (p[1] - a[1]).powi(2)
+    }
+
+    /// Picks this tick's near, mid and far entities for one client (see
+    /// `interest.rs`), fits them to the byte budget and appends the messages.
+    fn assemble(&self, slot: &mut ClientSlot, sc: &mut Scratch, snaps: &mut Vec<(ClientId, Vec<u8>)>) {
+        let (cfg, tick, e) = (self.cfg, self.tick, slot.entity);
+        let me = self.bodies[e as usize];
+        let fresh = !slot.near.started();
+        sc.epoch = sc.epoch.wrapping_add(1);
+        if sc.epoch == 0 {
+            sc.stamp.fill(0);
+            sc.epoch = 1;
+        }
+        let epoch = sc.epoch;
+        sc.stamp[e as usize] = epoch;
+
+        // Near: distance or interaction (squad), ranked by the accumulator. The
+        // scan only computes squared distances; priorities and seeded ages are
+        // computed for the <= near_candidates that make the cut.
+        let (r_near2, r_mid2, r_far2) = (cfg.near_radius.powi(2), cfg.mid_radius.powi(2), cfg.far_radius.powi(2));
+        // Non-squad candidates: a k-nearest ring walk, so a dense crowd costs
+        // a few cells instead of every entity within the radius.
+        let k = cfg.near_candidates;
+        sc.near_raw.clear();
+        let mut capped = false;
+        let near_raw = &mut sc.near_raw;
+        self.grid.walk_rings(me.state.pos, cfg.near_radius, |v| match v {
+            Ring::Item(j) => {
+                let b = &self.bodies[j as usize];
+                let squad = me.squad != NO_SQUAD && b.squad == me.squad;
+                if j != e as u32 && !squad {
+                    let d2 = (b.state.pos[0] - me.state.pos[0]).powi(2) + (b.state.pos[1] - me.state.pos[1]).powi(2);
+                    if d2 <= r_near2 {
+                        near_raw.push((d2, d2, j as u16));
+                    }
+                }
+                false
+            }
+            Ring::Done(bound) if near_raw.len() >= k && k > 0 => {
+                near_raw.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
+                let kth = near_raw[k - 1].0;
+                capped = true;
+                kth <= bound * bound
+            }
+            Ring::Done(_) => false,
+        });
+        if sc.near_raw.len() > k {
+            sc.near_raw.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
+            sc.near_raw.truncate(k);
+        }
+        if capped {
+            sc.tally.near_capped += 1;
+        }
+        // Squadmates are near-tier at any distance.
+        if let Some(members) = self.squads.get(&me.squad) {
+            for &j in members {
+                if j != e {
+                    sc.near_raw.push((-1.0, self.dist2(me.state.pos, j), j));
+                }
+            }
+        }
+        sc.near.clear();
+        for &(key, d2, j) in &sc.near_raw {
+            let d = d2.sqrt();
+            sc.near.push(NearCandidate {
+                entity: j,
+                base: near_base(d, key < 0.0),
+                seed_age: interest::seed_age(j, tick, d, cfg, fresh),
+            });
+            sc.stamp[j as usize] = epoch;
+        }
+        sc.picked.clear();
+        slot.near.select(&sc.near, tick, cfg.near_per_tick, &mut sc.select, &mut sc.picked);
+
+        // Mid: due this tick, not near-tier, nearest first (by squared distance).
+        sc.mid.clear();
+        let (mid, stamp, k) = (&mut sc.mid, &sc.stamp, cfg.mid_per_tick);
+        self.mid_grid.walk_rings(me.state.pos, cfg.mid_radius, |v| match v {
+            Ring::Item(j) => {
+                if stamp[j as usize] != epoch {
+                    let d2 = self.dist2(me.state.pos, j as u16);
+                    if d2 <= r_mid2 {
+                        mid.push((d2, j as u16));
+                    }
+                }
+                false
+            }
+            Ring::Done(bound) if mid.len() >= k && k > 0 => {
+                mid.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
+                mid[k - 1].0 <= bound * bound
+            }
+            Ring::Done(_) => false,
+        });
+        nearest(&mut sc.mid, cfg.mid_per_tick);
+        for &(_, j) in &sc.mid {
+            sc.stamp[j as usize] = epoch;
+        }
+
+        // Far: last tick's carries first (key -1), then this tick's due ones.
+        sc.far.clear();
+        let carried = std::mem::take(&mut slot.far_carry);
+        for &j in &carried {
+            let d2 = self.dist2(me.state.pos, j);
+            if self.bodies[j as usize].alive && sc.stamp[j as usize] != epoch && d2 > r_mid2 && d2 <= r_far2 {
+                sc.far.push((-1.0, j));
+                sc.stamp[j as usize] = epoch;
+            }
+        }
+        self.far_grid.for_each_near(me.state.pos, cfg.far_radius, |j| {
+            if sc.stamp[j as usize] != epoch {
+                let d2 = self.dist2(me.state.pos, j as u16);
+                if d2 > r_mid2 && d2 <= r_far2 {
+                    sc.far.push((d2, j as u16));
+                }
+            }
+        });
+        nearest(&mut sc.far, cfg.far_per_tick.max(carried.len()));
+        slot.far_carry = carried; // reuse the allocation
+        slot.far_carry.clear();
+
+        // Budget: own state, then near, then mid, then far. What doesn't fit of
+        // far is carried; a carried entity that doesn't fit again is starving.
+        let cost = |tier: Tier, n: usize| {
+            let per = msg::blobs_per_message(tier, self.max_message);
+            n.div_ceil(per) * msg::ENTITIES_HEADER + n * msg::blob_size(tier)
+        };
+        let mut left = cfg.budget_bytes.saturating_sub(SNAPSHOT_LEN + cost(Tier::Near, sc.picked.len()));
+        let mut n_mid = sc.mid.len();
+        while n_mid > 0 && cost(Tier::Mid, n_mid) > left {
+            n_mid -= 1;
+        }
+        sc.tally.mid_truncated += (sc.mid.len() - n_mid) as u64;
+        left -= cost(Tier::Mid, n_mid);
+        let mut n_far = sc.far.len();
+        while n_far > 0 && cost(Tier::Far, n_far) > left {
+            n_far -= 1;
+        }
+        for &(key, j) in &sc.far[n_far..] {
+            if key < 0.0 {
+                sc.tally.far_starved += 1;
+            } else {
+                sc.tally.far_skipped += 1;
+                slot.far_carry.push(j);
+            }
+        }
+
+        // Messages.
+        let inp = &self.inputs[e as usize];
+        let mut w = Writer::with_capacity(SNAPSHOT_LEN);
+        msg::write_snapshot(
+            &mut w,
+            &SnapshotHeader { server_tick: tick, ack_seq: inp.last_seq, buffered: inp.depth, wait: inp.wait, own: me.state },
+        );
+        let mut bytes = w.len();
+        snaps.push((slot.client, w.into_inner()));
+        let near_blobs = sc.picked.iter().map(|&j| &self.near_blobs[j as usize][..]);
+        bytes += self.write_tier(Tier::Near, near_blobs, slot.client, snaps);
+        let mid_blobs = sc.mid[..n_mid].iter().map(|&(_, j)| &self.far_blobs[j as usize][..]);
+        bytes += self.write_tier(Tier::Mid, mid_blobs, slot.client, snaps);
+        let far_blobs = sc.far[..n_far].iter().map(|&(_, j)| &self.far_blobs[j as usize][..]);
+        bytes += self.write_tier(Tier::Far, far_blobs, slot.client, snaps);
+
+        let t = &mut sc.tally;
+        t.snapshots += 1;
+        t.tier_sent[0] += sc.picked.len() as u64;
+        t.tier_sent[1] += n_mid as u64;
+        t.tier_sent[2] += n_far as u64;
+        t.bytes += bytes as u64;
+    }
+
+    /// Writes `blobs` as Entities messages of at most one packet each.
+    fn write_tier<'b>(
+        &self,
+        tier: Tier,
+        blobs: impl ExactSizeIterator<Item = &'b [u8]>,
+        client: ClientId,
+        snaps: &mut Vec<(ClientId, Vec<u8>)>,
+    ) -> usize {
+        let (per, total, size) = (msg::blobs_per_message(tier, self.max_message), blobs.len(), msg::blob_size(tier));
+        let mut blobs = blobs;
+        let (mut left, mut bytes) = (total, 0);
+        while left > 0 {
+            let n = left.min(per);
+            let mut w = Writer::with_capacity(msg::ENTITIES_HEADER + n * size);
+            msg::write_entities_header(&mut w, self.tick, tier, n as u8);
+            for b in blobs.by_ref().take(n) {
+                w.bytes(b);
+            }
+            bytes += w.len();
+            snaps.push((client, w.into_inner()));
+            left -= n;
+        }
+        bytes
+    }
+}
+
+/// Keeps the `k` smallest keys (unordered), in place.
+fn nearest(v: &mut Vec<(f32, u16)>, k: usize) {
+    if v.len() > k {
+        v.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
+        v.truncate(k);
     }
 }
 

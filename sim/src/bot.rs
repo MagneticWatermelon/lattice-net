@@ -2,9 +2,11 @@
 //! Transport-agnostic: feed it the messages a `lattice_net::Client` delivers and
 //! send the input batches it returns.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::movement::{step, Input, MoveState, BUTTON_SPRINT};
+use crate::interest::Tier;
 use crate::msg::{self, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
 use crate::rng::Rng;
 
@@ -35,7 +37,8 @@ pub struct BotStats {
     pub snapshots: u64,
     /// Snapshots that arrived after a newer one and were ignored.
     pub stale_snapshots: u64,
-    pub entities_seen: u64,
+    /// Entity updates received per tier (near, mid, far).
+    pub tier_seen: [u64; 3],
     /// Snapshots whose authoritative state disagreed with our prediction.
     pub corrections: u64,
     /// Sum and max of those position errors, in meters.
@@ -98,6 +101,7 @@ pub struct BotBrain {
     last_acked: u32,
     /// Timings not yet taken by `drain_latency`.
     latency: Vec<InputTiming>,
+    tracker: Option<Tracker>,
     pub stats: BotStats,
 }
 
@@ -122,6 +126,7 @@ impl BotBrain {
             last_server_tick: None,
             last_acked: 0,
             latency: Vec::new(),
+            tracker: None,
             stats: BotStats::default(),
         }
     }
@@ -140,6 +145,26 @@ impl BotBrain {
     }
 
     /// Moves input timings recorded since the last call into `out`.
+    /// Starts remembering every entity it hears about (a map per bot, so the
+    /// swarm enables it on a sample) to measure update intervals per tier.
+    pub fn enable_tracking(&mut self) {
+        self.tracker.get_or_insert_with(Tracker::default);
+    }
+
+    pub fn tracker(&self) -> Option<&Tracker> {
+        self.tracker.as_ref()
+    }
+
+    /// Moves the update intervals (in server ticks) recorded since the last
+    /// call into `out`, per tier.
+    pub fn drain_intervals(&mut self, out: &mut [Vec<u16>; 3]) {
+        if let Some(t) = &mut self.tracker {
+            for (o, i) in out.iter_mut().zip(&mut t.intervals) {
+                o.append(i);
+            }
+        }
+    }
+
     pub fn drain_latency(&mut self, out: &mut Vec<InputTiming>) {
         out.append(&mut self.latency);
     }
@@ -153,7 +178,16 @@ impl BotBrain {
                 // arrives just in time and any jitter makes it late.
                 self.clock += TARGET_DEPTH - 1.0;
             }
-            Ok(ServerMsg::Snapshot(h, _)) if self.welcome.is_some() => self.on_snapshot(&h, now),
+            Ok(ServerMsg::Snapshot(h)) if self.welcome.is_some() => self.on_snapshot(&h, now),
+            Ok(ServerMsg::Entities { server_tick, tier, blobs }) => {
+                let size = msg::blob_size(tier);
+                self.stats.tier_seen[tier as usize] += (blobs.len() / size) as u64;
+                if let Some(t) = &mut self.tracker {
+                    for b in blobs.chunks_exact(size) {
+                        t.on_update(server_tick, tier, b);
+                    }
+                }
+            }
             Ok(_) => {}
             Err(_) => self.stats.bad_messages += 1,
         }
@@ -166,7 +200,6 @@ impl BotBrain {
         }
         self.last_server_tick = Some(h.server_tick);
         self.stats.snapshots += 1;
-        self.stats.entities_seen += h.count as u64;
 
         if h.ack_seq == 0 {
             return; // server hasn't consumed any of our inputs yet
@@ -297,5 +330,54 @@ impl BotBrain {
             yaw: (self.heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16,
             buttons: if self.sprint { BUTTON_SPRINT } else { 0 },
         }
+    }
+}
+
+/// What a tracked bot knows about other entities.
+#[derive(Debug, Default)]
+pub struct Tracker {
+    known: HashMap<u16, Known>,
+    /// Update intervals per tier in server ticks, until drained.
+    pub intervals: [Vec<u16>; 3],
+    pub bad_blobs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Known {
+    /// Server tick of the last update.
+    pub tick: u32,
+    pub tier: Tier,
+    pub pos: [f32; 2],
+}
+
+impl Tracker {
+    fn on_update(&mut self, server_tick: u32, tier: Tier, blob: &[u8]) {
+        let decoded = match tier {
+            Tier::Near => msg::decode_near_blob(blob).map(|(e, pos, _, _)| (e, pos)),
+            Tier::Mid | Tier::Far => msg::decode_blob(blob).map(|(e, pos, _)| (e, pos)),
+        };
+        let Ok((entity, pos)) = decoded else {
+            self.bad_blobs += 1;
+            return;
+        };
+        let now = Known { tick: server_tick, tier, pos };
+        if let Some(prev) = self.known.insert(entity, now) {
+            let gap = server_tick.wrapping_sub(prev.tick);
+            if gap > 0 && gap < u16::MAX as u32 {
+                self.intervals[tier as usize].push(gap as u16);
+            }
+        }
+    }
+
+    pub fn get(&self, entity: u16) -> Option<Known> {
+        self.known.get(&entity).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.known.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.known.is_empty()
     }
 }

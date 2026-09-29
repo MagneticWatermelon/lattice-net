@@ -62,7 +62,18 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - Measure p50/p99 per-phase tick time, bytes per client, pps, and prediction corrections.
   - Scenarios: uniform spread; 3 hotspots of ~800; a 3,000-player blob within 200 m; 500 joins within 10 s.
   - Pass bar: p99 tick under ~25 ms on the blob.
-- **M2:** interest management (tiers, priority accumulator, grid), plus a web top-down debug map showing what client X receives.
+- **M2 (in progress):** interest management (tiers, priority accumulator, grid), plus a web top-down debug map showing what client X receives.
+  - **M2a (tiers) is built:** `sim/src/interest.rs`. Its design was decided in review (2026-09-29):
+    - mid and far tiers are staggered by entity id alone, with no per-pair state;
+    - the near tier is a per-client accumulator over ≤100 candidates;
+    - near membership is distance OR interaction (squad now, hits/targeting/scope with combat);
+    - a new near candidate's age is seeded from its old tier's stagger slot;
+    - the budget fills near → mid → far, with far skips carried one tick.
+  - **Next:**
+    - M2b: near-tier deltas vs. last acked state (needs unreliable-ack notifications from the transport);
+    - M2c: the web debug map;
+    - M2d: the degradation ladder.
+  - **The ladder must also pace clients.** When the server drops below 30 Hz, bots keep sending 30 inputs per second, the queues overflow and everything becomes corrections. The server has to advertise its real tick rate (time dilation), and the input clock has to follow it.
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.

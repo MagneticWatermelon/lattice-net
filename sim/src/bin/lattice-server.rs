@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use lattice_net::Config;
 use lattice_sim::cli::Args;
 use lattice_sim::movement::TICK_HZ;
+use lattice_sim::interest::InterestConfig;
 use lattice_sim::server::{Counters, Datagram, InDatagram, SimConfig, SimServer, SpawnMode, PHASES};
 use lattice_sim::stats::{summarize, Histogram};
 use rayon::prelude::*;
@@ -26,10 +27,14 @@ const USAGE: &str = "\
 lattice-server: M1 movement-only authoritative server
 
   --bind ADDR          [0.0.0.0:40000]
-  --spawn MODE         uniform | hotspots | blob   [uniform]
+  --spawn MODE         uniform | hotspots | blob | line:<meters>   [uniform]
   --max-clients N      [10000]
-  --near-radius M      interest stand-in radius, meters [150]
-  --near-max N         max entities per snapshot [64]
+  --near-radius M      near tier: 30 Hz, accumulator [150]
+  --near-per-tick N    near entities sent per client per tick [64]
+  --mid-radius M       mid tier: 10 Hz, staggered by id [500]
+  --far-radius M       far tier: 2 Hz, staggered by id [1500]
+  --budget-kbps K      snapshot budget per client [1500]
+  --squad-size N       squadmates are near-tier at any distance (0 = none) [4]
   --threads N          rayon threads [all cores]
   --shards N           transport shards [64]
   --accepts-per-tick N new connections accepted per tick, server-wide (0 = no limit) [256]
@@ -157,8 +162,18 @@ fn main() -> std::io::Result<()> {
     let cfg = SimConfig {
         spawn: a.get("spawn", SpawnMode::Uniform),
         max_clients: a.get("max-clients", 10_000),
-        near_radius: a.get("near-radius", 150.0),
-        near_max: a.get("near-max", 64),
+        interest: {
+            let d = InterestConfig::default();
+            InterestConfig {
+                near_radius: a.get("near-radius", d.near_radius),
+                near_per_tick: a.get("near-per-tick", d.near_per_tick),
+                mid_radius: a.get("mid-radius", d.mid_radius),
+                far_radius: a.get("far-radius", d.far_radius),
+                budget_bytes: a.get("budget-kbps", 1500) * 1000 / 8 / TICK_HZ as usize,
+                squad_size: a.get("squad-size", d.squad_size),
+                ..d
+            }
+        },
         shards: a.get("shards", 64),
         preallocate: !a.flag("no-prealloc"),
         seed: a.get("seed", 1),
@@ -197,10 +212,14 @@ fn main() -> std::io::Result<()> {
     let period = Duration::from_secs(1) / TICK_HZ;
 
     println!(
-        "listening on {bind} | spawn {:?}, near {} within {} m, {} rayon threads, {shards} shards, {} accepts/tick, egress {egress:?} | socket buffers rcv {} KiB snd {} KiB",
+        "listening on {bind} | spawn {:?} | tiers near {}@{} m, mid {} m, far {} m, budget {} B/tick, squads of {} | {} rayon threads, {shards} shards, {} accepts/tick, egress {egress:?} | socket buffers rcv {} KiB snd {} KiB",
         cfg.spawn,
-        cfg.near_max,
-        cfg.near_radius,
+        cfg.interest.near_per_tick,
+        cfg.interest.near_radius,
+        cfg.interest.mid_radius,
+        cfg.interest.far_radius,
+        cfg.interest.budget_bytes,
+        cfg.interest.squad_size,
         rayon::current_num_threads(),
         cfg.net.max_accepts_per_tick,
         rcvbuf >> 10,
@@ -389,8 +408,11 @@ impl Window {
         let entity_ticks = ((c.inputs_applied - self.counters.inputs_applied) + repeated + frozen).max(1) as f64;
         let (repeated_pct, frozen_pct) = (100.0 * repeated as f64 / entity_ticks, 100.0 * frozen as f64 / entity_ticks);
         let late = c.late_inputs - self.counters.late_inputs;
-        let snaps = c.snapshots - self.counters.snapshots;
-        let ents_avg = (c.snapshot_entities - self.counters.snapshot_entities) as f64 / snaps.max(1) as f64;
+        let snaps = (c.snapshots - self.counters.snapshots).max(1) as f64;
+        let tier = |i: usize| (c.tier_sent[i] - self.counters.tier_sent[i]) as f64 / snaps;
+        let snap_bytes = (c.snapshot_bytes - self.counters.snapshot_bytes) as f64 / snaps;
+        let far_skipped = c.far_skipped - self.counters.far_skipped;
+        let far_starved = c.far_starved - self.counters.far_starved;
         let kernel = kernel_udp_drops();
         let deferred = sim.net().deferred_accepts() - self.deferred;
         let (rcv_drops, snd_drops) = (kernel[0] - self.kernel[0], kernel[1] - self.kernel[1]);
@@ -402,7 +424,7 @@ impl Window {
             .collect();
         let tick = sums[COLS - 1];
         println!(
-            "[{:>5.0}s] clients {} | tick p50 {} p99 {} max {} ms, {} overruns | out {:.1}k pps {:.0} kbps/client, {:.0} Mbps | in {:.1}k pps {:.0} kbps/client | stand-ins: repeated {:.2}% frozen {:.2}%, {} late inputs | {:.1} entities/snapshot | input wait p50 {:.1} p99 {:.1} ms | {} joins deferred | kernel drops rcv {} snd {}",
+            "[{:>5.0}s] clients {} | tick p50 {} p99 {} max {} ms, {} overruns | out {:.1}k pps {:.0} kbps/client, {:.0} Mbps | in {:.1}k pps {:.0} kbps/client | stand-ins: repeated {:.2}% frozen {:.2}%, {} late inputs | per client-tick: {:.0} B, near {:.1} mid {:.1} far {:.1}, far skipped {} starved {} | input wait p50 {:.1} p99 {:.1} ms | {} joins deferred | kernel drops rcv {} snd {}",
             t.as_secs_f64(),
             sim.client_count(),
             ms(tick.p50),
@@ -417,7 +439,12 @@ impl Window {
             repeated_pct,
             frozen_pct,
             late,
-            ents_avg,
+            snap_bytes,
+            tier(0),
+            tier(1),
+            tier(2),
+            far_skipped,
+            far_starved,
             tenth(ws.p50),
             tenth(ws.p99),
             deferred,
@@ -434,7 +461,7 @@ impl Window {
                 line += &format!(",{},{},{}", s.p50, s.p99, s.max);
             }
             line += &format!(
-                ",{:.0},{:.0},{:.1},{:.1},{:.1},{:.3},{:.3},{},{:.1},{:.1},{:.1},{},{},{}",
+                ",{:.0},{:.0},{:.1},{:.1},{:.1},{:.3},{:.3},{},{:.0},{:.1},{:.1},{:.1},{},{},{:.1},{:.1},{},{},{}",
                 self.out_pkts as f64 / secs,
                 in_pkts as f64 / secs,
                 down_kbps,
@@ -443,7 +470,12 @@ impl Window {
                 repeated_pct,
                 frozen_pct,
                 late,
-                ents_avg,
+                snap_bytes,
+                tier(0),
+                tier(1),
+                tier(2),
+                far_skipped,
+                far_starved,
                 tenth(ws.p50),
                 tenth(ws.p99),
                 deferred,
@@ -466,7 +498,7 @@ fn open_csv(path: String) -> std::io::Result<BufWriter<File>> {
             let n = col_name(i);
             h += &format!(",{n}_p50_us,{n}_p99_us,{n}_max_us");
         }
-        h += ",out_pps,in_pps,down_kbps_per_client,up_kbps_per_client,egress_mbps,repeated_pct,frozen_pct,late_inputs,entities_per_snapshot,input_wait_p50_ms,input_wait_p99_ms,deferred_accepts,kernel_rcvbuf_drops,kernel_sndbuf_drops";
+        h += ",out_pps,in_pps,down_kbps_per_client,up_kbps_per_client,egress_mbps,repeated_pct,frozen_pct,late_inputs,snapshot_bytes_per_tick,near_per_tick,mid_per_tick,far_per_tick,far_skipped,far_starved,input_wait_p50_ms,input_wait_p99_ms,deferred_accepts,kernel_rcvbuf_drops,kernel_sndbuf_drops";
         writeln!(w, "{h}")?;
     }
     Ok(w)

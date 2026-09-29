@@ -3,33 +3,58 @@
 //! ```text
 //! C->S unreliable  Input    tag | newest_seq:4 | n:1 | n × (move_x:1 move_y:1 yaw:2 buttons:1)   newest first
 //! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32
-//! S->C unreliable  Snapshot tag | server_tick:4 | ack_seq:4 | buffered:1 | wait:2 | own pos:2×f32 vel:2×f32 | n:1 | n × blob:11
-//! blob := entity:2 | cell:1 (cx | cy<<4, 512 m cells) | 8 B bitpacked far-tier state (see bitpack.rs)
+//! S->C unreliable  Snapshot tag | server_tick:4 | ack_seq:4 | buffered:1 | wait:2 | own pos:2×f32 vel:2×f32
+//! S->C unreliable  Entities tag | server_tick:4 | tier:1 | n:1 | n × blob         (one or more per tier per tick)
+//! near blob (15 B) := entity:2 | cell:1 | 12 B bitpacked: x,y 2×16 | z 12 | vx,vy 2×10 | yaw 12 | pitch 8 | flags 3 | health 7
+//! far blob  (11 B) := entity:2 | cell:1 | 8 B bitpacked far-tier state (see bitpack.rs); also used for the mid tier
+//! cell := cx | cy<<4, the entity's own 512 m cell, so a blob is the same for every recipient
 //! ```
 //!
 //! Inputs are sent 3× redundantly, so one lost packet never starves the server.
 //! The snapshot's own state is full-precision f32: the bot compares it bit-exactly
-//! with its prediction for `ack_seq`.
+//! with its prediction for `ack_seq`. Entity messages carry one tier each and
+//! never exceed one packet (there's no fragmentation yet), so a tier with more
+//! blobs than fit is split over several messages.
 
 use lattice_net::bitpack::{dequantize, dequantize_angle, quantize, BitReader, BitWriter};
 use lattice_net::wire::{DecodeError, Reader, Writer};
 
+use crate::interest::Tier;
 use crate::movement::{Input, MoveState, WORLD_SIZE};
 
 pub const MSG_INPUT: u8 = 1;
 pub const MSG_WELCOME: u8 = 2;
 pub const MSG_SNAPSHOT: u8 = 3;
+pub const MSG_ENTITIES: u8 = 4;
 
 pub const INPUT_REDUNDANCY: usize = 3;
-pub const ENTITY_BLOB: usize = 11;
-pub const SNAPSHOT_HEADER: usize = 1 + 4 + 4 + 1 + 2 + 16 + 1;
+/// Mid- and far-tier blob.
+pub const FAR_BLOB: usize = 11;
+pub const NEAR_BLOB: usize = 15;
+pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 1 + 2 + 16;
+pub const ENTITIES_HEADER: usize = 1 + 4 + 1 + 1;
+/// Near-tier velocity range, m/s (sprint is 9).
+const NEAR_MAX_SPEED: f32 = 20.0;
 /// `SnapshotHeader::wait` when `ack_seq` was consumed by a stand-in, not a real input.
 pub const WAIT_STAND_IN: u16 = u16::MAX;
 const BLOB_CELL: f32 = 512.0;
 const BLOB_CELLS: u32 = (WORLD_SIZE / BLOB_CELL) as u32;
 const _: () = assert!(BLOB_CELLS <= 16, "cell index must fit in 4 bits per axis");
 
-pub type Blob = [u8; ENTITY_BLOB];
+pub type Blob = [u8; FAR_BLOB];
+pub type NearBlob = [u8; NEAR_BLOB];
+
+pub fn blob_size(tier: Tier) -> usize {
+    match tier {
+        Tier::Near => NEAR_BLOB,
+        Tier::Mid | Tier::Far => FAR_BLOB,
+    }
+}
+
+/// Most blobs of `tier` one Entities message of at most `max_message` bytes holds.
+pub fn blobs_per_message(tier: Tier, max_message: usize) -> usize {
+    ((max_message - ENTITIES_HEADER) / blob_size(tier)).min(u8::MAX as usize)
+}
 
 pub fn encode_inputs(newest_seq: u32, newest_first: &[Input]) -> Vec<u8> {
     let mut w = Writer::with_capacity(6 + newest_first.len() * 5);
@@ -96,10 +121,9 @@ pub struct SnapshotHeader {
     /// arrived in time. The client adds half the RTT to get input -> applied.
     pub wait: u16,
     pub own: MoveState,
-    pub count: u8,
 }
 
-pub fn write_snapshot_header(w: &mut Writer, h: &SnapshotHeader) {
+pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
     w.u8(MSG_SNAPSHOT);
     w.u32(h.server_tick);
     w.u32(h.ack_seq);
@@ -108,13 +132,22 @@ pub fn write_snapshot_header(w: &mut Writer, h: &SnapshotHeader) {
     for v in [h.own.pos[0], h.own.pos[1], h.own.vel[0], h.own.vel[1]] {
         w.u32(v.to_bits());
     }
-    w.u8(h.count);
+}
+
+/// Starts an Entities message; append exactly `count` blobs of `tier` after it.
+pub fn write_entities_header(w: &mut Writer, server_tick: u32, tier: Tier, count: u8) {
+    w.u8(MSG_ENTITIES);
+    w.u32(server_tick);
+    w.u8(tier as u8);
+    w.u8(count);
 }
 
 #[derive(Debug)]
 pub enum ServerMsg<'a> {
     Welcome(Welcome),
-    Snapshot(SnapshotHeader, &'a [u8]),
+    Snapshot(SnapshotHeader),
+    /// `blobs` holds whole blobs of `blob_size(tier)` bytes each.
+    Entities { server_tick: u32, tier: Tier, blobs: &'a [u8] },
 }
 
 pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
@@ -134,10 +167,16 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             let buffered = r.u8()?;
             let wait = r.u16()?;
             let own = MoveState { pos: [read_f32(&mut r)?, read_f32(&mut r)?], vel: [read_f32(&mut r)?, read_f32(&mut r)?] };
-            let count = r.u8()?;
-            let blobs = r.take(count as usize * ENTITY_BLOB)?;
             r.finish()?;
-            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, ack_seq, buffered, wait, own, count }, blobs))
+            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, ack_seq, buffered, wait, own }))
+        }
+        MSG_ENTITIES => {
+            let server_tick = r.u32()?;
+            let tier = Tier::from_u8(r.u8()?).ok_or(DecodeError::Invalid)?;
+            let count = r.u8()? as usize;
+            let blobs = r.take(count * blob_size(tier))?;
+            r.finish()?;
+            Ok(ServerMsg::Entities { server_tick, tier, blobs })
         }
         _ => Err(DecodeError::Invalid),
     }
@@ -150,8 +189,7 @@ fn read_f32(r: &mut Reader<'_>) -> Result<f32, DecodeError> {
 /// Far-tier encoding: position relative to the entity's own 512 m cell, so the
 /// blob is identical for every recipient and is serialized once per tick.
 pub fn encode_blob(entity: u16, pos: [f32; 2], yaw: u16) -> Blob {
-    let cell = |v: f32| ((v / BLOB_CELL) as u32).min(BLOB_CELLS - 1);
-    let (cx, cy) = (cell(pos[0]), cell(pos[1]));
+    let (cx, cy) = blob_cell(pos);
     let mut bw = BitWriter::new();
     bw.write(quantize(pos[0] - cx as f32 * BLOB_CELL, 0.0, BLOB_CELL, 15), 15);
     bw.write(quantize(pos[1] - cy as f32 * BLOB_CELL, 0.0, BLOB_CELL, 15), 15);
@@ -162,16 +200,60 @@ pub fn encode_blob(entity: u16, pos: [f32; 2], yaw: u16) -> Blob {
     bw.write(15, 4); // health bucket: full
     let bits = bw.finish();
 
-    let mut b = [0u8; ENTITY_BLOB];
+    let mut b = [0u8; FAR_BLOB];
     b[..2].copy_from_slice(&entity.to_le_bytes());
     b[2] = (cx | cy << 4) as u8;
     b[3..].copy_from_slice(&bits);
     b
 }
 
+fn blob_cell(pos: [f32; 2]) -> (u32, u32) {
+    let cell = |v: f32| ((v / BLOB_CELL) as u32).min(BLOB_CELLS - 1);
+    (cell(pos[0]), cell(pos[1]))
+}
+
+/// Near-tier encoding: ~8 mm position, velocity for extrapolation, finer angles.
+pub fn encode_near_blob(entity: u16, pos: [f32; 2], vel: [f32; 2], yaw: u16) -> NearBlob {
+    let (cx, cy) = blob_cell(pos);
+    let mut bw = BitWriter::new();
+    bw.write(quantize(pos[0] - cx as f32 * BLOB_CELL, 0.0, BLOB_CELL, 16), 16);
+    bw.write(quantize(pos[1] - cy as f32 * BLOB_CELL, 0.0, BLOB_CELL, 16), 16);
+    bw.write(0, 12); // altitude: flat world for now
+    bw.write(quantize(vel[0], -NEAR_MAX_SPEED, NEAR_MAX_SPEED, 10), 10);
+    bw.write(quantize(vel[1], -NEAR_MAX_SPEED, NEAR_MAX_SPEED, 10), 10);
+    bw.write(yaw as u32 >> 4, 12);
+    bw.write(128, 8); // pitch: level
+    bw.write(0, 3); // stance / seat flags
+    bw.write(100, 7); // health
+    let bits = bw.finish();
+
+    let mut b = [0u8; NEAR_BLOB];
+    b[..2].copy_from_slice(&entity.to_le_bytes());
+    b[2] = (cx | cy << 4) as u8;
+    b[3..].copy_from_slice(&bits);
+    b
+}
+
+/// Returns (entity, pos, vel, yaw radians).
+pub fn decode_near_blob(b: &[u8]) -> Result<(u16, [f32; 2], [f32; 2], f32), DecodeError> {
+    if b.len() != NEAR_BLOB {
+        return Err(DecodeError::Invalid);
+    }
+    let entity = u16::from_le_bytes([b[0], b[1]]);
+    let (cx, cy) = ((b[2] & 0xF) as f32, (b[2] >> 4) as f32);
+    let mut r = BitReader::new(&b[3..]);
+    let x = cx * BLOB_CELL + dequantize(r.read(16)?, 0.0, BLOB_CELL, 16);
+    let y = cy * BLOB_CELL + dequantize(r.read(16)?, 0.0, BLOB_CELL, 16);
+    let _z = r.read(12)?;
+    let vx = dequantize(r.read(10)?, -NEAR_MAX_SPEED, NEAR_MAX_SPEED, 10);
+    let vy = dequantize(r.read(10)?, -NEAR_MAX_SPEED, NEAR_MAX_SPEED, 10);
+    let yaw = dequantize_angle(r.read(12)?, 12);
+    Ok((entity, [x, y], [vx, vy], yaw))
+}
+
 /// Returns (entity, pos, yaw radians).
 pub fn decode_blob(b: &[u8]) -> Result<(u16, [f32; 2], f32), DecodeError> {
-    if b.len() != ENTITY_BLOB {
+    if b.len() != FAR_BLOB {
         return Err(DecodeError::Invalid);
     }
     let entity = u16::from_le_bytes([b[0], b[1]]);
@@ -203,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn welcome_and_snapshot_roundtrip() {
+    fn welcome_snapshot_and_entities_roundtrip() {
         let w = Welcome { entity: 7, spawn: [1.5, 2.5], anchor: [4096.0, 4096.0], radius: 200.0 };
         assert!(matches!(decode_server_msg(&encode_welcome(&w)), Ok(ServerMsg::Welcome(x)) if x == w));
 
@@ -213,17 +295,37 @@ mod tests {
             buffered: 2,
             wait: 333,
             own: MoveState { pos: [1.0, 2.0], vel: [-3.0, 0.125] },
-            count: 2,
         };
         let mut wr = Writer::default();
-        write_snapshot_header(&mut wr, &h);
-        assert_eq!(wr.len(), SNAPSHOT_HEADER);
-        wr.bytes(&encode_blob(1, [10.0, 20.0], 0));
-        wr.bytes(&encode_blob(2, [30.0, 40.0], 0));
-        let ServerMsg::Snapshot(got, blobs) = decode_server_msg(wr.as_slice()).unwrap() else { panic!() };
-        assert_eq!(got, h);
-        assert_eq!(blobs.len(), 2 * ENTITY_BLOB);
-        assert!(decode_server_msg(&wr.as_slice()[..wr.len() - 1]).is_err());
+        write_snapshot(&mut wr, &h);
+        assert_eq!(wr.len(), SNAPSHOT_LEN);
+        assert!(matches!(decode_server_msg(wr.as_slice()), Ok(ServerMsg::Snapshot(x)) if x == h));
+
+        let mut wr = Writer::default();
+        write_entities_header(&mut wr, 99, Tier::Near, 2);
+        wr.bytes(&encode_near_blob(1, [10.0, 20.0], [1.0, -2.0], 0));
+        wr.bytes(&encode_near_blob(2, [30.0, 40.0], [0.0, 0.0], 0));
+        assert_eq!(wr.len(), ENTITIES_HEADER + 2 * NEAR_BLOB);
+        let Ok(ServerMsg::Entities { server_tick: 99, tier: Tier::Near, blobs }) = decode_server_msg(wr.as_slice()) else {
+            panic!()
+        };
+        assert_eq!(blobs.len(), 2 * NEAR_BLOB);
+        assert!(decode_server_msg(&wr.as_slice()[..wr.len() - 1]).is_err(), "truncated");
+        assert_eq!(blobs_per_message(Tier::Near, 1176), 77);
+        assert_eq!(blobs_per_message(Tier::Far, 1176), 106);
+    }
+
+    #[test]
+    fn near_blob_precision() {
+        for &(x, y, vx, vy) in &[(0.0, 0.0, 0.0, 0.0), (511.99, 512.0, 9.0, -9.0), (4096.3, 7000.7, -3.3, 6.1)] {
+            let yaw = 40000u16;
+            let (id, p, v, a) = decode_near_blob(&encode_near_blob(3, [x, y], [vx, vy], yaw)).unwrap();
+            assert_eq!(id, 3);
+            assert!((p[0] - x).abs() < 0.005 && (p[1] - y).abs() < 0.005, "{x},{y} -> {p:?}");
+            assert!((v[0] - vx).abs() < 0.03 && (v[1] - vy).abs() < 0.03, "{vx},{vy} -> {v:?}");
+            let want = yaw as f32 / 65536.0 * std::f32::consts::TAU;
+            assert!((a - want).abs() < 0.002, "{a} vs {want}");
+        }
     }
 
     #[test]

@@ -22,8 +22,8 @@ cargo run --release --bin lattice-bots -- --help
 | movement | consume exactly one input seq per entity: the real input, or a stand-in if it hasn't arrived | rayon |
 | grid | counting-sort rebuild of the one shared 32 m grid | no |
 | history | positions into a 200 ms lag-comp ring (unused until M3) | no |
-| serialize | each entity once into an 11-byte far-tier blob | rayon |
-| assembly | per client: K nearest via the grid, memcpy blobs into a snapshot | per shard |
+| serialize | each entity once per tier: a 15-byte near blob for all, an 11-byte mid/far blob for those due | rayon |
+| assembly | per client: pick near/mid/far entities (`interest.rs`), fit the byte budget, memcpy blobs into messages | per shard |
 | transport | each shard's `send` + `flush`: framing, acks, CRC | per shard |
 | egress | `send_to` per packet (in the binary) | per shard |
 
@@ -31,7 +31,24 @@ The transport is 64 `lattice_net::Shard`s by default (`--shards`). The binary's 
 
 Shots and event application (phases 3–4) arrive with M3.
 
-**Interest stand-in:** M2 owns tiers and the priority accumulator. Until then every client gets its own full-precision state plus the 64 nearest entities within 150 m, every tick (`--near-max`, `--near-radius`).
+**Interest management (M2a, `interest.rs`).** Every client gets its own full-precision state, plus other entities in three tiers:
+
+| tier | range | rate | per tick | blob |
+|---|---|---|---|---|
+| near | 150 m, or a squadmate at any distance | 30 Hz, priority accumulator | 64 of up to 100 candidates | 15 B, with velocity |
+| mid | 500 m | 10 Hz, due when `id % 3 == tick % 3` | nearest 86 | 11 B |
+| far | 1500 m | 2 Hz, due when `id % 15 == tick % 15` | nearest 67 | 11 B |
+
+- **Stagger by entity id.** Mid and far are staggered by entity id alone, so every client gets entity X on the same tick. Only 1/3 and 1/15 of entities need a mid/far blob each tick, and there's no per-client state.
+- **Due-set grids.** Their queries run over grids of just the due entities: a 64 m grid for mid, and a 512 m grid for far.
+- **The near tier is an accumulator.** Candidates are ranked by `base(distance, squad) × ticks since last sent`, and the top 64 are sent. Per client that's one array of at most ~100 `(entity, last sent)` pairs.
+- **Promotion.** An entity new to the near set has its age seeded from its old tier's stagger slot (or "never sent"), so one arriving stale outranks the rest and is sent at once.
+- **Budget order.** Near first, then due mid, then due far, within `--budget-kbps` (1,500 by default). Due far entities that don't fit are carried to the next tick and sent first. A carried entity that doesn't fit again counts as `far_starved`, the signal for the degradation ladder (M2d), which never cuts into the near tier.
+- **One packet per message.** Each tier goes out as Entities messages of at most one packet, since there's no fragmentation yet. A client typically gets 2–3 packets per tick.
+- **k-nearest ring walk.** Near and mid candidates come from a ring walk over the grid (`Grid::walk_rings`). It stops once the k-th candidate is closer than any unvisited cell, so a 3,000-player crowd costs a few cells per client, not every entity within the radius.
+- **Squads.** Squads (`--squad-size`, 4 by default) spawn and roam together, and squadmates are always near-tier.
+
+`--spawn line:<meters>` places players on a line at fixed spacing, to check tiers by distance.
 
 **Bots (`bot.rs`, `lattice-bots`):** each bot runs a real `lattice_net::Client` with its own UDP socket, sharded across ≤8 threads that each tick their bots at 30 Hz. A bot wanders around the anchor the server's Welcome gives it, sends each input 3× redundantly, predicts with the same `movement::step`, and reconciles against the acked input.
 
@@ -66,14 +83,37 @@ Stand-ins can exceed bot corrections: a stand-in whose input matches what the bo
 The server preallocates `max-clients` connections at startup (`--no-prealloc` to skip). Egress uses `sendmmsg` on Linux (`--egress sendto` for comparison).
 
 **Bot output**
-- Snapshots, entities per snapshot, corrections, kbps per bot, RTT, join latency (connect → Welcome), and **swarm overruns**. An overrun means the bots were late, so treat any corrections in that window as swarm artifacts.
+- Snapshots, entities per snapshot per tier, **update interval per tier** (every 20th bot tracks the entities it hears about, `--track-every`), corrections, kbps per bot, RTT, join latency (connect → Welcome), and **swarm overruns**. An overrun means the bots were late, so treat any corrections in that window as swarm artifacts.
 - Input latency, split three ways:
   - **Input → applied on the server ≈ RTT/2 + server wait.** This is the number to tune the spare against: it's how late other players see you and when your shots resolve. The wait comes back in each snapshot, and needs no clock sync.
   - **Server wait** alone. The spare input is one tick of it.
   - **Round trip:** input → acked in a snapshot the bot has read. This bounds reconciliation replay. It's quantized to whole bot ticks, so its median jumps between 67 and 100 ms from run to run.
 - The bots' RTT is a network RTT. The server reports its hold as `ack_delay`, and the bots stamp arrivals with `SO_TIMESTAMPNS` instead of their tick time. It reads 1.7–1.9 ms on loopback.
 
-## Baseline: WSL2 dev box (behavior, not capacity)
+## M2a: tiered interest on the WSL2 dev box
+
+Same box and setup as the M1 baseline below. Phase columns are p50 in ms.
+
+| scenario | tick p50 / p99 (ms) | assembly | transport | egress | near / mid / far per client-tick | bytes per client-tick | update interval near / mid / far (p50) |
+|---|---|---|---|---|---|---|---|
+| blob 3,000 | 20.7 / 24.8 | 7.8 | 3.5 | 6.9 | 64 / 86 / 0 | 1,948 B (~470 kbps) | 67 / 100 / – ms |
+| hotspots 5,000 | 21.3 / 25.1 | 5.5 | 3.9 | 8.4 | 35 / 25 / 22 | 1,087 B (~270 kbps) | 67 / 100 / 500 ms |
+| uniform 10,000 | 47.9 / 59.7, every tick over | 10.6 | 10.3 | 17.7 | 16 / 42 / 59 | 1,392 B (~330 kbps) | 33 / 100 / 500 ms |
+
+Findings:
+
+1. **The tiers behave as designed.** In-process tests on a line of players check that each tier matches its distance band and that update intervals are exactly 1, 3 and 15 ticks. They also check that a squadmate 300 m away is near-tier, and that a tight budget skips far entities (counted) but never touches near. Over UDP, update intervals match their periods at p50 and p99. In the blob, near is every 2 ticks (100 candidates share 64 slots per tick).
+2. **The blob sits just under the bar.** Its p99 of 24.8 ms against 25 ms is now a real interest-management workload, not M1's "64 nearest".
+    - **Assembly is 7.8 ms.** It was 14.4 ms in the first version, which computed a priority for all ~3,000 candidates in range. What fixed it: squared distances, priorities only for the ≤100 survivors, a lookup array instead of sorts in the near select, and a k-nearest ring walk for near and mid.
+    - **What's left is per-client nearest-neighbor work in a dense crowd.** The ring walk still visits ~600 entities to prove the 100th is nearest. This is what M2d's ladder (shrinking radii under load) is for.
+3. **At 10k, output now costs more than the game.** Transport (10.3 ms) and egress (17.7 ms) scale with bytes and packets: 1.4 KB and 2–3 packets per client-tick, 2.3 Gbps over loopback, CRC and two copies of ~14 MB per tick. The bots decode the same traffic on the same 16 cores. What should help:
+    - GSO (clients now get several packets per tick);
+    - serialize-once fan-out;
+    - `SO_REUSEPORT` socket groups;
+    - bare metal.
+4. **A server that can't hold 30 Hz breaks the input clock.** At ~21 Hz, the bots still send 30 inputs per second. The queues overflow (2.9M inputs discarded, each a correction) and input → applied reaches ~550 ms, because the ±5% nudge can't follow a server at 70% speed. The degradation ladder has to tell clients the server's real tick rate (the ladder's lower tick rate and time dilation), and bots must pace inputs to it.
+
+## M1 baseline: WSL2 dev box (behavior, not capacity)
 
 Test box: 16 cores, WSL2 on Windows 10, with the server (8 rayon threads, 64 shards) and the bots (8 threads) on the same machine over loopback. Only bare-metal numbers count; these runs show where the time goes. Phase columns are p50 in ms; "before" is the single-shard server. The blob and 10k rows use `sendmmsg` and the accept budget; the other rows predate both and use `send_to`.
 
