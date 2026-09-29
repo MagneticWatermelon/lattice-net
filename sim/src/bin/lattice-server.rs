@@ -18,9 +18,9 @@ use lattice_net::Config;
 use lattice_sim::cli::{Args, HexKey};
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::interest::InterestConfig;
-use lattice_sim::ladder::LadderConfig;
+use lattice_sim::ladder::{LadderConfig, RUNGS};
 use lattice_sim::server::{Counters, Datagram, InDatagram, SimConfig, SimServer, SpawnMode, PHASES};
-use lattice_sim::stats::{summarize, Histogram};
+use lattice_sim::stats::{summarize, Histogram, KeyValues};
 use rayon::prelude::*;
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -52,6 +52,7 @@ lattice-server: M1 movement-only authoritative server
   --warmup S           ignore the first S seconds after the first client in the summary [3];
                        the summary also stops once clients drain below 90% of peak
   --csv PATH           append one row per report window
+  --summary PATH       write the end-of-run results as key=value lines (scripts/baseline.sh)
   --debug-http ADDR    serve the debug map (what one client receives) on ADDR, e.g. 0.0.0.0:8080
   --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
                        connect tokens, standing in for a login service) [the public dev key]
@@ -361,6 +362,7 @@ fn main() -> std::io::Result<()> {
     let report = Duration::from_secs_f64(a.get("report", 5.0));
     let warmup = Duration::from_secs_f64(a.get("warmup", 3.0));
     let csv_path: Option<String> = a.opt("csv");
+    let summary_path: Option<String> = a.opt("summary");
     let debug_http: Option<SocketAddr> = a.opt("debug-http");
     a.finish();
 
@@ -459,6 +461,7 @@ fn main() -> std::io::Result<()> {
     // Disconnect packets and leave entities frozen until they time out).
     let mut cool: Option<Counters> = None;
     let mut peak_clients = 0;
+    let mut steady_state = Steady::default();
     let mut next_tick = start;
 
     loop {
@@ -473,6 +476,7 @@ fn main() -> std::io::Result<()> {
             }
             sim.set_watch(watch);
         }
+        let level = sim.level();
         let times = sim.tick(&mut inbound, now, &mut out);
         if let (Some(map), Some(frame)) = (&debug_map, sim.take_debug_frame()) {
             map.publish(frame);
@@ -519,12 +523,20 @@ fn main() -> std::io::Result<()> {
         window.client_ticks += clients as u64;
         if warm.is_some() && cool.is_none() && clients < peak_clients * 9 / 10 {
             cool = Some(sim.counters().clone());
+            steady_state.net_end = Some(net_snapshot(&net));
         }
         let steady = |warm: &Option<Counters>, cool: &Option<Counters>| warm.is_some() && cool.is_none();
         if clients > 0 {
             let first = *first_client.get_or_insert(now);
             if now - first >= warmup && cool.is_none() {
                 warm.get_or_insert_with(|| sim.counters().clone());
+                steady_state.net_start.get_or_insert_with(|| net_snapshot(&net));
+                steady_state.first.get_or_insert(now);
+                steady_state.last = Some(done);
+                steady_state.client_ticks += clients as u64;
+                steady_state.out_pkts += pkts as u64;
+                steady_state.out_bytes += bytes as u64;
+                steady_state.level_ticks[level as usize] += 1;
                 kept.push(row);
                 kept_overruns += (done - now > period) as u64;
             }
@@ -562,8 +574,136 @@ fn main() -> std::io::Result<()> {
     }
     stop.store(true, Relaxed);
     let _ = receiver.join();
+    if let Some(path) = summary_path {
+        steady_state.net_end.get_or_insert_with(|| net_snapshot(&net));
+        let run = RunInfo { egress, peak_clients, overruns: kept_overruns };
+        summary_values(&kept, &run, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net, &steady_state).write(&path)?;
+    }
     print_summary(&mut kept, kept_overruns, peak_clients, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net);
     Ok(())
+}
+
+/// What the steady state (after warmup, before clients drain) sent and
+/// received, for `--summary`.
+#[derive(Default)]
+struct Steady {
+    first: Option<Instant>,
+    last: Option<Instant>,
+    client_ticks: u64,
+    out_pkts: u64,
+    out_bytes: u64,
+    /// Ticks run at each ladder level.
+    level_ticks: [u64; RUNGS.len()],
+    /// `net_snapshot` when the steady state began and ended.
+    net_start: Option<[u64; 4]>,
+    net_end: Option<[u64; 4]>,
+}
+
+/// Datagrams and bytes received, and the kernel's UDP drops so far.
+fn net_snapshot(net: &NetCounters) -> [u64; 4] {
+    let [rcv, snd] = kernel_udp_drops();
+    [net.in_pkts.load(Relaxed), net.in_bytes.load(Relaxed), rcv, snd]
+}
+
+struct RunInfo {
+    egress: Egress,
+    peak_clients: usize,
+    /// Steady-state ticks over their period.
+    overruns: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn summary_values(
+    kept: &[Row],
+    run: &RunInfo,
+    sim: &SimServer,
+    warm: Option<&Counters>,
+    cool: Option<&Counters>,
+    wait: &Histogram,
+    net: &NetCounters,
+    steady: &Steady,
+) -> KeyValues {
+    let mut kv = KeyValues::default();
+    let cfg = sim.config();
+    kv.put("spawn", format!("{:?}", cfg.spawn).to_lowercase());
+    kv.put("egress", format!("{:?}", run.egress).to_lowercase());
+    kv.put("ladder", if cfg.ladder.enabled { "on" } else { "off" });
+    kv.put("threads", rayon::current_num_threads());
+    kv.put("shards", cfg.shards);
+    kv.put("peak_clients", run.peak_clients);
+    kv.put("steady_ticks", kept.len());
+    let secs = match (steady.first, steady.last) {
+        (Some(a), Some(b)) => (b - a).as_secs_f64(),
+        _ => 0.0,
+    };
+    kv.put("steady_secs", format!("{secs:.1}"));
+    for i in 0..COLS {
+        let s = summarize(&mut kept.iter().map(|r| r[i]).collect::<Vec<_>>());
+        let n = col_name(i);
+        kv.put_ms(format!("{n}_p50_ms"), s.p50);
+        kv.put_ms(format!("{n}_p99_ms"), s.p99);
+        kv.put_ms(format!("{n}_max_ms"), s.max);
+    }
+    kv.put("steady_overruns", run.overruns);
+
+    // The level most steady ticks ran at, and all of them.
+    let mode = (0..RUNGS.len()).max_by_key(|&l| steady.level_ticks[l]).unwrap_or(0);
+    kv.put("level_mode", mode);
+    kv.put("tick_hz", RUNGS[mode].tick_hz);
+    kv.put("dilation", RUNGS[mode].dilation);
+    let levels: Vec<String> = (0..RUNGS.len())
+        .filter(|&l| steady.level_ticks[l] > 0)
+        .map(|l| format!("L{l}:{}", steady.level_ticks[l]))
+        .collect();
+    kv.put("levels", if levels.is_empty() { "-".to_string() } else { levels.join(",") });
+
+    let ticks = kept.len().max(1) as f64;
+    let clients_avg = steady.client_ticks as f64 / ticks;
+    let per_client_secs = (clients_avg * secs).max(1e-9);
+    let [in0, inb0, rcv0, snd0] = steady.net_start.unwrap_or_default();
+    let [in1, inb1, rcv1, snd1] = steady.net_end.unwrap_or_default();
+    kv.put("clients_avg", format!("{clients_avg:.0}"));
+    kv.put("out_pps", format!("{:.0}", steady.out_pkts as f64 / secs.max(1e-9)));
+    kv.put("in_pps", format!("{:.0}", in1.saturating_sub(in0) as f64 / secs.max(1e-9)));
+    kv.put("egress_mbps", format!("{:.1}", steady.out_bytes as f64 * 8.0 / 1e6 / secs.max(1e-9)));
+    kv.put("packets_per_client_tick", format!("{:.2}", steady.out_pkts as f64 / steady.client_ticks.max(1) as f64));
+    kv.put("wire_bytes_per_client_tick", format!("{:.0}", steady.out_bytes as f64 / steady.client_ticks.max(1) as f64));
+    kv.put("down_kbps_per_client", format!("{:.1}", steady.out_bytes as f64 * 8.0 / 1000.0 / per_client_secs));
+    kv.put("up_kbps_per_client", format!("{:.1}", inb1.saturating_sub(inb0) as f64 * 8.0 / 1000.0 / per_client_secs));
+    kv.put("kernel_rcvbuf_drops", rcv1.saturating_sub(rcv0));
+    kv.put("kernel_sndbuf_drops", snd1.saturating_sub(snd0));
+
+    let c = sim.counters();
+    if let Some(w) = warm {
+        let e = cool.unwrap_or(c);
+        let snaps = e.snapshots.saturating_sub(w.snapshots).max(1) as f64;
+        kv.put("snapshot_bytes_per_client_tick", format!("{:.0}", (e.snapshot_bytes - w.snapshot_bytes) as f64 / snaps));
+        kv.put("near_bytes_per_client_tick", format!("{:.0}", (e.near_bytes - w.near_bytes) as f64 / snaps));
+        for (i, tier) in ["near", "mid", "far"].iter().enumerate() {
+            kv.put(format!("{tier}_per_client_tick"), format!("{:.1}", (e.tier_sent[i] - w.tier_sent[i]) as f64 / snaps));
+        }
+        kv.put("far_skipped", e.far_skipped - w.far_skipped);
+        kv.put("far_starved", e.far_starved - w.far_starved);
+        kv.put("repeated", e.repeated - w.repeated);
+        kv.put("frozen", e.frozen - w.frozen);
+        kv.put("late_inputs", e.late_inputs - w.late_inputs);
+        kv.put("discarded_inputs", e.discarded_inputs - w.discarded_inputs);
+    }
+    let ws = wait.summary();
+    kv.put("input_wait_p50_ms", format!("{:.1}", ws.p50 as f64 / 10.0));
+    kv.put("input_wait_p99_ms", format!("{:.1}", ws.p99 as f64 / 10.0));
+
+    // Whole run.
+    kv.put("spawns", c.spawns);
+    kv.put("despawns", c.despawns);
+    kv.put("joins_deferred", sim.net().deferred_accepts());
+    kv.put("bad_messages", c.bad_messages);
+    kv.put("recv_errors", net.recv_errors.load(Relaxed));
+    kv.put("send_errors", net.send_errors.load(Relaxed));
+    kv.put("datagrams", net.out_pkts.load(Relaxed));
+    kv.put("sends", net.sends.load(Relaxed));
+    kv.put("send_syscalls", net.send_syscalls.load(Relaxed));
+    kv
 }
 
 struct Window {

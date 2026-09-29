@@ -6,6 +6,8 @@ A movement-only authoritative server and a bot swarm on top of `lattice-net`, me
 cargo test --release -p lattice-sim            # incl. in-process swarm: bit-exact prediction, loss recovery
 scripts/m1.sh blob 3000 60                     # scenario, bots, seconds -> results/m1-blob-3000-<time>/
 scripts/m1.sh <uniform|hotspots|blob|joins> <bots> [seconds] [extra lattice-server args]
+scripts/preflight.sh                           # is this machine set up for scale runs?
+scripts/baseline.sh full <name>                # the whole matrix, ~16 min -> baselines/<date>-<name>/
 
 cargo run --release --bin lattice-server -- --help
 cargo run --release --bin lattice-bots -- --help
@@ -100,6 +102,8 @@ Stand-ins can exceed bot corrections: a stand-in whose input matches what the bo
 - **Input wait**: from an input's datagram arriving (stamped by the receive thread) to the tick that applies it.
 - **The ladder**: level, tick rate, dilation and pace per window, the share of clients degraded by their own bandwidth ladder, and ticks spent at each level.
 
+With `--summary PATH`, the server and the bots also write their end-of-run results as `key=value` lines. The server's cover the steady state: phase times, ladder levels, pps, bytes per client-tick, stand-ins and kernel drops. `scripts/m1.sh` passes it, and `scripts/baseline.sh` reads it.
+
 The server preallocates `max-clients` connections at startup (`--no-prealloc` to skip). Egress uses `sendmmsg` on Linux (`--egress sendto` for comparison). `--egress gso` sends each client's packets for the tick as one `UDP_SEGMENT` send, and the summary counts datagrams, sends and syscalls.
 
 **Bot output**
@@ -111,6 +115,89 @@ The server preallocates `max-clients` connections at startup (`--no-prealloc` to
 - **Swarm busy %**: how much of the bot threads' time went to work. The harness shares the box with the server, so this shows how much it competes.
 - **Sink bots** (`--full-every K`; `BOT_ARGS="--full-every 30"` in `scripts/m1.sh`). All but every Kth bot keep playing (inputs, prediction, pace) but only count the entity messages they get. Every bot receives with `recvmmsg`, one syscall per bot per tick.
 - The bots' RTT is a network RTT. The server reports its hold as `ack_delay`, and the bots stamp arrivals with `SO_TIMESTAMPNS` instead of their tick time. It reads 1.7–1.9 ms on loopback.
+
+## Baselines (`scripts/baseline.sh`)
+
+One command runs the whole scenario matrix the same way on any Linux machine, and records the machine next to the numbers. Two baselines from different machines are then directly comparable.
+
+```
+scripts/preflight.sh                            # checks, with the fix for each problem
+PROFILE=1 scripts/baseline.sh full <name>       # ~16 min; leave the machine alone meanwhile
+```
+
+**The matrix** (`full`): 60 s runs, each scenario twice, interleaved so drift doesn't land on one scenario.
+
+| run | what it answers |
+|---|---|
+| `uniform-1k`, `uniform-5k`, `uniform-10k` | how the tick scales with players (10k settles on a ladder level) |
+| `uniform-10k-noladder` | 10k's raw cost at full rate and radii (`--ladder off`) |
+| `hotspots-5k` | 3 hotspots of ~800 |
+| `blob-3k-sendmmsg`, `blob-3k-gso` | the M1 pass bar (p99 under ~25 ms), and GSO against `sendmmsg` |
+| `joins-5k` | 500 joins at 50/s on top of 5,000 players |
+
+`quick` runs two small scenarios for 20 s: it checks the harness, not the machine.
+
+**Output** in `baselines/<date>-<name>/`:
+- `env.txt`: the machine (CPU, kernel, governor, socket limits, conntrack, loopback offloads, toolchain) and the preflight checks.
+- `summary.md`: server, phase and client tables, one row per run.
+- One directory per run with its logs, per-window CSV and `key=value` summaries.
+- With `PROFILE=1` and perf installed, a flat profile of the server in the first 10k and GSO blob runs (`perf.txt`).
+
+Baselines are small text files. Commit them.
+
+**Preflight** checks, and prints the fix for anything wrong:
+- **Failures:** a missing toolchain (`ring` needs a C compiler), the port taken, or a hard open-file limit too low for one socket per bot. The bots raise their soft limit themselves, since stock Linux allows only 1,024.
+- **Warnings:** WSL or a VM, socket buffers capped below the server's 16 MiB, a CPU governor other than `performance`, too few ephemeral ports, conntrack tracking flows, other load on the machine, low memory, and perf that can't profile.
+
+### The WSL reference (`baselines/2026-09-29-wsl2`)
+
+The dev box under WSL2, with the server on 8 threads and the bots on the other 8. Two runs each; tick times in ms.
+
+| run | level | tick p50 / p99 | notes |
+|---|---|---|---|
+| uniform 1k | L0 | 3.5–3.7 / 4.4–4.8 | |
+| uniform 5k | L0 | 17.2–17.5 / 21.2–23.4 | |
+| uniform 10k | L6–L8, mostly dilation 0.9–0.8 | 34.6–34.9 / 46.4–48.5 | input → applied p50 80 ms |
+| uniform 10k, ladder off | L0, every tick over its 33 ms | 47.2–47.8 / 62.5–63.6 | 1.75 packets, 1,313 B per client-tick |
+| hotspots 5k | L0–L2 | 22.2 / 26.9–29.4 | |
+| blob 3k, `sendmmsg` | mostly L1 | 22.8–23.2 / 27.0–28.1 | egress p50 6.7–6.8 |
+| blob 3k, GSO | mostly L0 | 21.4–21.6 / 27.6–28.5 | egress p50 5.0–5.1 |
+| joins 5k + 500 | L0 | 18.4–18.7 / 21.5–24.0 | joiners' p99 join time 165 ms |
+
+- **The blob is over the M1 pass bar here: p99 27–28.5 ms against ~25 ms.** At M1 it was 13 ms. M2's per-client interest work made assembly the biggest phase (10.6–10.8 ms p50).
+- **Sustained load is worse than short runs.** Within each minute-long run the tick p50 creeps up by 1–3 ms, and the p99 spikes (30–43 ms) come in the last 20 s. The earlier 40 s runs, each after a pause, showed blob p99 23–24.5 ms and 10k at L6.
+  - Likely causes: the CPU clocking down as it heats over 16 minutes of full load, or activity on the Windows host.
+  - WSL can't show clock speeds, so bare metal has to tell these apart.
+- **Kernel receive drops only at 10k:** 0–1,666 per run. WSL caps socket buffers at 4 MiB.
+
+### Running it on bare metal (the desktop, dual-booted)
+
+The repo has no remote, so carry it over as a git bundle.
+
+1. **In WSL**, bundle the repo onto the Windows drive: `git bundle create /mnt/c/lattice-net.bundle master`.
+2. **Boot Linux** (Ubuntu 24.04 is what WSL runs, so the same kernel family and toolchain). Install the tools: `sudo apt install build-essential git linux-tools-common linux-tools-$(uname -r)`, then rustup (`curl https://sh.rustup.rs -sSf | sh`).
+3. **Clone from the Windows drive:** open it once in the Files app so it mounts, then `git clone /media/$USER/<drive>/lattice-net.bundle ~/lattice-net`.
+4. **Run `scripts/preflight.sh`** and apply its fixes. They're temporary and gone after a reboot. On a stock install that's typically:
+   ```
+   sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+   sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0
+   echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+   ```
+5. **Run `PROFILE=1 scripts/baseline.sh full desktop-baremetal`**, from a terminal with nothing else running. Close the browser.
+6. **Bring the results back:** commit them, then `git bundle create /media/$USER/<drive>/baseline.bundle master`. Back in WSL, run `git pull /mnt/c/baseline.bundle master`.
+   - If the Windows drive mounts read-only, Windows is hibernated ("Fast Startup"). Use a USB stick, or turn Fast Startup off in Windows' power settings.
+
+The WSL reference to compare against is `baselines/2026-09-29-wsl2`: the same commit, script and matrix.
+
+### Two machines (next)
+
+On one box, the bots compete with the server for the same cores, and loopback isn't a NIC. So the dual-boot run can't settle whether 10k needs level 6, or what a real NIC does with GSO. That takes two machines in one datacenter on a private link:
+
+- **Server:** bare metal, a current single-socket EPYC or Xeon with 32–96 cores (the design targets 64–96), 64 GB RAM, and a 10–25 GbE NIC (NVIDIA ConnectX or Intel E810 offload UDP segmentation).
+- **Bots:** 16–32 cores, the same NIC speed. A VM is fine: at 10k the swarm uses about 4 of this Ryzen's threads.
+- **Link:** 10 GbE covers today's traffic. 10k moves ~0.7 Gbps down at level 6 (~2.5 Gbps if it held 30 Hz), the blob ~1 Gbps, at 0.2–0.6 million packets/s each way. 25 GbE is for the full game's 0.7–1.5 Mbps per client.
+
+`baseline.sh` doesn't split server and bots across machines yet.
 
 ## M2a: tiered interest on the WSL2 dev box
 

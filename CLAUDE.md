@@ -63,7 +63,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 ## Milestones
 
 - **M0: protocol.** Done: this crate, 18 tests.
-- **M1: headless scale test.** Pass bar met on the WSL2 dev box (blob p99 13 ms; 10k fits the tick). Bare-metal confirmation is still pending. Lives in `sim/` (`lattice-sim`, which may have deps: rayon, socket2). See `sim/README.md` for the WSL baseline.
+- **M1: headless scale test.** The pass bar was met on the WSL2 dev box at M1 (blob p99 13 ms). With M2's interest management and deltas, the WSL baseline (2026-09-29, sustained load) has the blob at p99 27–28.5 ms, over the ~25 ms bar; assembly (10.7 ms p50) is the biggest phase. Bare-metal confirmation is still pending. Lives in `sim/` (`lattice-sim`, which may have deps: rayon, socket2). See `sim/README.md` for the WSL baseline.
   - Server does movement only. A Rust bot swarm (`lattice-bots`, real `lattice_net::Client`s, one socket per bot, ≤8 threads) drives it at 1k, 5k and 10k. It's Rust, not Go, so there's one protocol implementation to change when crypto lands.
   - Measure p50/p99 per-phase tick time, bytes per client, pps, and prediction corrections.
   - Scenarios: uniform spread; 3 hotspots of ~800; a 3,000-player blob within 200 m; 500 joins within 10 s.
@@ -89,7 +89,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - **M2c (debug map) is built:** `lattice-server --debug-http 0.0.0.0:8080` serves a top-down map of what one client receives (`sim/src/debugmap.rs`, std only).
   - **GSO is built** (see Transport decisions, Done). Mid and far messages are split to fill packets rather than fragmented; real fragmentation stays transport step 3.
   - **Transport step 1 (tokens + encryption) is done** (see Transport decisions, Done).
-  - **Next:** the bare-metal baseline, then M3.
+  - **Next:** the bare-metal baseline (the harness is ready; it needs Linux booted natively), then M3.
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.
@@ -101,6 +101,9 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - A Windows client reaches the WSL server through the WSL IP from `hostname -I`. Bind the server to `0.0.0.0`.
 - Server and bots are developed in WSL2. The game client is native Windows.
 - Performance numbers only count from bare-metal Linux: a dual-boot on the desktop, then a rented 10/25 GbE server for 5k–10k runs.
+  - `scripts/baseline.sh full <name>` runs the scenario matrix into `baselines/<date>-<name>/`, with the machine recorded in `env.txt`. Run `scripts/preflight.sh` first. Baselines are committed.
+  - The WSL reference is `baselines/2026-09-29-wsl2`. sim/README has the dual-boot procedure (the repo travels as a git bundle; there's no remote).
+  - For the two-machine runs: a bare-metal server with 32–96 cores and a 10–25 GbE NIC (ConnectX or E810), plus a 16–32-core bot machine on the same private link. Hourly metal (AWS `*.metal`, Latitude.sh, Vultr, Cherry) suits a test day; Hetzner or OVH suit a box kept for months. `baseline.sh` can't split server and bots across machines yet.
 
 ## Conventions
 

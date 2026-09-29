@@ -108,3 +108,27 @@ mod tests {
         assert_eq!((capped.summary().p99, capped.summary().max), (10, 500));
     }
 }
+
+/// End-of-run results for scripts: one `key=value` per line, in insertion
+/// order (`--summary PATH` on the server and the bots; `scripts/baseline.sh`
+/// reads them). Values are plain numbers or words, never containing newlines.
+#[derive(Debug, Default)]
+pub struct KeyValues(Vec<(String, String)>);
+
+impl KeyValues {
+    pub fn put(&mut self, key: impl Into<String>, value: impl std::fmt::Display) {
+        let (key, value) = (key.into(), value.to_string());
+        debug_assert!(!key.contains(['=', '\n']) && !value.contains('\n'));
+        self.0.push((key, value));
+    }
+
+    /// Milliseconds with two decimals, from microseconds.
+    pub fn put_ms(&mut self, key: impl Into<String>, us: u32) {
+        self.put(key, format!("{:.2}", us as f64 / 1000.0));
+    }
+
+    pub fn write(&self, path: &str) -> std::io::Result<()> {
+        let text: String = self.0.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+        std::fs::write(path, text)
+    }
+}

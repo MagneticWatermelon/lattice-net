@@ -8,7 +8,7 @@ cargo run --release --example server                   # real UDP, 30 Hz tick, e
 cargo run --release --example client 127.0.0.1:40000 5
 ```
 
-The M1 headless scale test (a movement-only server, a bot swarm and per-phase tick metrics) lives in [`sim/`](sim/README.md): `scripts/m1.sh blob 3000 60`.
+The M1 headless scale test (a movement-only server, a bot swarm and per-phase tick metrics) lives in [`sim/`](sim/README.md): `scripts/m1.sh blob 3000 60` runs one scenario, and `scripts/baseline.sh full <name>` runs the whole matrix into a comparable baseline in `baselines/`.
 
 ## Wire format
 

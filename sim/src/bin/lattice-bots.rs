@@ -16,7 +16,7 @@ use lattice_net::{Channel, Client, ClientState, Config, ConnectToken};
 use lattice_sim::bot::{BotBrain, InputTiming};
 use lattice_sim::cli::{Args, HexKey};
 use lattice_sim::movement::TICK_HZ;
-use lattice_sim::stats::{summarize, Histogram};
+use lattice_sim::stats::{summarize, Histogram, KeyValues};
 
 const USAGE: &str = "\
 lattice-bots: M1 bot swarm
@@ -33,7 +33,8 @@ lattice-bots: M1 bot swarm
   --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
                        connect tokens, standing in for a login service) [the public dev key]
   --server-id N        the server id tokens are minted for [1]
-  --seed N             [1]";
+  --seed N             [1]
+  --summary PATH       write the end-of-run results as key=value lines (scripts/baseline.sh)";
 
 /// Cumulative per-thread totals; the main thread sums threads and diffs windows.
 #[derive(Debug, Clone, Default)]
@@ -432,6 +433,7 @@ fn main() -> std::io::Result<()> {
     let track_every: usize = a.get("track-every", 20);
     let full_every: usize = a.get::<usize>("full-every", 1).max(1);
     let key: HexKey = a.get("token-key", HexKey::default());
+    let summary_path: Option<String> = a.opt("summary");
     let login = Login { token_key: key.0, server_id: a.get("server-id", 1) };
     a.finish();
     if key.is_dev() {
@@ -443,6 +445,8 @@ fn main() -> std::io::Result<()> {
         count.div_ceil(full_every),
         count - count.div_ceil(full_every)
     );
+    // One socket per bot, plus a few for the process itself.
+    raise_open_file_limit(count as u64 + 64)?;
     let sockets = (0..count).map(|_| bot_socket(server)).collect::<std::io::Result<Vec<_>>>()?;
     let mut sockets = sockets.into_iter().map(Some).collect::<Vec<_>>();
     let start = Instant::now();
@@ -576,8 +580,55 @@ fn main() -> std::io::Result<()> {
     let (total, joins, latency) = snapshot(&shared);
     all_joins.extend(joins);
     all_latency.merge(&latency);
+    if let Some(path) = summary_path {
+        summary_values(&total, duration.as_secs_f64(), &mut all_joins.clone(), &all_latency).write(&path)?;
+    }
     print_summary(&total, duration.as_secs_f64(), &mut all_joins, &all_latency);
     Ok(())
+}
+
+/// The summary's numbers as key=value lines, for `--summary`.
+fn summary_values(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) -> KeyValues {
+    let mut kv = KeyValues::default();
+    let j = summarize(joins);
+    let bot_secs = (t.welcomed.max(1) as f64) * secs;
+    kv.put("started", t.started);
+    kv.put("welcomed", t.welcomed);
+    kv.put("failed", t.failed);
+    kv.put("join_p50_ms", j.p50);
+    kv.put("join_p99_ms", j.p99);
+    kv.put("join_max_ms", j.max);
+    kv.put("corrections", t.corrections);
+    kv.put("corrections_per_bot_minute", format!("{:.3}", t.corrections as f64 / bot_secs * 60.0));
+    kv.put("correction_max_m", format!("{:.3}", t.correction_err_max));
+    let snaps = t.snapshots.max(1) as f64;
+    kv.put("snapshots", t.snapshots);
+    for (i, tier) in ["near", "mid", "far"].iter().enumerate() {
+        kv.put(format!("{tier}_per_snapshot"), format!("{:.1}", t.tiers[i] as f64 / snaps));
+    }
+    kv.put("stale_snapshots", t.stale_snapshots);
+    kv.put("resyncs", t.resyncs);
+    let mut hist = |name: &str, h: &Histogram, scale: f64| {
+        let s = h.summary();
+        kv.put(format!("{name}_p50_ms"), format!("{:.1}", s.p50 as f64 * scale));
+        kv.put(format!("{name}_p99_ms"), format!("{:.1}", s.p99 as f64 * scale));
+        kv.put(format!("{name}_mean_ms"), format!("{:.1}", h.mean() * scale));
+    };
+    hist("input_applied", &latency.applied, 1.0);
+    hist("server_wait", &latency.wait, 0.1);
+    hist("round_trip", &latency.seen, 1.0);
+    for (name, h) in ["near", "mid", "far"].iter().zip(&latency.intervals) {
+        hist(&format!("{name}_interval"), h, 1.0);
+    }
+    kv.put("clock_extra", t.clock_extra);
+    kv.put("clock_skipped", t.clock_skipped);
+    kv.put("backlog_skips", t.backlog_skips);
+    kv.put("near_decode_errors", t.near_decode_errors);
+    kv.put("bytes_down_mb", format!("{:.1}", t.bytes_down as f64 / 1e6));
+    kv.put("bytes_up_mb", format!("{:.1}", t.bytes_up as f64 / 1e6));
+    kv.put("swarm_busy_pct", format!("{:.0}", 100.0 * t.busy_us as f64 / t.wall_us.max(1) as f64));
+    kv.put("swarm_overruns", t.tick_overruns);
+    kv
 }
 
 fn snapshot(shared: &Mutex<Shared>) -> (Totals, Vec<u32>, Latency) {
@@ -682,4 +733,35 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
         100.0 * t.busy_us as f64 / t.wall_us.max(1) as f64,
         t.tick_overruns
     );
+}
+
+/// Stock Linux allows 1,024 open files per process (soft limit), and each bot
+/// holds a socket: lift the soft limit toward the hard one, or explain.
+#[cfg(target_os = "linux")]
+fn raise_open_file_limit(needed: u64) -> std::io::Result<()> {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: lim is a valid rlimit to write into.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if lim.rlim_cur >= needed {
+        return Ok(());
+    }
+    lim.rlim_cur = needed.min(lim.rlim_max);
+    // SAFETY: lim holds a soft limit no higher than the hard one.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if lim.rlim_cur < needed {
+        return Err(std::io::Error::other(format!(
+            "{needed} open files needed (one socket per bot), but the hard limit is {}: raise it (ulimit -Hn, /etc/security/limits.conf)",
+            lim.rlim_max
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn raise_open_file_limit(_needed: u64) -> std::io::Result<()> {
+    Ok(())
 }
