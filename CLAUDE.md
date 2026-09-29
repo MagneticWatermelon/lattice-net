@@ -40,13 +40,21 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   2. per-connection bandwidth budget (token bucket)
   3. fragmentation for >1.2 KB messages
   4. serialize-once fan-out without copying bodies
-  5. syscall batching (now the biggest phase at 10k)
-- **Done:** connection sharding. `Server` is N `Shard`s routed by a keyed address hash, and the sim drives them from rayon.
+  5. syscall batching: `recvmmsg`, then `SO_REUSEPORT` (still the biggest phase at 10k)
+- **Done:**
+  - Connection sharding: `Server` is N `Shard`s routed by a keyed address hash, and the sim drives them from rayon.
+  - Accept budget per tick (`Config::max_accepts_per_tick`).
+  - `sendmmsg` egress.
+- **Decided (M1 review, 2026-09-29):**
+  - **With `SO_REUSEPORT`, the receiving socket picks the shard group.** The kernel hashes the 4-tuple, so the shard comes from the socket that received the handshake: each socket owns a fixed group of shards, and the keyed hash picks one within it. Don't re-bucket in receive threads.
+  - **GSO (`UDP_SEGMENT`) only after M2.** It batches datagrams to a single destination, which only helps once clients get several packets per tick.
+  - **Do deep egress tuning on bare metal, not WSL2.**
+  - **Watch the input-latency cost of spare inputs** (bots report it). Options for later: process inputs faster than the tick, or target a fractional spare.
 
 ## Milestones
 
 - **M0: protocol.** Done: this crate, 18 tests.
-- **M1 (in progress): headless scale test.** Lives in `sim/` (`lattice-sim`, which may have deps: rayon, socket2). See `sim/README.md` for the WSL baseline.
+- **M1: headless scale test.** Pass bar met on the WSL2 dev box (blob p99 13 ms; 10k fits the tick). Bare-metal confirmation is still pending. Lives in `sim/` (`lattice-sim`, which may have deps: rayon, socket2). See `sim/README.md` for the WSL baseline.
   - Server does movement only. A Rust bot swarm (`lattice-bots`, real `lattice_net::Client`s, one socket per bot, ≤8 threads) drives it at 1k, 5k and 10k. It's Rust, not Go, so there's one protocol implementation to change when crypto lands.
   - Measure p50/p99 per-phase tick time, bytes per client, pps, and prediction corrections.
   - Scenarios: uniform spread; 3 hotspots of ~800; a 3,000-player blob within 200 m; 500 joins within 10 s.

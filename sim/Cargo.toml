@@ -10,3 +10,6 @@ publish = false
 lattice-net = { path = ".." }
 rayon = "1"
 socket2 = "0.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

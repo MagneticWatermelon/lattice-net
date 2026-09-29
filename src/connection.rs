@@ -31,6 +31,13 @@ pub struct Config {
     pub max_packet_size: usize,
     /// Upper bound on packets one `flush` may emit for one connection.
     pub max_packets_per_flush: usize,
+    /// Server: most new connections accepted per tick (between `update` calls),
+    /// server-wide, split evenly across shards (rounded up). A client over the
+    /// budget is simply not answered; it resends its challenge response every
+    /// `handshake_resend_interval` and its cookie stays valid for 10-20 s, so a
+    /// mass join is spread over several ticks instead of stalling one.
+    /// Each accept allocates the connection's windows (~130 KB). 0 = no limit.
+    pub max_accepts_per_tick: usize,
 }
 
 impl Default for Config {
@@ -42,6 +49,7 @@ impl Default for Config {
             handshake_resend_interval: Duration::from_millis(100),
             max_packet_size: packet::MAX_PACKET_SIZE,
             max_packets_per_flush: 4,
+            max_accepts_per_tick: 256,
         }
     }
 }

@@ -54,9 +54,9 @@ impl Swarm {
             client.update(self.now);
             if client.state() == ClientState::Connected {
                 while let Some((_, data)) = client.recv() {
-                    brain.on_message(&data);
+                    brain.on_message(&data, self.now);
                 }
-                if let Some(batch) = brain.tick_inputs() {
+                if let Some(batch) = brain.tick_inputs(self.now) {
                     client.send(Channel::Unreliable, batch).unwrap();
                 }
             }
@@ -171,6 +171,15 @@ fn input_clock_keeps_one_to_two_spare_inputs() {
         assert!(b.stats.clock_extra + b.stats.clock_skipped <= 3, "clock hunting: {:?}", b.stats);
     }
     assert_eq!(stand_ins(&s), 0);
+
+    // Lockstep with one spare: an input sent on tick t is consumed on t+1, and
+    // its snapshot is read on t+2. So input latency is exactly 2 ticks.
+    for (_, _, b) in &mut s.bots {
+        let mut samples = Vec::new();
+        b.drain_latency(&mut samples);
+        let steady = &samples[samples.len() - 100..];
+        assert!(steady.iter().all(|&ms| ms == 67), "latency {:?}", &steady[..10]);
+    }
 }
 
 #[test]

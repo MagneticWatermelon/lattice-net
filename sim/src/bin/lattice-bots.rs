@@ -15,7 +15,7 @@ use lattice_net::{Channel, Client, ClientState, Config};
 use lattice_sim::bot::BotBrain;
 use lattice_sim::cli::Args;
 use lattice_sim::movement::TICK_HZ;
-use lattice_sim::stats::summarize;
+use lattice_sim::stats::{summarize, Histogram};
 
 const USAGE: &str = "\
 lattice-bots: M1 bot swarm
@@ -76,11 +76,12 @@ impl Totals {
     }
 }
 
-#[derive(Default)]
 struct Shared {
     threads: Vec<Totals>,
     /// Join latencies (ms) since the last report.
     joins: Vec<u32>,
+    /// Input latencies (ms) since the last report.
+    latency: Histogram,
 }
 
 struct Bot {
@@ -127,14 +128,14 @@ impl Bot {
         match client.state() {
             ClientState::Connected => {
                 while let Some((_, data)) = client.recv() {
-                    brain.on_message(&data);
+                    brain.on_message(&data, now);
                 }
                 if self.joined_ms.is_none() && brain.welcome().is_some() {
                     let ms = (now - self.start_at).as_millis() as u32;
                     self.joined_ms = Some(ms);
                     joined = Some(ms);
                 }
-                if let Some(batch) = brain.tick_inputs() {
+                if let Some(batch) = brain.tick_inputs(now) {
                     let _ = client.send(Channel::Unreliable, batch);
                 }
             }
@@ -179,6 +180,9 @@ impl Bot {
     }
 }
 
+/// Input latencies above this land in the histogram's last bucket.
+const LATENCY_CAP_MS: u32 = 2000;
+
 fn bot_socket(server: SocketAddr) -> std::io::Result<UdpSocket> {
     let sock = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
     sock.connect(server)?;
@@ -203,7 +207,11 @@ fn main() -> std::io::Result<()> {
     let mut sockets = sockets.into_iter().map(Some).collect::<Vec<_>>();
     let start = Instant::now();
     let end = start + duration;
-    let shared = Arc::new(Mutex::new(Shared { threads: vec![Totals::default(); threads], joins: Vec::new() }));
+    let shared = Arc::new(Mutex::new(Shared {
+        threads: vec![Totals::default(); threads],
+        joins: Vec::new(),
+        latency: Histogram::new(LATENCY_CAP_MS),
+    }));
 
     let mut handles = Vec::new();
     for t in 0..threads {
@@ -228,6 +236,8 @@ fn main() -> std::io::Result<()> {
             let mut buf = [0u8; 1500];
             let mut overruns = 0;
             let mut joins = Vec::new();
+            let mut latency = Histogram::new(LATENCY_CAP_MS);
+            let mut samples = Vec::new();
             let mut last_publish = start;
             loop {
                 let now = Instant::now();
@@ -240,7 +250,11 @@ fn main() -> std::io::Result<()> {
                 }
                 for bot in &mut bots {
                     joins.extend(bot.tick(server, now, &mut buf)?);
+                    if let Some(brain) = &mut bot.brain {
+                        brain.drain_latency(&mut samples);
+                    }
                 }
+                samples.drain(..).for_each(|ms| latency.record(ms as u32));
                 next += period;
                 if Instant::now() > next {
                     overruns += 1;
@@ -253,6 +267,7 @@ fn main() -> std::io::Result<()> {
                     let mut s = shared.lock().unwrap();
                     s.threads[t] = tot;
                     s.joins.append(&mut joins);
+                    s.latency.merge(&std::mem::replace(&mut latency, Histogram::new(LATENCY_CAP_MS)));
                 }
             }
             let mut tot = Totals { tick_overruns: overruns, ..Default::default() };
@@ -269,45 +284,51 @@ fn main() -> std::io::Result<()> {
             let mut s = shared.lock().unwrap();
             s.threads[t] = tot;
             s.joins.append(&mut joins);
+            s.latency.merge(&latency);
             Ok(())
         })?);
     }
 
     let mut prev = Totals::default();
     let mut all_joins = Vec::new();
+    let mut all_latency = Histogram::new(LATENCY_CAP_MS);
     let mut last = start;
     while Instant::now() < end {
         std::thread::sleep(report.min(end.saturating_duration_since(Instant::now())));
         let now = Instant::now();
-        let (cur, mut joins) = snapshot(&shared);
-        print_window(now - start, (now - last).as_secs_f64(), &cur, &prev, &mut joins);
+        let (cur, mut joins, latency) = snapshot(&shared);
+        print_window(now - start, (now - last).as_secs_f64(), &cur, &prev, &mut joins, &latency);
         all_joins.extend(joins);
+        all_latency.merge(&latency);
         prev = cur;
         last = now;
     }
     for h in handles {
         h.join().expect("bot thread panicked")?;
     }
-    let (total, joins) = snapshot(&shared);
+    let (total, joins, latency) = snapshot(&shared);
     all_joins.extend(joins);
-    print_summary(&total, duration.as_secs_f64(), &mut all_joins);
+    all_latency.merge(&latency);
+    print_summary(&total, duration.as_secs_f64(), &mut all_joins, &all_latency);
     Ok(())
 }
 
-fn snapshot(shared: &Mutex<Shared>) -> (Totals, Vec<u32>) {
+fn snapshot(shared: &Mutex<Shared>) -> (Totals, Vec<u32>, Histogram) {
     let mut s = shared.lock().unwrap();
     let mut t = Totals::default();
     s.threads.iter().for_each(|x| t.add(x));
-    (t, std::mem::take(&mut s.joins))
+    let latency = std::mem::replace(&mut s.latency, Histogram::new(LATENCY_CAP_MS));
+    (t, std::mem::take(&mut s.joins), latency)
 }
 
-fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut [u32]) {
+fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut [u32], latency: &Histogram) {
     let bots = cur.connected.max(1) as f64;
     let d = |a: u64, b: u64| a.saturating_sub(b) as f64;
     let snaps = d(cur.snapshots, prev.snapshots);
     let j = summarize(joins);
+    let l = latency.summary();
     println!(
-        "[{:>5.0}s] bots {}/{} connected, {} welcomed, {} failed | {:.1} snaps/s/bot, {:.1} entities/snap | corrections {:.3}/s/bot | down {:.0} up {:.0} kbps/bot | rtt {:.1} ms loss {:.2}% | joins {} (p50 {} p99 {} ms) | swarm overruns {}",
+        "[{:>5.0}s] bots {}/{} connected, {} welcomed, {} failed | {:.1} snaps/s/bot, {:.1} entities/snap | corrections {:.3}/s/bot | down {:.0} up {:.0} kbps/bot | rtt {:.1} ms loss {:.2}% | input latency p50 {} p99 {} ms | joins {} (p50 {} p99 {} ms) | swarm overruns {}",
         t.as_secs_f64(),
         cur.connected,
         cur.started,
@@ -320,6 +341,8 @@ fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut
         d(cur.bytes_up, prev.bytes_up) * 8.0 / 1000.0 / secs / bots,
         cur.rtt_sum / bots,
         100.0 * cur.loss_sum / bots,
+        l.p50,
+        l.p99,
         joins.len(),
         j.p50,
         j.p99,
@@ -327,8 +350,9 @@ fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut
     );
 }
 
-fn print_summary(t: &Totals, secs: f64, joins: &mut [u32]) {
+fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Histogram) {
     let j = summarize(joins);
+    let l = latency.summary();
     let bot_secs = (t.welcomed.max(1) as f64) * secs;
     println!("\n== bots summary ==");
     println!("  started {} welcomed {} failed {}", t.started, t.welcomed, t.failed);
@@ -353,6 +377,14 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32]) {
         t.stale_snapshots,
         t.unmatched_acks,
         t.resyncs
+    );
+    println!(
+        "  input latency ms (input generated -> acked in a snapshot): p50 {} p99 {} max {} mean {:.1} (n={})",
+        l.p50,
+        l.p99,
+        l.max,
+        latency.mean(),
+        latency.len()
     );
     println!("  input clock: {} extra inputs, {} skipped ticks", t.clock_extra, t.clock_skipped);
     println!(

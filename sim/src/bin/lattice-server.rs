@@ -3,8 +3,9 @@
 //!
 //! A dedicated thread blocks on `recv_from` and queues datagrams into per-shard
 //! buckets, so arrivals spread across the tick don't have to fit in the kernel
-//! buffer and routing costs no tick time. Egress is plain `send_to`, one rayon
-//! task per shard (`sendmmsg`/GSO come later).
+//! buffer and routing costs no tick time. Egress is one rayon task per shard,
+//! batched with `sendmmsg` on Linux (GSO waits for M2, when clients get several
+//! packets per tick).
 
 use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
@@ -13,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use lattice_net::Config;
 use lattice_sim::cli::Args;
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::server::{Counters, Datagram, SimConfig, SimServer, SpawnMode, PHASES};
@@ -30,6 +32,8 @@ lattice-server: M1 movement-only authoritative server
   --near-max N         max entities per snapshot [64]
   --threads N          rayon threads [all cores]
   --shards N           transport shards [64]
+  --accepts-per-tick N new connections accepted per tick, server-wide (0 = no limit) [256]
+  --egress MODE        sendmmsg | sendto   [sendmmsg on Linux, else sendto]
   --duration S         stop after S seconds (0 = run forever) [0]
   --until-empty        stop once clients connected and then all left
   --report S           report interval, seconds [5]
@@ -40,6 +44,94 @@ lattice-server: M1 movement-only authoritative server
 /// Columns of per-tick timing samples: the sim phases, then egress and total.
 const COLS: usize = PHASES.len() + 2;
 type Row = [u32; COLS];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Egress {
+    /// One `send_to` syscall per datagram.
+    SendTo,
+    /// Up to `MMSG_BATCH` datagrams per `sendmmsg` syscall (Linux only).
+    SendMmsg,
+}
+
+impl Default for Egress {
+    fn default() -> Self {
+        if cfg!(target_os = "linux") {
+            Egress::SendMmsg
+        } else {
+            Egress::SendTo
+        }
+    }
+}
+
+impl std::str::FromStr for Egress {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "sendto" => Ok(Egress::SendTo),
+            "sendmmsg" if cfg!(target_os = "linux") => Ok(Egress::SendMmsg),
+            "sendmmsg" => Err("sendmmsg needs Linux".into()),
+            _ => Err(format!("unknown egress mode {s:?} (sendmmsg|sendto)")),
+        }
+    }
+}
+
+/// Sends every datagram; returns how many failed.
+fn send_all(sock: &UdpSocket, batch: &[Datagram], mode: Egress) -> usize {
+    match mode {
+        #[cfg(target_os = "linux")]
+        Egress::SendMmsg => send_mmsg(sock, batch),
+        _ => batch.iter().filter(|(addr, pkt)| sock.send_to(pkt, addr).is_err()).count(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+const MMSG_BATCH: usize = 256;
+
+/// `sendmmsg` in batches. A datagram the kernel rejects is counted and
+/// skipped; the rest of the batch is retried from the next one.
+#[cfg(target_os = "linux")]
+fn send_mmsg(sock: &UdpSocket, batch: &[Datagram]) -> usize {
+    use std::os::fd::AsRawFd;
+    let fd = sock.as_raw_fd();
+    let mut errors = 0;
+    for chunk in batch.chunks(MMSG_BATCH) {
+        let addrs: Vec<socket2::SockAddr> = chunk.iter().map(|(a, _)| socket2::SockAddr::from(*a)).collect();
+        let mut iovs: Vec<libc::iovec> = chunk
+            .iter()
+            .map(|(_, p)| libc::iovec { iov_base: p.as_ptr() as *mut libc::c_void, iov_len: p.len() })
+            .collect();
+        let iov_base = iovs.as_mut_ptr();
+        let mut msgs: Vec<libc::mmsghdr> = addrs
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                // SAFETY: msghdr is plain data; all-zero is a valid empty header.
+                let mut h: libc::msghdr = unsafe { std::mem::zeroed() };
+                h.msg_name = addr.as_ptr() as *mut libc::c_void;
+                h.msg_namelen = addr.len();
+                // SAFETY: i < iovs.len(), and iovs outlives the sendmmsg calls below.
+                h.msg_iov = unsafe { iov_base.add(i) };
+                h.msg_iovlen = 1;
+                libc::mmsghdr { msg_hdr: h, msg_len: 0 }
+            })
+            .collect();
+        let mut off = 0;
+        while off < msgs.len() {
+            // SAFETY: every header points into `addrs`, `iovs` and the datagrams in
+            // `chunk`, all alive and unmoved for the duration of the call.
+            let n = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr().add(off), (msgs.len() - off) as libc::c_uint, 0) };
+            if n > 0 {
+                off += n as usize;
+            } else if n < 0 && std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                continue;
+            } else {
+                errors += 1; // the datagram at `off` was rejected
+                off += 1;
+            }
+        }
+    }
+    errors
+}
 
 fn col_name(i: usize) -> &'static str {
     match i {
@@ -67,8 +159,9 @@ fn main() -> std::io::Result<()> {
         near_max: a.get("near-max", 64),
         shards: a.get("shards", 64),
         seed: a.get("seed", 1),
-        ..Default::default()
+        net: Config { max_accepts_per_tick: a.get("accepts-per-tick", 256), ..Config::default() },
     };
+    let egress: Egress = a.get("egress", Egress::default());
     let threads: Option<usize> = a.opt("threads");
     let duration = Duration::from_secs_f64(a.get("duration", 0.0));
     let until_empty = a.flag("until-empty");
@@ -97,11 +190,12 @@ fn main() -> std::io::Result<()> {
     let shards = sim.shard_count();
 
     println!(
-        "listening on {bind} | spawn {:?}, near {} within {} m, {} rayon threads, {shards} shards | socket buffers rcv {} KiB snd {} KiB",
+        "listening on {bind} | spawn {:?}, near {} within {} m, {} rayon threads, {shards} shards, {} accepts/tick, egress {egress:?} | socket buffers rcv {} KiB snd {} KiB",
         cfg.spawn,
         cfg.near_max,
         cfg.near_radius,
         rayon::current_num_threads(),
+        cfg.net.max_accepts_per_tick,
         rcvbuf >> 10,
         sndbuf >> 10
     );
@@ -135,7 +229,7 @@ fn main() -> std::io::Result<()> {
 
     let mut inbound: Vec<Vec<Datagram>> = vec![Vec::new(); shards];
     let mut out: Vec<Vec<Datagram>> = vec![Vec::new(); shards];
-    let mut window = Window::new(start, sim.counters(), &net);
+    let mut window = Window::new(start, &sim, &net);
     let mut kept: Vec<Row> = Vec::new();
     let mut first_client: Option<Instant> = None;
     // Counters as of the end of warmup, so the summary can separate the join burst.
@@ -153,13 +247,12 @@ fn main() -> std::io::Result<()> {
         let (pkts, bytes) = out
             .par_iter_mut()
             .map(|bucket| {
-                let (n, mut bytes) = (bucket.len(), 0);
-                for (addr, pkt) in bucket.drain(..) {
-                    bytes += pkt.len();
-                    if sock.send_to(&pkt, addr).is_err() {
-                        net.send_errors.fetch_add(1, Relaxed);
-                    }
+                let (n, bytes) = (bucket.len(), bucket.iter().map(|(_, p)| p.len()).sum::<usize>());
+                let errors = send_all(&sock, bucket, egress);
+                if errors > 0 {
+                    net.send_errors.fetch_add(errors as u64, Relaxed);
                 }
+                bucket.clear();
                 (n, bytes)
             })
             .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
@@ -191,7 +284,7 @@ fn main() -> std::io::Result<()> {
 
         if done - window.start >= report {
             window.report(done - start, &sim, &net, csv.as_mut())?;
-            window = Window::new(done, sim.counters(), &net);
+            window = Window::new(done, &sim, &net);
         }
 
         let finished = (!duration.is_zero() && done - start >= duration) || (until_empty && peak_clients > 0 && clients == 0);
@@ -213,7 +306,7 @@ fn main() -> std::io::Result<()> {
     }
     stop.store(true, Relaxed);
     let _ = receiver.join();
-    print_summary(&mut kept, peak_clients, sim.counters(), warm.as_ref(), &net);
+    print_summary(&mut kept, peak_clients, &sim, warm.as_ref(), &net);
     Ok(())
 }
 
@@ -228,10 +321,11 @@ struct Window {
     in_pkts: u64,
     in_bytes: u64,
     kernel: [u64; 2],
+    deferred: u64,
 }
 
 impl Window {
-    fn new(start: Instant, counters: &Counters, net: &NetCounters) -> Self {
+    fn new(start: Instant, sim: &SimServer, net: &NetCounters) -> Self {
         Self {
             start,
             rows: Vec::new(),
@@ -239,10 +333,11 @@ impl Window {
             out_pkts: 0,
             out_bytes: 0,
             client_ticks: 0,
-            counters: counters.clone(),
+            counters: sim.counters().clone(),
             in_pkts: net.in_pkts.load(Relaxed),
             in_bytes: net.in_bytes.load(Relaxed),
             kernel: kernel_udp_drops(),
+            deferred: sim.net().deferred_accepts(),
         }
     }
 
@@ -261,6 +356,7 @@ impl Window {
         let snaps = c.snapshots - self.counters.snapshots;
         let ents_avg = (c.snapshot_entities - self.counters.snapshot_entities) as f64 / snaps.max(1) as f64;
         let kernel = kernel_udp_drops();
+        let deferred = sim.net().deferred_accepts() - self.deferred;
         let (rcv_drops, snd_drops) = (kernel[0] - self.kernel[0], kernel[1] - self.kernel[1]);
         let down_kbps = self.out_bytes as f64 * 8.0 / 1000.0 / per_client_secs;
         let up_kbps = in_bytes as f64 * 8.0 / 1000.0 / per_client_secs;
@@ -270,7 +366,7 @@ impl Window {
             .collect();
         let tick = sums[COLS - 1];
         println!(
-            "[{:>5.0}s] clients {} | tick p50 {} p99 {} max {} ms, {} overruns | out {:.1}k pps {:.0} kbps/client, {:.0} Mbps | in {:.1}k pps {:.0} kbps/client | stand-ins: repeated {:.2}% frozen {:.2}%, {} late inputs | {:.1} entities/snapshot | kernel drops rcv {} snd {}",
+            "[{:>5.0}s] clients {} | tick p50 {} p99 {} max {} ms, {} overruns | out {:.1}k pps {:.0} kbps/client, {:.0} Mbps | in {:.1}k pps {:.0} kbps/client | stand-ins: repeated {:.2}% frozen {:.2}%, {} late inputs | {:.1} entities/snapshot | {} joins deferred | kernel drops rcv {} snd {}",
             t.as_secs_f64(),
             sim.client_count(),
             ms(tick.p50),
@@ -286,6 +382,7 @@ impl Window {
             frozen_pct,
             late,
             ents_avg,
+            deferred,
             rcv_drops,
             snd_drops,
         );
@@ -299,7 +396,7 @@ impl Window {
                 line += &format!(",{},{},{}", s.p50, s.p99, s.max);
             }
             line += &format!(
-                ",{:.0},{:.0},{:.1},{:.1},{:.1},{:.3},{:.3},{},{:.1},{},{}",
+                ",{:.0},{:.0},{:.1},{:.1},{:.1},{:.3},{:.3},{},{:.1},{},{},{}",
                 self.out_pkts as f64 / secs,
                 in_pkts as f64 / secs,
                 down_kbps,
@@ -309,6 +406,7 @@ impl Window {
                 frozen_pct,
                 late,
                 ents_avg,
+                deferred,
                 rcv_drops,
                 snd_drops
             );
@@ -328,13 +426,14 @@ fn open_csv(path: String) -> std::io::Result<BufWriter<File>> {
             let n = col_name(i);
             h += &format!(",{n}_p50_us,{n}_p99_us,{n}_max_us");
         }
-        h += ",out_pps,in_pps,down_kbps_per_client,up_kbps_per_client,egress_mbps,repeated_pct,frozen_pct,late_inputs,entities_per_snapshot,kernel_rcvbuf_drops,kernel_sndbuf_drops";
+        h += ",out_pps,in_pps,down_kbps_per_client,up_kbps_per_client,egress_mbps,repeated_pct,frozen_pct,late_inputs,entities_per_snapshot,deferred_accepts,kernel_rcvbuf_drops,kernel_sndbuf_drops";
         writeln!(w, "{h}")?;
     }
     Ok(w)
 }
 
-fn print_summary(kept: &mut [Row], peak: usize, c: &Counters, warm: Option<&Counters>, net: &NetCounters) {
+fn print_summary(kept: &mut [Row], peak: usize, sim: &SimServer, warm: Option<&Counters>, net: &NetCounters) {
+    let c = sim.counters();
     println!("\n== summary: {} ticks after warmup, peak {peak} clients ==", kept.len());
     if kept.is_empty() {
         return;
@@ -346,9 +445,10 @@ fn print_summary(kept: &mut [Row], peak: usize, c: &Counters, warm: Option<&Coun
     }
     let over = kept.iter().filter(|r| r[COLS - 1] as u128 > (Duration::from_secs(1) / TICK_HZ).as_micros()).count();
     println!(
-        "  overruns {over} | spawns {} despawns {} | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
+        "  overruns {over} | spawns {} despawns {} ({} joins deferred) | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
         c.spawns,
         c.despawns,
+        sim.net().deferred_accepts(),
         c.repeated,
         c.frozen,
         c.late_inputs,

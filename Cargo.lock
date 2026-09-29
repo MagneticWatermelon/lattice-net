@@ -42,6 +42,7 @@ name = "lattice-sim"
 version = "0.1.0"
 dependencies = [
  "lattice-net",
+ "libc",
  "rayon",
  "socket2",
 ]

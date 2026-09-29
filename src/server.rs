@@ -110,9 +110,13 @@ pub struct Shard {
     by_addr: HashMap<SocketAddr, ClientId>,
     clients: HashMap<ClientId, Slot>,
     next_local: u32,
+    /// This shard's share of `Config::max_accepts_per_tick`.
+    accept_budget: usize,
+    accepts_this_tick: usize,
     events: VecDeque<ServerEvent>,
     outgoing: Vec<(SocketAddr, Vec<u8>)>,
     dropped_packets: u64,
+    deferred_accepts: u64,
 }
 
 impl Shard {
@@ -161,12 +165,18 @@ impl Shard {
                     self.dropped_packets += 1;
                     return;
                 }
+                if self.accepts_this_tick >= self.accept_budget {
+                    // Admission control: no reply. The client resends and gets in on a later tick.
+                    self.deferred_accepts += 1;
+                    return;
+                }
                 if !self.shared.reserve_slot() {
                     self.push(from, Packet::Denied { client_salt, reason: DenyReason::ServerFull });
                     return;
                 }
                 let id = self.next_local.wrapping_mul(self.shared.router.shards).wrapping_add(self.index);
                 self.next_local = self.next_local.wrapping_add(1);
+                self.accepts_this_tick += 1;
                 let conn = Connection::new(self.shared.cfg.clone(), session_from_cookie(cookie), now);
                 self.by_addr.insert(from, id);
                 self.clients.insert(id, Slot { addr: from, salt: client_salt, conn });
@@ -201,8 +211,9 @@ impl Shard {
         }
     }
 
-    /// Detect timeouts. Call once per tick.
+    /// Detect timeouts and start a new accept budget. Call once per tick.
     pub fn update(&mut self, now: Instant) {
+        self.accepts_this_tick = 0;
         let timed_out: Vec<ClientId> = self
             .clients
             .iter()
@@ -267,6 +278,12 @@ impl Shard {
         self.dropped_packets
     }
 
+    /// Valid challenge responses left unanswered because this tick's accept
+    /// budget was spent (the client retries).
+    pub fn deferred_accepts(&self) -> u64 {
+        self.deferred_accepts
+    }
+
     fn owns(&self, addr: &SocketAddr) -> bool {
         self.shared.router.shard(addr) == self.index as usize
     }
@@ -304,6 +321,10 @@ impl Server {
     /// threads lets a work-stealing pool balance uneven shards.
     pub fn with_shards(cfg: Config, max_clients: usize, shards: usize, now: Instant) -> Self {
         assert!((1..=u16::MAX as usize).contains(&shards), "shards must be 1..=65535");
+        let accept_budget = match cfg.max_accepts_per_tick {
+            0 => usize::MAX,
+            n => n.div_ceil(shards),
+        };
         let shared = Arc::new(Shared {
             cfg,
             max_clients,
@@ -319,9 +340,12 @@ impl Server {
                 by_addr: HashMap::new(),
                 clients: HashMap::new(),
                 next_local: 0,
+                accept_budget,
+                accepts_this_tick: 0,
                 events: VecDeque::new(),
                 outgoing: Vec::new(),
                 dropped_packets: 0,
+                deferred_accepts: 0,
             })
             .collect();
         Self { shared, shards }
@@ -348,7 +372,7 @@ impl Server {
         self.shards[s].receive(from, data, now);
     }
 
-    /// Detect timeouts in every shard. Call once per tick.
+    /// Detect timeouts and reset accept budgets in every shard. Call once per tick.
     pub fn update(&mut self, now: Instant) {
         self.shards.iter_mut().for_each(|s| s.update(now));
     }
@@ -397,5 +421,10 @@ impl Server {
     /// Datagrams dropped for bad CRC, bad cookie, wrong session, etc.
     pub fn dropped_packets(&self) -> u64 {
         self.shards.iter().map(|s| s.dropped_packets).sum()
+    }
+
+    /// Accepts deferred to a later tick by `Config::max_accepts_per_tick`.
+    pub fn deferred_accepts(&self) -> u64 {
+        self.shards.iter().map(|s| s.deferred_accepts).sum()
     }
 }

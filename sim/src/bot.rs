@@ -2,6 +2,8 @@
 //! Transport-agnostic: feed it the messages a `lattice_net::Client` delivers and
 //! send the input batches it returns.
 
+use std::time::Instant;
+
 use crate::movement::{step, Input, MoveState, BUTTON_SPRINT};
 use crate::msg::{self, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY};
 use crate::rng::Rng;
@@ -45,6 +47,10 @@ pub struct BotStats {
     pub clock_extra: u64,
     pub clock_skipped: u64,
     pub bad_messages: u64,
+    /// End-to-end input latency: from generating an input to seeing a snapshot
+    /// that acks it. Spare inputs, tick alignment and the network all add to it.
+    pub latency_samples: u64,
+    pub latency_sum_ms: f64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -53,6 +59,8 @@ struct Predicted {
     input: Input,
     /// State after applying `input`.
     state: MoveState,
+    /// When the input was generated (and sent).
+    sent_at: Option<Instant>,
 }
 
 pub struct BotBrain {
@@ -70,6 +78,9 @@ pub struct BotBrain {
     buffer_avg: f32,
     resyncing: bool,
     last_server_tick: Option<u32>,
+    last_acked: u32,
+    /// Latency samples (ms) not yet taken by `drain_latency`.
+    latency: Vec<u16>,
     pub stats: BotStats,
 }
 
@@ -92,6 +103,8 @@ impl BotBrain {
             buffer_avg: (TARGET_DEPTH.0 + TARGET_DEPTH.1) / 2.0,
             resyncing: false,
             last_server_tick: None,
+            last_acked: 0,
+            latency: Vec::new(),
             stats: BotStats::default(),
         }
     }
@@ -109,7 +122,12 @@ impl BotBrain {
         self.buffer_avg
     }
 
-    pub fn on_message(&mut self, data: &[u8]) {
+    /// Moves input-latency samples (ms) recorded since the last call into `out`.
+    pub fn drain_latency(&mut self, out: &mut Vec<u16>) {
+        out.append(&mut self.latency);
+    }
+
+    pub fn on_message(&mut self, data: &[u8], now: Instant) {
         match msg::decode_server_msg(data) {
             Ok(ServerMsg::Welcome(w)) if self.welcome.is_none() => {
                 self.state = MoveState { pos: w.spawn, vel: [0.0; 2] };
@@ -118,13 +136,13 @@ impl BotBrain {
                 // arrives just in time and any jitter makes it late.
                 self.clock += TARGET_DEPTH.0 - 1.0;
             }
-            Ok(ServerMsg::Snapshot(h, _)) if self.welcome.is_some() => self.on_snapshot(&h),
+            Ok(ServerMsg::Snapshot(h, _)) if self.welcome.is_some() => self.on_snapshot(&h, now),
             Ok(_) => {}
             Err(_) => self.stats.bad_messages += 1,
         }
     }
 
-    fn on_snapshot(&mut self, h: &SnapshotHeader) {
+    fn on_snapshot(&mut self, h: &SnapshotHeader, now: Instant) {
         if self.last_server_tick.is_some_and(|t| h.server_tick.wrapping_sub(t) as i32 <= 0) {
             self.stats.stale_snapshots += 1;
             return;
@@ -164,7 +182,9 @@ impl BotBrain {
             self.resyncing = true;
             self.seq = h.ack_seq;
             self.state = h.own;
-            self.history[self.seq as usize % HISTORY] = Predicted { seq: self.seq, input: Input::default(), state: h.own };
+            self.history[self.seq as usize % HISTORY] =
+                Predicted { seq: self.seq, input: Input::default(), state: h.own, sent_at: None };
+            self.last_acked = h.ack_seq;
             return;
         }
         self.resyncing = false;
@@ -172,6 +192,15 @@ impl BotBrain {
         if slot.seq != h.ack_seq {
             self.stats.unmatched_acks += 1;
             return;
+        }
+        if h.ack_seq > self.last_acked {
+            if let Some(sent) = slot.sent_at {
+                let ms = (now.saturating_duration_since(sent).as_secs_f64() * 1000.0).round();
+                self.latency.push(ms.min(u16::MAX as f64) as u16);
+                self.stats.latency_samples += 1;
+                self.stats.latency_sum_ms += ms;
+            }
+            self.last_acked = h.ack_seq;
         }
         let err = ((slot.state.pos[0] - h.own.pos[0]).powi(2) + (slot.state.pos[1] - h.own.pos[1]).powi(2)).sqrt();
         let vel_err = (slot.state.vel[0] - h.own.vel[0]).abs() + (slot.state.vel[1] - h.own.vel[1]).abs();
@@ -197,7 +226,7 @@ impl BotBrain {
     /// none while it steers the server's queue depth into `TARGET_DEPTH`. Returns
     /// the batch to send (unreliable), or `None` when there's nothing new or
     /// before the server has welcomed us.
-    pub fn tick_inputs(&mut self) -> Option<Vec<u8>> {
+    pub fn tick_inputs(&mut self, now: Instant) -> Option<Vec<u8>> {
         let w = self.welcome?;
         self.clock += self.rate;
         self.bump_cooldown = self.bump_cooldown.saturating_sub(1);
@@ -208,7 +237,8 @@ impl BotBrain {
             let input = self.think(&w);
             self.seq += 1;
             self.state = step(self.state, input);
-            self.history[self.seq as usize % HISTORY] = Predicted { seq: self.seq, input, state: self.state };
+            self.history[self.seq as usize % HISTORY] =
+                Predicted { seq: self.seq, input, state: self.state, sent_at: Some(now) };
             made += 1;
         }
         match made {

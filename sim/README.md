@@ -58,26 +58,36 @@ Stand-ins can exceed bot corrections: a stand-in whose input matches what the bo
 
 The server prints a line every `--report` seconds (with `--csv`, one row per window). At exit it prints p50/p99/max per phase over every tick after warmup. It also reports the system-wide kernel `RcvbufErrors`/`SndbufErrors` deltas from `/proc/net/snmp`.
 
-The bots report snapshots, entities per snapshot, corrections, kbps per bot, RTT, join latency (connect → Welcome), and **swarm overruns**. An overrun means the bots were late, so treat any corrections in that window as swarm artifacts.
+The server also reports **joins deferred** by the accept budget (`--accepts-per-tick`, default 256 per tick server-wide). Egress uses `sendmmsg` on Linux (`--egress sendto` for comparison).
+
+The bots report snapshots, entities per snapshot, corrections, kbps per bot, RTT, join latency (connect → Welcome), **input latency**, and **swarm overruns**. Input latency runs from generating an input to reading the first snapshot that acks it. It includes the spare input, the server tick, the network, and waiting for the bot's own next tick. Because it's quantized to whole ticks, its median jumps between 67 and 100 ms from run to run; the mean is the stable number. An overrun means the bots were late, so treat any corrections in that window as swarm artifacts.
 
 ## Baseline: WSL2 dev box (behavior, not capacity)
 
-Test box: 16 cores, WSL2 on Windows 10, with the server (8 rayon threads, 64 shards) and the bots (8 threads) on the same machine over loopback. Only bare-metal numbers count; these runs show where the time goes. Phase columns are p50 in ms; "before" is the single-shard server.
+Test box: 16 cores, WSL2 on Windows 10, with the server (8 rayon threads, 64 shards) and the bots (8 threads) on the same machine over loopback. Only bare-metal numbers count; these runs show where the time goes. Phase columns are p50 in ms; "before" is the single-shard server. The blob and 10k rows use `sendmmsg` and the accept budget; the other rows predate both and use `send_to`.
 
 | scenario | clients | tick p50 / p99 (ms) | before | ingress | events | assembly | transport | egress | stand-ins after warmup | down kbps/client |
 |---|---|---|---|---|---|---|---|---|---|---|
 | uniform | 1,000 | 2.8 / 3.4 | 3.0 / 3.8 | 0.35 | 0.09 | 0.30 | 0.31 | 1.4 | 0 | ~15 |
-| blob | 3,000 | 11.9 / **14.1** | 16.7 / 19.7 | 0.56 | 0.25 | 4.5 | 1.6 | 4.1 | 0 | ~180 |
+| blob | 3,000 | 11.5 / **13.1** | 16.7 / 19.7 | 0.57 | 0.25 | 4.4 | 1.7 | 3.5 | 0 | ~180 |
 | joins | 3,000 + 500 | 7.0 / 8.6 | 8.7 / 13.9 | 0.63 | 0.26 | 0.35 | 0.66 | 4.0 | 0 | ~21 |
 | hotspots | 5,000 | 11.4 / 13.5 | 17.8 / 23.7 | 1.1 | 0.38 | 1.7 | 1.6 | 5.5 | 0 | ~98 |
 | uniform | 5,000 | 10.0 / 12.1 | 14.3 / 17.6 | 1.2 | 0.39 | 0.44 | 1.1 | 5.8 | 0 | ~28 |
-| uniform | 10,000 | 19.0 / 22.4, 1 overrun | 31.1 / 39.6, 180 overruns | 2.4 | 1.2 | 1.2 | 2.2 | 11.0 | 0 | ~45 |
+| uniform | 10,000 | 16.5 / 22.2, 3 overruns | 31.1 / 39.6, 180 overruns | 2.4 | 1.2 | 1.2 | 2.3 | 8.3 | 0 | ~43 |
 
 Findings:
 
-1. **The blob passes with room to spare** (p99 14.1 ms against the 25 ms bar), and **10k now fits the 33 ms tick**: 1 overrun, down from 180.
+1. **The blob passes with room to spare** (p99 13.1 ms against the 25 ms bar), and **10k now fits the 33 ms tick**: 3 overruns in 40 s, all during machine-wide stalls that also overran the swarm, versus 180 before.
 2. **Sharding removed the serial transport cost.** At 10k, ingress fell from 9.6 to 2.4 ms and transport from 9.1 to 2.2 ms. What's left serial is the events phase (1.2 ms at 10k), where inputs are pushed into the world's queues.
-3. **Egress is now the biggest phase:** about 11 ms at 10k, one `send_to` per packet. That's transport step 5: `sendmmsg`/GSO, and `SO_REUSEPORT` sockets per group of shards.
+3. **Egress is still the biggest phase.** At 10k in the same session, `sendmmsg` takes 8.3 ms p50 against 10.8 ms for `send_to`, 23% less, and the tick p50 falls from 18.9 to 16.5 ms. The rest waits for `SO_REUSEPORT`, GSO after M2, and bare metal.
 4. **Assembly scales with density, as expected:** 4.5 ms for the blob (every client scans about 3,000 candidates) versus 1.2 ms for 10k uniform. This is where M2's tiers and budgets land.
-5. **Steady state has no stand-ins and no corrections in any scenario.** All stand-ins happen during a thundering-herd join: 10,000 bots connecting within about 0.5 s pushed the tick to ~150 ms once. The summary's "after warmup" line separates that burst out. No jitter or loss is simulated over the sockets yet; run under `netem` for that.
-6. **Joins don't spike the tick yet,** because a spawn here is just a Welcome. Zone-entry cost (the initial world state, which needs fragmentation) isn't modeled.
+5. **Steady state has no stand-ins and no corrections in any scenario.**
+    - **Joins used to spike the tick.** Without the accept budget, 10k bots connecting within about 0.5 s pushed one tick to about 150 ms: each accept costs about 138 µs, mostly page-faulting the ~130 KB of connection windows.
+    - **With the budget (256 per tick), the worst join tick is 23 ms.** Joins take p50 0.7 s and p99 1.6 s. Join-time stand-ins fall from about 20k to about 2k, none of them frozen.
+    - **No jitter or loss is simulated over the sockets yet;** run under `netem` for that.
+6. **Input latency averages 81–84 ms** (p99 ≈ 133 ms at 10k, 100 ms in the blob). The in-process lockstep floor is exactly 2 ticks (67 ms):
+    - the spare input costs 1 tick;
+    - reading the snapshot on the bot's next tick costs 1 more.
+
+    Over real sockets, the unaligned phases of the bot and server clocks add about half a tick, and at 10k the server's own ~16 ms tick adds to it as well.
+7. **Zone entry isn't modeled yet.** A spawn here is just a Welcome. The real zone-entry cost is sending the initial world state, which needs fragmentation first.

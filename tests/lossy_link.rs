@@ -89,9 +89,12 @@ impl World {
     }
 
     fn sharded(n_clients: usize, shards: usize, max_clients: usize, profile: LinkProfile, seed: u64) -> Self {
+        Self::with_config(Config::default(), n_clients, shards, max_clients, profile, seed)
+    }
+
+    fn with_config(cfg: Config, n_clients: usize, shards: usize, max_clients: usize, profile: LinkProfile, seed: u64) -> Self {
         let now = Instant::now();
         let server_addr: SocketAddr = SERVER.parse().unwrap();
-        let cfg = Config::default();
         let server = Server::with_shards(cfg.clone(), max_clients, shards, now);
         let clients = (0..n_clients)
             .map(|i| (client_addr(i), Client::new(cfg.clone(), server_addr, now)))
@@ -500,4 +503,24 @@ fn misrouted_handshake_is_dropped() {
     assert_eq!(server.drain_outgoing().count(), 0, "no challenge from the wrong shard");
     server.receive(addr, &req, now);
     assert_eq!(server.drain_outgoing().count(), 1, "routed correctly, it gets a challenge");
+}
+
+#[test]
+fn accept_budget_spreads_a_mass_join_over_ticks() {
+    let clean = LinkProfile { loss: 0.0, dup: 0.0, base_ms: 5, jitter_ms: 0 };
+    // 8 per tick server-wide = 2 per shard per tick.
+    let cfg = Config { max_accepts_per_tick: 8, ..Config::default() };
+    let mut w = World::with_config(cfg, 200, 4, 10_000, clean, 13);
+    let mut most_per_tick = 0;
+    for _ in 0..2000 {
+        let joined = w.step().iter().filter(|e| matches!(e, ServerEvent::Connected { .. })).count();
+        most_per_tick = most_per_tick.max(joined);
+        if w.clients.iter().all(|(_, c)| c.state() == ClientState::Connected) {
+            break;
+        }
+    }
+    assert!(w.clients.iter().all(|(_, c)| c.state() == ClientState::Connected), "everyone gets in eventually");
+    assert!(most_per_tick <= 8, "{most_per_tick} accepts in one tick");
+    assert!(w.server.deferred_accepts() > 0);
+    assert_eq!(w.server.client_count(), 200);
 }
