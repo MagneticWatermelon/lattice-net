@@ -30,7 +30,7 @@ use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearS
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{step, Input, MoveState, TICK_HZ, WORLD_SIZE};
 use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
-use crate::msg::{self, Blob, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
+use crate::msg::{self, Blob, PacketFill, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
 use crate::rng::Rng;
 use crate::stats::Histogram;
 
@@ -685,6 +685,7 @@ impl SimServer {
         // 8. per-client assembly, grouped by shard so each shard's snapshots
         // are ready for its transport task
         let max_message = self.cfg.net.max_message_size();
+        let packet_body = self.cfg.net.packet_body_size();
         let view = View {
             cfg: &self.interest,
             tick,
@@ -701,6 +702,7 @@ impl SimServer {
             far_grid: &self.far_grid,
             squads: &self.squads,
             max_message,
+            packet_body,
         };
         self.shard_clients
             .par_iter_mut()
@@ -882,6 +884,8 @@ struct View<'a> {
     far_grid: &'a Grid,
     squads: &'a HashMap<u32, Vec<u16>>,
     max_message: usize,
+    /// Message bytes per packet, for `PacketFill`.
+    packet_body: usize,
     pace: u16,
     level: u8,
     /// Capture this entity's client this tick.
@@ -1060,19 +1064,25 @@ impl View<'_> {
 
         // Budget: own state, then near, then mid, then far. What doesn't fit of
         // far is carried; a carried entity that doesn't fit again is starving.
-        let cost = |tier: Tier, n: usize| {
-            let per = msg::blobs_per_message(tier, self.max_message);
-            n.div_ceil(per) * msg::ENTITIES_HEADER + n * msg::blob_size(tier)
+        // Costs follow how the messages will pack (`PacketFill`).
+        let mut fill = PacketFill::new(self.packet_body);
+        fill.push(SNAPSHOT_LEN);
+        if near_bytes > 0 {
+            fill.push(near_bytes);
+        }
+        let cost = |fill: PacketFill, tier: Tier, n: usize| {
+            fill.entities(n, msg::blob_size(tier), msg::blobs_per_message(tier, self.max_message))
         };
         let mut left = cfg.budget_bytes.saturating_sub(SNAPSHOT_LEN + near_bytes);
         let mut n_mid = sc.mid.len();
-        while n_mid > 0 && cost(Tier::Mid, n_mid) > left {
+        while n_mid > 0 && cost(fill, Tier::Mid, n_mid).0 > left {
             n_mid -= 1;
         }
         sc.tally.mid_truncated += (sc.mid.len() - n_mid) as u64;
-        left -= cost(Tier::Mid, n_mid);
+        let (mid_cost, after_mid) = cost(fill, Tier::Mid, n_mid);
+        left -= mid_cost;
         let mut n_far = sc.far.len();
-        while n_far > 0 && cost(Tier::Far, n_far) > left {
+        while n_far > 0 && cost(after_mid, Tier::Far, n_far).0 > left {
             n_far -= 1;
         }
         let mut starved = 0;
@@ -1112,9 +1122,9 @@ impl View<'_> {
             snaps.push((slot.client, m, Some(tick))); // tagged: its ack sets baselines
         }
         let mid_blobs = sc.mid[..n_mid].iter().map(|&(_, j)| &self.far_blobs[j as usize][..]);
-        bytes += self.write_tier(Tier::Mid, mid_blobs, slot.client, snaps);
+        bytes += self.write_tier(Tier::Mid, mid_blobs, &mut fill, slot.client, snaps);
         let far_blobs = sc.far[..n_far].iter().map(|&(_, j)| &self.far_blobs[j as usize][..]);
-        bytes += self.write_tier(Tier::Far, far_blobs, slot.client, snaps);
+        bytes += self.write_tier(Tier::Far, far_blobs, &mut fill, slot.client, snaps);
 
         if self.watch == Some(e) {
             let sent: std::collections::HashSet<u16> = sc.picked.iter().map(|p| p.0).collect();
@@ -1157,11 +1167,13 @@ impl View<'_> {
         t.bytes += bytes as u64;
     }
 
-    /// Writes `blobs` as Entities messages of at most one packet each.
+    /// Writes `blobs` as Entities messages of at most one packet each, the
+    /// first sized to fill the current packet.
     fn write_tier<'b>(
         &self,
         tier: Tier,
         blobs: impl ExactSizeIterator<Item = &'b [u8]>,
+        fill: &mut PacketFill,
         client: ClientId,
         snaps: &mut Vec<Snap>,
     ) -> usize {
@@ -1169,13 +1181,14 @@ impl View<'_> {
         let mut blobs = blobs;
         let (mut left, mut bytes) = (total, 0);
         while left > 0 {
-            let n = left.min(per);
+            let n = fill.next_chunk(left, size, per);
             let mut w = Writer::with_capacity(msg::ENTITIES_HEADER + n * size);
             msg::write_entities_header(&mut w, self.tick, tier, n as u8);
             for b in blobs.by_ref().take(n) {
                 w.bytes(b);
             }
             bytes += w.len();
+            fill.push(w.len());
             snaps.push((client, w.into_inner(), None));
             left -= n;
         }

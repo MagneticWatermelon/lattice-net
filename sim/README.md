@@ -100,7 +100,7 @@ Stand-ins can exceed bot corrections: a stand-in whose input matches what the bo
 - **Input wait**: from an input's datagram arriving (stamped by the receive thread) to the tick that applies it.
 - **The ladder**: level, tick rate, dilation and pace per window, the share of clients degraded by their own bandwidth ladder, and ticks spent at each level.
 
-The server preallocates `max-clients` connections at startup (`--no-prealloc` to skip). Egress uses `sendmmsg` on Linux (`--egress sendto` for comparison).
+The server preallocates `max-clients` connections at startup (`--no-prealloc` to skip). Egress uses `sendmmsg` on Linux (`--egress sendto` for comparison). `--egress gso` sends each client's packets for the tick as one `UDP_SEGMENT` send, and the summary counts datagrams, sends and syscalls.
 
 **Bot output**
 - Snapshots, entities per snapshot per tier, **update interval per tier** (every 20th bot tracks the entities it hears about, `--track-every`), corrections, kbps per bot, RTT, join latency (connect → Welcome), and **swarm overruns**. An overrun means the bots were late, so treat any corrections in that window as swarm artifacts.
@@ -160,6 +160,28 @@ Findings:
     - The rest is encoding (~30 ns per entity for the codec itself), plus building the entries and a message per client.
     - At 10k that's ~4 ms. The level-6 tick still fits (p50 33 ms of its 50 ms period).
 - **Candidates if it matters:** writing the bits directly into the message buffer, and a flat per-shard index for acks.
+
+## GSO on the WSL2 dev box
+
+`UDP_SEGMENT` hands the kernel one buffer per destination, which it cuts into datagrams (on a real NIC, in hardware). Every segment but the last must be the same size, so:
+
+- **The sim fills packets.** Mid and far messages are lists of 11 B blobs, so they can be split at any entity. `PacketFill` (`msg.rs`) predicts how the transport packs a client's messages, and sizes each tier's first message to fill what's left of the current packet. The byte budget uses the same model. Every packet but a client's last leaves nearly full.
+- **The transport pads the rest** (`Config::pad_packets`, protocol `LATTICE2`), only with `--egress gso`.
+- **Egress groups each client's datagrams into one `sendmmsg` entry** with a `UDP_SEGMENT` cmsg. A run is cut wherever the equal-size rule breaks, and at the kernel's 64-segment limit, so egress stays correct even without padding.
+
+Without the filling, padding is 39.5% of bytes in the swarm test below. In the blob, a client's first packet carries the snapshot and the near message (~400 B), and the ~950 B mid message starts the second. With it, padding is 0.6% of bytes in that test (150 bots, several packets each), and 0.3% over UDP in the blob.
+
+**Results** (blob 3,000, two runs of each, in alternating order):
+
+| egress | datagrams per client-tick | sends per client-tick | egress p50 / p99 (ms) | tick p99 (ms) | bytes per snapshot |
+|---|---|---|---|---|---|
+| `sendmmsg` | 2.00 | 2.00 | 6.2–6.7 / 7.5–7.8 | 26.1–26.4 | 1,400 B |
+| `gso` | 2.00 | 1.00 | 4.5–4.9 / 5.7–6.0 | 24.5–24.6 | 1,405 B |
+
+- **Egress falls ~25%** for 0.3% more bytes, with zero send and decode errors. The syscall count doesn't change: one `sendmmsg` per shard per tick either way. What GSO saves is the per-datagram trip through the stack.
+- **The blob still needs 2 packets** (1,400 B of messages against 1,181 B per packet). Splitting costs ~0.7% of bytes (one more message header per client-tick) and saves no packet here. It can save one where whole-message packing would spill into a third.
+- **Clients with one packet per tick gain nothing.** That's most of hotspots and all of 10k at level 6.
+- **The real verdict needs bare metal.** On a NIC with segmentation offload, the kernel does the cutting once per client instead of once per datagram.
 
 ## M2d: the degradation ladder on the WSL2 dev box
 

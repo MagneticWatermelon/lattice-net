@@ -22,6 +22,8 @@ pub(crate) const MAX_RELIABLE_PER_PACKET: usize = 32;
 
 pub(crate) const KIND_UNRELIABLE: u8 = 0;
 pub(crate) const KIND_RELIABLE: u8 = 1;
+/// The rest of the packet is zero padding (see `Config::pad_packets`).
+pub(crate) const KIND_PADDING: u8 = 2;
 
 #[inline]
 pub(crate) fn wire_size(reliable: bool, len: usize) -> usize {

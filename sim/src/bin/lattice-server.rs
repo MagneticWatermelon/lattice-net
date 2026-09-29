@@ -4,8 +4,8 @@
 //! A dedicated thread blocks on `recv_from` and queues datagrams into per-shard
 //! buckets, so arrivals spread across the tick don't have to fit in the kernel
 //! buffer and routing costs no tick time. Egress is one rayon task per shard,
-//! batched with `sendmmsg` on Linux (GSO waits for M2, when clients get several
-//! packets per tick).
+//! batched with `sendmmsg` on Linux, optionally with GSO (`--egress gso`): each
+//! client's datagrams for the tick go out as one `UDP_SEGMENT` send.
 
 use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
@@ -43,7 +43,9 @@ lattice-server: M1 movement-only authoritative server
   --shards N           transport shards [64]
   --accepts-per-tick N new connections accepted per tick, server-wide (0 = no limit) [256]
   --no-prealloc        allocate connections on accept instead of pooling max-clients at startup
-  --egress MODE        sendmmsg | sendto   [sendmmsg on Linux, else sendto]
+  --egress MODE        gso | sendmmsg | sendto   [sendmmsg on Linux, else sendto]
+                       gso: sendmmsg with one UDP_SEGMENT send per client (pads
+                       all but a client's last packet to full size; Linux 4.18+)
   --duration S         stop after S seconds (0 = run forever) [0]
   --until-empty        stop once clients connected and then all left
   --report S           report interval, seconds [5]
@@ -63,6 +65,9 @@ enum Egress {
     SendTo,
     /// Up to `MMSG_BATCH` datagrams per `sendmmsg` syscall (Linux only).
     SendMmsg,
+    /// `sendmmsg` where each entry is one client's datagrams as a single
+    /// `UDP_SEGMENT` (GSO) send (Linux only).
+    Gso,
 }
 
 impl Default for Egress {
@@ -81,18 +86,42 @@ impl std::str::FromStr for Egress {
         match s {
             "sendto" => Ok(Egress::SendTo),
             "sendmmsg" if cfg!(target_os = "linux") => Ok(Egress::SendMmsg),
-            "sendmmsg" => Err("sendmmsg needs Linux".into()),
-            _ => Err(format!("unknown egress mode {s:?} (sendmmsg|sendto)")),
+            "gso" if cfg!(target_os = "linux") => Ok(Egress::Gso),
+            "sendmmsg" | "gso" => Err(format!("{s} needs Linux")),
+            _ => Err(format!("unknown egress mode {s:?} (gso|sendmmsg|sendto)")),
         }
     }
 }
 
-/// Sends every datagram; returns how many failed.
-fn send_all(sock: &UdpSocket, batch: &[Datagram], mode: Egress) -> usize {
+/// What one bucket's egress took.
+#[derive(Debug, Default, Clone, Copy)]
+struct Sent {
+    /// Datagrams the kernel rejected.
+    errors: usize,
+    /// Sends handed to the kernel: one per datagram, or per GSO run.
+    sends: usize,
+    syscalls: usize,
+}
+
+impl std::ops::Add for Sent {
+    type Output = Sent;
+    fn add(self, o: Sent) -> Sent {
+        Sent { errors: self.errors + o.errors, sends: self.sends + o.sends, syscalls: self.syscalls + o.syscalls }
+    }
+}
+
+/// Sends every datagram.
+fn send_all(sock: &UdpSocket, batch: &[Datagram], mode: Egress) -> Sent {
     match mode {
         #[cfg(target_os = "linux")]
         Egress::SendMmsg => send_mmsg(sock, batch),
-        _ => batch.iter().filter(|(addr, pkt)| sock.send_to(pkt, addr).is_err()).count(),
+        #[cfg(target_os = "linux")]
+        Egress::Gso => send_gso(sock, batch),
+        _ => Sent {
+            errors: batch.iter().filter(|(addr, pkt)| sock.send_to(pkt, addr).is_err()).count(),
+            sends: batch.len(),
+            syscalls: batch.len(),
+        },
     }
 }
 
@@ -102,10 +131,10 @@ const MMSG_BATCH: usize = 256;
 /// `sendmmsg` in batches. A datagram the kernel rejects is counted and
 /// skipped; the rest of the batch is retried from the next one.
 #[cfg(target_os = "linux")]
-fn send_mmsg(sock: &UdpSocket, batch: &[Datagram]) -> usize {
+fn send_mmsg(sock: &UdpSocket, batch: &[Datagram]) -> Sent {
     use std::os::fd::AsRawFd;
     let fd = sock.as_raw_fd();
-    let mut errors = 0;
+    let mut sent = Sent { sends: batch.len(), ..Sent::default() };
     for chunk in batch.chunks(MMSG_BATCH) {
         let addrs: Vec<socket2::SockAddr> = chunk.iter().map(|(a, _)| socket2::SockAddr::from(*a)).collect();
         let mut iovs: Vec<libc::iovec> = chunk
@@ -132,17 +161,134 @@ fn send_mmsg(sock: &UdpSocket, batch: &[Datagram]) -> usize {
             // SAFETY: every header points into `addrs`, `iovs` and the datagrams in
             // `chunk`, all alive and unmoved for the duration of the call.
             let n = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr().add(off), (msgs.len() - off) as libc::c_uint, 0) };
+            sent.syscalls += 1;
             if n > 0 {
                 off += n as usize;
             } else if n < 0 && std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
                 continue;
             } else {
-                errors += 1; // the datagram at `off` was rejected
+                sent.errors += 1; // the datagram at `off` was rejected
                 off += 1;
             }
         }
     }
-    errors
+    sent
+}
+
+/// Most segments per GSO send: the kernel's `UDP_MAX_SEGMENTS` (64), and
+/// the whole send must stay under 64 KB.
+#[cfg(target_os = "linux")]
+fn max_segments(seg: usize) -> usize {
+    (65_000 / seg.max(1)).min(64)
+}
+
+/// Splits `batch` into GSO runs: consecutive datagrams to one address where
+/// all but the last have the same size and the last is no bigger (what
+/// `UDP_SEGMENT` requires). The transport emits a client's datagrams back to
+/// back, padded (`Config::pad_packets`), so a run is normally one client's tick.
+#[cfg(target_os = "linux")]
+fn gso_runs(batch: &[Datagram]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < batch.len() {
+        let seg = batch[i].1.len();
+        let mut j = i + 1;
+        while j < batch.len()
+            && j - i < max_segments(seg)
+            && batch[j].0 == batch[i].0
+            && batch[j - 1].1.len() == seg
+            && batch[j].1.len() <= seg
+        {
+            j += 1;
+        }
+        runs.push((i, j - i));
+        i = j;
+    }
+    runs
+}
+
+/// Whether the kernel knows `UDP_SEGMENT` (Linux 4.18+).
+#[cfg(target_os = "linux")]
+fn gso_supported(sock: &UdpSocket) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: v and len are valid for writes of the sizes given.
+    let r = unsafe {
+        libc::getsockopt(sock.as_raw_fd(), libc::SOL_UDP, libc::UDP_SEGMENT, &mut v as *mut _ as *mut libc::c_void, &mut len)
+    };
+    r == 0
+}
+
+/// `sendmmsg` where each entry is a GSO run (`gso_runs`): one datagram per
+/// segment on the wire, but one trip through the stack per run. A run the
+/// kernel rejects counts all its datagrams as errors.
+#[cfg(target_os = "linux")]
+fn send_gso(sock: &UdpSocket, batch: &[Datagram]) -> Sent {
+    use std::os::fd::AsRawFd;
+    let fd = sock.as_raw_fd();
+    // SAFETY: CMSG_SPACE is a pure size computation.
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
+    assert!(space <= std::mem::size_of::<[u64; 4]>());
+    let runs = gso_runs(batch);
+    let mut sent = Sent { sends: runs.len(), ..Sent::default() };
+    let mut iovs: Vec<libc::iovec> = Vec::new();
+    for chunk in runs.chunks(MMSG_BATCH) {
+        let addrs: Vec<socket2::SockAddr> = chunk.iter().map(|&(i, _)| socket2::SockAddr::from(batch[i].0)).collect();
+        iovs.clear();
+        iovs.extend(chunk.iter().flat_map(|&(i, n)| &batch[i..i + n]).map(|(_, p)| libc::iovec {
+            iov_base: p.as_ptr() as *mut libc::c_void,
+            iov_len: p.len(),
+        }));
+        let mut cmsgs = vec![[0u64; 4]; chunk.len()];
+        let (iov_base, cmsg_base) = (iovs.as_mut_ptr(), cmsgs.as_mut_ptr());
+        let mut first = 0;
+        let mut msgs: Vec<libc::mmsghdr> = chunk
+            .iter()
+            .zip(&addrs)
+            .enumerate()
+            .map(|(k, (&(i, n), addr))| {
+                // SAFETY: msghdr is plain data; all-zero is a valid empty header.
+                let mut h: libc::msghdr = unsafe { std::mem::zeroed() };
+                h.msg_name = addr.as_ptr() as *mut libc::c_void;
+                h.msg_namelen = addr.len();
+                // SAFETY: first + n <= iovs.len(): the runs of this chunk, in order.
+                h.msg_iov = unsafe { iov_base.add(first) };
+                h.msg_iovlen = n;
+                first += n;
+                if n > 1 {
+                    // SAFETY: k < cmsgs.len(); each buffer is 8-aligned and at least
+                    // CMSG_SPACE(2) bytes, so the header and its u16 fit.
+                    unsafe {
+                        h.msg_control = cmsg_base.add(k) as *mut libc::c_void;
+                        h.msg_controllen = space;
+                        let c = libc::CMSG_FIRSTHDR(&h);
+                        (*c).cmsg_level = libc::SOL_UDP;
+                        (*c).cmsg_type = libc::UDP_SEGMENT;
+                        (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
+                        std::ptr::write_unaligned(libc::CMSG_DATA(c) as *mut u16, batch[i].1.len() as u16);
+                    }
+                }
+                libc::mmsghdr { msg_hdr: h, msg_len: 0 }
+            })
+            .collect();
+        let mut off = 0;
+        while off < msgs.len() {
+            // SAFETY: every header points into `addrs`, `iovs`, `cmsgs` and the
+            // datagrams in `batch`, all alive and unmoved for the duration of the call.
+            let n = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr().add(off), (msgs.len() - off) as libc::c_uint, 0) };
+            sent.syscalls += 1;
+            if n > 0 {
+                off += n as usize;
+            } else if n < 0 && std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                continue;
+            } else {
+                sent.errors += chunk[off].1; // the run at `off` was rejected
+                off += 1;
+            }
+        }
+    }
+    sent
 }
 
 fn col_name(i: usize) -> &'static str {
@@ -159,11 +305,16 @@ struct NetCounters {
     in_bytes: AtomicU64,
     recv_errors: AtomicU64,
     send_errors: AtomicU64,
+    /// Datagrams sent, and the sends (a GSO run counts once) and syscalls it took.
+    out_pkts: AtomicU64,
+    sends: AtomicU64,
+    send_syscalls: AtomicU64,
 }
 
 fn main() -> std::io::Result<()> {
     let mut a = Args::parse(USAGE);
     let bind: SocketAddr = a.get("bind", "0.0.0.0:40000".parse().unwrap());
+    let egress: Egress = a.get("egress", Egress::default());
     let cfg = SimConfig {
         spawn: a.get("spawn", SpawnMode::Uniform),
         max_clients: a.get("max-clients", 10_000),
@@ -191,9 +342,12 @@ fn main() -> std::io::Result<()> {
             LadderConfig { enabled, high: a.get("ladder-high", d.high), low: a.get("ladder-low", d.low) }
         },
         seed: a.get("seed", 1),
-        net: Config { max_accepts_per_tick: a.get("accepts-per-tick", 256), ..Config::default() },
+        net: Config {
+            max_accepts_per_tick: a.get("accepts-per-tick", 256),
+            pad_packets: egress == Egress::Gso,
+            ..SimConfig::default().net
+        },
     };
-    let egress: Egress = a.get("egress", Egress::default());
     let threads: Option<usize> = a.opt("threads");
     let duration = Duration::from_secs_f64(a.get("duration", 0.0));
     let until_empty = a.flag("until-empty");
@@ -214,6 +368,10 @@ fn main() -> std::io::Result<()> {
     sock.bind(&bind.into())?;
     let (rcvbuf, sndbuf) = (sock.recv_buffer_size()?, sock.send_buffer_size()?);
     let sock: UdpSocket = sock.into();
+    #[cfg(target_os = "linux")]
+    if egress == Egress::Gso && !gso_supported(&sock) {
+        return Err(std::io::Error::other("--egress gso: this kernel has no UDP_SEGMENT (needs Linux 4.18+)"));
+    }
     sock.set_read_timeout(Some(Duration::from_millis(50)))?;
     let sock = Arc::new(sock);
 
@@ -315,14 +473,17 @@ fn main() -> std::io::Result<()> {
             .par_iter_mut()
             .map(|bucket| {
                 let (n, bytes) = (bucket.len(), bucket.iter().map(|(_, p)| p.len()).sum::<usize>());
-                let errors = send_all(&sock, bucket, egress);
-                if errors > 0 {
-                    net.send_errors.fetch_add(errors as u64, Relaxed);
+                let sent = send_all(&sock, bucket, egress);
+                if sent.errors > 0 {
+                    net.send_errors.fetch_add(sent.errors as u64, Relaxed);
                 }
+                net.sends.fetch_add(sent.sends as u64, Relaxed);
+                net.send_syscalls.fetch_add(sent.syscalls as u64, Relaxed);
                 bucket.clear();
                 (n, bytes)
             })
             .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        net.out_pkts.fetch_add(pkts as u64, Relaxed);
         window.out_pkts += pkts as u64;
         window.out_bytes += bytes as u64;
 
@@ -599,6 +760,11 @@ fn print_summary(
         net.recv_errors.load(Relaxed),
         net.send_errors.load(Relaxed)
     );
+    let (pkts, sends, calls) = (net.out_pkts.load(Relaxed), net.sends.load(Relaxed), net.send_syscalls.load(Relaxed));
+    println!(
+        "  egress (whole run): {pkts} datagrams in {sends} sends ({:.2} per send), {calls} syscalls",
+        pkts as f64 / sends.max(1) as f64
+    );
     let levels: Vec<String> = c
         .level_ticks
         .iter()
@@ -647,4 +813,26 @@ fn kernel_udp_drops() -> [u64; 2] {
 #[cfg(not(target_os = "linux"))]
 fn kernel_udp_drops() -> [u64; 2] {
     [0; 2]
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gso_runs_follow_udp_segment_rules() {
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:1".parse().unwrap();
+        let d = |to, len| (to, vec![0u8; len]);
+        let batch = vec![
+            d(a, 1200), d(a, 1200), d(a, 300), // one client, padded: one run
+            d(a, 500),                          // same client again after its short last one
+            d(b, 900), d(b, 1000),              // bigger after smaller: can't share a run
+            d(b, 40),
+        ];
+        assert_eq!(gso_runs(&batch), [(0, 3), (3, 1), (4, 1), (5, 2)]);
+        // Never more than the kernel's segment limit.
+        let many: Vec<Datagram> = (0..70).map(|_| d(a, 1200)).collect();
+        assert_eq!(gso_runs(&many), [(0, 54), (54, 16)]);
+    }
 }

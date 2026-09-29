@@ -14,10 +14,13 @@
 //! The snapshot's own state is full-precision f32: the bot compares it bit-exactly
 //! with its prediction for `ack_seq`. Entity messages carry one tier each and
 //! never exceed one packet (there's no fragmentation yet), so a tier with more
-//! blobs than fit is split over several messages.
+//! blobs than fit is split over several messages. The first one is sized to
+//! fill what's left of the current packet (`PacketFill`), so every packet but
+//! a client's last leaves the server nearly full: GSO pads them to equal size.
 
 use lattice_net::bitpack::{dequantize, dequantize_angle, quantize, BitReader, BitWriter};
 use lattice_net::wire::{DecodeError, Reader, Writer};
+use lattice_net::Config;
 
 use crate::interest::Tier;
 use crate::movement::{Input, MoveState, WORLD_SIZE};
@@ -48,6 +51,50 @@ pub fn blob_size(_tier: Tier) -> usize {
 /// Most blobs of `tier` one Entities message of at most `max_message` bytes holds.
 pub fn blobs_per_message(tier: Tier, max_message: usize) -> usize {
     ((max_message - ENTITIES_HEADER) / blob_size(tier)).min(u8::MAX as usize)
+}
+
+/// Predicts how the transport packs one client's unreliable messages (in
+/// order, greedily, each packet holding `body` bytes), so a tier's blobs can be
+/// split to fill the current packet instead of leaving it part-empty.
+/// Reliable messages go first in the real packing; they are rare here, and
+/// when present only cost some fill, never correctness.
+#[derive(Debug, Clone, Copy)]
+pub struct PacketFill {
+    body: usize,
+    used: usize,
+}
+
+impl PacketFill {
+    pub fn new(body: usize) -> Self {
+        Self { body, used: 0 }
+    }
+
+    /// Account for an unreliable message of `len` bytes.
+    pub fn push(&mut self, len: usize) {
+        let w = Config::unreliable_wire_size(len);
+        self.used = if self.used + w > self.body { w } else { self.used + w };
+    }
+
+    /// Blobs in the next Entities message, given `left` to write: as many as
+    /// fit in the current packet, or a full message (`per`) if none do.
+    pub fn next_chunk(&self, left: usize, size: usize, per: usize) -> usize {
+        // framing: kind(1) + varlen(2, worst case)
+        let fit = (self.body - self.used).saturating_sub(3 + ENTITIES_HEADER) / size;
+        left.min(per).min(if fit > 0 { fit } else { per })
+    }
+
+    /// Bytes of `n` blobs written as Entities messages from here, and the fill after.
+    pub fn entities(mut self, n: usize, size: usize, per: usize) -> (usize, Self) {
+        let (mut left, mut bytes) = (n, 0);
+        while left > 0 {
+            let k = self.next_chunk(left, size, per);
+            let len = ENTITIES_HEADER + k * size;
+            self.push(len);
+            bytes += len;
+            left -= k;
+        }
+        (bytes, self)
+    }
 }
 
 pub fn encode_inputs(newest_seq: u32, newest_first: &[Input]) -> Vec<u8> {

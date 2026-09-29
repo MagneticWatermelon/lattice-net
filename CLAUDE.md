@@ -47,7 +47,8 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - `sendmmsg` egress.
   - Connection memory ~130 → ~36 KB: windows of 256 sent / 128 received / 256 reliable, reliable ids inline, reliable windows lazy.
   - A per-shard connection pool (`Server::preallocate`); an accept costs about 4 µs.
-  - `ack_delay` in the header, so RTT excludes the peer's hold. Protocol id is now `LATTICE1`.
+  - `ack_delay` in the header, so RTT excludes the peer's hold.
+  - GSO: `Config::pad_packets` pads all but a connection's last packet of the tick (a kind-2 padding message, protocol id `LATTICE2`), and the sim server's `--egress gso` sends each client's packets as one `UDP_SEGMENT` send. The sim fills packets first (`PacketFill`), so padding is ~0.3% of bytes. Blob egress −25% on WSL.
 - **Decided (M1 review, 2026-09-29):**
   - **With `SO_REUSEPORT`, the receiving socket picks the shard group.** The kernel hashes the 4-tuple, so the shard comes from the socket that received the handshake: each socket owns a fixed group of shards, and the keyed hash picks one within it. Don't re-bucket in receive threads.
   - **GSO (`UDP_SEGMENT`) only after M2.** It batches datagrams to a single destination, which only helps once clients get several packets per tick.
@@ -62,7 +63,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - Measure p50/p99 per-phase tick time, bytes per client, pps, and prediction corrections.
   - Scenarios: uniform spread; 3 hotspots of ~800; a 3,000-player blob within 200 m; 500 joins within 10 s.
   - Pass bar: p99 tick under ~25 ms on the blob.
-- **M2 (in progress):** interest management (tiers, priority accumulator, grid), plus a web top-down debug map showing what client X receives.
+- **M2 (built on WSL):** interest management (tiers, priority accumulator, grid), plus a web top-down debug map showing what client X receives.
   - **M2a (tiers) is built:** `sim/src/interest.rs`. Its design was decided in review (2026-09-29):
     - mid and far tiers are staggered by entity id alone, with no per-pair state;
     - the near tier is a per-client accumulator over ≤100 candidates;
@@ -81,7 +82,8 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - The cost: ~3.5 µs of assembly per client per tick (encoding + ack bookkeeping).
   - **Sink bots don't isolate server cost on one box:** the swarm is ~52% busy either way. Judging 10k's ladder level needs bots on a second machine.
   - **M2c (debug map) is built:** `lattice-server --debug-http 0.0.0.0:8080` serves a top-down map of what one client receives (`sim/src/debugmap.rs`, std only).
-  - **Next:** GSO, together with fixed-size packets or fragmentation (`UDP_SEGMENT` needs equal-size segments).
+  - **GSO is built** (see Transport decisions, Done). Mid and far messages are split to fill packets rather than fragmented; real fragmentation stays transport step 3.
+  - **Next:** transport step 1 (connect tokens + ChaCha20-Poly1305), before the bare-metal baseline and M3.
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.

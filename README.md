@@ -27,6 +27,7 @@ The CRC is a filter, not security. It cheaply rejects garbage, corrupted packets
 crc32:4 | type:1 | session:4 | seq:2 | ack:2 | ack_bits:32 | ack_delay:2 | messages...
                                                                             ^ 19 B fixed overhead
 message := kind:1 [id:2 if reliable] len:1-2 bytes
+padding := kind:1 (=2) zeros...     // to the end of the packet
 ```
 
 - `seq` is this packet's number, a u16 that wraps (compared with half-range arithmetic).
@@ -34,6 +35,7 @@ message := kind:1 [id:2 if reliable] len:1-2 bytes
 - So **every packet acks the last 33**. With 30–60 packets/s per direction, an ack survives unless ~33 consecutive packets are lost. You never send dedicated ack packets.
 - `ack_delay` is how long packet `ack` waited here before this packet carried its ack, in 10 µs units (saturating at ~655 ms). The peer subtracts it from its RTT sample (as QUIC does), so RTT measures the network, not the peer's tick rate.
 - `session` is a 32-bit tag derived from the handshake cookie. An off-path attacker who spoofs the client's IP still has to guess it.
+- **Padding.** With `Config::pad_packets`, `flush` pads every packet but a connection's last of the tick to `max_packet_size`, so the tick's packets can go out as one GSO send (`UDP_SEGMENT` needs equal-size segments). Padding is a kind-2 marker and zeros to the end; a receiver always accepts it and needs no setting. Padding bytes are counted in `Stats::padding_bytes`. `Config::packet_body_size` and `Config::unreliable_wire_size` let an application predict how its messages pack, and so fill packets instead of padding them (the sim does this for its mid and far tiers).
 
 ### Handshake (stateless, can't be used for amplification)
 
@@ -65,7 +67,7 @@ S→C  Accepted           { salt, client_id }            ← slot allocated here
 - Each sent packet records which reliable message ids it carried.
 - When that packet gets acked (via any of the 33 redundant acks), those messages are done.
 - Unacked messages are rewritten into new packets after the resend interval.
-- The receiver buffers out-of-order ids in a 256-slot window and delivers contiguous runs. The window is part of the protocol: both ends must use the same size (protocol id `LATTICE1`).
+- The receiver buffers out-of-order ids in a 256-slot window and delivers contiguous runs. The window is part of the protocol: both ends must use the same size. The protocol id changes with any such rule: `LATTICE1` was these windows, and `LATTICE2` added padding.
 - Limits:
   - Up to 256 messages can be in flight; excess waits in a backlog.
   - Up to 32 reliable messages per packet. A sent packet stays tracked for 256 packets, during which at most 32 × 256 = 8,192 new ids are issued, far below 65,536. So a late ack can never point at a reused message id.
@@ -90,7 +92,7 @@ In the M1 sim, 64 shards on 8 threads cut the 10k-client ingress from 9.6 ms to 
 
 ## Stats per connection
 
-The per-connection stats are packets and bytes sent and received, acked packets, lost packets, duplicates, dropped unreliable messages, smoothed RTT (EWMA 0.1), and smoothed loss (EWMA 0.05).
+The per-connection stats are packets and bytes sent and received, acked packets, lost packets, duplicates, dropped unreliable messages, padding bytes, smoothed RTT (EWMA 0.1), and smoothed loss (EWMA 0.05).
 - A packet counts as lost if it's still unacked 128 packets later.
 - RTT excludes the peer's hold time, via `ack_delay`. It still includes the gap between a datagram arriving and the `now` you pass to `receive`, so pass arrival timestamps: a receive thread's clock, or the kernel's `SO_TIMESTAMPNS`. With both, the sim's bots read 1.7–1.9 ms on loopback, down from 33–62 ms.
 - Only the newest ack yields an RTT sample (as in QUIC), since a packet first acked through `ack_bits` was held for an unknown extra time. Under heavy reordering this favors fast packets, so RTT reads low: 115 ms on the lossy-link test, whose mean path is ~140–155 ms.
@@ -118,6 +120,7 @@ The simulated link does loss, duplication, and base delay + jitter (which causes
 - **Many clients.** 300 clients connect through the lossy link, each with a unique id.
 - **Unreliable doesn't block.** 3 × 500 B unreliable messages per tick keep streaming, with no head-of-line blocking.
 - **Timeouts.** Both sides time out when the cable is cut.
+- **Padding** (unit tests in `connection.rs`). A flush of five 500 B messages makes three packets, the first two exactly 1,200 B, and the receiver gets all five messages. A lone packet is never padded, and padding that isn't all zeros is rejected.
 - **Server full.** A client over the limit gets Denied.
 - **Sharding.** Across 8 shards, 300 clients connect through the lossy link and echo reliably, and each id's shard matches its address route. `max_clients` holds across 16 shards (exactly 25 of 40 accepted). Shards run on real threads via `std::thread::scope`. A misrouted handshake is dropped. With an accept budget of 8 per tick, 200 simultaneous joins all get in, and no tick accepts more than 8.
 - **Recycled connections start clean.** A client that leaves unacked reliable messages behind hands its pooled connection to the next client. The next client gets none of the old messages, and its first reliable id isn't mistaken for a duplicate. (Skipping either reset fails this test.)
@@ -134,7 +137,7 @@ The simulated link does loss, duplication, and base delay + jitter (which causes
 5. **Syscall batching.** `sendmmsg` egress is done in the sim server (10k: 10.8 → 8.3 ms p50 on WSL). Still to do:
     - **`recvmmsg`.**
     - **`SO_REUSEPORT` with N network threads.** The kernel, not our keyed hash, picks the socket by hashing the 4-tuple. So at handshake time, take the shard from the socket that received the request: socket k owns a fixed group of shards, the keyed hash picks one within the group, and the client id encodes it. The kernel's hash is stable while the socket set is fixed, so no receive thread ever re-buckets. `SO_ATTACH_REUSEPORT_CBPF` is the fallback if exact control is needed.
-    - **`UDP_SEGMENT` GSO after M2.** GSO splits one buffer into datagrams for a single destination, so it only pays off once each client gets several packets per tick.
+    - **`UDP_SEGMENT` GSO is done** in the sim server (`--egress gso`): each client's padded packets go out as one `sendmmsg` entry. In the 3,000-player blob (2 packets per client-tick), egress falls ~25% on WSL for ~0.3% more bytes. Clients with one packet per tick gain nothing.
 
     Hand datagrams to the sim via SPSC rings. Move to AF_XDP only if pps becomes the bottleneck. Do the deep egress tuning on bare metal, since WSL's syscall and vswitch overhead distorts it. Because the protocol is sans-IO, none of this touches protocol code.
 6. **Connection memory, further.** The inline `[u16; 32]` of reliable ids makes the sent ring 256 × 88 B = 22 KB, most of a connection. Most packets carry no reliable ids, so a shared id ring would bring a connection to ~6 KB.

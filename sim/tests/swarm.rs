@@ -37,6 +37,8 @@ struct Swarm {
     stall_bot0: bool,
     /// Bot 0's outgoing packets are held back instead of sent (a lag switch).
     hold_bot0: Option<Vec<(SocketAddr, Vec<u8>)>>,
+    /// The server's datagrams from its latest tick, in send order.
+    last_out: Vec<(SocketAddr, usize)>,
 }
 
 impl Swarm {
@@ -67,6 +69,7 @@ impl Swarm {
             fake_load: None,
             stall_bot0: false,
             hold_bot0: None,
+            last_out: Vec::new(),
         }
     }
 
@@ -115,7 +118,9 @@ impl Swarm {
         self.server.tick(&mut inbound, self.now, &mut out);
         let work = self.fake_load.map_or(t.elapsed(), |f| period.mul_f32(f));
         self.server.observe_tick(work);
+        self.last_out.clear();
         for (to, pkt) in out.into_iter().flatten() {
+            self.last_out.push((to, pkt.len()));
             if self.rng.chance(self.loss) {
                 continue;
             }
@@ -621,4 +626,47 @@ fn debug_capture_reports_what_the_watched_client_got() {
     assert!(w.near.iter().all(|&(_, age, sent, _)| sent == (age == 0)));
     assert_eq!(w.radii, [150.0, 500.0, 1500.0]);
     assert!(w.bytes > w.near_bytes);
+}
+
+#[test]
+fn packets_fill_up_so_gso_padding_is_small() {
+    // A tight near radius in a blob: clients get big mid tiers, several packets each.
+    let cfg = SimConfig {
+        spawn: SpawnMode::Blob,
+        net: Config { pad_packets: true, max_packets_per_flush: 6, ..Config::default() },
+        interest: InterestConfig {
+            near_radius: 15.0,
+            squad_size: 0,
+            mid_period: 1,
+            mid_per_tick: 256,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut s = Swarm::with_config(150, cfg);
+    let mut multi = 0;
+    for step in 0..6 * TICK_HZ {
+        s.step();
+        if step < 3 * TICK_HZ {
+            continue;
+        }
+        // A client's packets are consecutive: all but its last are full size.
+        for run in s.last_out.chunk_by(|a, b| a.0 == b.0) {
+            multi += (run.len() > 1) as usize;
+            for &(_, len) in &run[..run.len() - 1] {
+                assert_eq!(len, lattice_net::packet::MAX_PACKET_SIZE);
+            }
+        }
+    }
+    assert!(multi > 1000, "clients got several packets per tick ({multi} times)");
+    let net = s.server.net();
+    let (mut padding, mut bytes, mut dropped) = (0, 0, 0);
+    for id in net.client_ids() {
+        let st = net.client_stats(id).unwrap();
+        (padding, bytes, dropped) = (padding + st.padding_bytes, bytes + st.bytes_sent, dropped + st.unreliable_dropped);
+    }
+    assert_eq!(dropped, 0);
+    let share = padding as f64 / bytes as f64;
+    assert!(share < 0.02, "padding is {:.1}% of bytes", share * 100.0);
+    assert_eq!(s.corrections(), 0);
 }

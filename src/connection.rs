@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::channel::{self, PacketIds, ReliableReceiver, ReliableSender, KIND_RELIABLE, KIND_UNRELIABLE};
+use crate::channel::{self, PacketIds, ReliableReceiver, ReliableSender, KIND_PADDING, KIND_RELIABLE, KIND_UNRELIABLE};
 use crate::packet::{self, AckHeader, Packet, ACK_DELAY_UNIT_US, PAYLOAD_OVERHEAD};
 use crate::seq::SequenceBuffer;
 use crate::wire::{DecodeError, Reader, Writer};
@@ -38,19 +38,24 @@ pub struct Config {
     /// mass join is spread over several ticks instead of stalling one.
     /// Each accept allocates the connection's windows (~130 KB). 0 = no limit.
     pub max_accepts_per_tick: usize,
+    /// Pad every packet of a flush but the last to `max_packet_size`, so the
+    /// flush can go out as one GSO send (`UDP_SEGMENT` needs equal-size
+    /// segments). Receivers need no setting: padding always parses.
+    pub pad_packets: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // LATTICE1: 256-message reliable windows (both ends must agree).
-            protocol_id: u64::from_le_bytes(*b"LATTICE1"),
+            // LATTICE2: padding messages. LATTICE1: 256-message reliable windows.
+            protocol_id: u64::from_le_bytes(*b"LATTICE2"),
             timeout: Duration::from_secs(5),
             keepalive_interval: Duration::from_millis(100),
             handshake_resend_interval: Duration::from_millis(100),
             max_packet_size: packet::MAX_PACKET_SIZE,
             max_packets_per_flush: 4,
             max_accepts_per_tick: 256,
+            pad_packets: false,
         }
     }
 }
@@ -60,6 +65,17 @@ impl Config {
     pub fn max_message_size(&self) -> usize {
         // worst-case message header: kind(1) + id(2) + varlen(2)
         self.max_packet_size - PAYLOAD_OVERHEAD - 5
+    }
+
+    /// Bytes of messages one packet holds.
+    pub fn packet_body_size(&self) -> usize {
+        self.max_packet_size - PAYLOAD_OVERHEAD
+    }
+
+    /// Bytes an unreliable message of `len` takes in a packet, framing included.
+    /// With `packet_body_size`, lets a caller predict how its messages pack.
+    pub fn unreliable_wire_size(len: usize) -> usize {
+        channel::wire_size(false, len)
     }
 }
 
@@ -75,6 +91,8 @@ pub struct Stats {
     pub bytes_received: u64,
     /// Unreliable messages that didn't fit in the flush they were queued for.
     pub unreliable_dropped: u64,
+    /// Bytes of padding sent (`Config::pad_packets`), included in `bytes_sent`.
+    pub padding_bytes: u64,
     /// Smoothed network RTT in ms (EWMA, alpha 0.1). The peer's ack delay is
     /// subtracted, so its tick rate doesn't count. What's left includes the gap
     /// between a datagram arriving and the `now` passed to `receive`, so pass
@@ -301,6 +319,7 @@ impl Connection {
             let id = match r.u8()? {
                 KIND_RELIABLE => Some(r.u16()?),
                 KIND_UNRELIABLE => None,
+                KIND_PADDING if r.rest().iter().all(|&b| b == 0) => break,
                 _ => return Err(DecodeError::Invalid),
             };
             let len = r.varlen()?;
@@ -381,13 +400,53 @@ impl Connection {
         AckHeader { seq, ack, ack_bits, ack_delay }
     }
 
+    /// Frame one packet body, optionally padded to `max_packet_size`.
+    fn emit(&mut self, mut body: Writer, ids: PacketIds, tags: PacketTags, pad: bool, now: Instant, out: &mut Vec<Vec<u8>>) {
+        let budget = self.cfg.packet_body_size();
+        if pad && body.len() < budget {
+            self.stats.padding_bytes += (budget - body.len()) as u64;
+            body.u8(KIND_PADDING);
+            body.pad_to(budget);
+        }
+        let seq = self.local_seq;
+
+        // Each sequence is judged exactly once, LOSS_LAG packets after it was sent.
+        if let Some(old) = self.sent.get(seq.wrapping_sub(LOSS_LAG)) {
+            let lost = !old.acked;
+            self.stats.packets_lost += lost as u64;
+            self.stats.loss += (lost as u8 as f32 - self.stats.loss) * 0.05;
+        }
+
+        let header = self.ack_fields(seq, now);
+        let pkt = packet::encode(
+            self.cfg.protocol_id,
+            &Packet::Payload {
+                session: self.session,
+                header,
+                body: body.as_slice(),
+            },
+        );
+        self.sent.insert(seq, SentPacket { time: now, acked: false, reliable: ids, tags });
+        self.local_seq = seq.wrapping_add(1);
+        self.last_send = Some(now);
+        self.stats.packets_sent += 1;
+        self.stats.bytes_sent += pkt.len() as u64;
+        out.push(pkt);
+    }
+
     /// Build this tick's packets: due reliable messages first, then queued
     /// unreliable ones. Emits a keepalive if nothing else was sent recently.
+    /// With `pad_packets`, all but the last are padded to `max_packet_size`.
     pub(crate) fn flush(&mut self, now: Instant, out: &mut Vec<Vec<u8>>) {
-        let budget = self.cfg.max_packet_size - PAYLOAD_OVERHEAD;
+        let budget = self.cfg.packet_body_size();
         let resend = self.resend_interval();
-        let mut produced = 0;
+        let keepalive_due =
+            self.last_send.is_none_or(|t| now.saturating_duration_since(t) >= self.cfg.keepalive_interval);
 
+        // Each body is held back until the next one exists, so only the last
+        // one goes out unpadded.
+        let mut pending: Option<(Writer, PacketIds, PacketTags)> = None;
+        let mut produced = 0;
         while produced < self.cfg.max_packets_per_flush {
             let mut body = Writer::with_capacity(budget);
             let mut ids = PacketIds::default();
@@ -405,38 +464,16 @@ impl Connection {
                 channel::write_message(&mut body, None, &msg);
             }
 
-            let keepalive_due = self
-                .last_send
-                .is_none_or(|t| now.saturating_duration_since(t) >= self.cfg.keepalive_interval);
             if body.is_empty() && !(produced == 0 && keepalive_due) {
                 break;
             }
-
-            let seq = self.local_seq;
-
-            // Each sequence is judged exactly once, LOSS_LAG packets after it was sent.
-            if let Some(old) = self.sent.get(seq.wrapping_sub(LOSS_LAG)) {
-                let lost = !old.acked;
-                self.stats.packets_lost += lost as u64;
-                self.stats.loss += (lost as u8 as f32 - self.stats.loss) * 0.05;
+            if let Some((prev, ids, tags)) = pending.replace((body, ids, tags)) {
+                self.emit(prev, ids, tags, self.cfg.pad_packets, now, out);
             }
-
-            let header = self.ack_fields(seq, now);
-            let pkt = packet::encode(
-                self.cfg.protocol_id,
-                &Packet::Payload {
-                    session: self.session,
-                    header,
-                    body: body.as_slice(),
-                },
-            );
-            self.sent.insert(seq, SentPacket { time: now, acked: false, reliable: ids, tags });
-            self.local_seq = seq.wrapping_add(1);
-            self.last_send = Some(now);
-            self.stats.packets_sent += 1;
-            self.stats.bytes_sent += pkt.len() as u64;
-            out.push(pkt);
             produced += 1;
+        }
+        if let Some((last, ids, tags)) = pending {
+            self.emit(last, ids, tags, false, now, out);
         }
 
         self.stats.unreliable_dropped += self.unreliable_tx.len() as u64;
@@ -453,6 +490,48 @@ mod tests {
             Packet::Payload { header, body, .. } => (header, body.to_vec()),
             p => panic!("not a payload: {p:?}"),
         }
+    }
+
+    #[test]
+    fn padding_fills_all_but_the_last_packet_and_parses_away() {
+        let t0 = Instant::now();
+        let cfg = Config { max_packets_per_flush: 8, pad_packets: true, ..Config::default() };
+        let (mut a, mut b) = (Connection::new(cfg.clone(), 1, t0), Connection::new(cfg, 1, t0));
+        let msgs: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8 + 1; 500]).collect();
+        for m in &msgs {
+            a.send(Channel::Unreliable, m.clone()).unwrap();
+        }
+        let mut out = Vec::new();
+        a.flush(t0, &mut out);
+        // Two 500 B messages per packet: 3 packets, the first two padded.
+        let sizes: Vec<usize> = out.iter().map(Vec::len).collect();
+        assert_eq!(sizes[..2], [packet::MAX_PACKET_SIZE; 2]);
+        assert!(sizes[2] < packet::MAX_PACKET_SIZE);
+        // Each padded body: two 503 B messages (kind, varlen, data) in 1181 B.
+        assert_eq!(a.stats().padding_bytes, 2 * (1181 - 2 * 503));
+        for p in &out {
+            let (h, body) = payload(p);
+            b.on_payload(h, &body, t0).unwrap();
+        }
+        let got: Vec<Vec<u8>> = std::iter::from_fn(|| b.recv()).map(|(_, m)| m).collect();
+        assert_eq!(got, msgs);
+
+        // A single packet is never padded.
+        a.send(Channel::Unreliable, vec![9; 10]).unwrap();
+        out.clear();
+        a.flush(t0, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].len() < 40);
+    }
+
+    #[test]
+    fn padding_must_be_zeros() {
+        let t0 = Instant::now();
+        let mut b = Connection::new(Config::default(), 1, t0);
+        let h = AckHeader { seq: 0, ack: 0, ack_bits: 0, ack_delay: 0 };
+        assert!(b.on_payload(h, &[KIND_PADDING, 0, 0, 0], t0).is_ok());
+        let h = AckHeader { seq: 1, ..h };
+        assert_eq!(b.on_payload(h, &[KIND_PADDING, 0, 7, 0], t0), Err(DecodeError::Invalid));
     }
 
     #[test]
