@@ -69,11 +69,14 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - near membership is distance OR interaction (squad now, hits/targeting/scope with combat);
     - a new near candidate's age is seeded from its old tier's stagger slot;
     - the budget fills near → mid → far, with far skips carried one tick.
+  - **M2d (degradation ladder) is built:** `sim/src/ladder.rs`.
+    - Levels 1–3 shrink radii, 4–5 lower rates, 6 is 20 Hz, 7–8 are dilation 0.9 and 0.8. The controller steps down on p90 work/period > 0.85 over 30 ticks and up after 90 ticks < 0.6.
+    - A lower tick rate keeps inputs as 1/30 s movement steps (1.5 per 20 Hz tick), so prediction stays bit-exact.
+    - Snapshots carry `pace` (dilation ÷ how far the server is behind schedule), and clients send inputs at pace × 30/s. Without this, a server below 30 Hz overflows input queues.
+    - A per-client bandwidth ladder shrinks a starving client's mid/far radii, and its probes back up back off exponentially.
   - **Next:**
     - M2b: near-tier deltas vs. last acked state (needs unreliable-ack notifications from the transport);
-    - M2c: the web debug map;
-    - M2d: the degradation ladder.
-  - **The ladder must also pace clients.** When the server drops below 30 Hz, bots keep sending 30 inputs per second, the queues overflow and everything becomes corrections. The server has to advertise its real tick rate (time dilation), and the input clock has to follow it.
+    - M2c: the web debug map.
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.

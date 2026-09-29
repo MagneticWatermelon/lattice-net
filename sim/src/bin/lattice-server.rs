@@ -18,6 +18,7 @@ use lattice_net::Config;
 use lattice_sim::cli::Args;
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::interest::InterestConfig;
+use lattice_sim::ladder::LadderConfig;
 use lattice_sim::server::{Counters, Datagram, InDatagram, SimConfig, SimServer, SpawnMode, PHASES};
 use lattice_sim::stats::{summarize, Histogram};
 use rayon::prelude::*;
@@ -35,6 +36,9 @@ lattice-server: M1 movement-only authoritative server
   --far-radius M       far tier: 2 Hz, staggered by id [1500]
   --budget-kbps K      snapshot budget per client [1500]
   --squad-size N       squadmates are near-tier at any distance (0 = none) [4]
+  --ladder on|off      degrade under load: radii, rates, 20 Hz, dilation [on]
+  --ladder-high F      step down when the p90 of work/period exceeds this [0.85]
+  --ladder-low F       step up after 3 s with work/period below this [0.6]
   --threads N          rayon threads [all cores]
   --shards N           transport shards [64]
   --accepts-per-tick N new connections accepted per tick, server-wide (0 = no limit) [256]
@@ -176,6 +180,15 @@ fn main() -> std::io::Result<()> {
         },
         shards: a.get("shards", 64),
         preallocate: !a.flag("no-prealloc"),
+        ladder: {
+            let d = LadderConfig::default();
+            let enabled = match a.get("ladder", "on".to_string()).as_str() {
+                "on" => true,
+                "off" => false,
+                other => panic!("--ladder {other:?}: expected on or off"),
+            };
+            LadderConfig { enabled, high: a.get("ladder-high", d.high), low: a.get("ladder-low", d.low) }
+        },
         seed: a.get("seed", 1),
         net: Config { max_accepts_per_tick: a.get("accepts-per-tick", 256), ..Config::default() },
     };
@@ -209,7 +222,6 @@ fn main() -> std::io::Result<()> {
         println!("preallocated connections for {} clients in {:?}", cfg.max_clients, t0.elapsed());
     }
     let start = Instant::now();
-    let period = Duration::from_secs(1) / TICK_HZ;
 
     println!(
         "listening on {bind} | spawn {:?} | tiers near {}@{} m, mid {} m, far {} m, budget {} B/tick, squads of {} | {} rayon threads, {shards} shards, {} accepts/tick, egress {egress:?} | socket buffers rcv {} KiB snd {} KiB",
@@ -259,6 +271,7 @@ fn main() -> std::io::Result<()> {
     let mut inbound: Vec<Vec<InDatagram>> = vec![Vec::new(); shards];
     // Server-side input waits after warmup, 0.1 ms units.
     let mut kept_wait = Histogram::new(10_000);
+    let mut kept_overruns = 0u64;
     let mut out: Vec<Vec<Datagram>> = vec![Vec::new(); shards];
     let mut window = Window::new(start, &sim, &net);
     let mut kept: Vec<Row> = Vec::new();
@@ -294,6 +307,11 @@ fn main() -> std::io::Result<()> {
         window.out_bytes += bytes as u64;
 
         let done = Instant::now();
+        // The ladder judges this tick against the period it ran at.
+        let period = sim.tick_period();
+        sim.observe_tick(done - now);
+        window.level_min = window.level_min.min(sim.level());
+        window.level_max = window.level_max.max(sim.level());
         let mut row = [0u32; COLS];
         for (r, t) in row.iter_mut().zip(times) {
             *r = t.as_micros() as u32;
@@ -317,6 +335,7 @@ fn main() -> std::io::Result<()> {
             if now - first >= warmup && cool.is_none() {
                 warm.get_or_insert_with(|| sim.counters().clone());
                 kept.push(row);
+                kept_overruns += (done - now > period) as u64;
             }
         }
 
@@ -334,7 +353,7 @@ fn main() -> std::io::Result<()> {
             break;
         }
 
-        next_tick += period;
+        next_tick += sim.tick_period();
         let now = Instant::now();
         if next_tick > now {
             std::thread::sleep(next_tick - now);
@@ -352,7 +371,7 @@ fn main() -> std::io::Result<()> {
     }
     stop.store(true, Relaxed);
     let _ = receiver.join();
-    print_summary(&mut kept, peak_clients, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net);
+    print_summary(&mut kept, kept_overruns, peak_clients, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net);
     Ok(())
 }
 
@@ -368,6 +387,8 @@ struct Window {
     in_bytes: u64,
     kernel: [u64; 2],
     deferred: u64,
+    level_min: u8,
+    level_max: u8,
 }
 
 impl Window {
@@ -384,6 +405,8 @@ impl Window {
             in_bytes: net.in_bytes.load(Relaxed),
             kernel: kernel_udp_drops(),
             deferred: sim.net().deferred_accepts(),
+            level_min: sim.level(),
+            level_max: sim.level(),
         }
     }
 
@@ -413,6 +436,8 @@ impl Window {
         let snap_bytes = (c.snapshot_bytes - self.counters.snapshot_bytes) as f64 / snaps;
         let far_skipped = c.far_skipped - self.counters.far_skipped;
         let far_starved = c.far_starved - self.counters.far_starved;
+        let degraded = (c.degraded_clients - self.counters.degraded_clients) as f64 / snaps;
+        let rung = sim.rung();
         let kernel = kernel_udp_drops();
         let deferred = sim.net().deferred_accepts() - self.deferred;
         let (rcv_drops, snd_drops) = (kernel[0] - self.kernel[0], kernel[1] - self.kernel[1]);
@@ -424,9 +449,16 @@ impl Window {
             .collect();
         let tick = sums[COLS - 1];
         println!(
-            "[{:>5.0}s] clients {} | tick p50 {} p99 {} max {} ms, {} overruns | out {:.1}k pps {:.0} kbps/client, {:.0} Mbps | in {:.1}k pps {:.0} kbps/client | stand-ins: repeated {:.2}% frozen {:.2}%, {} late inputs | per client-tick: {:.0} B, near {:.1} mid {:.1} far {:.1}, far skipped {} starved {} | input wait p50 {:.1} p99 {:.1} ms | {} joins deferred | kernel drops rcv {} snd {}",
+            "[{:>5.0}s] clients {} | level {} ({}-{} in window: {} Hz, dilation {:.1}), pace {:.2}, {:.1}% clients bandwidth-degraded | tick p50 {} p99 {} max {} ms, {} overruns | out {:.1}k pps {:.0} kbps/client, {:.0} Mbps | in {:.1}k pps {:.0} kbps/client | stand-ins: repeated {:.2}% frozen {:.2}%, {} late inputs | per client-tick: {:.0} B, near {:.1} mid {:.1} far {:.1}, far skipped {} starved {} | input wait p50 {:.1} p99 {:.1} ms | {} joins deferred | kernel drops rcv {} snd {}",
             t.as_secs_f64(),
             sim.client_count(),
+            sim.level(),
+            self.level_min,
+            self.level_max,
+            rung.tick_hz,
+            rung.dilation,
+            sim.pace(),
+            degraded * 100.0,
             ms(tick.p50),
             ms(tick.p99),
             ms(tick.max),
@@ -461,7 +493,7 @@ impl Window {
                 line += &format!(",{},{},{}", s.p50, s.p99, s.max);
             }
             line += &format!(
-                ",{:.0},{:.0},{:.1},{:.1},{:.1},{:.3},{:.3},{},{:.0},{:.1},{:.1},{:.1},{},{},{:.1},{:.1},{},{},{}",
+                ",{:.0},{:.0},{:.1},{:.1},{:.1},{:.3},{:.3},{},{:.0},{:.1},{:.1},{:.1},{},{},{:.1},{:.1},{},{},{},{},{},{:.3},{:.4}",
                 self.out_pkts as f64 / secs,
                 in_pkts as f64 / secs,
                 down_kbps,
@@ -480,7 +512,11 @@ impl Window {
                 tenth(ws.p99),
                 deferred,
                 rcv_drops,
-                snd_drops
+                snd_drops,
+                sim.level(),
+                rung.tick_hz,
+                sim.pace(),
+                degraded
             );
             writeln!(w, "{line}")?;
             w.flush()?;
@@ -498,14 +534,16 @@ fn open_csv(path: String) -> std::io::Result<BufWriter<File>> {
             let n = col_name(i);
             h += &format!(",{n}_p50_us,{n}_p99_us,{n}_max_us");
         }
-        h += ",out_pps,in_pps,down_kbps_per_client,up_kbps_per_client,egress_mbps,repeated_pct,frozen_pct,late_inputs,snapshot_bytes_per_tick,near_per_tick,mid_per_tick,far_per_tick,far_skipped,far_starved,input_wait_p50_ms,input_wait_p99_ms,deferred_accepts,kernel_rcvbuf_drops,kernel_sndbuf_drops";
+        h += ",out_pps,in_pps,down_kbps_per_client,up_kbps_per_client,egress_mbps,repeated_pct,frozen_pct,late_inputs,snapshot_bytes_per_tick,near_per_tick,mid_per_tick,far_per_tick,far_skipped,far_starved,input_wait_p50_ms,input_wait_p99_ms,deferred_accepts,kernel_rcvbuf_drops,kernel_sndbuf_drops,level,tick_hz,pace,degraded_client_share";
         writeln!(w, "{h}")?;
     }
     Ok(w)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_summary(
     kept: &mut [Row],
+    over: u64,
     peak: usize,
     sim: &SimServer,
     warm: Option<&Counters>,
@@ -523,7 +561,6 @@ fn print_summary(
         let s = summarize(&mut kept.iter().map(|r| r[i]).collect::<Vec<_>>());
         println!("  {:<10} {:>8} {:>8} {:>8}", col_name(i), ms(s.p50), ms(s.p99), ms(s.max));
     }
-    let over = kept.iter().filter(|r| r[COLS - 1] as u128 > (Duration::from_secs(1) / TICK_HZ).as_micros()).count();
     println!(
         "  overruns {over} | spawns {} despawns {} ({} joins deferred) | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
         c.spawns,
@@ -537,6 +574,14 @@ fn print_summary(
         net.recv_errors.load(Relaxed),
         net.send_errors.load(Relaxed)
     );
+    let levels: Vec<String> = c
+        .level_ticks
+        .iter()
+        .enumerate()
+        .filter(|(_, &n)| n > 0)
+        .map(|(l, n)| format!("L{l}: {n}"))
+        .collect();
+    println!("  ticks per ladder level (whole run): {}", levels.join(", "));
     let ws = wait.summary();
     println!(
         "  input wait on the server (datagram arrival -> applied): p50 {:.1} p99 {:.1} max {:.1} mean {:.1} ms",

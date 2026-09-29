@@ -50,6 +50,20 @@ Shots and event application (phases 3–4) arrive with M3.
 
 `--spawn line:<meters>` places players on a line at fixed spacing, to check tiers by distance.
 
+**Degradation ladder (M2d, `ladder.rs`).** Under load the server gives up quality in the order CLAUDE.md fixes. Each level keeps the changes before it:
+
+| level | change |
+|---|---|
+| 1–3 | shrink mid/far radii (down to 70% / 45%); near candidates 80 at level 3 |
+| 4–5 | slower staggers (mid every 5 ticks, far every 30); near 48, then 40 per tick from 64 candidates |
+| 6 | 20 Hz tick |
+| 7–8 | time dilation 0.9, then 0.8 |
+
+- **The controller.** Its input is each tick's work time (simulation + egress, reported via `observe_tick`) as a fraction of the tick's period. It steps down when the p90 over the last 30 ticks exceeds 0.85, and holds 30 ticks after each step. It steps up after 90 consecutive ticks below 0.6. Flags: `--ladder off`, `--ladder-high`, `--ladder-low`.
+- **A lower tick rate doesn't change what an input means.** Each input is still one 1/30 s movement step, and a 20 Hz tick consumes 1.5 of them on average. Prediction stays bit-exact, and the reported queue depth is normalized by steps per tick.
+- **Pace.** Every snapshot carries `pace`: game-seconds per wall-second. That's the dilation, divided by how far the server is behind its own schedule (actual tick intervals over intended ones, across 30 ticks; up to 2% counts as sleep jitter). Planned changes show at once, and a server that falls behind slows its clients too. Bots send inputs at `pace × 30/s`, the depth nudge fine-tunes it, and a backlog of 3+ extra inputs is dropped at once.
+- **Per-client bandwidth ladder.** A client whose carried far entities starve gets its own mid/far radii shrunk, levels 0–3. It probes back up after 90 calm ticks, and each probe that fails at once doubles the wait (up to 30 s), so a client that can't afford more doesn't starve every few seconds. The near tier is never cut.
+
 **Bots (`bot.rs`, `lattice-bots`):** each bot runs a real `lattice_net::Client` with its own UDP socket, sharded across ≤8 threads that each tick their bots at 30 Hz. A bot wanders around the anchor the server's Welcome gives it, sends each input 3× redundantly, predicts with the same `movement::step`, and reconciles against the acked input.
 
 Movement is deterministic f32 code shared by both sides, so prediction matches the server **bit-for-bit**. A correction only happens when the server had to stand in for an input it hadn't received.
@@ -79,6 +93,7 @@ Stand-ins can exceed bot corrections: a stand-in whose input matches what the bo
 - The system-wide kernel `RcvbufErrors`/`SndbufErrors` deltas from `/proc/net/snmp`.
 - **Joins deferred** by the accept budget (`--accepts-per-tick`, default 256 per tick server-wide).
 - **Input wait**: from an input's datagram arriving (stamped by the receive thread) to the tick that applies it.
+- **The ladder**: level, tick rate, dilation and pace per window, the share of clients degraded by their own bandwidth ladder, and ticks spent at each level.
 
 The server preallocates `max-clients` connections at startup (`--no-prealloc` to skip). Egress uses `sendmmsg` on Linux (`--egress sendto` for comparison).
 
@@ -111,7 +126,20 @@ Findings:
     - serialize-once fan-out;
     - `SO_REUSEPORT` socket groups;
     - bare metal.
-4. **A server that can't hold 30 Hz breaks the input clock.** At ~21 Hz, the bots still send 30 inputs per second. The queues overflow (2.9M inputs discarded, each a correction) and input → applied reaches ~550 ms, because the ±5% nudge can't follow a server at 70% speed. The degradation ladder has to tell clients the server's real tick rate (the ladder's lower tick rate and time dilation), and bots must pace inputs to it.
+4. **A server that couldn't hold 30 Hz broke the input clock (fixed by M2d, below).** At ~21 Hz, the bots still sent 30 inputs per second. The queues overflowed (2.9M inputs discarded, each a correction) and input → applied reached ~550 ms, because the ±5% nudge can't follow a server at 70% speed.
+
+## M2d: the degradation ladder on the WSL2 dev box
+
+| scenario | levels used | tick p50 / p99 (ms) | discarded inputs | corrections | input → applied (mean) | bytes per client-tick |
+|---|---|---|---|---|---|---|
+| blob 3,000 | 0 only | 19.6 / 23.6 | 0 | 0 | 61 ms | ~1,950 B |
+| hotspots 5,000 | 0 only | 21.2 / 23.9 | 0 | 0 | 60 ms | ~1,090 B |
+| uniform 10,000 | 0 → 6 within 10 s, then 6 (20 Hz) | 29.3 / 35.3 against a 50 ms period | 0 (was 2.9M) | 17 in 60 s (was 2.9M) | 70 ms (was ~550) | 477 B at 20 Hz (~76 kbps) |
+
+- **The ladder leaves healthy scenarios alone.** The blob and hotspots run at a load of ~0.65, below the 0.85 step-down threshold.
+- **At 10k it settles where the tick fits.** Level 6 (20 Hz, shrunk radii, slower staggers) runs at a load of ~0.6, between the thresholds, so it doesn't flap.
+- **Stand-ins at 10k are 0.003% of input steps**: arrival jitter at 1.5 steps per tick with one spare input.
+- **The in-process tests cover every rung, both ways.** Sustained forced load walks the server down all nine levels (20 Hz, dilation 0.8) and back up, with zero discarded inputs, stand-ins or corrections throughout. A server that ticks at 20 Hz while meaning to tick at 30 advertises a pace of 2/3, and the bots follow it with zero discards. With the bots' pacing disabled, that test reproduces the 10k failure (720 discards).
 
 ## M1 baseline: WSL2 dev box (behavior, not capacity)
 

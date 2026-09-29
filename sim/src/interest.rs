@@ -65,6 +65,9 @@ pub struct InterestConfig {
     pub budget_bytes: usize,
     /// Squadmates are always near-tier, at any distance. 0 = no squads.
     pub squad_size: usize,
+    /// Stagger periods in ticks (the degradation ladder lengthens them).
+    pub mid_period: u32,
+    pub far_period: u32,
 }
 
 impl Default for InterestConfig {
@@ -79,6 +82,8 @@ impl Default for InterestConfig {
             far_per_tick: 1000_usize.div_ceil(FAR_PERIOD as usize),
             budget_bytes: 1_500_000 / 8 / TICK_HZ as usize,
             squad_size: 4,
+            mid_period: MID_PERIOD,
+            far_period: FAR_PERIOD,
         }
     }
 }
@@ -113,9 +118,9 @@ pub fn seed_age(entity: u16, tick: u32, distance: f32, cfg: &InterestConfig, fre
     if fresh_client {
         NEVER_SENT_AGE
     } else if distance <= cfg.mid_radius {
-        tick - last_due(entity, prev, MID_PERIOD)
+        tick - last_due(entity, prev, cfg.mid_period)
     } else if distance <= cfg.far_radius {
-        tick - last_due(entity, prev, FAR_PERIOD)
+        tick - last_due(entity, prev, cfg.far_period)
     } else {
         NEVER_SENT_AGE
     }

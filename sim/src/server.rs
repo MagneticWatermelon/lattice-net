@@ -26,7 +26,8 @@ use lattice_net::{Channel, ClientId, Config, Router, Server, ServerEvent};
 use rayon::prelude::*;
 
 use crate::grid::{Grid, Ring};
-use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier, FAR_PERIOD, MID_PERIOD};
+use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
+use crate::ladder::{self, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{step, Input, MoveState, TICK_HZ, WORLD_SIZE};
 use crate::msg::{self, Blob, NearBlob, SnapshotHeader, Welcome, FAR_BLOB, NEAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
 use crate::rng::Rng;
@@ -52,6 +53,17 @@ const GRID_CELL: f32 = 32.0;
 const MID_GRID_CELL: f32 = 64.0;
 const FAR_GRID_CELL: f32 = 512.0;
 const NO_SQUAD: u32 = u32::MAX;
+/// Per-client bandwidth ladder: mid and far radius scales by level. A client
+/// whose carried far entities starve steps down (at most every
+/// `CLIENT_HOLD` ticks) and steps back up after `CLIENT_CALM` starve-free
+/// ticks. The near tier is never cut.
+const CLIENT_MID: [f32; 4] = [1.0, 0.9, 0.8, 0.7];
+const CLIENT_FAR: [f32; 4] = [1.0, 0.8, 0.6, 0.45];
+const CLIENT_HOLD: u16 = 15;
+const CLIENT_CALM: u16 = 90;
+/// A probe (step back up) that starves again within `CLIENT_HOLD` ticks
+/// doubles the calm stretch needed before the next probe, up to this.
+const CLIENT_CALM_MAX: u16 = 30 * 30;
 /// Input waits above 1 s land in the histogram's last bucket (0.1 ms units).
 const INPUT_WAIT_CAP: u32 = 10_000;
 
@@ -93,6 +105,7 @@ pub struct SimConfig {
     pub shards: usize,
     /// Allocate `max_clients` connections at startup so accepts reuse them.
     pub preallocate: bool,
+    pub ladder: LadderConfig,
     pub seed: u64,
 }
 
@@ -106,6 +119,7 @@ impl Default for SimConfig {
             interest: InterestConfig::default(),
             shards: 64,
             preallocate: false,
+            ladder: LadderConfig::default(),
             seed: 1,
         }
     }
@@ -141,6 +155,10 @@ pub struct Counters {
     pub far_skipped: u64,
     /// Carried far entities that didn't fit again: the degrade signal.
     pub far_starved: u64,
+    /// Ticks spent at each degradation level.
+    pub level_ticks: [u64; MAX_LEVEL as usize + 1],
+    /// Client-ticks with the client's own bandwidth level above 0.
+    pub degraded_clients: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -164,6 +182,13 @@ struct ClientSlot {
     near: NearState,
     /// Far entities that were due but didn't fit the budget: sent first next tick.
     far_carry: Vec<u16>,
+    /// Per-client bandwidth ladder (see `CLIENT_FAR`).
+    level: u8,
+    hold: u16,
+    calm: u16,
+    /// Calm ticks needed before the next step up: doubles when a probe fails.
+    calm_needed: u16,
+    probing: bool,
 }
 
 /// Per-shard scratch for assembly, reused every tick.
@@ -192,6 +217,7 @@ struct Tally {
     mid_truncated: u64,
     far_skipped: u64,
     far_starved: u64,
+    degraded: u64,
 }
 
 /// Per-entity input stream. Every tick consumes exactly one input seq, so each
@@ -329,6 +355,14 @@ pub struct SimServer {
     far_grid: Grid,
     rng: Rng,
     counters: Counters,
+    ladder: Ladder,
+    pace: PaceMeter,
+    /// Pace advertised in this tick's snapshots.
+    pace_now: f32,
+    /// Fractional 1/30 s movement steps carried between ticks (at 20 Hz: 1.5 per tick).
+    step_acc: f64,
+    /// `cfg.interest` at the current ladder level.
+    interest: InterestConfig,
 }
 
 impl SimServer {
@@ -338,6 +372,7 @@ impl SimServer {
         if cfg.preallocate {
             net.preallocate(cfg.max_clients);
         }
+        let (ladder, interest) = (Ladder::new(cfg.ladder.clone()), cfg.interest.clone());
         Self {
             net,
             shard_clients: (0..cfg.shards).map(|_| Vec::new()).collect(),
@@ -361,6 +396,11 @@ impl SimServer {
             mid_grid: Grid::new(MID_GRID_CELL),
             far_grid: Grid::new(FAR_GRID_CELL),
             counters: Counters::default(),
+            ladder,
+            pace: PaceMeter::default(),
+            pace_now: 1.0,
+            step_acc: 0.0,
+            interest,
         }
     }
 
@@ -383,6 +423,34 @@ impl SimServer {
     /// Routes an inbound datagram's source address to its bucket index.
     pub fn router(&self) -> Router {
         self.net.router()
+    }
+
+    /// Wall-clock time until the next tick should start, at the current level.
+    pub fn tick_period(&self) -> Duration {
+        self.ladder.rung().period()
+    }
+
+    /// The degradation level (0 = normal) and what it means.
+    pub fn level(&self) -> u8 {
+        self.ladder.level()
+    }
+
+    pub fn rung(&self) -> &Rung {
+        self.ladder.rung()
+    }
+
+    /// Game-seconds per wall-second advertised to clients.
+    pub fn pace(&self) -> f32 {
+        self.pace_now
+    }
+
+    /// Feed the last tick's total work time (simulation plus egress), so the
+    /// ladder can degrade or recover. Call once per tick, after egress.
+    pub fn observe_tick(&mut self, work: Duration) {
+        let period = self.tick_period();
+        if self.ladder.observe(work, period).is_some() {
+            self.interest = self.ladder.rung().apply(&self.cfg.interest);
+        }
     }
 
     pub fn shard_count(&self) -> usize {
@@ -411,6 +479,14 @@ impl SimServer {
             times[i] = n - t;
             t = n;
         };
+
+        let rung = *self.ladder.rung();
+        self.pace.record(now, rung.period());
+        self.pace_now = ladder::advertised_pace(rung.dilation, self.pace.stretch());
+        self.step_acc += rung.steps_per_tick();
+        let steps = self.step_acc.floor() as u32;
+        self.step_acc -= steps as f64;
+        self.counters.level_ticks[self.ladder.level() as usize] += 1;
 
         // 1. ingress: the per-packet transport work, one task per shard
         self.net
@@ -456,11 +532,21 @@ impl SimServer {
             .zip(self.inputs.par_iter_mut())
             .with_min_len(256)
             .filter(|(b, _)| b.alive)
-            .map(|(b, q)| match q.advance(b, now) {
-                Step::Applied => [1, 0, 0],
-                Step::Repeated => [0, 1, 0],
-                Step::Frozen => [0, 0, 1],
-                Step::Waiting => [0, 0, 0],
+            .map(|(b, q)| {
+                // A tick consumes `steps` 1/30 s movement steps (1 or 2 at 20 Hz).
+                let queued = q.pending.len();
+                let mut n = [0u64; 3];
+                for _ in 0..steps {
+                    match q.advance(b, now) {
+                        Step::Applied => n[0] += 1,
+                        Step::Repeated => n[1] += 1,
+                        Step::Frozen => n[2] += 1,
+                        Step::Waiting => {}
+                    }
+                }
+                // Reported depth means "due now + spares", whatever the step count.
+                q.depth = (queued + 1).saturating_sub(steps as usize).min(u8::MAX as usize) as u8;
+                n
             })
             .reduce(|| [0u64; 3], |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]]);
         self.counters.inputs_applied += applied;
@@ -477,8 +563,9 @@ impl SimServer {
         let (bodies, tick) = (&self.bodies, self.tick);
         let alive = || bodies.iter().enumerate().filter(|(_, b)| b.alive).map(|(i, b)| (i as u32, b.state.pos));
         self.grid.rebuild(alive());
-        self.mid_grid.rebuild(alive().filter(|&(i, _)| due(i as u16, tick, MID_PERIOD)));
-        self.far_grid.rebuild(alive().filter(|&(i, _)| due(i as u16, tick, FAR_PERIOD)));
+        let (mid_period, far_period) = (self.interest.mid_period, self.interest.far_period);
+        self.mid_grid.rebuild(alive().filter(|&(i, _)| due(i as u16, tick, mid_period)));
+        self.far_grid.rebuild(alive().filter(|&(i, _)| due(i as u16, tick, far_period)));
         lap(3);
 
         // 6. lag-comp history
@@ -500,7 +587,7 @@ impl SimServer {
                 let e = i as u16;
                 *near = msg::encode_near_blob(e, b.state.pos, b.state.vel, b.yaw);
                 let prev = tick.wrapping_sub(1);
-                if due(e, tick, MID_PERIOD) || due(e, tick, FAR_PERIOD) || due(e, prev, FAR_PERIOD) {
+                if due(e, tick, mid_period) || due(e, tick, far_period) || due(e, prev, far_period) {
                     *far = msg::encode_blob(e, b.state.pos, b.yaw);
                 }
             });
@@ -510,8 +597,10 @@ impl SimServer {
         // are ready for its transport task
         let max_message = self.cfg.net.max_message_size();
         let view = View {
-            cfg: &self.cfg.interest,
+            cfg: &self.interest,
             tick,
+            pace: (self.pace_now * 1000.0).round() as u16,
+            level: self.ladder.level(),
             bodies: &self.bodies,
             inputs: &self.inputs,
             near_blobs: &self.near_blobs,
@@ -546,6 +635,7 @@ impl SimServer {
             c.mid_truncated += t.mid_truncated;
             c.far_skipped += t.far_skipped;
             c.far_starved += t.far_starved;
+            c.degraded_clients += t.degraded;
         }
         lap(6);
 
@@ -592,7 +682,17 @@ impl SimServer {
             self.squads.entry(squad).or_default().push(e);
         }
         self.by_client.insert(client, e);
-        let slot = ClientSlot { client, entity: e, near: NearState::default(), far_carry: Vec::new() };
+        let slot = ClientSlot {
+            client,
+            entity: e,
+            near: NearState::default(),
+            far_carry: Vec::new(),
+            level: 0,
+            hold: 0,
+            calm: 0,
+            calm_needed: CLIENT_CALM,
+            probing: false,
+        };
         self.shard_clients[self.net.shard_of_client(client)].push(slot);
         self.counters.spawns += 1;
         let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius });
@@ -670,6 +770,8 @@ struct View<'a> {
     far_grid: &'a Grid,
     squads: &'a HashMap<u32, Vec<u16>>,
     max_message: usize,
+    pace: u16,
+    level: u8,
 }
 
 impl View<'_> {
@@ -696,7 +798,9 @@ impl View<'_> {
         // Near: distance or interaction (squad), ranked by the accumulator. The
         // scan only computes squared distances; priorities and seeded ages are
         // computed for the <= near_candidates that make the cut.
-        let (r_near2, r_mid2, r_far2) = (cfg.near_radius.powi(2), cfg.mid_radius.powi(2), cfg.far_radius.powi(2));
+        let (mid_radius, far_radius) =
+            (cfg.mid_radius * CLIENT_MID[slot.level as usize], cfg.far_radius * CLIENT_FAR[slot.level as usize]);
+        let (r_near2, r_mid2, r_far2) = (cfg.near_radius.powi(2), mid_radius.powi(2), far_radius.powi(2));
         // Non-squad candidates: a k-nearest ring walk, so a dense crowd costs
         // a few cells instead of every entity within the radius.
         let k = cfg.near_candidates;
@@ -754,7 +858,7 @@ impl View<'_> {
         // Mid: due this tick, not near-tier, nearest first (by squared distance).
         sc.mid.clear();
         let (mid, stamp, k) = (&mut sc.mid, &sc.stamp, cfg.mid_per_tick);
-        self.mid_grid.walk_rings(me.state.pos, cfg.mid_radius, |v| match v {
+        self.mid_grid.walk_rings(me.state.pos, mid_radius, |v| match v {
             Ring::Item(j) => {
                 if stamp[j as usize] != epoch {
                     let d2 = self.dist2(me.state.pos, j as u16);
@@ -785,7 +889,7 @@ impl View<'_> {
                 sc.stamp[j as usize] = epoch;
             }
         }
-        self.far_grid.for_each_near(me.state.pos, cfg.far_radius, |j| {
+        self.far_grid.for_each_near(me.state.pos, far_radius, |j| {
             if sc.stamp[j as usize] != epoch {
                 let d2 = self.dist2(me.state.pos, j as u16);
                 if d2 > r_mid2 && d2 <= r_far2 {
@@ -814,21 +918,63 @@ impl View<'_> {
         while n_far > 0 && cost(Tier::Far, n_far) > left {
             n_far -= 1;
         }
+        let mut starved = 0;
         for &(key, j) in &sc.far[n_far..] {
             if key < 0.0 {
-                sc.tally.far_starved += 1;
+                starved += 1;
             } else {
                 sc.tally.far_skipped += 1;
                 slot.far_carry.push(j);
             }
         }
+        sc.tally.far_starved += starved;
+
+        // This client's bandwidth ladder: starving shrinks its mid/far radii,
+        // a long starve-free stretch grows them back.
+        // Probes back up back off exponentially while they keep failing, so a
+        // client that can't afford more doesn't starve every few seconds.
+        let probe_failed = slot.probing && slot.hold > 0;
+        slot.hold = slot.hold.saturating_sub(1);
+        if starved > 0 {
+            slot.calm = 0;
+            if probe_failed {
+                slot.calm_needed = slot.calm_needed.saturating_mul(2).min(CLIENT_CALM_MAX);
+            }
+            slot.probing = false;
+            if slot.hold == 0 && (slot.level as usize) < CLIENT_FAR.len() - 1 || probe_failed {
+                slot.level = (slot.level + 1).min(CLIENT_FAR.len() as u8 - 1);
+                slot.hold = CLIENT_HOLD;
+            }
+        } else {
+            slot.calm = slot.calm.saturating_add(1);
+            if slot.probing && slot.hold == 0 {
+                slot.probing = false;
+                slot.calm_needed = CLIENT_CALM; // the probe held
+            }
+            if slot.calm >= slot.calm_needed && slot.hold == 0 && slot.level > 0 {
+                slot.level -= 1;
+                slot.calm = 0;
+                slot.hold = CLIENT_HOLD;
+                slot.probing = true;
+            }
+        }
+        sc.tally.degraded += (slot.level > 0) as u64;
 
         // Messages.
         let inp = &self.inputs[e as usize];
         let mut w = Writer::with_capacity(SNAPSHOT_LEN);
         msg::write_snapshot(
             &mut w,
-            &SnapshotHeader { server_tick: tick, ack_seq: inp.last_seq, buffered: inp.depth, wait: inp.wait, own: me.state },
+            &SnapshotHeader {
+                server_tick: tick,
+                ack_seq: inp.last_seq,
+                buffered: inp.depth,
+                wait: inp.wait,
+                pace: self.pace,
+                level: self.level,
+                client_level: slot.level,
+                own: me.state,
+            },
         );
         let mut bytes = w.len();
         snaps.push((slot.client, w.into_inner()));

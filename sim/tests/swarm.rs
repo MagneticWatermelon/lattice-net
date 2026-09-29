@@ -20,10 +20,19 @@ struct Swarm {
     rng: Rng,
     /// Probability that any datagram (either direction) is dropped.
     loss: f32,
-    to_server: Vec<(SocketAddr, Vec<u8>)>,
+    /// Datagrams on their way to the server, stamped with their arrival time.
+    to_server: Vec<(SocketAddr, Instant, Vec<u8>)>,
     /// Probability that a bot->server datagram arrives one tick late (jitter).
     delay: f32,
     delayed: Vec<(SocketAddr, Vec<u8>)>,
+    /// The server ticks on its own schedule (its period depends on its level).
+    next_server: Instant,
+    /// Stretch the server's period by this factor: it falls behind its own
+    /// schedule, as when it can't finish ticks in time.
+    stretch: f32,
+    /// Report this fraction of the period as each tick's work, instead of the
+    /// real (tiny) in-process time, to drive the degradation ladder.
+    fake_load: Option<f32>,
     /// Bot 0 doesn't run at all (a client hitch).
     stall_bot0: bool,
     /// Bot 0's outgoing packets are held back instead of sent (a lag switch).
@@ -44,12 +53,27 @@ impl Swarm {
                 (addr, Client::new(Config::default(), server_addr, now), BotBrain::new(i as u64))
             })
             .collect();
-        Self { server: SimServer::new(cfg, now), bots, now, rng: Rng::new(7), loss: 0.0, to_server: Vec::new(), delay: 0.0, delayed: Vec::new(), stall_bot0: false, hold_bot0: None }
+        Self {
+            server: SimServer::new(cfg, now),
+            bots,
+            now,
+            rng: Rng::new(7),
+            loss: 0.0,
+            to_server: Vec::new(),
+            delay: 0.0,
+            delayed: Vec::new(),
+            next_server: now,
+            stretch: 1.0,
+            fake_load: None,
+            stall_bot0: false,
+            hold_bot0: None,
+        }
     }
 
     fn step(&mut self) {
         // Held back last step: they reach the server this step, a tick late.
-        self.to_server.append(&mut self.delayed);
+        let now = self.now;
+        self.to_server.extend(self.delayed.drain(..).map(|(a, p)| (a, now, p)));
         let server_addr: SocketAddr = SERVER.parse().unwrap();
         for (i, (addr, client, brain)) in self.bots.iter_mut().enumerate() {
             if i == 0 && self.stall_bot0 {
@@ -70,18 +94,27 @@ impl Swarm {
                     Some(held) if i == 0 => held.push((*addr, pkt)),
                     _ if self.rng.chance(self.loss) => {}
                     _ if self.rng.chance(self.delay) => self.delayed.push((*addr, pkt)),
-                    _ => self.to_server.push((*addr, pkt)),
+                    _ => self.to_server.push((*addr, self.now, pkt)),
                 }
             }
         }
 
+        if self.now < self.next_server {
+            self.now += Duration::from_secs(1) / TICK_HZ;
+            return; // the server isn't due: datagrams wait for it
+        }
+        let period = self.server.tick_period();
+        self.next_server += period.mul_f32(self.stretch);
         let router = self.server.router();
         let mut inbound = vec![Vec::new(); router.shard_count()];
-        for (from, pkt) in self.to_server.drain(..) {
-            inbound[router.shard(&from)].push((from, self.now, pkt));
+        for (from, at, pkt) in self.to_server.drain(..) {
+            inbound[router.shard(&from)].push((from, at, pkt));
         }
         let mut out = vec![Vec::new(); router.shard_count()];
+        let t = Instant::now();
         self.server.tick(&mut inbound, self.now, &mut out);
+        let work = self.fake_load.map_or(t.elapsed(), |f| period.mul_f32(f));
+        self.server.observe_tick(work);
         for (to, pkt) in out.into_iter().flatten() {
             if self.rng.chance(self.loss) {
                 continue;
@@ -240,7 +273,8 @@ fn lag_switch_buys_no_movement() {
 
     // Release the burst: every held input is too late to apply.
     let burst = s.hold_bot0.take().unwrap();
-    s.to_server.extend(burst);
+    let now = s.now;
+    s.to_server.extend(burst.into_iter().map(|(a, p)| (a, now, p)));
     let late_before = s.server.counters().late_inputs;
     s.step();
     assert!(s.server.counters().late_inputs - late_before >= TICK_HZ as u64 - 3);
@@ -397,9 +431,11 @@ fn squadmates_are_near_tier_at_any_distance() {
 
 #[test]
 fn a_tight_budget_never_cuts_the_near_tier() {
-    // Room for own state, near and mid, and about one far entity per tick,
-    // while ~2.5 are due: far falls behind and the server flags it.
-    let interest = InterestConfig { budget_bytes: 190, ..Default::default() };
+    // Room for own state and near (up to ~190 B mid-line), but not for all of
+    // mid and far (~357 B at level 0): far falls behind, the server flags it,
+    // and the starving clients shrink their own mid/far radii until it fits.
+    const BUDGET: u64 = 320;
+    let interest = InterestConfig { budget_bytes: BUDGET as usize, ..Default::default() };
     let mut s = line_swarm(62, interest);
     for _ in 0..3 * TICK_HZ {
         s.step();
@@ -407,9 +443,94 @@ fn a_tight_budget_never_cuts_the_near_tier() {
     let mut iv: [Vec<u16>; 3] = Default::default();
     s.bots[0].2.drain_intervals(&mut iv);
     assert!(iv[0].iter().all(|&g| g == 1), "near still every tick");
-    let c = s.server.counters();
+    let c = s.server.counters().clone();
     assert!(c.far_skipped > 0 && c.far_starved > 0, "skips and starvation are counted: {c:?}");
+    assert!(c.degraded_clients > 0, "starving clients shrink their own mid/far radii");
+    // Degraded, the budget fits: no starvation until clients probe back up
+    // (after 3 calm seconds). A probe that fails backs off, so over the next
+    // 20 s starvation bursts get rarer instead of repeating every 3 s.
+    let mut per_sec = Vec::new();
+    let mut prev = c.far_starved;
+    for _ in 0..20 {
+        for _ in 0..TICK_HZ {
+            s.step();
+        }
+        per_sec.push(s.server.counters().far_starved - prev);
+        prev = s.server.counters().far_starved;
+    }
+    // A burst is a run of seconds with starvation (one failed probe).
+    let bursts = |w: &[u64]| w.windows(2).filter(|p| p[0] == 0 && p[1] > 0).count() + (w[0] > 0) as usize;
+    let longest_calm = per_sec.split(|&n| n > 0).map(|run| run.len()).max().unwrap();
+    assert!(longest_calm >= 8, "degraded, the budget fits for long stretches: {per_sec:?}");
+    assert!(bursts(&per_sec[10..]) < bursts(&per_sec[..10]), "failed probes back off: {per_sec:?}");
+    let c = s.server.counters();
     // Every client stayed within its budget (the client at the end of the line
     // sees less, so the average is below 190).
-    assert!(c.snapshot_bytes <= 190 * c.snapshots, "{} B over {} client-ticks", c.snapshot_bytes, c.snapshots);
+    assert!(c.snapshot_bytes <= BUDGET * c.snapshots, "{} B over {} client-ticks", c.snapshot_bytes, c.snapshots);
 }
+
+fn stand_ins_and_discards(s: &Swarm) -> (u64, u64) {
+    let c = s.server.counters();
+    (c.repeated + c.frozen, c.discarded_inputs)
+}
+
+#[test]
+fn ladder_degrades_to_the_bottom_and_back_without_breaking_clients() {
+    let mut s = Swarm::new(20, SpawnMode::Blob);
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+    }
+    // Sustained overload: every rung, down to 20 Hz at dilation 0.8.
+    s.fake_load = Some(0.95);
+    for _ in 0..30 * TICK_HZ {
+        s.step();
+    }
+    assert_eq!(s.server.level(), lattice_sim::ladder::MAX_LEVEL);
+    assert_eq!(s.server.rung().tick_hz, 20);
+    assert!((s.server.pace() - 0.8).abs() < 0.01, "pace {}", s.server.pace());
+    for (_, _, b) in &s.bots {
+        assert_eq!((b.stats.level, b.stats.pace), (lattice_sim::ladder::MAX_LEVEL, 800), "clients are told");
+    }
+    // Load gone: back to normal, one level per calm stretch.
+    s.fake_load = Some(0.2);
+    for _ in 0..60 * TICK_HZ {
+        s.step();
+    }
+    assert_eq!((s.server.level(), s.server.rung().tick_hz), (0, 30));
+    assert!((s.server.pace() - 1.0).abs() < 0.001, "pace {}", s.server.pace());
+    let visited = s.server.counters().level_ticks.iter().filter(|&&t| t > 0).count();
+    assert_eq!(visited, 9, "every level was used: {:?}", s.server.counters().level_ticks);
+    // Through every rung, 20 Hz ticks and dilation included, clients kept pace:
+    // no input overflowed a queue, none arrived late, prediction never broke.
+    assert_eq!(stand_ins_and_discards(&s), (0, 0));
+    assert_eq!(s.corrections(), 0);
+}
+
+#[test]
+fn clients_follow_a_server_that_falls_behind() {
+    // The server means to tick at 30 Hz but only manages 20 (and its ladder is
+    // off, so it doesn't adapt). It advertises the pace it achieves, 2/3, and
+    // the bots slow their inputs to match instead of overflowing its queues.
+    let ladder = lattice_sim::ladder::LadderConfig { enabled: false, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Blob, ladder, ..Default::default() };
+    let mut s = Swarm::with_config(10, cfg);
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+    }
+    s.stretch = 1.5;
+    for _ in 0..15 * TICK_HZ {
+        s.step();
+    }
+    assert!((s.server.pace() - 2.0 / 3.0).abs() < 0.02, "pace {}", s.server.pace());
+    assert_eq!(stand_ins_and_discards(&s), (0, 0));
+    for (_, _, b) in &mut s.bots {
+        let mut samples = Vec::new();
+        b.drain_latency(&mut samples);
+        // The backlog built before the bots heard is drained: about one
+        // server tick (50 ms here) of wait again.
+        let w = samples.last().unwrap().server_wait.unwrap();
+        assert!(w <= 1000, "server wait {} ms", w / 10);
+    }
+    assert_eq!(s.corrections(), 0);
+}
+

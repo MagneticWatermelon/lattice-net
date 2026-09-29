@@ -31,6 +31,9 @@ const MAX_CLOCK_ADJUST: f32 = 0.05;
 /// than waiting ~20 ticks for the nudge; then this many ticks pass before the
 /// next such bump, so reports still in flight don't stack up bumps.
 const BUMP_COOLDOWN: u32 = 10;
+/// A reported depth this far above target (say, after the server slowed down
+/// before we heard) drops an input at once instead of draining at 5%.
+const BACKLOG: f32 = 3.0;
 
 #[derive(Debug, Clone, Default)]
 pub struct BotStats {
@@ -60,6 +63,12 @@ pub struct BotStats {
     /// Server-reported waits (arrival -> applied) for real, non-stand-in inputs.
     pub wait_samples: u64,
     pub wait_sum_ms: f64,
+    /// Inputs skipped to drain a backlog at the server.
+    pub backlog_skips: u64,
+    /// From the latest snapshot: the server's pace (per mille) and levels.
+    pub pace: u16,
+    pub level: u8,
+    pub client_level: u8,
 }
 
 /// When one of our inputs was first seen acked.
@@ -93,6 +102,8 @@ pub struct BotBrain {
     history: Vec<Predicted>,
     /// Input clock: `rate` inputs per tick, accumulated in `clock`.
     rate: f32,
+    /// The server's pace: inputs per client tick before the depth nudge.
+    pace: f32,
     clock: f32,
     bump_cooldown: u32,
     buffer_avg: f32,
@@ -117,6 +128,7 @@ impl BotBrain {
             state: MoveState::default(),
             history: vec![Predicted::default(); HISTORY],
             rate: 1.0,
+            pace: 1.0,
             // Mid-phase: a rate a hair off 1.0 must drift half a tick before it
             // adds or skips an input, instead of flipping at the edge every tick.
             clock: 0.5,
@@ -200,6 +212,10 @@ impl BotBrain {
         }
         self.last_server_tick = Some(h.server_tick);
         self.stats.snapshots += 1;
+        (self.stats.pace, self.stats.level, self.stats.client_level) = (h.pace, h.level, h.client_level);
+        // The server consumes inputs at `pace` x 30 per wall second (slower
+        // under time dilation, or when it falls behind): send at that rate.
+        self.pace = (h.pace as f32 / 1000.0).clamp(0.1, 1.0);
 
         if h.ack_seq == 0 {
             return; // server hasn't consumed any of our inputs yet
@@ -207,10 +223,16 @@ impl BotBrain {
         self.buffer_avg += (h.buffered as f32 - self.buffer_avg) * 0.1;
         let (lo, hi) = DEPTH_BAND;
         let error = if self.buffer_avg < lo || self.buffer_avg > hi { TARGET_DEPTH - self.buffer_avg } else { 0.0 };
-        self.rate = 1.0 + (CLOCK_GAIN * error).clamp(-MAX_CLOCK_ADJUST, MAX_CLOCK_ADJUST);
-        if h.buffered == 0 && self.bump_cooldown == 0 {
-            self.clock += 1.0;
-            self.bump_cooldown = BUMP_COOLDOWN;
+        self.rate = self.pace * (1.0 + (CLOCK_GAIN * error).clamp(-MAX_CLOCK_ADJUST, MAX_CLOCK_ADJUST));
+        if self.bump_cooldown == 0 {
+            if h.buffered == 0 {
+                self.clock += 1.0;
+                self.bump_cooldown = BUMP_COOLDOWN;
+            } else if h.buffered as f32 >= TARGET_DEPTH + BACKLOG {
+                self.clock -= 1.0;
+                self.bump_cooldown = BUMP_COOLDOWN;
+                self.stats.backlog_skips += 1;
+            }
         }
 
         if h.ack_seq > self.seq {

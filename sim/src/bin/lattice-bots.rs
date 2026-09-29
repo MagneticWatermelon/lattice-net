@@ -44,6 +44,12 @@ struct Totals {
     clock_skipped: u64,
     /// Entity updates received per tier.
     tiers: [u64; 3],
+    /// Gauges over connected bots: summed pace (per mille), deepest server
+    /// level seen, bots with their own bandwidth level above 0.
+    pace_sum: f64,
+    level_max: u8,
+    client_degraded: u64,
+    backlog_skips: u64,
     corrections: u64,
     correction_err_sum: f64,
     correction_err_max: f32,
@@ -69,6 +75,10 @@ impl Totals {
         for (a, b) in self.tiers.iter_mut().zip(o.tiers) {
             *a += b;
         }
+        self.pace_sum += o.pace_sum;
+        self.level_max = self.level_max.max(o.level_max);
+        self.client_degraded += o.client_degraded;
+        self.backlog_skips += o.backlog_skips;
         self.corrections += o.corrections;
         self.correction_err_sum += o.correction_err_sum;
         self.correction_err_max = self.correction_err_max.max(o.correction_err_max);
@@ -96,7 +106,7 @@ struct Latency {
     wait: Histogram,
     /// Estimated input generated -> applied on the server: RTT / 2 + wait, ms.
     applied: Histogram,
-    /// Update interval per entity, in server ticks, per tier (tracked bots only).
+    /// Update interval per entity, in ms, per tier (tracked bots only).
     intervals: [Histogram; 3],
 }
 
@@ -106,7 +116,7 @@ impl Latency {
             seen: Histogram::new(LATENCY_CAP_MS),
             wait: Histogram::new(LATENCY_CAP_MS * 10),
             applied: Histogram::new(LATENCY_CAP_MS),
-            intervals: std::array::from_fn(|_| Histogram::new(300)),
+            intervals: std::array::from_fn(|_| Histogram::new(10_000)),
         }
     }
 
@@ -229,6 +239,9 @@ impl Bot {
         if let Some((_, client)) = &self.net {
             if let (ClientState::Connected, Some(s)) = (client.state(), client.stats()) {
                 t.connected += 1;
+                t.pace_sum += brain.stats.pace as f64;
+                t.level_max = t.level_max.max(brain.stats.level);
+                t.client_degraded += (brain.stats.client_level > 0) as u64;
                 t.rtt_sum += s.rtt_ms as f64;
                 t.loss_sum += s.loss as f64;
             }
@@ -244,6 +257,7 @@ impl Bot {
         for (a, b) in t.tiers.iter_mut().zip(s.tier_seen) {
             *a += b;
         }
+        t.backlog_skips += s.backlog_skips;
         t.corrections += s.corrections;
         t.correction_err_sum += s.correction_error_sum;
         t.correction_err_max = t.correction_err_max.max(s.correction_error_max);
@@ -391,8 +405,10 @@ fn main() -> std::io::Result<()> {
                         let rtt = client.stats().map_or(0.0, |s| s.rtt_ms);
                         samples.drain(..).for_each(|t| latency.record(t, rtt));
                         brain.drain_intervals(&mut intervals);
+                        // Intervals come in server ticks; a tick's length depends on the level.
+                        let hz = lattice_sim::ladder::RUNGS[(brain.stats.level as usize).min(lattice_sim::ladder::MAX_LEVEL as usize)].tick_hz;
                         for (h, v) in latency.intervals.iter_mut().zip(&mut intervals) {
-                            v.drain(..).for_each(|g| h.record(g as u32));
+                            v.drain(..).for_each(|g| h.record(g as u32 * 1000 / hz));
                         }
                     }
                 }
@@ -469,7 +485,7 @@ fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut
     let j = summarize(joins);
     let (applied, seen) = (latency.applied.summary(), latency.seen.summary());
     println!(
-        "[{:>5.0}s] bots {}/{} connected, {} welcomed, {} failed | {:.1} snaps/s/bot, entities/snap near {:.1} mid {:.1} far {:.1} | corrections {:.3}/s/bot | down {:.0} up {:.0} kbps/bot | rtt {:.1} ms loss {:.2}% | input->applied ~ p50 {} p99 {} ms, round trip p50 {} p99 {} ms | joins {} (p50 {} p99 {} ms) | swarm overruns {}",
+        "[{:>5.0}s] bots {}/{} connected, {} welcomed, {} failed | {:.1} snaps/s/bot, entities/snap near {:.1} mid {:.1} far {:.1} | corrections {:.3}/s/bot | down {:.0} up {:.0} kbps/bot | rtt {:.1} ms loss {:.2}% | input->applied ~ p50 {} p99 {} ms, round trip p50 {} p99 {} ms | joins {} (p50 {} p99 {} ms) | server pace {:.2} level {}, {} bots bandwidth-degraded | swarm overruns {}",
         t.as_secs_f64(),
         cur.connected,
         cur.started,
@@ -491,6 +507,9 @@ fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut
         joins.len(),
         j.p50,
         j.p99,
+        cur.pace_sum / 1000.0 / bots,
+        cur.level_max,
+        cur.client_degraded,
         cur.tick_overruns - prev.tick_overruns,
     );
 }
@@ -538,11 +557,13 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
     line("input -> applied on server (est. RTT/2 + server wait)", &latency.applied, 1.0);
     line("  of which server wait (arrival -> applied)", &latency.wait, 0.1);
     line("input -> seen acked (round trip)", &latency.seen, 1.0);
-    let tick_ms = 1000.0 / TICK_HZ as f64;
     for (name, h) in ["near", "mid", "far"].iter().zip(&latency.intervals) {
-        line(&format!("{name} entity update interval (tracked bots)"), h, tick_ms);
+        line(&format!("{name} entity update interval (tracked bots)"), h, 1.0);
     }
-    println!("  input clock: {} extra inputs, {} skipped ticks", t.clock_extra, t.clock_skipped);
+    println!(
+        "  input clock: {} extra inputs, {} skipped ticks, {} backlog skips",
+        t.clock_extra, t.clock_skipped, t.backlog_skips
+    );
     println!(
         "  bytes down {:.1} MB up {:.1} MB | swarm tick overruns {}",
         t.bytes_down as f64 / 1e6,

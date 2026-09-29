@@ -3,7 +3,7 @@
 //! ```text
 //! C->S unreliable  Input    tag | newest_seq:4 | n:1 | n × (move_x:1 move_y:1 yaw:2 buttons:1)   newest first
 //! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32
-//! S->C unreliable  Snapshot tag | server_tick:4 | ack_seq:4 | buffered:1 | wait:2 | own pos:2×f32 vel:2×f32
+//! S->C unreliable  Snapshot tag | server_tick:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1 | own pos:2×f32 vel:2×f32
 //! S->C unreliable  Entities tag | server_tick:4 | tier:1 | n:1 | n × blob         (one or more per tier per tick)
 //! near blob (15 B) := entity:2 | cell:1 | 12 B bitpacked: x,y 2×16 | z 12 | vx,vy 2×10 | yaw 12 | pitch 8 | flags 3 | health 7
 //! far blob  (11 B) := entity:2 | cell:1 | 8 B bitpacked far-tier state (see bitpack.rs); also used for the mid tier
@@ -31,7 +31,7 @@ pub const INPUT_REDUNDANCY: usize = 3;
 /// Mid- and far-tier blob.
 pub const FAR_BLOB: usize = 11;
 pub const NEAR_BLOB: usize = 15;
-pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 1 + 2 + 16;
+pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 16;
 pub const ENTITIES_HEADER: usize = 1 + 4 + 1 + 1;
 /// Near-tier velocity range, m/s (sprint is 9).
 const NEAR_MAX_SPEED: f32 = 20.0;
@@ -120,6 +120,13 @@ pub struct SnapshotHeader {
     /// arriving to being applied, in 0.1 ms. `WAIT_STAND_IN` if it never
     /// arrived in time. The client adds half the RTT to get input -> applied.
     pub wait: u16,
+    /// Game-seconds per wall-second, per mille: the rate at which the server
+    /// consumes inputs, relative to 30 per second. Clients pace their inputs by it.
+    pub pace: u16,
+    /// Server-wide degradation level (0 = normal), and this client's own
+    /// bandwidth level.
+    pub level: u8,
+    pub client_level: u8,
     pub own: MoveState,
 }
 
@@ -129,6 +136,9 @@ pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
     w.u32(h.ack_seq);
     w.u8(h.buffered);
     w.u16(h.wait);
+    w.u16(h.pace);
+    w.u8(h.level);
+    w.u8(h.client_level);
     for v in [h.own.pos[0], h.own.pos[1], h.own.vel[0], h.own.vel[1]] {
         w.u32(v.to_bits());
     }
@@ -166,9 +176,10 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             let ack_seq = r.u32()?;
             let buffered = r.u8()?;
             let wait = r.u16()?;
+            let (pace, level, client_level) = (r.u16()?, r.u8()?, r.u8()?);
             let own = MoveState { pos: [read_f32(&mut r)?, read_f32(&mut r)?], vel: [read_f32(&mut r)?, read_f32(&mut r)?] };
             r.finish()?;
-            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, ack_seq, buffered, wait, own }))
+            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, ack_seq, buffered, wait, pace, level, client_level, own }))
         }
         MSG_ENTITIES => {
             let server_tick = r.u32()?;
@@ -294,6 +305,9 @@ mod tests {
             ack_seq: 42,
             buffered: 2,
             wait: 333,
+            pace: 800,
+            level: 7,
+            client_level: 1,
             own: MoveState { pos: [1.0, 2.0], vel: [-3.0, 0.125] },
         };
         let mut wr = Writer::default();
