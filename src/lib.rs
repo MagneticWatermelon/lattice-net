@@ -1,6 +1,7 @@
 //! # lattice-net
 //!
-//! A small, dependency-free UDP transport for a large-scale shooter.
+//! A small UDP transport for a large-scale shooter. Its one dependency is `ring`
+//! (ChaCha20-Poly1305 and OS randomness).
 //!
 //! Design goals:
 //! - **Sans-IO.** `Server`, `Client` and `Connection` never touch a socket. You feed
@@ -15,12 +16,15 @@
 //! - **Sharded server.** Connections are partitioned by a keyed hash of the peer
 //!   address into `Shard`s that share nothing mutable but an atomic client count,
 //!   so a caller's thread pool can receive and flush them in parallel.
+//! - **Authenticated and encrypted.** A login service mints netcode.io-style connect
+//!   tokens (`token`); every packet after the handshake is sealed with ChaCha20-Poly1305
+//!   under per-connection keys from the token, its nonce the 64-bit packet counter.
 //! - **Stateless, amplification-safe handshake.** Client->server handshake packets are
 //!   padded larger than the server's replies. The server keeps no state until the client
-//!   echoes a keyed cookie bound to its address.
+//!   echoes a keyed cookie bound to its address and proves it holds the token's keys.
 //!
-//! Not included yet (see README): encryption, fragmentation of >MTU messages, and
-//! congestion / bandwidth budgeting.
+//! Not included yet (see README): fragmentation of >MTU messages, and congestion /
+//! bandwidth budgeting.
 
 pub mod bitpack;
 mod channel;

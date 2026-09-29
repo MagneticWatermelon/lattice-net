@@ -17,14 +17,14 @@ cargo run --release --bin lattice-bots -- --help
 
 | phase | work | parallel |
 |---|---|---|
-| ingress | each transport shard decodes its datagrams: CRC, acks, handshakes, timeouts | per shard |
+| ingress | each transport shard opens its datagrams: AEAD tag, acks, token handshakes, timeouts | per shard |
 | events | spawn/despawn, and push inputs into per-entity queues (touches the world) | no |
 | movement | consume exactly one input seq per entity: the real input, or a stand-in if it hasn't arrived | rayon |
 | grid | counting-sort rebuild of the one shared 32 m grid | no |
 | history | positions into a 200 ms lag-comp ring (unused until M3) | no |
 | serialize | each entity once per tier: a 15-byte near blob for all, an 11-byte mid/far blob for those due | rayon |
 | assembly | per client: pick near/mid/far entities (`interest.rs`), fit the byte budget, memcpy blobs into messages | per shard |
-| transport | each shard's `send` + `flush`: framing, acks, CRC | per shard |
+| transport | each shard's `send` + `flush`: framing, acks, sealing | per shard |
 | egress | `send_to` per packet (in the binary) | per shard |
 
 The transport is 64 `lattice_net::Shard`s by default (`--shards`). The binary's receive thread buckets each datagram by `Router::shard`, so routing costs no tick time.
@@ -160,6 +160,25 @@ Findings:
     - The rest is encoding (~30 ns per entity for the codec itself), plus building the entries and a message per client.
     - At 10k that's ~4 ms. The level-6 tick still fits (p50 33 ms of its 50 ms period).
 - **Candidates if it matters:** writing the bits directly into the message buffer, and a flat per-shard index for acks.
+
+## Encryption on the WSL2 dev box
+
+Every packet after the handshake is sealed with ChaCha20-Poly1305 (`ring`), and clients connect with tokens. The bots mint their own tokens with `--token-key` (default: the public dev key, and the server warns about it), standing in for a login service. `lattice-server` takes the same `--token-key` and `--server-id`.
+
+**Before and after** (GSO egress in the blob; "before" is `4ad39ca`, with the CRC):
+
+| scenario | build | tick p50 / p99 | ingress p50 | transport p50 | ladder |
+|---|---|---|---|---|---|
+| blob 3,000 | before (2 runs) | 20.1–20.5 / 23.1–24.4 ms | 1.0–1.1 ms | 3.4–3.5 ms | L0 (one run fell to L1 after a 46 ms hitch) |
+| blob 3,000 | `ring` | 20.7 / 24.5 ms | 1.28 ms | 3.0 ms | L0 |
+| uniform 10,000 | before (2 runs) | 33.2–33.3 / 37.2–39.5 ms | 3.9–4.0 ms | 6.1 ms | L6 |
+| uniform 10,000 | RustCrypto (2 runs) | 34.0–34.7 / 39.9–43.4 ms | 4.6–4.7 ms | 6.2–6.3 ms | mostly **L7** |
+| uniform 10,000 | `ring` (3 runs) | 33.9–34.0 / 39.2–39.7 ms | 4.4–4.6 ms | 6.0–6.2 ms | L6 |
+
+- **Sealing big packets is cheaper than the CRC was,** so transport time falls. Opening the small input packets costs more, so ingress rises ~0.5 ms at 10k.
+- **RustCrypto's AEAD cost 10k a ladder level.** With it, 10k spent most of the run at dilation 0.9. `ring` keeps level 6, so it's the one used.
+- **Bytes:** +8 B per packet (27 B overhead, was 19). That's +1.1% down in the blob, and ~+12% up, since inputs are small packets.
+- **Candidate if ingress matters:** the receive path zeroes a 1,200 B stack buffer per packet before opening into it.
 
 ## GSO on the WSL2 dev box
 

@@ -10,8 +10,7 @@
 //! different messages, so each kind of sealed packet has its own domain and a
 //! counter that is unique within it (see the `DOMAIN_*` constants).
 
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
+use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, CHACHA20_POLY1305};
 
 use crate::token::Key;
 
@@ -33,7 +32,7 @@ fn nonce(domain: u32, counter: u64) -> Nonce {
     let mut n = [0; 12];
     n[..4].copy_from_slice(&domain.to_le_bytes());
     n[4..].copy_from_slice(&counter.to_le_bytes());
-    n.into()
+    Nonce::assume_unique_for_key(n)
 }
 
 fn associated_data<'a>(buf: &'a mut [u8; 8 + MAX_PREFIX], protocol_id: u64, prefix: &[u8]) -> &'a [u8] {
@@ -43,12 +42,11 @@ fn associated_data<'a>(buf: &'a mut [u8; 8 + MAX_PREFIX], protocol_id: u64, pref
     &buf[..8 + prefix.len()]
 }
 
-#[derive(Clone)]
-pub(crate) struct Cipher(ChaCha20Poly1305);
+pub(crate) struct Cipher(LessSafeKey);
 
 impl Cipher {
     pub fn new(key: &Key) -> Self {
-        Self(ChaCha20Poly1305::new(key.into()))
+        Self(LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).expect("32-byte key")))
     }
 
     /// Encrypts `packet[prefix..]` in place and appends the tag.
@@ -58,9 +56,9 @@ impl Cipher {
         let ad = associated_data(&mut ad, protocol_id, head);
         let tag = self
             .0
-            .encrypt_in_place_detached(&nonce(domain, counter), ad, msg)
+            .seal_in_place_separate_tag(nonce(domain, counter), Aad::from(ad), msg)
             .expect("packets are far below the AEAD's size limit");
-        packet.extend_from_slice(&tag);
+        packet.extend_from_slice(tag.as_ref());
     }
 
     /// Authenticates `packet` (sealed with `prefix` bytes of prefix) and
@@ -82,9 +80,8 @@ impl Cipher {
         out.copy_from_slice(msg);
         let mut ad = [0; 8 + MAX_PREFIX];
         let ad = associated_data(&mut ad, protocol_id, head);
-        self.0
-            .decrypt_in_place_detached(&nonce(domain, counter), ad, out, Tag::from_slice(tag))
-            .ok()?;
+        let tag = Tag::try_from(tag).ok()?;
+        self.0.open_in_place_separate_tag(nonce(domain, counter), Aad::from(ad), tag, out, 0..).ok()?;
         Some(len)
     }
 }

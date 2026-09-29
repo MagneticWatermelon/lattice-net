@@ -4,9 +4,9 @@
 //! token for one game server and hands it to the client over TLS:
 //!
 //! ```text
-//! ConnectToken (client-visible, 224 B as bytes):
-//!   server_id:8 | expires:8 | c2s_key:32 | s2c_key:32 | private:144
-//! private := nonce:24 | XChaCha20-Poly1305(token_key, nonce,
+//! ConnectToken (client-visible, 212 B as bytes):
+//!   server_id:8 | expires:8 | c2s_key:32 | s2c_key:32 | private:132
+//! private := nonce:12 | ChaCha20-Poly1305(token_key, nonce,
 //!              ad = protocol_id ++ server_id ++ expires,
 //!              user_id:8 | c2s_key:32 | s2c_key:32 | user_data:32) | tag:16
 //! ```
@@ -18,17 +18,18 @@
 //! two keys without ever having talked to the login service.
 //!
 //! Tokens are meant to expire within tens of seconds: they only matter until
-//! the handshake completes.
+//! the handshake completes. Nonces are random: 96 bits keep collisions
+//! negligible for up to ~2^32 tokens per `token_key`, so rotate the key well
+//! before that (at a million logins a day, that's millennia).
 
-use chacha20poly1305::aead::rand_core::RngCore;
-use chacha20poly1305::aead::{AeadInPlace, KeyInit, OsRng};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, CHACHA20_POLY1305};
+use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::wire::{DecodeError, Reader, Writer};
 
 pub type Key = [u8; 32];
 pub const USER_DATA_BYTES: usize = 32;
-const NONCE_BYTES: usize = 24;
+const NONCE_BYTES: usize = 12;
 const TAG_BYTES: usize = 16;
 const SEALED_BYTES: usize = 8 + 32 + 32 + USER_DATA_BYTES;
 /// The encrypted part of a token, as carried in handshake packets.
@@ -41,11 +42,20 @@ pub const CONNECT_TOKEN_BYTES: usize = 8 + 8 + 32 + 32 + PRIVATE_TOKEN_BYTES;
 /// deploy a server that uses it.
 pub const DEV_TOKEN_KEY: Key = *b"lattice-net dev key: NOT SECRET!";
 
+/// Fills `buf` from the OS's secure random source.
+pub(crate) fn random_bytes(buf: &mut [u8]) {
+    SystemRandom::new().fill(buf).expect("the OS random source failed");
+}
+
 /// A fresh random key from the OS.
 pub fn generate_key() -> Key {
     let mut k = [0; 32];
-    OsRng.fill_bytes(&mut k);
+    random_bytes(&mut k);
     k
+}
+
+fn aead_key(key: &Key) -> LessSafeKey {
+    LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).expect("32-byte key"))
 }
 
 /// What the client holds: where the token is valid, until when, the
@@ -116,21 +126,18 @@ impl ConnectToken {
     ) -> Self {
         let (c2s, s2c) = (generate_key(), generate_key());
         let mut private = [0; PRIVATE_TOKEN_BYTES];
-        OsRng.fill_bytes(&mut private[..NONCE_BYTES]);
+        random_bytes(&mut private[..NONCE_BYTES]);
         let (nonce, rest) = private.split_at_mut(NONCE_BYTES);
         let (sealed, tag_out) = rest.split_at_mut(SEALED_BYTES);
         sealed[..8].copy_from_slice(&user_id.to_le_bytes());
         sealed[8..40].copy_from_slice(&c2s);
         sealed[40..72].copy_from_slice(&s2c);
         sealed[72..].copy_from_slice(user_data);
-        let tag = XChaCha20Poly1305::new(token_key.into())
-            .encrypt_in_place_detached(
-                XNonce::from_slice(nonce),
-                &associated_data(protocol_id, server_id, expires),
-                sealed,
-            )
+        let nonce = Nonce::try_assume_unique_for_key(nonce).expect("12-byte nonce");
+        let tag = aead_key(token_key)
+            .seal_in_place_separate_tag(nonce, Aad::from(associated_data(protocol_id, server_id, expires)), sealed)
             .expect("buffer is far below the AEAD's size limit");
-        tag_out.copy_from_slice(&tag);
+        tag_out.copy_from_slice(tag.as_ref());
         Self { server_id, expires, client_to_server_key: c2s, server_to_client_key: s2c, private }
     }
 
@@ -159,16 +166,15 @@ impl ConnectToken {
 }
 
 /// Server side: opens the private part of tokens minted for this server.
-#[derive(Clone)]
 pub struct TokenOpener {
-    cipher: XChaCha20Poly1305,
+    cipher: LessSafeKey,
     protocol_id: u64,
     server_id: u64,
 }
 
 impl TokenOpener {
     pub fn new(token_key: &Key, protocol_id: u64, server_id: u64) -> Self {
-        Self { cipher: XChaCha20Poly1305::new(token_key.into()), protocol_id, server_id }
+        Self { cipher: aead_key(token_key), protocol_id, server_id }
     }
 
     /// Checks the clear fields first (cheap), then authenticates and decrypts.
@@ -189,13 +195,11 @@ impl TokenOpener {
         let (sealed, tag) = rest.split_at(SEALED_BYTES);
         let mut plain = [0u8; SEALED_BYTES];
         plain.copy_from_slice(sealed);
+        let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| TokenError::Invalid)?;
+        let tag = Tag::try_from(tag).map_err(|_| TokenError::Invalid)?;
+        let ad = Aad::from(associated_data(self.protocol_id, server_id, expires));
         self.cipher
-            .decrypt_in_place_detached(
-                XNonce::from_slice(nonce),
-                &associated_data(self.protocol_id, server_id, expires),
-                &mut plain,
-                tag.into(),
-            )
+            .open_in_place_separate_tag(nonce, ad, tag, &mut plain, 0..)
             .map_err(|_| TokenError::Invalid)?;
         Ok(TokenContents {
             user_id: u64::from_le_bytes(plain[..8].try_into().unwrap()),

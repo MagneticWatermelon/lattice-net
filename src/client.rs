@@ -3,9 +3,6 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use chacha20poly1305::aead::rand_core::RngCore;
-use chacha20poly1305::aead::OsRng;
-
 use crate::connection::{Channel, Config, Connection, Sealed, SendError, Stats};
 use crate::crypto::Cipher;
 use crate::packet::{self, DenyReason, Handshake, T_DISCONNECT, T_PAYLOAD};
@@ -50,7 +47,11 @@ impl Client {
             cfg,
             server,
             token,
-            salt: OsRng.next_u64(),
+            salt: {
+                let mut b = [0; 8];
+                crate::token::random_bytes(&mut b);
+                u64::from_le_bytes(b)
+            },
             phase: Phase::Requesting,
             started: now,
             last_handshake: None,

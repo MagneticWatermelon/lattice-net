@@ -16,9 +16,9 @@
 //!
 //! Handshake:
 //! ```text
-//! C->S Request   { server_id:8 expires:8 private:144 salt:8 }                    padded to 256 B
+//! C->S Request   { server_id:8 expires:8 private:132 salt:8 }                    padded to 256 B
 //! S->C Challenge { salt:8 cookie:8 }                                             17 B  (server keeps NO state)
-//! C->S Response  { server_id:8 expires:8 private:144 salt:8 cookie:8 tag:16 }    padded to 256 B
+//! C->S Response  { server_id:8 expires:8 private:132 salt:8 cookie:8 tag:16 }    padded to 256 B
 //! S->C Accepted  { salt:8 sealed(client_id:4) tag:16 }                           29 B  (server allocates the slot now)
 //! S->C Denied    { salt:8 reason:1 }
 //! ```

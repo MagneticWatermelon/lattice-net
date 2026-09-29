@@ -1,9 +1,9 @@
 # lattice-net
 
-The custom UDP transport for a PlanetSide-style MMOFPS, where each continent runs as one server process targeting up to 10k players. Written in Rust with zero dependencies. It's sans-IO: the protocol code never touches a socket, so you feed it datagrams and a timestamp and drain the datagrams it wants sent.
+The custom UDP transport for a PlanetSide-style MMOFPS, where each continent runs as one server process targeting up to 10k players. Written in Rust; its one dependency is `ring`, for ChaCha20-Poly1305 and OS randomness. It's sans-IO: the protocol code never touches a socket, so you feed it datagrams and a timestamp and drain the datagrams it wants sent.
 
 ```
-cargo test --release                                   # workspace: 27 transport tests incl. 25%-loss/jitter/dup sim, + sim/
+cargo test --release                                   # workspace: 42 transport tests incl. 25%-loss/jitter/dup sim, + sim/
 cargo run --release --example server                   # real UDP, 30 Hz tick, echo
 cargo run --release --example client 127.0.0.1:40000 5
 ```
@@ -12,46 +12,70 @@ The M1 headless scale test (a movement-only server, a bot swarm and per-phase ti
 
 ## Wire format
 
-Every datagram starts with a CRC32 and a type byte:
+Every datagram starts with a type byte. There's no checksum: packets are authenticated instead.
 
-```
-crc32:4 | type:1 | ...
-crc32 = CRC32(protocol_id ++ bytes[4..])    // protocol id is never sent
-```
-
-The CRC is a filter, not security. It cheaply rejects garbage, corrupted packets, and traffic from other games or other protocol versions, before any state is touched.
+- **Payload, disconnect and accept packets are sealed** with ChaCha20-Poly1305, using one key per direction per connection. The 16-byte tag rejects garbage, corruption, forgeries and other protocol versions before any state is touched.
+- **The protocol id is part of every tag and token, but never sent.**
+- **The client's handshake packets carry a connect token** that only the server can open.
 
 ### Payload packet (the hot path, sent every tick)
 
 ```
-crc32:4 | type:1 | session:4 | seq:2 | ack:2 | ack_bits:32 | ack_delay:2 | messages...
-                                                                            ^ 19 B fixed overhead
+type:1 | seq:2 | sealed( ack:2 | ack_bits:32 | ack_delay:2 | messages... ) | tag:16
+                                                                            ^ 27 B fixed overhead
 message := kind:1 [id:2 if reliable] len:1-2 bytes
 padding := kind:1 (=2) zeros...     // to the end of the packet
+nonce   := 0:4 | the sender's 64-bit packet counter      AD := protocol_id ++ type ++ seq
 ```
 
-- `seq` is this packet's number, a u16 that wraps (compared with half-range arithmetic).
+- `seq` is the low 16 bits of the sender's packet counter, compared with half-range arithmetic.
+- **The nonce is the full 64-bit counter.** The receiver rebuilds it from `seq` and the newest counter it has authenticated, as QUIC decodes packet numbers. The counter never repeats under a key, and an old packet replayed from a previous wrap fails the tag. A replay inside the window authenticates but is dropped as a duplicate.
 - `ack` is the newest packet received from the peer. `ack_bits` covers the 32 packets before it.
 - So **every packet acks the last 33**. With 30–60 packets/s per direction, an ack survives unless ~33 consecutive packets are lost. You never send dedicated ack packets.
 - `ack_delay` is how long packet `ack` waited here before this packet carried its ack, in 10 µs units (saturating at ~655 ms). The peer subtracts it from its RTT sample (as QUIC does), so RTT measures the network, not the peer's tick rate.
-- `session` is a 32-bit tag derived from the handshake cookie. An off-path attacker who spoofs the client's IP still has to guess it.
+- **Disconnect** is `type | seq | tag`, sealed like a payload. It uses up a sequence, so it can't be forged or replayed.
 - **Padding.** With `Config::pad_packets`, `flush` pads every packet but a connection's last of the tick to `max_packet_size`, so the tick's packets can go out as one GSO send (`UDP_SEGMENT` needs equal-size segments). Padding is a kind-2 marker and zeros to the end; a receiver always accepts it and needs no setting. Padding bytes are counted in `Stats::padding_bytes`. `Config::packet_body_size` and `Config::unreliable_wire_size` let an application predict how its messages pack, and so fill packets instead of padding them (the sim does this for its mid and far tiers).
 
-### Handshake (stateless, can't be used for amplification)
+### Connect tokens (`token.rs`, netcode.io-style)
+
+A login service (not in this crate) authenticates the player, then mints a token for one game server (`ConnectToken::mint`) and hands it to the client over TLS:
 
 ```
-C→S  ConnectionRequest  { salt }             padded to 256 B
-S→C  Challenge          { salt, cookie }     21 B      ← server stores NOTHING
-C→S  ChallengeResponse  { salt, cookie }     padded to 256 B
-S→C  Accepted           { salt, client_id }            ← slot allocated here
+server_id:8 | expires:8 | c2s_key:32 | s2c_key:32 | private:132
+private := nonce:12 | ChaCha20-Poly1305(token_key, ad = protocol_id ++ server_id ++ expires,
+                                        user_id:8 | c2s_key:32 | s2c_key:32 | user_data:32) | tag:16
 ```
 
-- `cookie = SipHash(server_secret, client_addr, salt, 10s_time_bucket)`.
-- Only a client that actually receives packets at its claimed address can echo the cookie back, so spoofed floods can't fill connection slots.
-- Requests are padded bigger than the replies, so the server can't be used for reflection or amplification attacks.
-- The server rejects unpadded requests at decode time.
-- **Admission control.** `Config::max_accepts_per_tick` (default 256, server-wide, split across shards) caps new connections per tick. A client over the budget just isn't answered: it resends its ChallengeResponse every 100 ms, and its cookie stays valid for 10–20 s. Because the handshake is stateless, deferring costs nothing, and a mass join (a server restart, a continent unlocking) is spread over several ticks.
+- The client can't read or alter `private`.
+- The server opens it with the `token_key` it shares with the login service (`ServerIdentity`). It learns the user and the connection's two fresh keys without ever talking to the login service.
+- Tokens should expire within tens of seconds. Nonces are random, which is safe for ~2^32 tokens per key.
+
+### Handshake (stateless until accept, can't be used for amplification)
+
+```
+C→S  Request    { server_id, expires, private, salt }                 padded to 256 B
+S→C  Challenge  { salt, cookie }                                      17 B   ← server stores NOTHING
+C→S  Response   { server_id, expires, private, salt, cookie, tag }    padded to 256 B
+S→C  Accepted   { salt, sealed(client_id), tag }                      29 B   ← slot allocated here
+```
+
+- **A request only gets a Challenge if its token opens.** It must be for this server, unexpired, sealed with our key, and on our protocol version. Anything else is dropped without a reply.
+- **The cookie proves the address.** `cookie = SipHash(server_secret, client_addr, salt, 10s_time_bucket)`, so only a client that receives packets at its claimed address can echo it back. Spoofed floods can't fill connection slots.
+- **The Response proves the keys.** It's tagged with the client→server key (nonce domain 1, counter = cookie). A token copied off the wire is useless without the keys the client got over TLS.
+- **Accepted is sealed with the server→client key,** so a client only believes its own server.
+- **A token connects once.** Its keys become the connection's, so a second connection would reuse their nonces. The server remembers used tokens until they expire, in a small registry shared by the shards. It's behind one lock, taken only on accept and removal.
+- **A user connecting again replaces the old connection** (`DisconnectReason::Replaced`), even across shards, and so does a new client instance at a connected address. The new connection needs a fresh token, and it proved its keys.
+- **The app learns who connected:** `ServerEvent::Connected` carries the token's `user_id` and 32 B of `user_data`.
+- **Wall clock:** `Server::update(now, unix_secs)` takes wall-clock time for token expiry.
+- **Amplification:** requests and responses are padded bigger than any reply. The server rejects handshake packets of the wrong size.
+- **Admission control.** `Config::max_accepts_per_tick` (default 256, server-wide, split across shards) caps new connections per tick. A client over the budget just isn't answered: it resends its Response every 100 ms, and its cookie stays valid for 10–20 s. Because the handshake is stateless, deferring costs nothing, and a mass join (a server restart, a continent unlocking) is spread over several ticks.
 - **Cheap accepts.** Removed connections go back to a per-shard pool, and `Server::preallocate(n)` fills the pools up front (with 25% headroom for uneven hashing). An accept then resets a pooled connection: about 4 µs, against 24 µs for a fresh one and 138 µs before the windows shrank. In the sim, 10k simultaneous joins without a budget finish in p99 215 ms, with one 58 ms tick. With the default budget, the worst tick is ~31 ms and p99 join time is 1.75 s. Keep the budget as a safety valve.
+
+### Crypto cost
+
+`ring`'s ChaCha20-Poly1305 (BoringSSL's assembly, dispatched at run time) takes 0.17 µs to open a 60 B packet and 0.59 µs for 1,200 B on the Ryzen 5700X3D. The CRC32 it replaced took 0.11 and 2.4 µs.
+
+RustCrypto's `chacha20poly1305` was tried first: 0.43 and 1.26 µs even with AVX2 enabled at compile time. The small-packet cost added ~0.7 ms of ingress at 10k and cost the server a ladder level on the WSL box. With `ring`, the level and tick p99 match the unencrypted build (see `sim/README.md`).
 
 ## Channels
 
@@ -102,12 +126,14 @@ The per-connection stats are packets and bytes sent and received, acked packets,
 
 | file | what |
 |---|---|
-| `wire.rs` | LE reader/writer, 1–2 byte varlen, table CRC32 |
+| `wire.rs` | LE reader/writer, 1–2 byte varlen |
 | `seq.rs` | wrapping u16 compare + `SequenceBuffer<T>` ring (clears skipped slots on jumps) |
-| `packet.rs` | packet types, encode/decode, padding rules |
+| `packet.rs` | packet types, handshake encode/decode, sealed payload framing |
+| `crypto.rs` | ChaCha20-Poly1305 sealing with nonce domains, 64-bit seq rebuilt from 16 bits |
+| `token.rs` | connect tokens: mint, bytes, open (`TokenOpener`), `DEV_TOKEN_KEY` |
 | `channel.rs` | `ReliableSender` / `ReliableReceiver` |
 | `connection.rs` | seq/ack/RTT/loss, `flush()` packs reliable then unreliable |
-| `server.rs` | `Server` → `Shard`s + `Router`: handshake, client tables, events, timeouts |
+| `server.rs` | `Server` → `Shard`s + `Router`: token handshake, client tables, used-token/user registry, events, timeouts |
 | `client.rs` | handshake state machine, resends every 100 ms |
 | `bitpack.rs` | bit writer/reader + quantization, e.g. a far-tier player in 8 bytes |
 
@@ -120,17 +146,19 @@ The simulated link does loss, duplication, and base delay + jitter (which causes
 - **Many clients.** 300 clients connect through the lossy link, each with a unique id.
 - **Unreliable doesn't block.** 3 × 500 B unreliable messages per tick keep streaming, with no head-of-line blocking.
 - **Timeouts.** Both sides time out when the cable is cut.
+- **Crypto** (unit tests in `crypto.rs`, `token.rs`, `packet.rs`, `connection.rs`). Seal/open with every byte flipped, and a wrong key, protocol, counter or domain. Sequence rebuilding across five wraps. Tokens refused for the wrong server, expiry, key, protocol or bytes. Handshake packets round-trip and aren't amplifiers. Replays deliver nothing twice.
+- **Token handshake** (`lossy_link.rs`). A token copied off the wire can't connect without its keys (the owner still can). A token connects once. The same user with a new token replaces the old connection across shards, and the old client is told by a sealed disconnect. Expired, foreign, forged and other-protocol tokens get no reply. Forged payloads and disconnects from a client's address are ignored.
 - **Padding** (unit tests in `connection.rs`). A flush of five 500 B messages makes three packets, the first two exactly 1,200 B, and the receiver gets all five messages. A lone packet is never padded, and padding that isn't all zeros is rejected.
 - **Server full.** A client over the limit gets Denied.
 - **Sharding.** Across 8 shards, 300 clients connect through the lossy link and echo reliably, and each id's shard matches its address route. `max_clients` holds across 16 shards (exactly 25 of 40 accepted). Shards run on real threads via `std::thread::scope`. A misrouted handshake is dropped. With an accept budget of 8 per tick, 200 simultaneous joins all get in, and no tick accepts more than 8.
 - **Recycled connections start clean.** A client that leaves unacked reliable messages behind hands its pooled connection to the next client. The next client gets none of the old messages, and its first reliable id isn't mistaken for a duplicate. (Skipping either reset fails this test.)
 - **RTT excludes the peer's hold.** On a 20 ms round trip where the peer held the ack for 30 ms, the sample reads 20 ms, not 50 ms.
 - **Delivery tags.** Of two packets carrying 12 tagged messages (8 tags per packet at most), only the delivered one's tags come back, each once.
-- **Bad input.** Garbage packets, forged cookies, and payloads with a spoofed address but wrong session are all dropped.
+- **Bad input.** Garbage packets, junk tokens, and payloads with a spoofed address but no valid tag are all dropped.
 
 ## What's deliberately missing (next steps, roughly in order)
 
-1. **Encryption + auth tokens.** *In progress: connect tokens are built (`token.rs`: mint, bytes, open, with tests for wrong server, expiry, key, protocol and tampering). The handshake and sealed packets are next.* Swap the SipHash cookie and session tag for netcode.io-style connect tokens: a login service issues a token encrypted with XChaCha20-Poly1305, and packets are then AEAD-encrypted per connection. Encryption also kills the CRC (the AEAD tag replaces it) and makes the session tag real authentication. Use the `chacha20poly1305` crate; don't roll your own.
+1. ~~**Encryption + auth tokens.**~~ Done: see Wire format.
 2. **Bandwidth budget per connection.** A token bucket (e.g. 1.5 Mbps down) that `flush` respects, with prioritized content filling the budget. This is where the interest-management layer plugs in: it decides *what* goes in the unreliable stream, and the budget decides *how much*.
 3. **Fragmentation** for messages > ~1.2 KB (initial world state, loadouts). Split them into a sliced reliable "block" channel, one block in flight at a time.
 4. **Serialize-once fan-out.** Right now `flush` copies the body into the packet. For 10k clients, write headers in place and assemble per-client packets from shared, pre-encoded entity blobs.

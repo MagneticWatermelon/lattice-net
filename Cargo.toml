@@ -6,8 +6,10 @@ description = "Custom UDP transport for a large-scale MMOFPS: acks, reliable-ord
 license = "MIT"
 
 [dependencies]
-# The one dependency: audited AEADs (RustCrypto, NCC Group audit), plus OS randomness for keys.
-chacha20poly1305 = "0.10"
+# The one dependency: ChaCha20-Poly1305 and OS randomness. ring's AEAD is BoringSSL's
+# assembly: 0.17 us to open a 60 B packet vs 0.43 us for RustCrypto's (which cost
+# 10k clients a ladder level on the WSL box). Builds C/asm, so it needs a C toolchain.
+ring = "0.17"
 
 [profile.release]
 debug = 1

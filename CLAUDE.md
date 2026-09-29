@@ -36,12 +36,17 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - QUIC (quinn-proto) is fine for a separate non-tick connection: login, loadouts, asset and map deltas, chat.
 - **The protocol code never does socket I/O.** Keep it that way: the Linux fast paths (`recvmmsg`/`sendmmsg`, GSO, `SO_REUSEPORT`, AF_XDP) only touch the socket loop, behind `cfg(target_os = "linux")`.
 - **Next transport steps, in order:**
-  1. netcode.io-style connect tokens + per-connection ChaCha20-Poly1305 using the `chacha20poly1305` crate (the AEAD tag replaces the CRC and the session tag; the packet seq is the nonce)
+  1. ~~connect tokens + per-connection ChaCha20-Poly1305~~ (done, see below)
   2. per-connection bandwidth budget (token bucket)
   3. fragmentation for >1.2 KB messages
   4. serialize-once fan-out without copying bodies
   5. syscall batching: `recvmmsg`, then `SO_REUSEPORT` (still the biggest phase at 10k)
 - **Done:**
+  - **Connect tokens and sealed packets (protocol `LATTICE3`).**
+    - **Tokens:** netcode.io-style (`token.rs`). ChaCha20-Poly1305 under a key the login service shares with the servers, holding the user id, both connection keys and 32 B of user data. Server id and expiry are clear associated data.
+    - **Packets:** payload and disconnect are `type:1 seq:2 sealed(...) tag:16` (27 B overhead). The nonce is the 64-bit packet counter, rebuilt from the u16 seq. There is no CRC and no session tag.
+    - **Handshake:** stateless until accept. The Response proves the keys, Accepted is sealed, and a token connects once. The same user with a new token replaces the old connection.
+    - **Crypto is `ring`, not RustCrypto** (decided 2026-09-29). RustCrypto's `chacha20poly1305` took 0.43 µs to open a 60 B packet and cost 10k a ladder level on WSL. `ring` takes 0.17 µs, needs no build flags, and matches the unencrypted build at 10k and in the blob.
   - Connection sharding: `Server` is N `Shard`s routed by a keyed address hash, and the sim drives them from rayon.
   - Accept budget per tick (`Config::max_accepts_per_tick`).
   - `sendmmsg` egress.
@@ -83,11 +88,8 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - **Sink bots don't isolate server cost on one box:** the swarm is ~52% busy either way. Judging 10k's ladder level needs bots on a second machine.
   - **M2c (debug map) is built:** `lattice-server --debug-http 0.0.0.0:8080` serves a top-down map of what one client receives (`sim/src/debugmap.rs`, std only).
   - **GSO is built** (see Transport decisions, Done). Mid and far messages are split to fill packets rather than fragmented; real fragmentation stays transport step 3.
-  - **Next:** transport step 1 (connect tokens + ChaCha20-Poly1305), before the bare-metal baseline and M3. Scoped 2026-09-29, built in 4 commits:
-    1. `token.rs`: tokens (XChaCha20-Poly1305 under a login-service key; user id, both keys, 32 B user data; server id and expiry as clear AD). **Done.**
-    2. Sealed payload and disconnect: `type:1 seq:2 sealed(ack header, messages) tag:16` (27 B overhead), AD = protocol id + type + seq, nonce = 64-bit counter rebuilt from the u16 seq; CRC and session go.
-    3. Token handshake, still stateless until accept: Request(token) → Challenge(cookie) → Response(token, cookie, sealed with c2s key: proves the keys) → Accepted (sealed). A second connection for a user id replaces the first. `Server::update(now, unix_secs)`, `Client::new(cfg, server, token, now)`, protocol `LATTICE3`.
-    4. Sim, bots and tests migrated; `.cargo/config.toml` builds for x86-64-v3 (the AEAD is 2–4× slower without AVX2 at compile time; with it, sealing 1,200 B takes 1.25 µs vs 2.4 µs for today's CRC32). Bar: blob tick p99 ≤ +1 ms, 10k's ladder level unchanged.
+  - **Transport step 1 (tokens + encryption) is done** (see Transport decisions, Done).
+  - **Next:** the bare-metal baseline, then M3.
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.
@@ -103,4 +105,4 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 ## Conventions
 
 - `cargo test --release` (runs the whole workspace) and `cargo clippy --workspace --all-targets` must stay clean.
-- Zero dependencies in the core crate unless there's a strong reason. Crypto uses audited crates, never hand-rolled. The one dependency is `chacha20poly1305` (RustCrypto, NCC-audited; brings `getrandom` for keys).
+- Zero dependencies in the core crate unless there's a strong reason. Crypto uses audited, widely used crates, never hand-rolled. The one dependency is `ring` (BoringSSL-derived ChaCha20-Poly1305 and OS randomness); it builds C/asm, so a C toolchain is needed (MSVC on Windows).
