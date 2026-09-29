@@ -1,0 +1,69 @@
+# lattice-net: project context for Claude Code
+
+Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This crate is the UDP transport. Start with `README.md`, which covers the wire format, channels, test coverage and the missing pieces.
+
+## Core architecture decisions (already made)
+
+- **One authoritative server process per continent**, with every player on the continent in that one process. Initial hard ceiling: **10k players**. Don't split one battle across servers: cross-server hit resolution means two clocks and two rewind histories.
+- **Server is authoritative for movement and hits.**
+  - Lag-compensated rewind is capped at ~150–200 ms.
+  - Projectiles are simulated on the server from a rewound origin.
+  - Hit detection is not client-side (PS2's model).
+- **Per-client downstream is O(k), not O(N).** Interest management uses tiers:
+  - Near (~64 entities @ 30 Hz)
+  - Mid (~256 @ 10 Hz)
+  - Far (~1000 @ 2 Hz, 8 B each, see `bitpack.rs`)
+  - Budget: ~0.7–1.5 Mbps per client, ~7–15 Gbps egress at 10k, so the server needs a 25G NIC.
+- **Server is a many-core box (64–96 cores).** Rust, ECS/SoA data layout. The tick is a phase pipeline, each phase run in parallel:
+  1. ingress
+  2. movement
+  3. shots (rewind)
+  4. apply events
+  5. spatial grid rebuild (one index shared by ALL systems, including networking, NPC proximity and AoE)
+  6. lag-comp history
+  7. **serialize each entity once per tier**
+  8. per-client assembly (priority accumulator + memcpy)
+  9. egress
+- **Delta compression scheme:** far and mid tiers send absolute state quantized relative to the grid cell, shared by all clients. Only the near tier gets per-client deltas against that client's last acked state.
+- **Degrade under load in this order:** shrink tier radii, then lower update rates, then lower the tick rate (30 → 20 Hz), then a mild time dilation (≥0.8).
+- **Lessons from Daybreak's 2023 PS2 profiling:** zone entry/spawn cost and NPC proximity sweeps killed performance in big fights, not bandwidth. Budget those systems.
+
+## Transport decisions
+
+- **Custom UDP, not QUIC, for tick traffic.**
+  - QUIC doesn't expose per-datagram acks, and delta-vs-last-acked needs them.
+  - QUIC's congestion control applies to datagrams and fights a fixed 30–60 Hz send rate.
+  - QUIC (quinn-proto) is fine for a separate non-tick connection: login, loadouts, asset and map deltas, chat.
+- **The protocol code never does socket I/O.** Keep it that way: the Linux fast paths (`recvmmsg`/`sendmmsg`, GSO, `SO_REUSEPORT`, AF_XDP) only touch the socket loop, behind `cfg(target_os = "linux")`.
+- **Next transport steps, in order:**
+  1. netcode.io-style connect tokens + per-connection ChaCha20-Poly1305 using the `chacha20poly1305` crate (the AEAD tag replaces the CRC and the session tag; the packet seq is the nonce)
+  2. per-connection bandwidth budget (token bucket)
+  3. fragmentation for >1.2 KB messages
+  4. serialize-once fan-out without copying bodies
+  5. syscall batching
+
+## Milestones
+
+- **M0: protocol.** Done: this crate, 18 tests.
+- **M1 (next): headless scale test.**
+  - Server does movement only. A Go bot swarm, one goroutine per bot, drives it at 1k, 5k and 10k.
+  - Measure p50/p99 per-phase tick time, bytes per client, pps, and prediction corrections.
+  - Scenarios: uniform spread; 3 hotspots of ~800; a 3,000-player blob within 200 m; 500 joins within 10 s.
+  - Pass bar: p99 tick under ~25 ms on the blob.
+- **M2:** interest management (tiers, priority accumulator, grid), plus a web top-down debug map showing what client X receives.
+- **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
+- **M4:** vehicles.
+- **M5:** minimal playable client.
+
+## Dev environment
+
+- Windows 10 22H2 desktop with WSL2 in NAT mode (mirrored networking isn't available on Win10).
+  - Keep the repo in WSL's `~/`, not `/mnt/c`.
+  - A Windows client reaches the WSL server through the WSL IP from `hostname -I`. Bind the server to `0.0.0.0`.
+- Server and bots are developed in WSL2. The game client is native Windows.
+- Performance numbers only count from bare-metal Linux: a dual-boot on the desktop, then a rented 10/25 GbE server for 5k–10k runs.
+
+## Conventions
+
+- `cargo test --release` and `cargo clippy --all-targets` must stay clean.
+- Zero dependencies in the core crate unless there's a strong reason. Crypto uses audited crates, never hand-rolled.

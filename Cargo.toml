@@ -1,0 +1,11 @@
+[package]
+name = "lattice-net"
+version = "0.1.0"
+edition = "2021"
+description = "Custom UDP transport for a large-scale MMOFPS: acks, reliable-ordered + unreliable channels, stateless handshake. Sans-IO, zero dependencies."
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+debug = 1
