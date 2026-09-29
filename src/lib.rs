@@ -29,9 +29,11 @@ mod connection;
 pub mod packet;
 pub mod seq;
 mod server;
+pub mod token;
 pub mod wire;
 
 pub use client::{Client, ClientState};
 pub use connection::{Channel, Config, Connection, SendError, Stats};
 pub use packet::DenyReason;
 pub use server::{ClientId, DisconnectReason, Router, Server, ServerEvent, Shard};
+pub use token::{ConnectToken, TokenContents, TokenError, TokenOpener};

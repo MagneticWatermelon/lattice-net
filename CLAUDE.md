@@ -83,7 +83,11 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - **Sink bots don't isolate server cost on one box:** the swarm is ~52% busy either way. Judging 10k's ladder level needs bots on a second machine.
   - **M2c (debug map) is built:** `lattice-server --debug-http 0.0.0.0:8080` serves a top-down map of what one client receives (`sim/src/debugmap.rs`, std only).
   - **GSO is built** (see Transport decisions, Done). Mid and far messages are split to fill packets rather than fragmented; real fragmentation stays transport step 3.
-  - **Next:** transport step 1 (connect tokens + ChaCha20-Poly1305), before the bare-metal baseline and M3.
+  - **Next:** transport step 1 (connect tokens + ChaCha20-Poly1305), before the bare-metal baseline and M3. Scoped 2026-09-29, built in 4 commits:
+    1. `token.rs`: tokens (XChaCha20-Poly1305 under a login-service key; user id, both keys, 32 B user data; server id and expiry as clear AD). **Done.**
+    2. Sealed payload and disconnect: `type:1 seq:2 sealed(ack header, messages) tag:16` (27 B overhead), AD = protocol id + type + seq, nonce = 64-bit counter rebuilt from the u16 seq; CRC and session go.
+    3. Token handshake, still stateless until accept: Request(token) → Challenge(cookie) → Response(token, cookie, sealed with c2s key: proves the keys) → Accepted (sealed). A second connection for a user id replaces the first. `Server::update(now, unix_secs)`, `Client::new(cfg, server, token, now)`, protocol `LATTICE3`.
+    4. Sim, bots and tests migrated; `.cargo/config.toml` builds for x86-64-v3 (the AEAD is 2–4× slower without AVX2 at compile time; with it, sealing 1,200 B takes 1.25 µs vs 2.4 µs for today's CRC32). Bar: blob tick p99 ≤ +1 ms, 10k's ladder level unchanged.
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.
@@ -99,4 +103,4 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 ## Conventions
 
 - `cargo test --release` (runs the whole workspace) and `cargo clippy --workspace --all-targets` must stay clean.
-- Zero dependencies in the core crate unless there's a strong reason. Crypto uses audited crates, never hand-rolled.
+- Zero dependencies in the core crate unless there's a strong reason. Crypto uses audited crates, never hand-rolled. The one dependency is `chacha20poly1305` (RustCrypto, NCC-audited; brings `getrandom` for keys).
