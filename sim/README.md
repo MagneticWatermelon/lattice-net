@@ -40,7 +40,7 @@ Movement is deterministic f32 code shared by both sides, so prediction matches t
 **Input policy.** Every tick consumes exactly one input seq, so each server step matches exactly one client step:
 - If the next input is missing, a stand-in takes its seq: the last input for 2 ticks (`GRACE_TICKS`), then a frozen input (no movement, facing kept).
 - The real input is dropped if it shows up later (`late_inputs`). Holding packets back (a lag switch) therefore buys no movement.
-- There's no 2-per-tick catch-up. Instead, each snapshot carries the server's queue depth for that client (`buffered`), and the bot nudges its input clock by up to ±5% to keep the input due now plus 1–2 spare queued. Inside that band the clock is left alone.
+- There's no 2-per-tick catch-up. Instead, each snapshot carries the server's queue depth for that client (`buffered`), and the bot nudges its input clock by up to ±5% to keep the input due now plus one spare queued. It's left alone while the smoothed depth is within [1.75, 2.5]. Two spares (depth 3, which a stall can leave behind) sit above that band, so they drain back.
 - The spare is there from the start: the first tick after Welcome sends 2 inputs. Starting at depth 1 left every input arriving just in time, and jitter kept bots one tick late.
 - When a snapshot reports a stand-in (depth 0), the bot sends one extra input at once, at most once per 10 ticks. The nudge handles slow drift.
 - A client that stalls past the server's seq jumps ahead to it (`resyncs`) and rebuilds its spare, instead of staying late forever.
@@ -107,5 +107,5 @@ Findings:
     | mean at 3k–10k | 54–57 ms |
 
     - The round trip players never feel is 80–100 ms.
-    - **Found by this metric: after a hiccup, bots can stay at 2 spares.** Once a stall makes a bot rebuild its lead, it can settle at depth 3, and the [2, 3] dead band never pulls it back. In one 10k run the server wait rose from ~50 to ~80 ms at t = 20 s and stayed there. A band that drains back to 1 spare (upper edge at 2.5) would fix it. That's for the netem tuning.
+    - **Found by this metric, and fixed: after a hiccup, bots could stay at 2 spares.** A stall made bots rebuild their lead and settle at depth 3, and the old [2, 3] dead band never pulled them back. In one 10k run the server wait rose from ~50 to ~80 ms at t = 20 s and stayed there. The band is now [1.75, 2.5]; a test delays every input a tick for 3 s, then checks the wait returns to one tick.
 7. **Zone entry isn't modeled yet.** A spawn here is just a Welcome. The real zone-entry cost is sending the initial world state, which needs fragmentation first.

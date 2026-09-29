@@ -88,8 +88,8 @@ pub struct SnapshotHeader {
     /// Newest input seq the server has consumed (real or stand-in), 0 if none yet.
     pub ack_seq: u32,
     /// Real inputs the server had queued for this client when the tick began.
-    /// The client speeds its input clock up or down to keep this at 2-3
-    /// (the input due now plus 1-2 spare).
+    /// The client speeds its input clock up or down to keep this at 2
+    /// (the input due now plus one spare).
     pub buffered: u8,
     /// How long input `ack_seq` waited on the server, from its datagram
     /// arriving to being applied, in 0.1 ms. `WAIT_STAND_IN` if it never

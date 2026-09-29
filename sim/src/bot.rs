@@ -14,11 +14,14 @@ const HISTORY: usize = 128;
 /// error is left alone; exact determinism makes that case rare.
 pub const CORRECTION_EPSILON: f32 = 0.001;
 /// Inputs we want queued at the server when it consumes one: the one it needs
-/// plus 1-2 spare. With a spare, a lost packet is covered by the next packet's
-/// redundant copy; more spares only add input latency. The clock is left alone
-/// inside this band (depth is an integer, so a point target would oscillate).
-const TARGET_DEPTH: (f32, f32) = (2.0, 3.0);
-const DEAD_BAND: f32 = 0.25;
+/// plus one spare. With a spare, a lost packet is covered by the next packet's
+/// redundant copy. Each spare adds a tick of input -> applied latency.
+const TARGET_DEPTH: f32 = 2.0;
+/// The clock is left alone while the smoothed depth is inside this band.
+/// Depth is an integer, so a point target would oscillate: the band holds a
+/// steady depth of 2, and puts a steady 3 (two spares, left over after a
+/// stall) above the band, so it drains back instead of costing 33 ms forever.
+const DEPTH_BAND: (f32, f32) = (1.75, 2.5);
 /// Input clock speed change per input of depth error, capped at ±5 %.
 const CLOCK_GAIN: f32 = 0.03;
 const MAX_CLOCK_ADJUST: f32 = 0.05;
@@ -114,7 +117,7 @@ impl BotBrain {
             // adds or skips an input, instead of flipping at the edge every tick.
             clock: 0.5,
             bump_cooldown: 0,
-            buffer_avg: (TARGET_DEPTH.0 + TARGET_DEPTH.1) / 2.0,
+            buffer_avg: TARGET_DEPTH,
             resyncing: false,
             last_server_tick: None,
             last_acked: 0,
@@ -148,7 +151,7 @@ impl BotBrain {
                 self.welcome = Some(w);
                 // Start with the spare already queued: at depth 1 every input
                 // arrives just in time and any jitter makes it late.
-                self.clock += TARGET_DEPTH.0 - 1.0;
+                self.clock += TARGET_DEPTH - 1.0;
             }
             Ok(ServerMsg::Snapshot(h, _)) if self.welcome.is_some() => self.on_snapshot(&h, now),
             Ok(_) => {}
@@ -169,14 +172,8 @@ impl BotBrain {
             return; // server hasn't consumed any of our inputs yet
         }
         self.buffer_avg += (h.buffered as f32 - self.buffer_avg) * 0.1;
-        let (lo, hi) = (TARGET_DEPTH.0 - DEAD_BAND, TARGET_DEPTH.1 + DEAD_BAND);
-        let error = if self.buffer_avg < lo {
-            TARGET_DEPTH.0 - self.buffer_avg
-        } else if self.buffer_avg > hi {
-            TARGET_DEPTH.1 - self.buffer_avg
-        } else {
-            0.0
-        };
+        let (lo, hi) = DEPTH_BAND;
+        let error = if self.buffer_avg < lo || self.buffer_avg > hi { TARGET_DEPTH - self.buffer_avg } else { 0.0 };
         self.rate = 1.0 + (CLOCK_GAIN * error).clamp(-MAX_CLOCK_ADJUST, MAX_CLOCK_ADJUST);
         if h.buffered == 0 && self.bump_cooldown == 0 {
             self.clock += 1.0;
@@ -191,7 +188,7 @@ impl BotBrain {
             if !self.resyncing {
                 // Landing exactly on the server's seq leaves no lead: the next
                 // input would be late too. Rebuild the spare right away.
-                self.clock += TARGET_DEPTH.0;
+                self.clock += TARGET_DEPTH;
             }
             self.resyncing = true;
             self.seq = h.ack_seq;
@@ -242,7 +239,7 @@ impl BotBrain {
     }
 
     /// Run the input clock for one tick: usually one input, occasionally two or
-    /// none while it steers the server's queue depth into `TARGET_DEPTH`. Returns
+    /// none while it steers the server's queue depth into `DEPTH_BAND`. Returns
     /// the batch to send (unreliable), or `None` when there's nothing new or
     /// before the server has welcomed us.
     pub fn tick_inputs(&mut self, now: Instant) -> Option<Vec<u8>> {

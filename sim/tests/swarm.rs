@@ -158,14 +158,14 @@ fn loss_causes_corrections_then_reconverges() {
 }
 
 #[test]
-fn input_clock_keeps_one_to_two_spare_inputs() {
+fn input_clock_keeps_one_spare_input() {
     let mut s = Swarm::new(20, SpawnMode::Uniform);
     for _ in 0..20 * TICK_HZ {
         s.step();
     }
     for (_, _, b) in &s.bots {
         let depth = b.server_buffer();
-        assert!((1.75..=3.25).contains(&depth), "server queue depth {depth}");
+        assert!((1.75..=2.5).contains(&depth), "server queue depth {depth}");
         // Lockstep starts at depth 1: the clock runs ahead once, then holds steady.
         assert!(b.stats.clock_extra >= 1, "the clock must run ahead to build a spare");
         assert!(b.stats.clock_extra + b.stats.clock_skipped <= 3, "clock hunting: {:?}", b.stats);
@@ -269,5 +269,32 @@ fn one_tick_of_jitter_is_absorbed_from_the_start() {
     assert_eq!(s.corrections(), 0);
     for (_, _, b) in &s.bots {
         assert_eq!(b.stats.resyncs, 0);
+    }
+}
+
+#[test]
+fn input_clock_drains_back_to_one_spare_after_jitter() {
+    // Every input packet arrives a tick late for 3 s: the bots build an extra
+    // tick of lead to keep their spare. When the delay goes away, that lead is a
+    // second spare (depth 3, +33 ms of input latency) and must drain away.
+    let mut s = Swarm::new(5, SpawnMode::Blob);
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    s.delay = 1.0;
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    s.delay = 0.0;
+    for _ in 0..4 * TICK_HZ {
+        s.step();
+    }
+    assert_eq!(stand_ins(&s), 0, "one spare absorbs a one-tick delay");
+    for (_, _, b) in &mut s.bots {
+        assert!(b.server_buffer() < 2.5, "still at depth {}", b.server_buffer());
+        let mut samples = Vec::new();
+        b.drain_latency(&mut samples);
+        let last = samples.last().unwrap();
+        assert_eq!(last.server_wait, Some(333), "server wait back to one tick");
     }
 }
