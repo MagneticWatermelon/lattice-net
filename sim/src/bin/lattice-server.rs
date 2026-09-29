@@ -50,6 +50,7 @@ lattice-server: M1 movement-only authoritative server
   --warmup S           ignore the first S seconds after the first client in the summary [3];
                        the summary also stops once clients drain below 90% of peak
   --csv PATH           append one row per report window
+  --debug-http ADDR    serve the debug map (what one client receives) on ADDR, e.g. 0.0.0.0:8080
   --seed N             spawn RNG seed [1]";
 
 /// Columns of per-tick timing samples: the sim phases, then egress and total.
@@ -199,6 +200,7 @@ fn main() -> std::io::Result<()> {
     let report = Duration::from_secs_f64(a.get("report", 5.0));
     let warmup = Duration::from_secs_f64(a.get("warmup", 3.0));
     let csv_path: Option<String> = a.opt("csv");
+    let debug_http: Option<SocketAddr> = a.opt("debug-http");
     a.finish();
 
     if let Some(n) = threads {
@@ -267,6 +269,13 @@ fn main() -> std::io::Result<()> {
     };
 
     let mut csv = csv_path.map(open_csv).transpose()?;
+    let debug_map = match debug_http {
+        Some(addr) => {
+            println!("debug map on http://{addr}/ (from Windows, use the WSL IP from `hostname -I`)");
+            Some(lattice_sim::debugmap::DebugMap::start(addr)?)
+        }
+        None => None,
+    };
 
     let mut inbound: Vec<Vec<InDatagram>> = vec![Vec::new(); shards];
     // Server-side input waits after warmup, 0.1 ms units.
@@ -288,7 +297,14 @@ fn main() -> std::io::Result<()> {
         let now = Instant::now();
         std::mem::swap(&mut inbound, &mut *inbox.lock().unwrap());
 
+        if let Some(map) = &debug_map {
+            let watch = map.watch().or_else(|| sim.any_entity());
+            sim.set_watch(watch);
+        }
         let times = sim.tick(&mut inbound, now, &mut out);
+        if let (Some(map), Some(frame)) = (&debug_map, sim.take_debug_frame()) {
+            map.publish(frame);
+        }
 
         let t_egress = Instant::now();
         let (pkts, bytes) = out

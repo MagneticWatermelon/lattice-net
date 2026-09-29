@@ -599,3 +599,26 @@ fn near_deltas_survive_loss() {
     let c = s.server.counters();
     assert!(c.near_deltas > c.near_full, "deltas {} vs full {}", c.near_deltas, c.near_full);
 }
+
+#[test]
+fn debug_capture_reports_what_the_watched_client_got() {
+    let mut s = line_swarm(62, InterestConfig::default());
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let entity = s.bots[0].2.welcome().unwrap().entity;
+    s.server.set_watch(Some(entity));
+    let mut frame = None;
+    for _ in 0..12 {
+        s.step();
+        frame = frame.or(s.server.take_debug_frame());
+    }
+    let f = frame.expect("a capture every 6th tick");
+    let w = f.watched.unwrap();
+    assert_eq!(w.entity, entity);
+    assert_eq!(f.entities.len(), 62);
+    assert!(!w.near.is_empty() && !w.mid.is_empty(), "{w:?}");
+    assert!(w.near.iter().all(|&(_, age, sent, _)| sent == (age == 0)));
+    assert_eq!(w.radii, [150.0, 500.0, 1500.0]);
+    assert!(w.bytes > w.near_bytes);
+}

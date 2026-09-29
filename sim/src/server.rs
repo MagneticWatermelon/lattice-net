@@ -60,6 +60,41 @@ const SENT_RING: usize = 16;
 
 /// A message for one client, and its delivery tag if it wants acks.
 type Snap = (ClientId, Vec<u8>, Option<u32>);
+
+/// What one watched client got on one tick, for the debug map.
+#[derive(Debug, Clone, Default)]
+pub struct WatchedClient {
+    pub client: ClientId,
+    pub entity: u16,
+    pub pos: [f32; 2],
+    /// Near, mid and far radii for this client (its bandwidth level applied).
+    pub radii: [f32; 3],
+    pub client_level: u8,
+    /// Near set: (entity, ticks since last sent before this tick, sent now,
+    /// sent as a delta).
+    pub near: Vec<(u16, u32, bool, bool)>,
+    pub mid: Vec<u16>,
+    pub far: Vec<u16>,
+    /// Due far entities that didn't fit the budget (carried to next tick).
+    pub far_skipped: Vec<u16>,
+    pub far_starved: u32,
+    pub bytes: usize,
+    pub near_bytes: usize,
+}
+
+/// The debug map's view of one tick.
+#[derive(Debug, Clone, Default)]
+pub struct DebugFrame {
+    pub tick: u32,
+    pub level: u8,
+    pub tick_hz: u32,
+    pub dilation: f32,
+    pub pace: f32,
+    pub clients: usize,
+    /// Every entity: (entity, position).
+    pub entities: Vec<(u16, [f32; 2])>,
+    pub watched: Option<WatchedClient>,
+}
 /// Input waits above 1 s land in the histogram's last bucket (0.1 ms units).
 const INPUT_WAIT_CAP: u32 = 10_000;
 
@@ -207,6 +242,8 @@ struct Scratch {
     acked: Vec<u32>,
     ack_pairs: Vec<(u16, u32)>,
     near_entries: Vec<NearEntry>,
+    /// Filled when this shard assembled the watched client.
+    watched: Option<WatchedClient>,
     mid: Vec<(f32, u16)>,
     far: Vec<(f32, u16)>,
     tally: Tally,
@@ -374,6 +411,9 @@ pub struct SimServer {
     step_acc: f64,
     /// `cfg.interest` at the current ladder level.
     interest: InterestConfig,
+    /// Debug map: the entity whose client to watch, and the last capture.
+    watch: Option<u16>,
+    debug: Option<DebugFrame>,
 }
 
 impl SimServer {
@@ -413,7 +453,25 @@ impl SimServer {
             pace_now: 1.0,
             step_acc: 0.0,
             interest,
+            watch: None,
+            debug: None,
         }
+    }
+
+    /// Record what `entity`'s client receives, for the debug map (`None` stops).
+    /// Captures happen every 6th tick (5 Hz at 30 Hz).
+    pub fn set_watch(&mut self, entity: Option<u16>) {
+        self.watch = entity;
+    }
+
+    /// The latest capture, if one was taken since the last call.
+    pub fn take_debug_frame(&mut self) -> Option<DebugFrame> {
+        self.debug.take()
+    }
+
+    /// Some connected client's entity (to watch when none was chosen).
+    pub fn any_entity(&self) -> Option<u16> {
+        self.by_client.values().min().copied()
     }
 
     pub fn config(&self) -> &SimConfig {
@@ -627,6 +685,7 @@ impl SimServer {
             tick,
             pace: (self.pace_now * 1000.0).round() as u16,
             level: self.ladder.level(),
+            watch: self.watch.filter(|_| tick % 6 == 0),
             bodies: &self.bodies,
             inputs: &self.inputs,
             near_hist: &self.near_hist,
@@ -655,6 +714,19 @@ impl SimServer {
                     view.assemble(slot, scratch, snaps);
                 }
             });
+        if let Some(watched) = self.scratch.iter_mut().find_map(|sc| sc.watched.take()) {
+            let rung = self.ladder.rung();
+            self.debug = Some(DebugFrame {
+                tick,
+                level: self.ladder.level(),
+                tick_hz: rung.tick_hz,
+                dilation: rung.dilation,
+                pace: self.pace_now,
+                clients: self.by_client.len(),
+                entities: self.bodies.iter().enumerate().filter(|(_, b)| b.alive).map(|(i, b)| (i as u16, b.state.pos)).collect(),
+                watched: Some(watched),
+            });
+        }
         for sc in &self.scratch {
             let (c, t) = (&mut self.counters, &sc.tally);
             c.snapshots += t.snapshots;
@@ -807,6 +879,8 @@ struct View<'a> {
     max_message: usize,
     pace: u16,
     level: u8,
+    /// Capture this entity's client this tick.
+    watch: Option<u16>,
 }
 
 impl View<'_> {
@@ -1036,6 +1110,36 @@ impl View<'_> {
         bytes += self.write_tier(Tier::Mid, mid_blobs, slot.client, snaps);
         let far_blobs = sc.far[..n_far].iter().map(|&(_, j)| &self.far_blobs[j as usize][..]);
         bytes += self.write_tier(Tier::Far, far_blobs, slot.client, snaps);
+
+        if self.watch == Some(e) {
+            let sent: std::collections::HashSet<u16> = sc.picked.iter().map(|p| p.0).collect();
+            let near = slot
+                .near
+                .entries()
+                .iter()
+                .map(|&(j, last, base)| {
+                    let was_sent = sent.contains(&j);
+                    let usable = base > 0 && tick - base <= MAX_BASE_AGE && base >= self.bodies[j as usize].spawned;
+                    // `last` is now this tick for the ones just sent.
+                    let age = if was_sent { 0 } else { tick.saturating_sub(last) };
+                    (j, age, was_sent, was_sent && usable)
+                })
+                .collect();
+            sc.watched = Some(WatchedClient {
+                client: slot.client,
+                entity: e,
+                pos: me.state.pos,
+                radii: [cfg.near_radius, mid_radius, far_radius],
+                client_level: slot.ladder.level(),
+                near,
+                mid: sc.mid[..n_mid].iter().map(|m| m.1).collect(),
+                far: sc.far[..n_far].iter().map(|f| f.1).collect(),
+                far_skipped: slot.far_carry.clone(),
+                far_starved: starved as u32,
+                bytes,
+                near_bytes,
+            });
+        }
 
         let t = &mut sc.tally;
         t.snapshots += 1;

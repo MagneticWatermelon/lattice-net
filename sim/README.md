@@ -50,6 +50,11 @@ Shots and event application (phases 3–4) arrive with M3.
 
 `--spawn line:<meters>` places players on a line at fixed spacing, to check tiers by distance.
 
+**Debug map (M2c, `debugmap.rs`).** `lattice-server --debug-http 0.0.0.0:8080` serves a top-down map of what one client receives. From Windows, open `http://<WSL IP>:8080/`, taking the IP from `hostname -I`.
+- **Capture.** The sim records the watched client's decisions every 6th tick (5 Hz): its near set with each entity's age and whether it went as a delta or in full, the mid and far entities sent, far skips and starvation, its radii (with its bandwidth level), and its bytes. The rest of the server is unaffected.
+- **Page.** It draws every entity, the three tier rings, and colors each entity by what the client got. Near entities that were held back fade with their age, so starvation and tier flips show up at a glance. Scroll to zoom; click an entity to watch its client.
+- **Implementation.** Std only: one HTTP thread, hand-written JSON (`/frame`), and `/watch?entity=N`.
+
 **Degradation ladder (M2d, `ladder.rs`).** Under load the server gives up quality in the order CLAUDE.md fixes. Each level keeps the changes before it:
 
 | level | change |

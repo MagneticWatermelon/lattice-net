@@ -80,9 +80,8 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - Near bytes in the blob fell 63% (967 → 357 B per client-tick). The blob stays at 2 packets, which was decided: mid alone is ~950 B.
     - The cost: ~3.5 µs of assembly per client per tick (encoding + ack bookkeeping).
   - **Sink bots don't isolate server cost on one box:** the swarm is ~52% busy either way. Judging 10k's ladder level needs bots on a second machine.
-  - **Next:**
-    - M2c: the web debug map;
-    - GSO, together with fixed-size packets or fragmentation (`UDP_SEGMENT` needs equal-size segments).
+  - **M2c (debug map) is built:** `lattice-server --debug-http 0.0.0.0:8080` serves a top-down map of what one client receives (`sim/src/debugmap.rs`, std only).
+  - **Next:** GSO, together with fixed-size packets or fragmentation (`UDP_SEGMENT` needs equal-size segments).
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.

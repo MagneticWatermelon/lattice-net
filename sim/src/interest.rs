@@ -173,6 +173,11 @@ impl NearState {
         self.entries.iter().find(|e| e.0 == entity).map(|e| e.1)
     }
 
+    /// The near set: (entity, last sent tick, acked baseline tick or 0).
+    pub fn entries(&self) -> &[(u16, u32, u32)] {
+        &self.entries
+    }
+
     /// The newest tick of `entity`'s state the client is known to have (0 = none).
     pub fn baseline(&self, entity: u16) -> Option<u32> {
         self.entries.iter().find(|e| e.0 == entity).map(|e| e.2)

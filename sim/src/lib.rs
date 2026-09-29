@@ -6,6 +6,7 @@
 //! own the sockets.
 
 pub mod bot;
+pub mod debugmap;
 pub mod delta;
 pub mod cli;
 pub mod grid;
