@@ -56,11 +56,22 @@ Stand-ins can exceed bot corrections: a stand-in whose input matches what the bo
 
 ## Output
 
-The server prints a line every `--report` seconds (with `--csv`, one row per window). At exit it prints p50/p99/max per phase over every tick after warmup. It also reports the system-wide kernel `RcvbufErrors`/`SndbufErrors` deltas from `/proc/net/snmp`.
+**Server output**
+- A line every `--report` seconds (with `--csv`, one row per window).
+- At exit, p50/p99/max per phase over the **steady state**: after warmup, and before clients drain below 90% of peak. A mass disconnect loses some Disconnect packets, and those entities sit frozen until they time out, so the drain is left out.
+- The system-wide kernel `RcvbufErrors`/`SndbufErrors` deltas from `/proc/net/snmp`.
+- **Joins deferred** by the accept budget (`--accepts-per-tick`, default 256 per tick server-wide).
+- **Input wait**: from an input's datagram arriving (stamped by the receive thread) to the tick that applies it.
 
-The server also reports **joins deferred** by the accept budget (`--accepts-per-tick`, default 256 per tick server-wide). Egress uses `sendmmsg` on Linux (`--egress sendto` for comparison).
+The server preallocates `max-clients` connections at startup (`--no-prealloc` to skip). Egress uses `sendmmsg` on Linux (`--egress sendto` for comparison).
 
-The bots report snapshots, entities per snapshot, corrections, kbps per bot, RTT, join latency (connect → Welcome), **input latency**, and **swarm overruns**. Input latency runs from generating an input to reading the first snapshot that acks it. It includes the spare input, the server tick, the network, and waiting for the bot's own next tick. Because it's quantized to whole ticks, its median jumps between 67 and 100 ms from run to run; the mean is the stable number. An overrun means the bots were late, so treat any corrections in that window as swarm artifacts.
+**Bot output**
+- Snapshots, entities per snapshot, corrections, kbps per bot, RTT, join latency (connect → Welcome), and **swarm overruns**. An overrun means the bots were late, so treat any corrections in that window as swarm artifacts.
+- Input latency, split three ways:
+  - **Input → applied on the server ≈ RTT/2 + server wait.** This is the number to tune the spare against: it's how late other players see you and when your shots resolve. The wait comes back in each snapshot, and needs no clock sync.
+  - **Server wait** alone. The spare input is one tick of it.
+  - **Round trip:** input → acked in a snapshot the bot has read. This bounds reconciliation replay. It's quantized to whole bot ticks, so its median jumps between 67 and 100 ms from run to run.
+- The bots' RTT is a network RTT. The server reports its hold as `ack_delay`, and the bots stamp arrivals with `SO_TIMESTAMPNS` instead of their tick time. It reads 1.7–1.9 ms on loopback.
 
 ## Baseline: WSL2 dev box (behavior, not capacity)
 
@@ -82,12 +93,19 @@ Findings:
 3. **Egress is still the biggest phase.** At 10k in the same session, `sendmmsg` takes 8.3 ms p50 against 10.8 ms for `send_to`, 23% less, and the tick p50 falls from 18.9 to 16.5 ms. The rest waits for `SO_REUSEPORT`, GSO after M2, and bare metal.
 4. **Assembly scales with density, as expected:** 4.5 ms for the blob (every client scans about 3,000 candidates) versus 1.2 ms for 10k uniform. This is where M2's tiers and budgets land.
 5. **Steady state has no stand-ins and no corrections in any scenario.**
-    - **Joins used to spike the tick.** Without the accept budget, 10k bots connecting within about 0.5 s pushed one tick to about 150 ms: each accept costs about 138 µs, mostly page-faulting the ~130 KB of connection windows.
-    - **With the budget (256 per tick), the worst join tick is 23 ms.** Joins take p50 0.7 s and p99 1.6 s. Join-time stand-ins fall from about 20k to about 2k, none of them frozen.
+    - **Joins used to spike the tick.** 10k bots connecting within about 0.5 s pushed one tick to about 150 ms, because each accept cost ~138 µs page-faulting ~130 KB of connection windows.
+    - **Accepts are now ~4 µs**, with smaller windows and pooled connections. Without a budget, all 10k join in p99 215 ms, with one 58 ms tick from the handshake burst and first sends.
+    - **With the default budget (256 per tick)**, the worst join tick is ~31 ms and joins take p99 1.75 s.
     - **No jitter or loss is simulated over the sockets yet;** run under `netem` for that.
-6. **Input latency averages 81–84 ms** (p99 ≈ 133 ms at 10k, 100 ms in the blob). The in-process lockstep floor is exactly 2 ticks (67 ms):
-    - the spare input costs 1 tick;
-    - reading the snapshot on the bot's next tick costs 1 more.
+6. **Input → applied averages 51 ms with 200 bots and 57–67 ms at 3k–10k.** The spare input is 33 ms of it. RTT/2 is under 1 ms on loopback; the rest is server wait:
 
-    Over real sockets, the unaligned phases of the bot and server clocks add about half a tick, and at 10k the server's own ~16 ms tick adds to it as well.
+    | | wait |
+    |---|---|
+    | the spare input (in-process lockstep) | exactly 1 tick |
+    | plus tick phase alignment | +0.5 tick |
+    | mean at 200 bots | 50 ms |
+    | mean at 3k–10k | 54–57 ms |
+
+    - The round trip players never feel is 80–100 ms.
+    - **Found by this metric: after a hiccup, bots can stay at 2 spares.** Once a stall makes a bot rebuild its lead, it can settle at depth 3, and the [2, 3] dead band never pulls it back. In one 10k run the server wait rose from ~50 to ~80 ms at t = 20 s and stayed there. A band that drains back to 1 spare (upper edge at 2.5) would fix it. That's for the netem tuning.
 7. **Zone entry isn't modeled yet.** A spawn here is just a Welcome. The real zone-entry cost is sending the initial world state, which needs fragmentation first.

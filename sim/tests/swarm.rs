@@ -74,7 +74,7 @@ impl Swarm {
         let router = self.server.router();
         let mut inbound = vec![Vec::new(); router.shard_count()];
         for (from, pkt) in self.to_server.drain(..) {
-            inbound[router.shard(&from)].push((from, pkt));
+            inbound[router.shard(&from)].push((from, self.now, pkt));
         }
         let mut out = vec![Vec::new(); router.shard_count()];
         self.server.tick(&mut inbound, self.now, &mut out);
@@ -172,13 +172,18 @@ fn input_clock_keeps_one_to_two_spare_inputs() {
     }
     assert_eq!(stand_ins(&s), 0);
 
-    // Lockstep with one spare: an input sent on tick t is consumed on t+1, and
-    // its snapshot is read on t+2. So input latency is exactly 2 ticks.
-    for (_, _, b) in &mut s.bots {
+    // Lockstep with one spare: an input sent on tick t arrives at once, waits a
+    // tick on the server (the spare) and is applied on t+1; its snapshot is read
+    // on t+2. So the server wait is exactly 1 tick and the round trip exactly 2.
+    // The network takes no time here, so the transport RTT must read ~0: the
+    // server's hold is reported as ack_delay and subtracted.
+    for (_, client, b) in &mut s.bots {
         let mut samples = Vec::new();
         b.drain_latency(&mut samples);
         let steady = &samples[samples.len() - 100..];
-        assert!(steady.iter().all(|&ms| ms == 67), "latency {:?}", &steady[..10]);
+        assert!(steady.iter().all(|t| t.seen_ms == 67 && t.server_wait == Some(333)), "{:?}", &steady[..3]);
+        let rtt = client.stats().unwrap().rtt_ms;
+        assert!(rtt < 0.5, "rtt {rtt} ms over a zero-latency link");
     }
 }
 

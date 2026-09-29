@@ -3,7 +3,7 @@
 //! ```text
 //! C->S unreliable  Input    tag | newest_seq:4 | n:1 | n × (move_x:1 move_y:1 yaw:2 buttons:1)   newest first
 //! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32
-//! S->C unreliable  Snapshot tag | server_tick:4 | ack_seq:4 | buffered:1 | own pos:2×f32 vel:2×f32 | n:1 | n × blob:11
+//! S->C unreliable  Snapshot tag | server_tick:4 | ack_seq:4 | buffered:1 | wait:2 | own pos:2×f32 vel:2×f32 | n:1 | n × blob:11
 //! blob := entity:2 | cell:1 (cx | cy<<4, 512 m cells) | 8 B bitpacked far-tier state (see bitpack.rs)
 //! ```
 //!
@@ -22,7 +22,9 @@ pub const MSG_SNAPSHOT: u8 = 3;
 
 pub const INPUT_REDUNDANCY: usize = 3;
 pub const ENTITY_BLOB: usize = 11;
-pub const SNAPSHOT_HEADER: usize = 1 + 4 + 4 + 1 + 16 + 1;
+pub const SNAPSHOT_HEADER: usize = 1 + 4 + 4 + 1 + 2 + 16 + 1;
+/// `SnapshotHeader::wait` when `ack_seq` was consumed by a stand-in, not a real input.
+pub const WAIT_STAND_IN: u16 = u16::MAX;
 const BLOB_CELL: f32 = 512.0;
 const BLOB_CELLS: u32 = (WORLD_SIZE / BLOB_CELL) as u32;
 const _: () = assert!(BLOB_CELLS <= 16, "cell index must fit in 4 bits per axis");
@@ -89,6 +91,10 @@ pub struct SnapshotHeader {
     /// The client speeds its input clock up or down to keep this at 2-3
     /// (the input due now plus 1-2 spare).
     pub buffered: u8,
+    /// How long input `ack_seq` waited on the server, from its datagram
+    /// arriving to being applied, in 0.1 ms. `WAIT_STAND_IN` if it never
+    /// arrived in time. The client adds half the RTT to get input -> applied.
+    pub wait: u16,
     pub own: MoveState,
     pub count: u8,
 }
@@ -98,6 +104,7 @@ pub fn write_snapshot_header(w: &mut Writer, h: &SnapshotHeader) {
     w.u32(h.server_tick);
     w.u32(h.ack_seq);
     w.u8(h.buffered);
+    w.u16(h.wait);
     for v in [h.own.pos[0], h.own.pos[1], h.own.vel[0], h.own.vel[1]] {
         w.u32(v.to_bits());
     }
@@ -125,11 +132,12 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             let server_tick = r.u32()?;
             let ack_seq = r.u32()?;
             let buffered = r.u8()?;
+            let wait = r.u16()?;
             let own = MoveState { pos: [read_f32(&mut r)?, read_f32(&mut r)?], vel: [read_f32(&mut r)?, read_f32(&mut r)?] };
             let count = r.u8()?;
             let blobs = r.take(count as usize * ENTITY_BLOB)?;
             r.finish()?;
-            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, ack_seq, buffered, own, count }, blobs))
+            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, ack_seq, buffered, wait, own, count }, blobs))
         }
         _ => Err(DecodeError::Invalid),
     }
@@ -203,6 +211,7 @@ mod tests {
             server_tick: 99,
             ack_seq: 42,
             buffered: 2,
+            wait: 333,
             own: MoveState { pos: [1.0, 2.0], vel: [-3.0, 0.125] },
             count: 2,
         };

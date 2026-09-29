@@ -12,10 +12,12 @@ use crate::connection::Channel;
 use crate::seq::{seq_lt, SequenceBuffer};
 use crate::wire::Writer;
 
-/// Max reliable messages in flight (sent but unacked). Also the receive window.
-pub(crate) const RELIABLE_WINDOW: usize = 1024;
-/// 32 msgs * 1024 tracked packets < 65536 message ids, so an ack for an old
-/// packet can never refer to a message id that has since been reused.
+/// Max reliable messages in flight (sent but unacked). Also the receive window:
+/// both ends must agree, so changing it changes the protocol.
+pub(crate) const RELIABLE_WINDOW: usize = 256;
+/// A sent packet stays tracked for `SENT_BUFFER` (256) packets, during which at
+/// most 32 * 256 = 8192 new message ids are issued, far below 65536. So an ack
+/// for an old packet can never refer to a message id that has since been reused.
 pub(crate) const MAX_RELIABLE_PER_PACKET: usize = 32;
 
 pub(crate) const KIND_UNRELIABLE: u8 = 0;
@@ -39,6 +41,32 @@ pub(crate) fn write_message(w: &mut Writer, reliable_id: Option<u16>, data: &[u8
     w.bytes(data);
 }
 
+/// The reliable message ids one packet carried, inline: no allocation per sent packet.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PacketIds {
+    len: u8,
+    ids: [u16; MAX_RELIABLE_PER_PACKET],
+}
+
+impl PacketIds {
+    pub fn push(&mut self, id: u16) {
+        self.ids[self.len as usize] = id;
+        self.len += 1;
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[u16] {
+        &self.ids[..self.len as usize]
+    }
+}
+
 struct Pending {
     data: Vec<u8>,
     last_sent: Option<Instant>,
@@ -55,11 +83,19 @@ pub(crate) struct ReliableSender {
 impl ReliableSender {
     pub fn new() -> Self {
         Self {
-            window: SequenceBuffer::new(RELIABLE_WINDOW),
+            window: SequenceBuffer::lazy(RELIABLE_WINDOW),
             next_id: 0,
             oldest_unacked: 0,
             backlog: VecDeque::new(),
         }
+    }
+
+    /// Back to a fresh sender, keeping allocations (connection reuse).
+    pub fn reset(&mut self) {
+        self.window.clear();
+        self.next_id = 0;
+        self.oldest_unacked = 0;
+        self.backlog.clear();
     }
 
     fn in_flight(&self) -> usize {
@@ -90,7 +126,7 @@ impl ReliableSender {
         budget: usize,
         now: Instant,
         resend_after: Duration,
-        ids: &mut Vec<u16>,
+        ids: &mut PacketIds,
     ) {
         let mut id = self.oldest_unacked;
         while id != self.next_id && ids.len() < MAX_RELIABLE_PER_PACKET && budget - w.len() >= 5 {
@@ -124,7 +160,12 @@ pub(crate) struct ReliableReceiver {
 
 impl ReliableReceiver {
     pub fn new() -> Self {
-        Self { buffer: SequenceBuffer::new(RELIABLE_WINDOW), next_id: 0 }
+        Self { buffer: SequenceBuffer::lazy(RELIABLE_WINDOW), next_id: 0 }
+    }
+
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.next_id = 0;
     }
 
     pub fn on_message(&mut self, id: u16, data: &[u8]) {

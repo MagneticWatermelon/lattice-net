@@ -5,7 +5,7 @@
 use std::time::Instant;
 
 use crate::movement::{step, Input, MoveState, BUTTON_SPRINT};
-use crate::msg::{self, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY};
+use crate::msg::{self, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
 use crate::rng::Rng;
 
 /// Predicted states kept for reconciliation (~4 s at 30 Hz).
@@ -47,10 +47,24 @@ pub struct BotStats {
     pub clock_extra: u64,
     pub clock_skipped: u64,
     pub bad_messages: u64,
-    /// End-to-end input latency: from generating an input to seeing a snapshot
-    /// that acks it. Spare inputs, tick alignment and the network all add to it.
+    /// Round trip: from generating an input to reading the first snapshot that
+    /// acks it. This bounds how far reconciliation replays.
     pub latency_samples: u64,
     pub latency_sum_ms: f64,
+    /// Server-reported waits (arrival -> applied) for real, non-stand-in inputs.
+    pub wait_samples: u64,
+    pub wait_sum_ms: f64,
+}
+
+/// When one of our inputs was first seen acked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputTiming {
+    /// Input generated -> first snapshot acking it read here, in ms (round trip).
+    pub seen_ms: u16,
+    /// How long it waited on the server, arrival -> applied, in 0.1 ms.
+    /// `None` if a stand-in consumed its seq. What other players and hit
+    /// detection feel is one-way latency (about RTT / 2) plus this.
+    pub server_wait: Option<u16>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -79,8 +93,8 @@ pub struct BotBrain {
     resyncing: bool,
     last_server_tick: Option<u32>,
     last_acked: u32,
-    /// Latency samples (ms) not yet taken by `drain_latency`.
-    latency: Vec<u16>,
+    /// Timings not yet taken by `drain_latency`.
+    latency: Vec<InputTiming>,
     pub stats: BotStats,
 }
 
@@ -122,8 +136,8 @@ impl BotBrain {
         self.buffer_avg
     }
 
-    /// Moves input-latency samples (ms) recorded since the last call into `out`.
-    pub fn drain_latency(&mut self, out: &mut Vec<u16>) {
+    /// Moves input timings recorded since the last call into `out`.
+    pub fn drain_latency(&mut self, out: &mut Vec<InputTiming>) {
         out.append(&mut self.latency);
     }
 
@@ -196,9 +210,14 @@ impl BotBrain {
         if h.ack_seq > self.last_acked {
             if let Some(sent) = slot.sent_at {
                 let ms = (now.saturating_duration_since(sent).as_secs_f64() * 1000.0).round();
-                self.latency.push(ms.min(u16::MAX as f64) as u16);
+                let server_wait = (h.wait != WAIT_STAND_IN).then_some(h.wait);
+                self.latency.push(InputTiming { seen_ms: ms.min(u16::MAX as f64) as u16, server_wait });
                 self.stats.latency_samples += 1;
                 self.stats.latency_sum_ms += ms;
+                if let Some(w) = server_wait {
+                    self.stats.wait_samples += 1;
+                    self.stats.wait_sum_ms += w as f64 / 10.0;
+                }
             }
             self.last_acked = h.ack_seq;
         }

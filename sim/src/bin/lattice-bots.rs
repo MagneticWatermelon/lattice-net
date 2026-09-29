@@ -9,10 +9,10 @@
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use lattice_net::{Channel, Client, ClientState, Config};
-use lattice_sim::bot::BotBrain;
+use lattice_sim::bot::{BotBrain, InputTiming};
 use lattice_sim::cli::Args;
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::stats::{summarize, Histogram};
@@ -80,8 +80,55 @@ struct Shared {
     threads: Vec<Totals>,
     /// Join latencies (ms) since the last report.
     joins: Vec<u32>,
-    /// Input latencies (ms) since the last report.
-    latency: Histogram,
+    /// Input timings since the last report.
+    latency: Latency,
+}
+
+/// Input timing histograms.
+struct Latency {
+    /// Input generated -> acked in a snapshot we read (round trip), ms.
+    seen: Histogram,
+    /// Server wait, arrival -> applied, 0.1 ms.
+    wait: Histogram,
+    /// Estimated input generated -> applied on the server: RTT / 2 + wait, ms.
+    applied: Histogram,
+}
+
+impl Latency {
+    fn new() -> Self {
+        Self { seen: Histogram::new(LATENCY_CAP_MS), wait: Histogram::new(LATENCY_CAP_MS * 10), applied: Histogram::new(LATENCY_CAP_MS) }
+    }
+
+    fn record(&mut self, t: InputTiming, rtt_ms: f32) {
+        self.seen.record(t.seen_ms as u32);
+        if let Some(w) = t.server_wait {
+            self.wait.record(w as u32);
+            self.applied.record((rtt_ms / 2.0 + w as f32 / 10.0).round() as u32);
+        }
+    }
+
+    fn merge(&mut self, o: &Latency) {
+        self.seen.merge(&o.seen);
+        self.wait.merge(&o.wait);
+        self.applied.merge(&o.applied);
+    }
+}
+
+/// Converts kernel receive timestamps (wall clock) to `Instant`s, using one
+/// pair of clock readings per tick.
+struct Clocks {
+    instant: Instant,
+    system: SystemTime,
+}
+
+impl Clocks {
+    fn now() -> Self {
+        Self { instant: Instant::now(), system: SystemTime::now() }
+    }
+
+    fn instant_of(&self, t: SystemTime) -> Instant {
+        self.system.duration_since(t).map_or(self.instant, |ago| self.instant - ago)
+    }
 }
 
 struct Bot {
@@ -99,7 +146,8 @@ struct Bot {
 }
 
 impl Bot {
-    fn tick(&mut self, server: SocketAddr, now: Instant, buf: &mut [u8]) -> std::io::Result<Option<u32>> {
+    fn tick(&mut self, server: SocketAddr, clocks: &Clocks, buf: &mut [u8]) -> std::io::Result<Option<u32>> {
+        let now = clocks.instant;
         if self.failed || now < self.start_at {
             return Ok(None);
         }
@@ -114,8 +162,11 @@ impl Bot {
         let (sock, client) = self.net.as_mut().unwrap();
         let brain = self.brain.as_mut().unwrap();
         loop {
-            match sock.recv(buf) {
-                Ok(n) => client.receive(server, &buf[..n], now),
+            match recv_stamped(sock, buf) {
+                // Pass the arrival time, not the tick: the transport's RTT (and
+                // the input -> applied estimate built on it) must not include
+                // the up-to-a-tick wait for our own tick.
+                Ok((n, stamp)) => client.receive(server, &buf[..n], stamp.map_or(now, |t| clocks.instant_of(t))),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 // ICMP port unreachable (server not up yet) surfaces here; keep going.
                 Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset) => {}
@@ -187,7 +238,67 @@ fn bot_socket(server: SocketAddr) -> std::io::Result<UdpSocket> {
     let sock = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
     sock.connect(server)?;
     sock.set_nonblocking(true)?;
+    #[cfg(target_os = "linux")]
+    enable_rx_timestamps(&sock)?;
     Ok(sock)
+}
+
+#[cfg(target_os = "linux")]
+fn enable_rx_timestamps(sock: &UdpSocket) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let on: libc::c_int = 1;
+    // SAFETY: a plain setsockopt with a valid fd and an int option value.
+    let r = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            &on as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `recv` plus the kernel's arrival timestamp (`SO_TIMESTAMPNS`), if any.
+#[cfg(target_os = "linux")]
+fn recv_stamped(sock: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, Option<SystemTime>)> {
+    use std::os::fd::AsRawFd;
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+    let mut control = [0u64; 8]; // u64s for cmsghdr alignment
+    // SAFETY: msghdr is plain data; all-zero is a valid empty header.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = std::mem::size_of_val(&control) as _;
+    // SAFETY: msg points at `iov` (into `buf`) and `control`, both alive for the call.
+    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut stamp = None;
+    // SAFETY: walking the control messages the kernel just wrote into `control`.
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_TIMESTAMPNS {
+                let ts: libc::timespec = std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::timespec);
+                stamp = Some(SystemTime::UNIX_EPOCH + Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+    }
+    Ok((n as usize, stamp))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn recv_stamped(sock: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, Option<SystemTime>)> {
+    sock.recv(buf).map(|n| (n, None))
 }
 
 fn main() -> std::io::Result<()> {
@@ -210,7 +321,7 @@ fn main() -> std::io::Result<()> {
     let shared = Arc::new(Mutex::new(Shared {
         threads: vec![Totals::default(); threads],
         joins: Vec::new(),
-        latency: Histogram::new(LATENCY_CAP_MS),
+        latency: Latency::new(),
     }));
 
     let mut handles = Vec::new();
@@ -236,7 +347,7 @@ fn main() -> std::io::Result<()> {
             let mut buf = [0u8; 1500];
             let mut overruns = 0;
             let mut joins = Vec::new();
-            let mut latency = Histogram::new(LATENCY_CAP_MS);
+            let mut latency = Latency::new();
             let mut samples = Vec::new();
             let mut last_publish = start;
             loop {
@@ -244,17 +355,19 @@ fn main() -> std::io::Result<()> {
                 if next > now {
                     std::thread::sleep(next - now);
                 }
-                let now = Instant::now();
+                let clocks = Clocks::now();
+                let now = clocks.instant;
                 if now >= end {
                     break;
                 }
                 for bot in &mut bots {
-                    joins.extend(bot.tick(server, now, &mut buf)?);
-                    if let Some(brain) = &mut bot.brain {
+                    joins.extend(bot.tick(server, &clocks, &mut buf)?);
+                    if let (Some(brain), Some((_, client))) = (&mut bot.brain, &bot.net) {
                         brain.drain_latency(&mut samples);
+                        let rtt = client.stats().map_or(0.0, |s| s.rtt_ms);
+                        samples.drain(..).for_each(|t| latency.record(t, rtt));
                     }
                 }
-                samples.drain(..).for_each(|ms| latency.record(ms as u32));
                 next += period;
                 if Instant::now() > next {
                     overruns += 1;
@@ -267,7 +380,7 @@ fn main() -> std::io::Result<()> {
                     let mut s = shared.lock().unwrap();
                     s.threads[t] = tot;
                     s.joins.append(&mut joins);
-                    s.latency.merge(&std::mem::replace(&mut latency, Histogram::new(LATENCY_CAP_MS)));
+                    s.latency.merge(&std::mem::replace(&mut latency, Latency::new()));
                 }
             }
             let mut tot = Totals { tick_overruns: overruns, ..Default::default() };
@@ -291,7 +404,7 @@ fn main() -> std::io::Result<()> {
 
     let mut prev = Totals::default();
     let mut all_joins = Vec::new();
-    let mut all_latency = Histogram::new(LATENCY_CAP_MS);
+    let mut all_latency = Latency::new();
     let mut last = start;
     while Instant::now() < end {
         std::thread::sleep(report.min(end.saturating_duration_since(Instant::now())));
@@ -313,22 +426,22 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn snapshot(shared: &Mutex<Shared>) -> (Totals, Vec<u32>, Histogram) {
+fn snapshot(shared: &Mutex<Shared>) -> (Totals, Vec<u32>, Latency) {
     let mut s = shared.lock().unwrap();
     let mut t = Totals::default();
     s.threads.iter().for_each(|x| t.add(x));
-    let latency = std::mem::replace(&mut s.latency, Histogram::new(LATENCY_CAP_MS));
+    let latency = std::mem::replace(&mut s.latency, Latency::new());
     (t, std::mem::take(&mut s.joins), latency)
 }
 
-fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut [u32], latency: &Histogram) {
+fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut [u32], latency: &Latency) {
     let bots = cur.connected.max(1) as f64;
     let d = |a: u64, b: u64| a.saturating_sub(b) as f64;
     let snaps = d(cur.snapshots, prev.snapshots);
     let j = summarize(joins);
-    let l = latency.summary();
+    let (applied, seen) = (latency.applied.summary(), latency.seen.summary());
     println!(
-        "[{:>5.0}s] bots {}/{} connected, {} welcomed, {} failed | {:.1} snaps/s/bot, {:.1} entities/snap | corrections {:.3}/s/bot | down {:.0} up {:.0} kbps/bot | rtt {:.1} ms loss {:.2}% | input latency p50 {} p99 {} ms | joins {} (p50 {} p99 {} ms) | swarm overruns {}",
+        "[{:>5.0}s] bots {}/{} connected, {} welcomed, {} failed | {:.1} snaps/s/bot, {:.1} entities/snap | corrections {:.3}/s/bot | down {:.0} up {:.0} kbps/bot | rtt {:.1} ms loss {:.2}% | input->applied ~ p50 {} p99 {} ms, round trip p50 {} p99 {} ms | joins {} (p50 {} p99 {} ms) | swarm overruns {}",
         t.as_secs_f64(),
         cur.connected,
         cur.started,
@@ -341,8 +454,10 @@ fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut
         d(cur.bytes_up, prev.bytes_up) * 8.0 / 1000.0 / secs / bots,
         cur.rtt_sum / bots,
         100.0 * cur.loss_sum / bots,
-        l.p50,
-        l.p99,
+        applied.p50,
+        applied.p99,
+        seen.p50,
+        seen.p99,
         joins.len(),
         j.p50,
         j.p99,
@@ -350,9 +465,8 @@ fn print_window(t: Duration, secs: f64, cur: &Totals, prev: &Totals, joins: &mut
     );
 }
 
-fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Histogram) {
+fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
     let j = summarize(joins);
-    let l = latency.summary();
     let bot_secs = (t.welcomed.max(1) as f64) * secs;
     println!("\n== bots summary ==");
     println!("  started {} welcomed {} failed {}", t.started, t.welcomed, t.failed);
@@ -378,14 +492,20 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Histogram) 
         t.unmatched_acks,
         t.resyncs
     );
-    println!(
-        "  input latency ms (input generated -> acked in a snapshot): p50 {} p99 {} max {} mean {:.1} (n={})",
-        l.p50,
-        l.p99,
-        l.max,
-        latency.mean(),
-        latency.len()
-    );
+    let line = |name: &str, h: &Histogram, scale: f64| {
+        let s = h.summary();
+        println!(
+            "  {name}: p50 {:.1} p99 {:.1} max {:.1} mean {:.1} ms (n={})",
+            s.p50 as f64 * scale,
+            s.p99 as f64 * scale,
+            s.max as f64 * scale,
+            h.mean() * scale,
+            h.len()
+        );
+    };
+    line("input -> applied on server (est. RTT/2 + server wait)", &latency.applied, 1.0);
+    line("  of which server wait (arrival -> applied)", &latency.wait, 0.1);
+    line("input -> seen acked (round trip)", &latency.seen, 1.0);
     println!("  input clock: {} extra inputs, {} skipped ticks", t.clock_extra, t.clock_skipped);
     println!(
         "  bytes down {:.1} MB up {:.1} MB | swarm tick overruns {}",

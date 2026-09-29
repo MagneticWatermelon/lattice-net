@@ -113,6 +113,9 @@ pub struct Shard {
     /// This shard's share of `Config::max_accepts_per_tick`.
     accept_budget: usize,
     accepts_this_tick: usize,
+    /// Recycled connections: an accept resets one of these instead of
+    /// allocating (and page-faulting) fresh windows.
+    pool: Vec<Connection>,
     events: VecDeque<ServerEvent>,
     outgoing: Vec<(SocketAddr, Vec<u8>)>,
     dropped_packets: u64,
@@ -177,7 +180,14 @@ impl Shard {
                 let id = self.next_local.wrapping_mul(self.shared.router.shards).wrapping_add(self.index);
                 self.next_local = self.next_local.wrapping_add(1);
                 self.accepts_this_tick += 1;
-                let conn = Connection::new(self.shared.cfg.clone(), session_from_cookie(cookie), now);
+                let session = session_from_cookie(cookie);
+                let conn = match self.pool.pop() {
+                    Some(mut c) => {
+                        c.reset(session, now);
+                        c
+                    }
+                    None => Connection::new(self.shared.cfg.clone(), session, now),
+                };
                 self.by_addr.insert(from, id);
                 self.clients.insert(id, Slot { addr: from, salt: client_salt, conn });
                 self.push(from, Packet::Accepted { client_salt, client_id: id });
@@ -291,13 +301,15 @@ impl Shard {
     fn remove(&mut self, id: ClientId, reason: DisconnectReason, notify: bool) {
         let Some(slot) = self.clients.remove(&id) else { return };
         self.by_addr.remove(&slot.addr);
+        let session = slot.conn.session();
         self.shared.clients.fetch_sub(1, Ordering::AcqRel);
         if notify {
             // Redundant: this is fire-and-forget over UDP.
             for _ in 0..3 {
-                self.push(slot.addr, Packet::Disconnect { session: slot.conn.session() });
+                self.push(slot.addr, Packet::Disconnect { session });
             }
         }
+        self.pool.push(slot.conn);
         self.events.push_back(ServerEvent::Disconnected { client: id, reason });
     }
 
@@ -342,6 +354,7 @@ impl Server {
                 next_local: 0,
                 accept_budget,
                 accepts_this_tick: 0,
+                pool: Vec::new(),
                 events: VecDeque::new(),
                 outgoing: Vec::new(),
                 dropped_packets: 0,
@@ -349,6 +362,20 @@ impl Server {
             })
             .collect();
         Self { shared, shards }
+    }
+
+    /// Allocates `connections` ready-to-use connections up front, spread over
+    /// the shards with 25% headroom for uneven hashing, so accepts don't allocate
+    /// or page-fault. Shards that run out fall back to allocating. Returns how
+    /// many were created.
+    pub fn preallocate(&mut self, connections: usize) -> usize {
+        let per_shard = (connections.div_ceil(self.shards.len()) * 5).div_ceil(4);
+        let cfg = &self.shared.cfg;
+        let epoch = self.shared.epoch;
+        for shard in &mut self.shards {
+            shard.pool.extend((0..per_shard).map(|_| Connection::new(cfg.clone(), 0, epoch)));
+        }
+        per_shard * self.shards.len()
     }
 
     pub fn router(&self) -> Router {

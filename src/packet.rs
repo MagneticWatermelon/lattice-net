@@ -11,7 +11,7 @@
 //!
 //! Payload (the hot path, sent every tick):
 //! ```text
-//! crc32:4 | type:1 | session:4 | seq:2 | ack:2 | ack_bits:4 | messages...   (17 B overhead)
+//! crc32:4 | type:1 | session:4 | seq:2 | ack:2 | ack_bits:4 | ack_delay:2 | messages...   (19 B overhead)
 //! message := kind:1 [reliable_id:2 if kind==reliable] len:varlen(1-2) bytes
 //! ```
 //!
@@ -31,8 +31,10 @@ pub const MAX_PACKET_SIZE: usize = 1200;
 /// Client->server handshake packets are padded to this size, and the server's
 /// replies are much smaller, so the handshake can't be abused for reflection/amplification.
 pub const HANDSHAKE_PADDED_SIZE: usize = 256;
-/// crc32(4) + type(1) + session(4) + seq(2) + ack(2) + ack_bits(4)
-pub const PAYLOAD_OVERHEAD: usize = 17;
+/// crc32(4) + type(1) + session(4) + seq(2) + ack(2) + ack_bits(4) + ack_delay(2)
+pub const PAYLOAD_OVERHEAD: usize = 19;
+/// `AckHeader::ack_delay` unit, in microseconds.
+pub const ACK_DELAY_UNIT_US: u64 = 10;
 
 const T_REQUEST: u8 = 1;
 const T_CHALLENGE: u8 = 2;
@@ -55,6 +57,10 @@ pub struct AckHeader {
     pub ack: u16,
     /// Bit i set => packet `ack - 1 - i` was also received.
     pub ack_bits: u32,
+    /// How long packet `ack` waited at this end before this packet carried its
+    /// ack, in `ACK_DELAY_UNIT_US` (saturating, ~655 ms). The peer subtracts it
+    /// from its RTT sample, so the RTT measures the network, not our tick rate.
+    pub ack_delay: u16,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -115,6 +121,7 @@ pub fn encode(protocol_id: u64, packet: &Packet<'_>) -> Vec<u8> {
             w.u16(header.seq);
             w.u16(header.ack);
             w.u32(header.ack_bits);
+            w.u16(header.ack_delay);
             w.bytes(body);
         }
         Packet::Disconnect { session } => {
@@ -166,7 +173,7 @@ pub fn decode(protocol_id: u64, data: &[u8]) -> Result<Packet<'_>, DecodeError> 
         }
         T_PAYLOAD => {
             let session = r.u32()?;
-            let header = AckHeader { seq: r.u16()?, ack: r.u16()?, ack_bits: r.u32()? };
+            let header = AckHeader { seq: r.u16()?, ack: r.u16()?, ack_bits: r.u32()?, ack_delay: r.u16()? };
             Packet::Payload { session, header, body: r.rest() }
         }
         T_DISCONNECT => {
@@ -196,7 +203,7 @@ mod tests {
             Packet::Denied { client_salt: 7, reason: DenyReason::ServerFull },
             Packet::Payload {
                 session: 5,
-                header: AckHeader { seq: 1, ack: 2, ack_bits: 0xF0F0 },
+                header: AckHeader { seq: 1, ack: 2, ack_bits: 0xF0F0, ack_delay: 777 },
                 body: &body,
             },
             Packet::Disconnect { session: 5 },

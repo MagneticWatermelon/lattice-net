@@ -27,11 +27,14 @@ use rayon::prelude::*;
 
 use crate::grid::Grid;
 use crate::movement::{step, Input, MoveState, TICK_HZ, WORLD_SIZE};
-use crate::msg::{self, Blob, SnapshotHeader, Welcome, ENTITY_BLOB, SNAPSHOT_HEADER};
+use crate::msg::{self, Blob, SnapshotHeader, Welcome, ENTITY_BLOB, SNAPSHOT_HEADER, WAIT_STAND_IN};
 use crate::rng::Rng;
+use crate::stats::Histogram;
 
 pub const PHASES: [&str; 8] = ["ingress", "events", "movement", "grid", "history", "serialize", "assembly", "transport"];
 pub type Datagram = (SocketAddr, Vec<u8>);
+/// An inbound datagram with its arrival time, as the receive thread saw it.
+pub type InDatagram = (SocketAddr, Instant, Vec<u8>);
 pub type PhaseTimes = [Duration; PHASES.len()];
 
 /// Lag-compensation window: 200 ms.
@@ -42,6 +45,8 @@ pub const GRACE_TICKS: u32 = 2;
 /// are discarded unapplied rather than letting latency grow.
 const MAX_QUEUED_INPUTS: usize = 16;
 const GRID_CELL: f32 = 32.0;
+/// Input waits above 1 s land in the histogram's last bucket (0.1 ms units).
+const INPUT_WAIT_CAP: u32 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnMode {
@@ -76,6 +81,8 @@ pub struct SimConfig {
     pub near_max: usize,
     /// Transport shards. More than the thread count lets rayon balance them.
     pub shards: usize,
+    /// Allocate `max_clients` connections at startup so accepts reuse them.
+    pub preallocate: bool,
     pub seed: u64,
 }
 
@@ -88,6 +95,7 @@ impl Default for SimConfig {
             near_radius: 150.0,
             near_max: 64,
             shards: 64,
+            preallocate: false,
             seed: 1,
         }
     }
@@ -134,8 +142,11 @@ struct InputQueue {
     stand_ins: u32,
     /// Real inputs queued when this tick started; steers the client's input clock.
     depth: u8,
-    /// Sorted by seq, all > last_seq.
-    pending: VecDeque<(u32, Input)>,
+    /// Wait of the newest consumed seq, arrival to applied, in 0.1 ms, or
+    /// `WAIT_STAND_IN`. Set by `advance`; reported in the snapshot.
+    wait: u16,
+    /// Sorted by seq, all > last_seq, each with its first arrival time.
+    pending: VecDeque<(u32, Input, Instant)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,7 +170,7 @@ enum Step {
 }
 
 impl InputQueue {
-    fn push(&mut self, seq: u32, input: Input) -> Push {
+    fn push(&mut self, seq: u32, input: Input, arrived: Instant) -> Push {
         if seq <= self.last_seq {
             let age = self.last_seq - seq;
             if age < 32 && self.stand_ins & (1 << age) != 0 {
@@ -168,13 +179,13 @@ impl InputQueue {
             }
             return Push::Duplicate;
         }
-        let at = self.pending.partition_point(|&(s, _)| s < seq);
-        if self.pending.get(at).is_some_and(|&(s, _)| s == seq) {
-            return Push::Duplicate;
+        let at = self.pending.partition_point(|&(s, _, _)| s < seq);
+        if self.pending.get(at).is_some_and(|&(s, _, _)| s == seq) {
+            return Push::Duplicate; // keep the first arrival
         }
-        self.pending.insert(at, (seq, input));
+        self.pending.insert(at, (seq, input, arrived));
         if self.pending.len() > MAX_QUEUED_INPUTS {
-            let (s, _) = self.pending.pop_front().unwrap();
+            let (s, _, _) = self.pending.pop_front().unwrap();
             self.consume(s, false);
             return Push::Discarded;
         }
@@ -187,12 +198,14 @@ impl InputQueue {
         self.last_seq = seq;
     }
 
-    /// Advance one tick, consuming seq `last_seq + 1`.
-    fn advance(&mut self, body: &mut Body) -> Step {
+    /// Advance one tick, consuming seq `last_seq + 1`. `now` is the tick's time.
+    fn advance(&mut self, body: &mut Body, now: Instant) -> Step {
         self.depth = self.pending.len().min(u8::MAX as usize) as u8;
         let next = self.last_seq + 1;
-        let (input, kind) = if self.pending.front().is_some_and(|&(s, _)| s == next) {
-            let (_, input) = self.pending.pop_front().unwrap();
+        let (input, kind) = if self.pending.front().is_some_and(|&(s, _, _)| s == next) {
+            let (_, input, arrived) = self.pending.pop_front().unwrap();
+            let waited = now.saturating_duration_since(arrived).as_micros() / 100;
+            self.wait = waited.min(WAIT_STAND_IN as u128 - 1) as u16;
             self.last = input;
             self.starved_run = 0;
             (input, Step::Applied)
@@ -204,6 +217,7 @@ impl InputQueue {
             // the real one is dropped if it shows up. Freezing after the grace
             // means holding packets back (a lag switch) buys no movement.
             self.starved_run += 1;
+            self.wait = WAIT_STAND_IN;
             if self.starved_run <= GRACE_TICKS {
                 (self.last, Step::Repeated)
             } else {
@@ -231,6 +245,11 @@ pub struct SimServer {
     shard_clients: Vec<Vec<(ClientId, u16)>>,
     /// Per-shard snapshot buffers, reused every tick.
     snapshots: Vec<Vec<(ClientId, Vec<u8>)>>,
+    /// Per-shard transport events, each with the arrival time of the datagram
+    /// that caused it.
+    shard_events: Vec<Vec<(Instant, ServerEvent)>>,
+    /// Input waits (arrival -> applied) since the last `take_input_wait`, in 0.1 ms.
+    input_wait: Histogram,
     grid: Grid,
     rng: Rng,
     counters: Counters,
@@ -241,10 +260,16 @@ impl SimServer {
         let max_fit = (cfg.net.max_message_size() - SNAPSHOT_HEADER) / ENTITY_BLOB;
         cfg.near_max = cfg.near_max.min(max_fit).min(u8::MAX as usize);
         assert!(cfg.max_clients <= u16::MAX as usize, "entity ids are u16");
+        let mut net = Server::with_shards(cfg.net.clone(), cfg.max_clients, cfg.shards, now);
+        if cfg.preallocate {
+            net.preallocate(cfg.max_clients);
+        }
         Self {
-            net: Server::with_shards(cfg.net.clone(), cfg.max_clients, cfg.shards, now),
+            net,
             shard_clients: vec![Vec::new(); cfg.shards],
             snapshots: vec![Vec::new(); cfg.shards],
+            shard_events: (0..cfg.shards).map(|_| Vec::new()).collect(),
+            input_wait: Histogram::new(INPUT_WAIT_CAP),
             rng: Rng::new(cfg.seed),
             cfg,
             tick: 0,
@@ -284,6 +309,11 @@ impl SimServer {
         self.shard_clients.len()
     }
 
+    /// Input waits recorded since the last call, arrival -> applied, in 0.1 ms.
+    pub fn take_input_wait(&mut self) -> Histogram {
+        std::mem::replace(&mut self.input_wait, Histogram::new(INPUT_WAIT_CAP))
+    }
+
     pub fn entity_state(&self, entity: u16) -> Option<MoveState> {
         self.bodies.get(entity as usize).filter(|b| b.alive).map(|b| b.state)
     }
@@ -291,7 +321,7 @@ impl SimServer {
     /// Run one tick. `inbound` and `out` have one bucket per shard: inbound
     /// datagrams must be bucketed by `router()`, and are consumed; outgoing ones
     /// are appended to their shard's bucket.
-    pub fn tick(&mut self, inbound: &mut [Vec<Datagram>], now: Instant, out: &mut [Vec<Datagram>]) -> PhaseTimes {
+    pub fn tick(&mut self, inbound: &mut [Vec<InDatagram>], now: Instant, out: &mut [Vec<Datagram>]) -> PhaseTimes {
         assert_eq!(inbound.len(), self.shard_count(), "one inbound bucket per shard");
         assert_eq!(out.len(), self.shard_count(), "one outgoing bucket per shard");
         let mut times = PhaseTimes::default();
@@ -303,24 +333,39 @@ impl SimServer {
         };
 
         // 1. ingress: the per-packet transport work, one task per shard
-        self.net.shards_mut().par_iter_mut().zip(inbound.par_iter_mut()).for_each(|(shard, bucket)| {
-            for (from, data) in bucket.drain(..) {
-                shard.receive(from, &data, now);
-            }
-            shard.update(now);
-        });
+        self.net
+            .shards_mut()
+            .par_iter_mut()
+            .zip(inbound.par_iter_mut())
+            .zip(self.shard_events.par_iter_mut())
+            .for_each(|((shard, bucket), events)| {
+                for (from, arrived, data) in bucket.drain(..) {
+                    shard.receive(from, &data, arrived);
+                    while let Some(ev) = shard.poll_event() {
+                        events.push((arrived, ev));
+                    }
+                }
+                shard.update(now);
+                while let Some(ev) = shard.poll_event() {
+                    events.push((now, ev));
+                }
+            });
         lap(0);
 
         // 1b. events: these touch the world, so they're applied on one thread
         for k in 0..self.shard_count() {
-            while let Some(ev) = self.net.shards_mut()[k].poll_event() {
+            let mut events = std::mem::take(&mut self.shard_events[k]);
+            for (arrived, ev) in events.drain(..) {
                 match ev {
                     ServerEvent::Connected { client, .. } => self.spawn(client),
                     ServerEvent::Disconnected { client, .. } => self.despawn(client),
-                    ServerEvent::Message { client, channel: Channel::Unreliable, data } => self.on_input(client, &data),
+                    ServerEvent::Message { client, channel: Channel::Unreliable, data } => {
+                        self.on_input(client, &data, arrived)
+                    }
                     ServerEvent::Message { .. } => self.counters.bad_messages += 1,
                 }
             }
+            self.shard_events[k] = events; // keep the allocation
         }
         lap(1);
 
@@ -331,7 +376,7 @@ impl SimServer {
             .zip(self.inputs.par_iter_mut())
             .with_min_len(256)
             .filter(|(b, _)| b.alive)
-            .map(|(b, q)| match q.advance(b) {
+            .map(|(b, q)| match q.advance(b, now) {
                 Step::Applied => [1, 0, 0],
                 Step::Repeated => [0, 1, 0],
                 Step::Frozen => [0, 0, 1],
@@ -341,6 +386,11 @@ impl SimServer {
         self.counters.inputs_applied += applied;
         self.counters.repeated += repeated;
         self.counters.frozen += frozen;
+        for (b, q) in self.bodies.iter().zip(&self.inputs) {
+            if b.alive && q.last_seq > 0 && q.wait != WAIT_STAND_IN {
+                self.input_wait.record(q.wait as u32);
+            }
+        }
         lap(2);
 
         // 5. spatial grid
@@ -393,6 +443,7 @@ impl SimServer {
                     server_tick: tick,
                     ack_seq: inputs[e as usize].last_seq,
                     buffered: inputs[e as usize].depth,
+                    wait: inputs[e as usize].wait,
                     own: me,
                     count: near.len() as u8,
                 };
@@ -463,10 +514,10 @@ impl SimServer {
         }
     }
 
-    fn on_input(&mut self, client: ClientId, data: &[u8]) {
+    fn on_input(&mut self, client: ClientId, data: &[u8], arrived: Instant) {
         let Some(&e) = self.by_client.get(&client) else { return };
         let (q, c) = (&mut self.inputs[e as usize], &mut self.counters);
-        let ok = msg::decode_inputs(data, |seq, input| match q.push(seq, input) {
+        let ok = msg::decode_inputs(data, |seq, input| match q.push(seq, input, arrived) {
             Push::Late => c.late_inputs += 1,
             Push::Discarded => c.discarded_inputs += 1,
             Push::Queued | Push::Duplicate => {}
@@ -503,40 +554,59 @@ mod tests {
     }
 
     #[test]
+    fn wait_runs_from_first_arrival_to_applied() {
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        let mut q = InputQueue::default();
+        let mut b = Body { alive: true, ..Default::default() };
+        q.push(1, fwd(), ms(0));
+        q.push(1, fwd(), ms(20)); // a redundant copy doesn't reset the clock
+        q.push(2, fwd(), ms(20));
+        assert_eq!(q.advance(&mut b, ms(33)), Step::Applied);
+        assert_eq!(q.wait, 330, "33 ms in 0.1 ms units");
+        assert_eq!(q.advance(&mut b, ms(66)), Step::Applied);
+        assert_eq!(q.wait, 460);
+        assert_eq!(q.advance(&mut b, ms(99)), Step::Repeated);
+        assert_eq!(q.wait, WAIT_STAND_IN);
+    }
+
+    #[test]
     fn input_queue_orders_and_dedups() {
+        let t = Instant::now();
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
 
-        assert_eq!(q.advance(&mut b), Step::Waiting, "no input yet consumes nothing");
+        assert_eq!(q.advance(&mut b, t), Step::Waiting, "no input yet consumes nothing");
         assert_eq!(q.last_seq, 0);
-        assert_eq!(q.push(2, fwd()), Push::Queued);
-        assert_eq!(q.push(1, fwd()), Push::Queued);
-        assert_eq!(q.push(2, fwd()), Push::Duplicate);
-        assert_eq!(q.advance(&mut b), Step::Applied);
+        assert_eq!(q.push(2, fwd(), t), Push::Queued);
+        assert_eq!(q.push(1, fwd(), t), Push::Queued);
+        assert_eq!(q.push(2, fwd(), t), Push::Duplicate);
+        assert_eq!(q.advance(&mut b, t), Step::Applied);
         assert_eq!((q.last_seq, q.depth), (1, 2));
-        assert_eq!(q.push(1, fwd()), Push::Duplicate, "already applied");
-        assert_eq!(q.advance(&mut b), Step::Applied);
+        assert_eq!(q.push(1, fwd(), t), Push::Duplicate, "already applied");
+        assert_eq!(q.advance(&mut b, t), Step::Applied);
         assert_eq!(q.last_seq, 2);
 
         // A backlog drains one per tick; overflow discards the oldest unapplied.
         for s in 3..=3 + MAX_QUEUED_INPUTS as u32 {
-            q.push(s, fwd());
+            q.push(s, fwd(), t);
         }
         assert_eq!(q.pending.len(), MAX_QUEUED_INPUTS);
         assert_eq!(q.last_seq, 3, "seq 3 was discarded");
-        assert_eq!(q.advance(&mut b), Step::Applied);
+        assert_eq!(q.advance(&mut b, t), Step::Applied);
         assert_eq!(q.last_seq, 4);
     }
 
     #[test]
     fn starvation_repeats_then_freezes_and_drops_late_inputs() {
+        let t = Instant::now();
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
-        q.push(1, fwd());
-        assert_eq!(q.advance(&mut b), Step::Applied);
+        q.push(1, fwd(), t);
+        assert_eq!(q.advance(&mut b, t), Step::Applied);
 
         // Lag switch: nothing arrives for 10 ticks.
-        let kinds: Vec<Step> = (0..10).map(|_| q.advance(&mut b)).collect();
+        let kinds: Vec<Step> = (0..10).map(|_| q.advance(&mut b, t)).collect();
         assert_eq!(&kinds[..2], &[Step::Repeated; 2]);
         assert!(kinds[2..].iter().all(|&k| k == Step::Frozen));
         assert_eq!(q.last_seq, 11, "every stand-in consumes a seq");
@@ -545,18 +615,18 @@ mod tests {
 
         // The held-back burst arrives: all of it is too late to move anyone.
         for s in 2..=11 {
-            assert_eq!(q.push(s, fwd()), Push::Late);
-            assert_eq!(q.push(s, fwd()), Push::Duplicate, "a late seq counts once");
+            assert_eq!(q.push(s, fwd(), t), Push::Late);
+            assert_eq!(q.push(s, fwd(), t), Push::Duplicate, "a late seq counts once");
         }
         assert!(q.pending.is_empty());
         for _ in 0..30 {
-            q.advance(&mut b);
+            q.advance(&mut b, t);
         }
         assert!(b.state.vel == [0.0, 0.0] && b.state.pos[0] - frozen_at[0] < 0.5, "{:?}", b.state);
 
         // Fresh input for the next seq resumes movement and resets the grace.
-        assert_eq!(q.push(q.last_seq + 1, fwd()), Push::Queued);
-        assert_eq!(q.advance(&mut b), Step::Applied);
+        assert_eq!(q.push(q.last_seq + 1, fwd(), t), Push::Queued);
+        assert_eq!(q.advance(&mut b, t), Step::Applied);
         assert_eq!(q.starved_run, 0);
         assert!(b.state.vel[0] > 0.0);
     }

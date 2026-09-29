@@ -365,7 +365,7 @@ fn spoofed_and_garbage_packets_are_ignored() {
         Config::default().protocol_id,
         &lattice_net::packet::Packet::Payload {
             session: 0xDEAD_BEEF,
-            header: lattice_net::packet::AckHeader { seq: 999, ack: 0, ack_bits: 0 },
+            header: lattice_net::packet::AckHeader { seq: 999, ack: 0, ack_bits: 0, ack_delay: 0 },
             body: &[0, 3, b'b', b'a', b'd'],
         },
     );
@@ -523,4 +523,90 @@ fn accept_budget_spreads_a_mass_join_over_ticks() {
     assert!(most_per_tick <= 8, "{most_per_tick} accepts in one tick");
     assert!(w.server.deferred_accepts() > 0);
     assert_eq!(w.server.client_count(), 200);
+}
+
+/// One exchange over a perfect link: clients send, the server ticks, replies arrive.
+fn pump(server: &mut Server, peers: &mut [(SocketAddr, &mut Client)], t: Instant) -> Vec<ServerEvent> {
+    let server_addr: SocketAddr = SERVER.parse().unwrap();
+    for (addr, c) in peers.iter_mut() {
+        c.update(t);
+        c.flush(t);
+        for p in c.drain_outgoing() {
+            server.receive(*addr, &p, t);
+        }
+    }
+    let mut events = Vec::new();
+    while let Some(e) = server.poll_event() {
+        events.push(e);
+    }
+    server.update(t);
+    server.flush(t);
+    let out: Vec<_> = server.drain_outgoing().collect();
+    for (to, p) in out {
+        if let Some((_, c)) = peers.iter_mut().find(|(a, _)| *a == to) {
+            c.receive(server_addr, &p, t);
+        }
+    }
+    events
+}
+
+#[test]
+fn recycled_connection_starts_clean() {
+    let cfg = Config::default();
+    let server_addr: SocketAddr = SERVER.parse().unwrap();
+    let mut t = Instant::now();
+    let mut server = Server::with_shards(cfg.clone(), 10, 1, t);
+    assert_eq!(server.preallocate(1), 2, "25% headroom, rounded up");
+    let (aa, ba) = (client_addr(0), client_addr(1));
+
+    // A connects and leaves state behind in its connection: reliable messages
+    // the server delivered (rx ids advanced) and ones A never got (tx in flight).
+    let mut a = Client::new(cfg.clone(), server_addr, t);
+    for _ in 0..10 {
+        t += TICK;
+        pump(&mut server, &mut [(aa, &mut a)], t);
+    }
+    let a_id = a.client_id().unwrap();
+    for i in 0..5 {
+        a.send(Channel::Reliable, vec![i]).unwrap();
+    }
+    for _ in 0..5 {
+        t += TICK;
+        pump(&mut server, &mut [(aa, &mut a)], t);
+    }
+    for m in [b"a0", b"a1", b"a2"] {
+        server.send(a_id, Channel::Reliable, m.to_vec()).unwrap();
+    }
+    t += TICK;
+    server.flush(t);
+    server.drain_outgoing().for_each(drop); // A never gets these
+    a.disconnect();
+    t += TICK;
+    pump(&mut server, &mut [(aa, &mut a)], t);
+    assert_eq!(server.client_count(), 0);
+
+    // B gets A's recycled connection (the pool is LIFO).
+    let mut b = Client::new(cfg.clone(), server_addr, t);
+    let mut server_got = Vec::new();
+    let mut b_got = Vec::new();
+    for step in 0..30 {
+        t += TICK;
+        for e in pump(&mut server, &mut [(ba, &mut b)], t) {
+            if let ServerEvent::Message { data, .. } = e {
+                server_got.push(data);
+            }
+        }
+        if step == 10 {
+            let b_id = b.client_id().unwrap();
+            assert!(server.client_stats(b_id).unwrap().packets_received < 15, "stats reset");
+            server.send(b_id, Channel::Reliable, b"b0".to_vec()).unwrap();
+            server.send(b_id, Channel::Reliable, b"b1".to_vec()).unwrap();
+            b.send(Channel::Reliable, b"hello".to_vec()).unwrap();
+        }
+        while let Some((_, d)) = b.recv() {
+            b_got.push(d);
+        }
+    }
+    assert_eq!(b_got, vec![b"b0".to_vec(), b"b1".to_vec()], "none of A's messages leak to B");
+    assert_eq!(server_got, vec![b"hello".to_vec()], "B's message id 0 isn't mistaken for a duplicate");
 }

@@ -20,23 +20,42 @@ const EMPTY: u32 = u32::MAX;
 pub struct SequenceBuffer<T> {
     /// Most recent inserted sequence + 1.
     sequence: u16,
+    size: usize,
+    /// Empty until the first insert for a lazy buffer.
     entry_seq: Vec<u32>,
     entries: Vec<Option<T>>,
 }
 
 impl<T> SequenceBuffer<T> {
     pub fn new(size: usize) -> Self {
+        let mut b = Self::lazy(size);
+        b.allocate();
+        b
+    }
+
+    /// Allocates its storage on the first insert, so a buffer that's never
+    /// used (say, the reliable window of a client that sends nothing reliable)
+    /// costs nothing.
+    pub fn lazy(size: usize) -> Self {
         assert!(size.is_power_of_two() && size <= 0x8000, "size must be a power of two <= 32768");
-        Self {
-            sequence: 0,
-            entry_seq: vec![EMPTY; size],
-            entries: (0..size).map(|_| None).collect(),
-        }
+        Self { sequence: 0, size, entry_seq: Vec::new(), entries: Vec::new() }
+    }
+
+    fn allocate(&mut self) {
+        self.entry_seq = vec![EMPTY; self.size];
+        self.entries = (0..self.size).map(|_| None).collect();
+    }
+
+    /// Back to the state of a fresh buffer, keeping the allocation.
+    pub fn clear(&mut self) {
+        self.sequence = 0;
+        self.entry_seq.fill(EMPTY);
+        self.entries.iter_mut().for_each(|e| *e = None);
     }
 
     #[inline]
     fn size(&self) -> usize {
-        self.entries.len()
+        self.size
     }
 
     #[inline]
@@ -54,6 +73,9 @@ impl<T> SequenceBuffer<T> {
         if seq_lt(s, self.sequence.wrapping_sub(self.size() as u16)) {
             return false;
         }
+        if self.entries.is_empty() {
+            self.allocate();
+        }
         let next = s.wrapping_add(1);
         if seq_gt(next, self.sequence) {
             self.clear_range(self.sequence, s);
@@ -67,6 +89,9 @@ impl<T> SequenceBuffer<T> {
 
     /// Clears [start, end).
     fn clear_range(&mut self, start: u16, end: u16) {
+        if self.entries.is_empty() {
+            return;
+        }
         let n = end.wrapping_sub(start) as usize;
         if n >= self.size() {
             self.entry_seq.fill(EMPTY);
@@ -82,7 +107,7 @@ impl<T> SequenceBuffer<T> {
 
     #[inline]
     pub fn exists(&self, s: u16) -> bool {
-        self.entry_seq[self.idx(s)] == s as u32
+        self.entry_seq.get(self.idx(s)) == Some(&(s as u32))
     }
 
     pub fn get(&self, s: u16) -> Option<&T> {
@@ -116,6 +141,22 @@ impl<T> SequenceBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_buffer_allocates_on_first_insert_and_clear_resets() {
+        let mut b: SequenceBuffer<u8> = SequenceBuffer::lazy(8);
+        assert!(b.entries.is_empty());
+        assert!(!b.exists(0) && b.get(3).is_none() && b.remove(3).is_none());
+        assert!(b.insert(5, 7));
+        assert_eq!(b.entries.len(), 8);
+        assert_eq!(b.get(5), Some(&7));
+        assert_eq!(b.sequence(), 6);
+        b.clear();
+        assert!(!b.exists(5));
+        assert_eq!(b.sequence(), 0);
+        assert_eq!(b.entries.len(), 8, "clear keeps the allocation");
+        assert!(b.insert(0, 1) && b.exists(0));
+    }
 
     #[test]
     fn wraparound_compare() {

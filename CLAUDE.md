@@ -45,11 +45,14 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - Connection sharding: `Server` is N `Shard`s routed by a keyed address hash, and the sim drives them from rayon.
   - Accept budget per tick (`Config::max_accepts_per_tick`).
   - `sendmmsg` egress.
+  - Connection memory ~130 → ~36 KB: windows of 256 sent / 128 received / 256 reliable, reliable ids inline, reliable windows lazy.
+  - A per-shard connection pool (`Server::preallocate`); an accept costs about 4 µs.
+  - `ack_delay` in the header, so RTT excludes the peer's hold. Protocol id is now `LATTICE1`.
 - **Decided (M1 review, 2026-09-29):**
   - **With `SO_REUSEPORT`, the receiving socket picks the shard group.** The kernel hashes the 4-tuple, so the shard comes from the socket that received the handshake: each socket owns a fixed group of shards, and the keyed hash picks one within it. Don't re-bucket in receive threads.
   - **GSO (`UDP_SEGMENT`) only after M2.** It batches datagrams to a single destination, which only helps once clients get several packets per tick.
   - **Do deep egress tuning on bare metal, not WSL2.**
-  - **Watch the input-latency cost of spare inputs** (bots report it). Options for later: process inputs faster than the tick, or target a fractional spare.
+  - **Tune the spare against input → applied on the server, not against the round trip.** Measure it without clock sync as RTT/2 + the server-reported queue wait (bots report both). With prediction, a player's own movement is instant; the spare delays how others see you, when your shots resolve, and how far reconciliation replays. Options for later: process inputs faster than the tick, or target a fractional spare.
 
 ## Milestones
 

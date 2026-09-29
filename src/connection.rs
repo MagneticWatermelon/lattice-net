@@ -5,8 +5,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::channel::{self, ReliableReceiver, ReliableSender, KIND_RELIABLE, KIND_UNRELIABLE};
-use crate::packet::{self, AckHeader, Packet, PAYLOAD_OVERHEAD};
+use crate::channel::{self, PacketIds, ReliableReceiver, ReliableSender, KIND_RELIABLE, KIND_UNRELIABLE};
+use crate::packet::{self, AckHeader, Packet, ACK_DELAY_UNIT_US, PAYLOAD_OVERHEAD};
 use crate::seq::SequenceBuffer;
 use crate::wire::{DecodeError, Reader, Writer};
 
@@ -43,7 +43,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            protocol_id: u64::from_le_bytes(*b"LATTICE0"),
+            // LATTICE1: 256-message reliable windows (both ends must agree).
+            protocol_id: u64::from_le_bytes(*b"LATTICE1"),
             timeout: Duration::from_secs(5),
             keepalive_interval: Duration::from_millis(100),
             handshake_resend_interval: Duration::from_millis(100),
@@ -74,7 +75,10 @@ pub struct Stats {
     pub bytes_received: u64,
     /// Unreliable messages that didn't fit in the flush they were queued for.
     pub unreliable_dropped: u64,
-    /// Smoothed RTT in ms (EWMA, alpha 0.1).
+    /// Smoothed network RTT in ms (EWMA, alpha 0.1). The peer's ack delay is
+    /// subtracted, so its tick rate doesn't count. What's left includes the gap
+    /// between a datagram arriving and the `now` passed to `receive`, so pass
+    /// arrival timestamps where you have them.
     pub rtt_ms: f32,
     /// Smoothed packet loss 0..1 (EWMA, alpha 0.05).
     pub loss: f32,
@@ -98,16 +102,21 @@ impl fmt::Display for SendError {
 }
 impl std::error::Error for SendError {}
 
-const SENT_BUFFER: usize = 1024;
-const RECV_BUFFER: usize = 1024;
+/// Sent packets tracked for acks. Must exceed `LOSS_LAG`, and covers ~3 s at the
+/// ~90 packets/s a client gets once snapshots span several packets.
+const SENT_BUFFER: usize = 256;
+/// Received packets remembered: only feeds the 33-packet ack field and
+/// duplicate detection, so a packet older than this is dropped as a duplicate.
+const RECV_BUFFER: usize = 128;
 /// A sent packet still unacked after this many newer packets counts as lost.
 const LOSS_LAG: u16 = 128;
+const _: () = assert!(SENT_BUFFER > LOSS_LAG as usize);
 const DEFAULT_RTT_MS: f32 = 100.0;
 
 struct SentPacket {
     time: Instant,
     acked: bool,
-    reliable_ids: Vec<u16>,
+    reliable: PacketIds,
 }
 
 pub struct Connection {
@@ -115,13 +124,15 @@ pub struct Connection {
     session: u32,
     local_seq: u16,
     sent: SequenceBuffer<SentPacket>,
-    received: SequenceBuffer<()>,
+    /// Arrival time of each received packet, for `ack_delay`.
+    received: SequenceBuffer<Instant>,
     reliable_tx: ReliableSender,
     reliable_rx: ReliableReceiver,
     unreliable_tx: VecDeque<Vec<u8>>,
     inbox: VecDeque<(Channel, Vec<u8>)>,
     last_recv: Instant,
     last_send: Option<Instant>,
+    rtt_samples: u64,
     stats: Stats,
 }
 
@@ -139,8 +150,43 @@ impl Connection {
             inbox: VecDeque::new(),
             last_recv: now,
             last_send: None,
+            rtt_samples: 0,
             stats: Stats::default(),
         }
+    }
+
+    /// Back to the state of `Connection::new` for a new peer, keeping every
+    /// allocation, so a server can recycle connections instead of allocating
+    /// (and page-faulting) fresh windows on each accept.
+    pub(crate) fn reset(&mut self, session: u32, now: Instant) {
+        // Destructured so that a new field can't be forgotten here.
+        let Connection {
+            cfg: _,
+            session: sess,
+            local_seq,
+            sent,
+            received,
+            reliable_tx,
+            reliable_rx,
+            unreliable_tx,
+            inbox,
+            last_recv,
+            last_send,
+            rtt_samples,
+            stats,
+        } = self;
+        *sess = session;
+        *local_seq = 0;
+        sent.clear();
+        received.clear();
+        reliable_tx.reset();
+        reliable_rx.reset();
+        unreliable_tx.clear();
+        inbox.clear();
+        *last_recv = now;
+        *last_send = None;
+        *rtt_samples = 0;
+        *stats = Stats::default();
     }
 
     pub fn send(&mut self, channel: Channel, data: Vec<u8>) -> Result<(), SendError> {
@@ -181,7 +227,7 @@ impl Connection {
     }
 
     fn rtt_ms(&self) -> f32 {
-        if self.stats.packets_acked == 0 {
+        if self.rtt_samples == 0 {
             DEFAULT_RTT_MS
         } else {
             self.stats.rtt_ms
@@ -208,7 +254,7 @@ impl Connection {
             msgs.push((id, r.take(len)?));
         }
 
-        if self.received.exists(h.seq) || !self.received.insert(h.seq, ()) {
+        if self.received.exists(h.seq) || !self.received.insert(h.seq, now) {
             self.stats.duplicate_packets += 1; // duplicate, or too old to track
             return Ok(());
         }
@@ -216,7 +262,7 @@ impl Connection {
         self.stats.packets_received += 1;
         self.stats.bytes_received += (PAYLOAD_OVERHEAD + body.len()) as u64;
 
-        self.process_acks(h.ack, h.ack_bits, now);
+        self.process_acks(h, now);
 
         for (id, data) in msgs {
             match id {
@@ -228,7 +274,8 @@ impl Connection {
         Ok(())
     }
 
-    fn process_acks(&mut self, ack: u16, bits: u32, now: Instant) {
+    fn process_acks(&mut self, h: AckHeader, now: Instant) {
+        let (ack, bits) = (h.ack, h.ack_bits);
         for i in 0..=32u16 {
             let acked = i == 0 || bits & (1 << (i - 1)) != 0;
             if !acked {
@@ -239,32 +286,40 @@ impl Connection {
                 continue;
             }
             sp.acked = true;
-            let ids = std::mem::take(&mut sp.reliable_ids);
-            let sample = now.saturating_duration_since(sp.time).as_secs_f32() * 1000.0;
-
+            let ids = std::mem::take(&mut sp.reliable);
             self.stats.packets_acked += 1;
-            self.stats.rtt_ms = if self.stats.packets_acked == 1 {
-                sample
-            } else {
-                self.stats.rtt_ms + (sample - self.stats.rtt_ms) * 0.1
-            };
+
+            // Only the newest ack carries the peer's hold time (as in QUIC). A packet
+            // first acked through ack_bits was held for an unknown extra time: skip it.
+            if i == 0 {
+                let hold = Duration::from_micros(h.ack_delay as u64 * ACK_DELAY_UNIT_US);
+                let sample = now.saturating_duration_since(sp.time).saturating_sub(hold).as_secs_f32() * 1000.0;
+                self.rtt_samples += 1;
+                self.stats.rtt_ms = if self.rtt_samples == 1 {
+                    sample
+                } else {
+                    self.stats.rtt_ms + (sample - self.stats.rtt_ms) * 0.1
+                };
+            }
             if !ids.is_empty() {
-                self.reliable_tx.on_acked(&ids);
+                self.reliable_tx.on_acked(ids.as_slice());
             }
         }
     }
 
-    fn ack_fields(&self) -> (u16, u32) {
+    fn ack_fields(&self, seq: u16, now: Instant) -> AckHeader {
         // Before anything is received this acks 65535. Harmless: we'd have to
         // send 65536 packets with zero replies first, and we time out long before that.
         let ack = self.received.sequence().wrapping_sub(1);
-        let mut bits = 0u32;
+        let mut ack_bits = 0u32;
         for i in 0..32u16 {
             if self.received.exists(ack.wrapping_sub(i + 1)) {
-                bits |= 1 << i;
+                ack_bits |= 1 << i;
             }
         }
-        (ack, bits)
+        let held = self.received.get(ack).map_or(Duration::ZERO, |&at| now.saturating_duration_since(at));
+        let ack_delay = (held.as_micros() as u64 / ACK_DELAY_UNIT_US).min(u16::MAX as u64) as u16;
+        AckHeader { seq, ack, ack_bits, ack_delay }
     }
 
     /// Build this tick's packets: due reliable messages first, then queued
@@ -276,7 +331,7 @@ impl Connection {
 
         while produced < self.cfg.max_packets_per_flush {
             let mut body = Writer::with_capacity(budget);
-            let mut ids = Vec::new();
+            let mut ids = PacketIds::default();
             self.reliable_tx.write(&mut body, budget, now, resend, &mut ids);
 
             while let Some(front) = self.unreliable_tx.front() {
@@ -303,16 +358,16 @@ impl Connection {
                 self.stats.loss += (lost as u8 as f32 - self.stats.loss) * 0.05;
             }
 
-            let (ack, ack_bits) = self.ack_fields();
+            let header = self.ack_fields(seq, now);
             let pkt = packet::encode(
                 self.cfg.protocol_id,
                 &Packet::Payload {
                     session: self.session,
-                    header: AckHeader { seq, ack, ack_bits },
+                    header,
                     body: body.as_slice(),
                 },
             );
-            self.sent.insert(seq, SentPacket { time: now, acked: false, reliable_ids: ids });
+            self.sent.insert(seq, SentPacket { time: now, acked: false, reliable: ids });
             self.local_seq = seq.wrapping_add(1);
             self.last_send = Some(now);
             self.stats.packets_sent += 1;
@@ -323,5 +378,36 @@ impl Connection {
 
         self.stats.unreliable_dropped += self.unreliable_tx.len() as u64;
         self.unreliable_tx.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(bytes: &[u8]) -> (AckHeader, Vec<u8>) {
+        match packet::decode(Config::default().protocol_id, bytes).unwrap() {
+            Packet::Payload { header, body, .. } => (header, body.to_vec()),
+            p => panic!("not a payload: {p:?}"),
+        }
+    }
+
+    #[test]
+    fn rtt_excludes_the_peers_hold_time() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let (mut a, mut b) = (Connection::new(Config::default(), 1, t0), Connection::new(Config::default(), 1, t0));
+        let mut out = Vec::new();
+
+        // A sends at 0; 10 ms of network; B holds it 30 ms (its tick), then replies;
+        // 10 ms back. The network RTT is 20 ms, though the ack took 50.
+        a.flush(ms(0), &mut out);
+        let (h, body) = payload(&out.pop().unwrap());
+        b.on_payload(h, &body, ms(10)).unwrap();
+        b.flush(ms(40), &mut out);
+        let (h, body) = payload(&out.pop().unwrap());
+        assert_eq!(h.ack_delay, 3000, "30 ms in 10 us units");
+        a.on_payload(h, &body, ms(50)).unwrap();
+        assert!((a.stats().rtt_ms - 20.0).abs() < 0.01, "rtt {}", a.stats().rtt_ms);
     }
 }
