@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lattice_net::Config;
-use lattice_sim::cli::Args;
+use lattice_sim::cli::{Args, HexKey};
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::interest::InterestConfig;
 use lattice_sim::ladder::LadderConfig;
@@ -53,6 +53,9 @@ lattice-server: M1 movement-only authoritative server
                        the summary also stops once clients drain below 90% of peak
   --csv PATH           append one row per report window
   --debug-http ADDR    serve the debug map (what one client receives) on ADDR, e.g. 0.0.0.0:8080
+  --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
+                       connect tokens, standing in for a login service) [the public dev key]
+  --server-id N        the server id tokens are minted for [1]
   --seed N             spawn RNG seed [1]";
 
 /// Columns of per-tick timing samples: the sim phases, then egress and total.
@@ -342,6 +345,10 @@ fn main() -> std::io::Result<()> {
             LadderConfig { enabled, high: a.get("ladder-high", d.high), low: a.get("ladder-low", d.low) }
         },
         seed: a.get("seed", 1),
+        identity: lattice_net::ServerIdentity {
+            token_key: a.get("token-key", HexKey::default()).0,
+            server_id: a.get("server-id", 1),
+        },
         net: Config {
             max_accepts_per_tick: a.get("accepts-per-tick", 256),
             pad_packets: egress == Egress::Gso,
@@ -397,6 +404,9 @@ fn main() -> std::io::Result<()> {
         rcvbuf >> 10,
         sndbuf >> 10
     );
+    if cfg.identity.token_key == lattice_net::token::DEV_TOKEN_KEY {
+        println!("WARNING: token key is the public dev key; anyone can mint tokens for this server (--token-key)");
+    }
 
     let net = Arc::new(NetCounters::default());
     let inbox: Arc<Mutex<Vec<Vec<InDatagram>>>> = Arc::new(Mutex::new(vec![Vec::new(); shards]));

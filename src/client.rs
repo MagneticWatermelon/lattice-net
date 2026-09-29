@@ -1,13 +1,16 @@
 //! Sans-IO client: handshake state machine wrapping a `Connection`.
 
-use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
 use std::net::SocketAddr;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
-use crate::connection::{Channel, Config, Connection, SendError, Stats};
-use crate::packet::{self, session_from_cookie, DenyReason, Packet};
+use chacha20poly1305::aead::rand_core::RngCore;
+use chacha20poly1305::aead::OsRng;
+
+use crate::connection::{Channel, Config, Connection, Sealed, SendError, Stats};
+use crate::crypto::Cipher;
+use crate::packet::{self, DenyReason, Handshake, T_DISCONNECT, T_PAYLOAD};
 use crate::server::ClientId;
+use crate::token::ConnectToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientState {
@@ -31,6 +34,7 @@ enum Phase {
 pub struct Client {
     cfg: Config,
     server: SocketAddr,
+    token: ConnectToken,
     salt: u64,
     phase: Phase,
     started: Instant,
@@ -39,11 +43,14 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(cfg: Config, server: SocketAddr, now: Instant) -> Self {
+    /// Connects to `server` with a token from the login service (which says
+    /// where to connect). A token connects once: reconnecting takes a new one.
+    pub fn new(cfg: Config, server: SocketAddr, token: ConnectToken, now: Instant) -> Self {
         Self {
             cfg,
             server,
-            salt: random_u64(),
+            token,
+            salt: OsRng.next_u64(),
             phase: Phase::Requesting,
             started: now,
             last_handshake: None,
@@ -76,28 +83,30 @@ impl Client {
         if from != self.server {
             return;
         }
-        let Ok(pkt) = packet::decode(self.cfg.protocol_id, data) else { return };
+        if let Phase::Connected { conn, .. } = &mut self.phase {
+            if matches!(data.first(), Some(&(T_PAYLOAD | T_DISCONNECT)))
+                && conn.receive_sealed(data, now) == Ok(Sealed::Disconnect)
+            {
+                self.phase = Phase::Disconnected;
+            }
+            return;
+        }
+        let Ok(pkt) = packet::decode_handshake(data) else { return };
         let salt = self.salt;
-        let next = match (&mut self.phase, pkt) {
-            (Phase::Requesting, Packet::Challenge { client_salt, cookie }) if client_salt == salt => {
+        let next = match (&self.phase, pkt) {
+            (Phase::Requesting, Handshake::Challenge { salt: s, cookie }) if s == salt => {
                 self.last_handshake = None; // answer on the next update, no waiting
                 Some(Phase::Responding { cookie })
             }
-            (Phase::Responding { cookie }, Packet::Accepted { client_salt, client_id }) if client_salt == salt => {
-                let conn = Connection::new(self.cfg.clone(), session_from_cookie(*cookie), now);
-                Some(Phase::Connected { conn, id: client_id })
+            (Phase::Responding { .. }, Handshake::Accepted { salt: s }) if s == salt => {
+                let s2c = Cipher::new(&self.token.server_to_client_key);
+                packet::open_accepted(self.cfg.protocol_id, &s2c, data, salt).map(|id| {
+                    let (send, recv) = (&self.token.client_to_server_key, &self.token.server_to_client_key);
+                    Phase::Connected { conn: Connection::new(self.cfg.clone(), send, recv, now), id }
+                })
             }
-            (Phase::Requesting | Phase::Responding { .. }, Packet::Denied { client_salt, reason })
-                if client_salt == salt =>
-            {
+            (Phase::Requesting | Phase::Responding { .. }, Handshake::Denied { salt: s, reason }) if s == salt => {
                 Some(Phase::Denied(reason))
-            }
-            (Phase::Connected { conn, .. }, Packet::Payload { session, header, body }) if session == conn.session() => {
-                let _ = conn.on_payload(header, body, now);
-                None
-            }
-            (Phase::Connected { conn, .. }, Packet::Disconnect { session }) if session == conn.session() => {
-                Some(Phase::Disconnected)
             }
             _ => None,
         };
@@ -118,11 +127,13 @@ impl Client {
                     .last_handshake
                     .is_none_or(|t| now.saturating_duration_since(t) >= self.cfg.handshake_resend_interval);
                 if due {
-                    let p = match self.phase {
-                        Phase::Responding { cookie } => Packet::ChallengeResponse { client_salt: self.salt, cookie },
-                        _ => Packet::ConnectionRequest { client_salt: self.salt },
+                    let pkt = match self.phase {
+                        Phase::Responding { cookie } => {
+                            packet::encode_response(self.cfg.protocol_id, &self.token, self.salt, cookie)
+                        }
+                        _ => packet::encode_request(&self.token, self.salt),
                     };
-                    self.outgoing.push(packet::encode(self.cfg.protocol_id, &p));
+                    self.outgoing.push(pkt);
                     self.last_handshake = Some(now);
                 }
             }
@@ -159,10 +170,10 @@ impl Client {
     }
 
     pub fn disconnect(&mut self) {
-        if let Phase::Connected { conn, .. } = &self.phase {
-            let pkt = packet::encode(self.cfg.protocol_id, &Packet::Disconnect { session: conn.session() });
+        if let Phase::Connected { conn, .. } = &mut self.phase {
             for _ in 0..3 {
-                self.outgoing.push(pkt.clone());
+                let pkt = conn.seal_disconnect();
+                self.outgoing.push(pkt);
             }
         }
         self.phase = Phase::Disconnected;
@@ -181,11 +192,4 @@ impl Client {
             _ => 0,
         }
     }
-}
-
-fn random_u64() -> u64 {
-    // RandomState is seeded from the OS RNG; good enough for a salt.
-    
-    
-    RandomState::new().hash_one(SystemTime::now())
 }

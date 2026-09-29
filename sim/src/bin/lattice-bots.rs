@@ -11,9 +11,10 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use lattice_net::{Channel, Client, ClientState, Config};
+use lattice_net::token::USER_DATA_BYTES;
+use lattice_net::{Channel, Client, ClientState, Config, ConnectToken};
 use lattice_sim::bot::{BotBrain, InputTiming};
-use lattice_sim::cli::Args;
+use lattice_sim::cli::{Args, HexKey};
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::stats::{summarize, Histogram};
 
@@ -29,6 +30,9 @@ lattice-bots: M1 bot swarm
   --track-every N      every Nth bot tracks entities to measure update intervals per tier [20]
   --full-every K       only every Kth bot measures (prediction, latency, tracking); the
                        rest are sink bots that play but only count what they're sent [1]
+  --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
+                       connect tokens, standing in for a login service) [the public dev key]
+  --server-id N        the server id tokens are minted for [1]
   --seed N             [1]";
 
 /// Cumulative per-thread totals; the main thread sums threads and diffs windows.
@@ -164,6 +168,21 @@ impl Clocks {
     }
 }
 
+/// Stands in for the login service: mints each bot's connect token.
+#[derive(Clone, Copy)]
+struct Login {
+    token_key: [u8; 32],
+    server_id: u64,
+}
+
+impl Login {
+    fn token(&self, user: u64, now: SystemTime) -> ConnectToken {
+        let unix = now.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let cfg = Config::default();
+        ConnectToken::mint(&self.token_key, cfg.protocol_id, self.server_id, unix + 60, user, &[0; USER_DATA_BYTES])
+    }
+}
+
 struct Bot {
     start_at: Instant,
     seed: u64,
@@ -181,7 +200,7 @@ struct Bot {
 }
 
 impl Bot {
-    fn tick(&mut self, server: SocketAddr, clocks: &Clocks, rx: &mut RecvBatch) -> std::io::Result<Option<u32>> {
+    fn tick(&mut self, server: SocketAddr, login: &Login, clocks: &Clocks, rx: &mut RecvBatch) -> std::io::Result<Option<u32>> {
         let now = clocks.instant;
         if self.failed || now < self.start_at {
             return Ok(None);
@@ -191,7 +210,8 @@ impl Bot {
                 Some(s) => s,
                 None => bot_socket(server)?,
             };
-            self.net = Some((sock, Client::new(Config::default(), server, now)));
+            let token = login.token(self.seed, clocks.system);
+            self.net = Some((sock, Client::new(Config::default(), server, token, now)));
             let mut brain = BotBrain::new(self.seed);
             if self.track {
                 brain.enable_tracking();
@@ -411,7 +431,12 @@ fn main() -> std::io::Result<()> {
     let seed: u64 = a.get("seed", 1);
     let track_every: usize = a.get("track-every", 20);
     let full_every: usize = a.get::<usize>("full-every", 1).max(1);
+    let key: HexKey = a.get("token-key", HexKey::default());
+    let login = Login { token_key: key.0, server_id: a.get("server-id", 1) };
     a.finish();
+    if key.is_dev() {
+        println!("minting tokens with the public dev key (--token-key to change)");
+    }
 
     println!(
         "{count} bots -> {server} on {threads} threads, ramp {ramp}/s, {duration:?}, {} full + {} sink bots",
@@ -470,7 +495,7 @@ fn main() -> std::io::Result<()> {
                 }
                 let work = Instant::now();
                 for bot in &mut bots {
-                    joins.extend(bot.tick(server, &clocks, &mut rx)?);
+                    joins.extend(bot.tick(server, &login, &clocks, &mut rx)?);
                     if bot.sink {
                         continue;
                     }

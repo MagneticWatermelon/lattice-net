@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use lattice_net::wire::Writer;
-use lattice_net::{Channel, ClientId, Config, Router, Server, ServerEvent};
+use lattice_net::{Channel, ClientId, Config, Router, Server, ServerEvent, ServerIdentity};
 use rayon::prelude::*;
 
 use crate::grid::{Grid, Ring};
@@ -138,6 +138,9 @@ pub struct SimConfig {
     pub preallocate: bool,
     pub ladder: LadderConfig,
     pub seed: u64,
+    /// Server id and token key, shared with whatever mints the clients'
+    /// tokens (the bots, standing in for a login service).
+    pub identity: ServerIdentity,
 }
 
 impl Default for SimConfig {
@@ -152,6 +155,7 @@ impl Default for SimConfig {
             preallocate: false,
             ladder: LadderConfig::default(),
             seed: 1,
+            identity: ServerIdentity { server_id: 1, token_key: lattice_net::token::DEV_TOKEN_KEY },
         }
     }
 }
@@ -419,7 +423,7 @@ pub struct SimServer {
 impl SimServer {
     pub fn new(cfg: SimConfig, now: Instant) -> Self {
         assert!(cfg.max_clients <= u16::MAX as usize, "entity ids are u16");
-        let mut net = Server::with_shards(cfg.net.clone(), cfg.max_clients, cfg.shards, now);
+        let mut net = Server::with_shards(cfg.net.clone(), &cfg.identity, cfg.max_clients, cfg.shards, now);
         if cfg.preallocate {
             net.preallocate(cfg.max_clients);
         }
@@ -575,6 +579,8 @@ impl SimServer {
         self.counters.level_ticks[self.ladder.level() as usize] += 1;
 
         // 1. ingress: the per-packet transport work, one task per shard
+        // (wall-clock time only matters for connect-token expiry)
+        let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         self.net
             .shards_mut()
             .par_iter_mut()
@@ -587,7 +593,7 @@ impl SimServer {
                         events.push((arrived, ev));
                     }
                 }
-                shard.update(now);
+                shard.update(now, unix_now);
                 while let Some(ev) = shard.poll_event() {
                     events.push((now, ev));
                 }

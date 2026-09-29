@@ -9,7 +9,8 @@ use std::io::ErrorKind;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use lattice_net::{Config, Server, ServerEvent};
+use lattice_net::token::DEV_TOKEN_KEY;
+use lattice_net::{Config, Server, ServerEvent, ServerIdentity};
 
 fn main() -> std::io::Result<()> {
     let bind = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:40000".into());
@@ -18,7 +19,9 @@ fn main() -> std::io::Result<()> {
     println!("listening on {bind}");
 
     let tick = Duration::from_micros(33_333);
-    let mut server = Server::new(Config::default(), 10_000, Instant::now());
+    // Tokens come from a login service; here the client mints its own with the dev key.
+    let identity = ServerIdentity { server_id: 1, token_key: DEV_TOKEN_KEY };
+    let mut server = Server::new(Config::default(), &identity, 10_000, Instant::now());
     let mut buf = [0u8; 1500];
     let mut next_tick = Instant::now();
     let mut ticks = 0u64;
@@ -38,7 +41,9 @@ fn main() -> std::io::Result<()> {
         // 2. game logic (here: echo)
         while let Some(ev) = server.poll_event() {
             match ev {
-                ServerEvent::Connected { client, addr } => println!("+ client {client} from {addr}"),
+                ServerEvent::Connected { client, addr, user_id, .. } => {
+                    println!("+ client {client} (user {user_id}) from {addr}")
+                }
                 ServerEvent::Disconnected { client, reason } => println!("- client {client}: {reason:?}"),
                 ServerEvent::Message { client, channel, data } => {
                     let _ = server.send(client, channel, data);
@@ -47,7 +52,8 @@ fn main() -> std::io::Result<()> {
         }
 
         // 3. timeouts + build packets
-        server.update(now);
+        let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        server.update(now, unix);
         server.flush(now);
 
         // 4. egress

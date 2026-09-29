@@ -62,3 +62,35 @@ fn die(usage: &str, msg: &str) -> ! {
     eprintln!("error: {msg}\n\n{usage}");
     std::process::exit(2);
 }
+
+/// A 32-byte key as 64 hex digits (`--token-key`).
+#[derive(Clone, Copy)]
+pub struct HexKey(pub [u8; 32]);
+
+impl HexKey {
+    pub fn is_dev(&self) -> bool {
+        self.0 == lattice_net::token::DEV_TOKEN_KEY
+    }
+}
+
+impl Default for HexKey {
+    fn default() -> Self {
+        Self(lattice_net::token::DEV_TOKEN_KEY)
+    }
+}
+
+impl FromStr for HexKey {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bytes = s.as_bytes();
+        if bytes.len() != 64 {
+            return Err(format!("expected 64 hex digits, got {}", bytes.len()));
+        }
+        let mut key = [0; 32];
+        for (i, pair) in bytes.chunks(2).enumerate() {
+            let hex = std::str::from_utf8(pair).map_err(|e| e.to_string())?;
+            key[i] = u8::from_str_radix(hex, 16).map_err(|e| format!("{hex:?}: {e}"))?;
+        }
+        Ok(Self(key))
+    }
+}

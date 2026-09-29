@@ -6,7 +6,8 @@ use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
-use lattice_net::{Channel, Client, ClientState, Config};
+use lattice_net::token::{DEV_TOKEN_KEY, USER_DATA_BYTES};
+use lattice_net::{Channel, Client, ClientState, Config, ConnectToken};
 
 fn main() -> std::io::Result<()> {
     let server: SocketAddr = std::env::args()
@@ -20,7 +21,11 @@ fn main() -> std::io::Result<()> {
     socket.set_nonblocking(true)?;
 
     let start = Instant::now();
-    let mut client = Client::new(Config::default(), server, start);
+    // Stands in for the login service, which would mint this and send it over TLS.
+    let cfg = Config::default();
+    let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let token = ConnectToken::mint(&DEV_TOKEN_KEY, cfg.protocol_id, 1, unix + 30, 1, &[0; USER_DATA_BYTES]);
+    let mut client = Client::new(cfg, server, token, start);
     let tick = Duration::from_micros(16_667);
     let mut buf = [0u8; 1500];
     let mut frame = 0u32;

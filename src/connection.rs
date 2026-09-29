@@ -6,7 +6,9 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::channel::{self, PacketIds, ReliableReceiver, ReliableSender, KIND_PADDING, KIND_RELIABLE, KIND_UNRELIABLE};
-use crate::packet::{self, AckHeader, Packet, ACK_DELAY_UNIT_US, PAYLOAD_OVERHEAD};
+use crate::crypto::{expand_seq, Cipher, DOMAIN_PACKET};
+use crate::packet::{self, AckHeader, ACK_DELAY_UNIT_US, MAX_PACKET_SIZE, PAYLOAD_OVERHEAD, SEALED_PREFIX, T_DISCONNECT};
+use crate::token::Key;
 use crate::seq::SequenceBuffer;
 use crate::wire::{DecodeError, Reader, Writer};
 
@@ -21,7 +23,8 @@ pub enum Channel {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Mixed into every packet's CRC. Bump it when the protocol changes.
+    /// Authenticated with every sealed packet and token (never sent). Bump it
+    /// when the protocol changes: peers on another version fail authentication.
     pub protocol_id: u64,
     /// Drop the connection after this long with no valid packets.
     pub timeout: Duration,
@@ -47,8 +50,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // LATTICE2: padding messages. LATTICE1: 256-message reliable windows.
-            protocol_id: u64::from_le_bytes(*b"LATTICE2"),
+            // LATTICE3: connect tokens and sealed packets. LATTICE2: padding
+            // messages. LATTICE1: 256-message reliable windows.
+            protocol_id: u64::from_le_bytes(*b"LATTICE3"),
             timeout: Duration::from_secs(5),
             keepalive_interval: Duration::from_millis(100),
             handshake_resend_interval: Duration::from_millis(100),
@@ -165,10 +169,23 @@ impl PacketTags {
     }
 }
 
+/// What a sealed packet turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sealed {
+    Payload,
+    Disconnect,
+}
+
 pub struct Connection {
     cfg: Config,
-    session: u32,
-    local_seq: u16,
+    /// Seals what we send; its nonce counter is `local_seq`.
+    send_cipher: Cipher,
+    /// Opens what the peer sends.
+    recv_cipher: Cipher,
+    /// Our 64-bit packet counter (the nonce). Its low 16 bits are the wire seq.
+    local_seq: u64,
+    /// Newest peer counter authenticated so far, to rebuild the next ones.
+    recv_top: u64,
     sent: SequenceBuffer<SentPacket>,
     /// Arrival time of each received packet, for `ack_delay`.
     received: SequenceBuffer<Instant>,
@@ -187,11 +204,14 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(cfg: Config, session: u32, now: Instant) -> Self {
+    /// `send_key` seals our packets, `recv_key` opens the peer's.
+    pub(crate) fn new(cfg: Config, send_key: &Key, recv_key: &Key, now: Instant) -> Self {
         Self {
             cfg,
-            session,
+            send_cipher: Cipher::new(send_key),
+            recv_cipher: Cipher::new(recv_key),
             local_seq: 0,
+            recv_top: 0,
             sent: SequenceBuffer::new(SENT_BUFFER),
             received: SequenceBuffer::new(RECV_BUFFER),
             reliable_tx: ReliableSender::new(),
@@ -209,12 +229,14 @@ impl Connection {
     /// Back to the state of `Connection::new` for a new peer, keeping every
     /// allocation, so a server can recycle connections instead of allocating
     /// (and page-faulting) fresh windows on each accept.
-    pub(crate) fn reset(&mut self, session: u32, now: Instant) {
+    pub(crate) fn reset(&mut self, send_key: &Key, recv_key: &Key, now: Instant) {
         // Destructured so that a new field can't be forgotten here.
         let Connection {
             cfg: _,
-            session: sess,
+            send_cipher,
+            recv_cipher,
             local_seq,
+            recv_top,
             sent,
             received,
             reliable_tx,
@@ -227,8 +249,10 @@ impl Connection {
             rtt_samples,
             stats,
         } = self;
-        *sess = session;
+        *send_cipher = Cipher::new(send_key);
+        *recv_cipher = Cipher::new(recv_key);
         *local_seq = 0;
+        *recv_top = 0;
         sent.clear();
         received.clear();
         reliable_tx.reset();
@@ -289,8 +313,38 @@ impl Connection {
         self.reliable_tx.pending()
     }
 
-    pub(crate) fn session(&self) -> u32 {
-        self.session
+    pub(crate) fn send_cipher(&self) -> &Cipher {
+        &self.send_cipher
+    }
+
+    /// Opens a payload or disconnect from the peer. A payload's messages go to
+    /// the inbox. Fails, touching nothing, on anything the peer didn't seal.
+    pub(crate) fn receive_sealed(&mut self, data: &[u8], now: Instant) -> Result<Sealed, DecodeError> {
+        let (ty, low) = packet::sealed_prefix(data).ok_or(DecodeError::Invalid)?;
+        let seq = expand_seq(self.recv_top, low);
+        let mut plain = [0u8; MAX_PACKET_SIZE];
+        let n = self
+            .recv_cipher
+            .open(self.cfg.protocol_id, DOMAIN_PACKET, seq, data, SEALED_PREFIX, &mut plain)
+            .ok_or(DecodeError::Unauthenticated)?;
+        self.recv_top = self.recv_top.max(seq);
+        if ty == T_DISCONNECT {
+            return if n == 0 { Ok(Sealed::Disconnect) } else { Err(DecodeError::Invalid) };
+        }
+        let (header, body) = packet::read_payload(low, &plain[..n])?;
+        self.on_payload(header, body, now)?;
+        Ok(Sealed::Payload)
+    }
+
+    /// A sealed disconnect, using up one packet sequence.
+    pub(crate) fn seal_disconnect(&mut self) -> Vec<u8> {
+        let seq = self.local_seq;
+        self.local_seq += 1;
+        let mut pkt = Vec::with_capacity(SEALED_PREFIX + crate::crypto::TAG_BYTES);
+        pkt.push(T_DISCONNECT);
+        pkt.extend_from_slice(&(seq as u16).to_le_bytes());
+        self.send_cipher.seal(self.cfg.protocol_id, DOMAIN_PACKET, seq, &mut pkt, SEALED_PREFIX);
+        pkt
     }
 
     pub(crate) fn timed_out(&self, now: Instant) -> bool {
@@ -309,8 +363,8 @@ impl Connection {
         Duration::from_secs_f32((self.rtt_ms() * 1.25).max(20.0) / 1000.0)
     }
 
-    /// Handle a decoded, session-checked payload packet.
-    pub(crate) fn on_payload(&mut self, h: AckHeader, body: &[u8], now: Instant) -> Result<(), DecodeError> {
+    /// Handle an opened payload.
+    fn on_payload(&mut self, h: AckHeader, body: &[u8], now: Instant) -> Result<(), DecodeError> {
         // Parse fully before committing: never ack a packet we couldn't process,
         // or the sender would consider its reliable messages delivered.
         let mut msgs: Vec<(Option<u16>, &[u8])> = Vec::new();
@@ -408,7 +462,7 @@ impl Connection {
             body.u8(KIND_PADDING);
             body.pad_to(budget);
         }
-        let seq = self.local_seq;
+        let seq = self.local_seq as u16;
 
         // Each sequence is judged exactly once, LOSS_LAG packets after it was sent.
         if let Some(old) = self.sent.get(seq.wrapping_sub(LOSS_LAG)) {
@@ -418,16 +472,11 @@ impl Connection {
         }
 
         let header = self.ack_fields(seq, now);
-        let pkt = packet::encode(
-            self.cfg.protocol_id,
-            &Packet::Payload {
-                session: self.session,
-                header,
-                body: body.as_slice(),
-            },
-        );
+        let mut pkt = packet::begin_payload(&header, body.len());
+        pkt.extend_from_slice(body.as_slice());
+        self.send_cipher.seal(self.cfg.protocol_id, DOMAIN_PACKET, self.local_seq, &mut pkt, SEALED_PREFIX);
         self.sent.insert(seq, SentPacket { time: now, acked: false, reliable: ids, tags });
-        self.local_seq = seq.wrapping_add(1);
+        self.local_seq += 1;
         self.last_send = Some(now);
         self.stats.packets_sent += 1;
         self.stats.bytes_sent += pkt.len() as u64;
@@ -485,18 +534,29 @@ impl Connection {
 mod tests {
     use super::*;
 
-    fn payload(bytes: &[u8]) -> (AckHeader, Vec<u8>) {
-        match packet::decode(Config::default().protocol_id, bytes).unwrap() {
-            Packet::Payload { header, body, .. } => (header, body.to_vec()),
-            p => panic!("not a payload: {p:?}"),
-        }
+    const A_TO_B: Key = [1; 32];
+    const B_TO_A: Key = [2; 32];
+
+    fn pair(cfg: Config, now: Instant) -> (Connection, Connection) {
+        (Connection::new(cfg.clone(), &A_TO_B, &B_TO_A, now), Connection::new(cfg, &B_TO_A, &A_TO_B, now))
+    }
+
+    /// The ack header of a packet sealed with `key`, read as the peer would.
+    fn header(key: &Key, pkt: &[u8]) -> AckHeader {
+        let (_, low) = packet::sealed_prefix(pkt).unwrap();
+        let mut plain = [0; MAX_PACKET_SIZE];
+        let n = Cipher::new(key)
+            .open(Config::default().protocol_id, DOMAIN_PACKET, low as u64, pkt, SEALED_PREFIX, &mut plain)
+            .unwrap();
+        packet::read_payload(low, &plain[..n]).unwrap().0
     }
 
     #[test]
     fn padding_fills_all_but_the_last_packet_and_parses_away() {
         let t0 = Instant::now();
         let cfg = Config { max_packets_per_flush: 8, pad_packets: true, ..Config::default() };
-        let (mut a, mut b) = (Connection::new(cfg.clone(), 1, t0), Connection::new(cfg, 1, t0));
+        let body = cfg.packet_body_size();
+        let (mut a, mut b) = pair(cfg, t0);
         let msgs: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8 + 1; 500]).collect();
         for m in &msgs {
             a.send(Channel::Unreliable, m.clone()).unwrap();
@@ -507,11 +567,10 @@ mod tests {
         let sizes: Vec<usize> = out.iter().map(Vec::len).collect();
         assert_eq!(sizes[..2], [packet::MAX_PACKET_SIZE; 2]);
         assert!(sizes[2] < packet::MAX_PACKET_SIZE);
-        // Each padded body: two 503 B messages (kind, varlen, data) in 1181 B.
-        assert_eq!(a.stats().padding_bytes, 2 * (1181 - 2 * 503));
+        // Each padded body: two 503 B messages (kind, varlen, data).
+        assert_eq!(a.stats().padding_bytes, 2 * (body - 2 * 503) as u64);
         for p in &out {
-            let (h, body) = payload(p);
-            b.on_payload(h, &body, t0).unwrap();
+            assert_eq!(b.receive_sealed(p, t0), Ok(Sealed::Payload));
         }
         let got: Vec<Vec<u8>> = std::iter::from_fn(|| b.recv()).map(|(_, m)| m).collect();
         assert_eq!(got, msgs);
@@ -521,13 +580,13 @@ mod tests {
         out.clear();
         a.flush(t0, &mut out);
         assert_eq!(out.len(), 1);
-        assert!(out[0].len() < 40);
+        assert!(out[0].len() < 50);
     }
 
     #[test]
     fn padding_must_be_zeros() {
         let t0 = Instant::now();
-        let mut b = Connection::new(Config::default(), 1, t0);
+        let (_, mut b) = pair(Config::default(), t0);
         let h = AckHeader { seq: 0, ack: 0, ack_bits: 0, ack_delay: 0 };
         assert!(b.on_payload(h, &[KIND_PADDING, 0, 0, 0], t0).is_ok());
         let h = AckHeader { seq: 1, ..h };
@@ -535,11 +594,54 @@ mod tests {
     }
 
     #[test]
+    fn only_the_peers_untouched_packets_get_in_and_only_once() {
+        let t0 = Instant::now();
+        let (mut a, mut b) = pair(Config::default(), t0);
+        a.send(Channel::Reliable, b"fire".to_vec()).unwrap();
+        let mut out = Vec::new();
+        a.flush(t0, &mut out);
+        let pkt = out.pop().unwrap();
+
+        for i in 0..pkt.len() {
+            let mut bad = pkt.clone();
+            bad[i] ^= 1;
+            assert!(b.receive_sealed(&bad, t0).is_err(), "flipped byte {i}");
+        }
+        let (mut other, _) = pair(Config { protocol_id: 1, ..Config::default() }, t0);
+        other.send(Channel::Reliable, b"fire".to_vec()).unwrap();
+        let mut theirs = Vec::new();
+        other.flush(t0, &mut theirs);
+        assert_eq!(b.receive_sealed(&theirs[0], t0), Err(DecodeError::Unauthenticated), "other protocol");
+        assert_eq!(b.stats().packets_received, 0, "rejects touch nothing");
+
+        assert_eq!(b.receive_sealed(&pkt, t0), Ok(Sealed::Payload));
+        assert_eq!(b.recv(), Some((Channel::Reliable, b"fire".to_vec())));
+        // A replay authenticates but is a duplicate: nothing is delivered twice.
+        assert_eq!(b.receive_sealed(&pkt, t0), Ok(Sealed::Payload));
+        assert_eq!(b.recv(), None);
+        assert_eq!(b.stats().duplicate_packets, 1);
+    }
+
+    #[test]
+    fn disconnects_are_sealed_and_use_up_a_sequence() {
+        let t0 = Instant::now();
+        let (mut a, mut b) = pair(Config::default(), t0);
+        let d = a.seal_disconnect();
+        let mut forged = d.clone();
+        forged[1] ^= 1;
+        assert!(b.receive_sealed(&forged, t0).is_err());
+        let mut out = Vec::new();
+        a.flush(t0, &mut out); // the keepalive after it gets the next sequence
+        assert_eq!(packet::sealed_prefix(&out[0]).unwrap().1, 1);
+        assert_eq!(b.receive_sealed(&out[0], t0), Ok(Sealed::Payload));
+        assert_eq!(b.receive_sealed(&d, t0), Ok(Sealed::Disconnect));
+    }
+
+    #[test]
     fn tags_come_back_when_their_packet_is_acked_and_never_when_lost() {
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
-        let cfg = Config { max_packets_per_flush: 8, ..Config::default() };
-        let (mut a, mut b) = (Connection::new(cfg.clone(), 1, t0), Connection::new(cfg, 1, t0));
+        let (mut a, mut b) = pair(Config { max_packets_per_flush: 8, ..Config::default() }, t0);
         let mut out = Vec::new();
 
         // 12 small tagged messages: at most 8 tags per packet, so two packets.
@@ -549,12 +651,10 @@ mod tests {
         a.flush(ms(0), &mut out);
         assert_eq!(out.len(), 2);
         // The first packet is lost; the second arrives and b acks it.
-        let (h, body) = payload(&out[1]);
-        b.on_payload(h, &body, ms(5)).unwrap();
+        b.receive_sealed(&out[1], ms(5)).unwrap();
         let mut back = Vec::new();
         b.flush(ms(10), &mut back);
-        let (h, body) = payload(&back[0]);
-        a.on_payload(h, &body, ms(15)).unwrap();
+        a.receive_sealed(&back[0], ms(15)).unwrap();
 
         let mut acked = Vec::new();
         a.take_acked(&mut acked);
@@ -567,18 +667,17 @@ mod tests {
     fn rtt_excludes_the_peers_hold_time() {
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
-        let (mut a, mut b) = (Connection::new(Config::default(), 1, t0), Connection::new(Config::default(), 1, t0));
+        let (mut a, mut b) = pair(Config::default(), t0);
         let mut out = Vec::new();
 
         // A sends at 0; 10 ms of network; B holds it 30 ms (its tick), then replies;
         // 10 ms back. The network RTT is 20 ms, though the ack took 50.
         a.flush(ms(0), &mut out);
-        let (h, body) = payload(&out.pop().unwrap());
-        b.on_payload(h, &body, ms(10)).unwrap();
+        b.receive_sealed(&out.pop().unwrap(), ms(10)).unwrap();
         b.flush(ms(40), &mut out);
-        let (h, body) = payload(&out.pop().unwrap());
-        assert_eq!(h.ack_delay, 3000, "30 ms in 10 us units");
-        a.on_payload(h, &body, ms(50)).unwrap();
+        let reply = out.pop().unwrap();
+        assert_eq!(header(&B_TO_A, &reply).ack_delay, 3000, "30 ms in 10 us units");
+        a.receive_sealed(&reply, ms(50)).unwrap();
         assert!((a.stats().rtt_ms - 20.0).abs() < 0.01, "rtt {}", a.stats().rtt_ms);
     }
 }

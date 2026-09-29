@@ -36,6 +36,11 @@ pub const PRIVATE_TOKEN_BYTES: usize = NONCE_BYTES + SEALED_BYTES + TAG_BYTES;
 /// `ConnectToken::to_bytes` length.
 pub const CONNECT_TOKEN_BYTES: usize = 8 + 8 + 32 + 32 + PRIVATE_TOKEN_BYTES;
 
+/// A well-known key for examples, the sim and local tests, so a server and its
+/// bots agree without configuration. Anyone can mint tokens with it: never
+/// deploy a server that uses it.
+pub const DEV_TOKEN_KEY: Key = *b"lattice-net dev key: NOT SECRET!";
+
 /// A fresh random key from the OS.
 pub fn generate_key() -> Key {
     let mut k = [0; 32];

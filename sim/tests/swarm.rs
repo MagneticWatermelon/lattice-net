@@ -4,7 +4,8 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use lattice_net::{Channel, Client, ClientState, Config};
+use lattice_net::token::USER_DATA_BYTES;
+use lattice_net::{Channel, Client, ClientState, Config, ConnectToken};
 use lattice_sim::bot::BotBrain;
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::rng::Rng;
@@ -12,6 +13,13 @@ use lattice_sim::interest::{InterestConfig, Tier, FAR_PERIOD, MID_PERIOD};
 use lattice_sim::server::{SimConfig, SimServer, SpawnMode};
 
 const SERVER: &str = "10.0.0.1:40000";
+
+/// What a login service would give user `user` for this server.
+fn token(cfg: &SimConfig, user: u64) -> ConnectToken {
+    let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let id = &cfg.identity;
+    ConnectToken::mint(&id.token_key, cfg.net.protocol_id, id.server_id, unix + 60, user, &[0; USER_DATA_BYTES])
+}
 
 struct Swarm {
     server: SimServer,
@@ -52,7 +60,7 @@ impl Swarm {
         let bots = (0..n)
             .map(|i| {
                 let addr: SocketAddr = format!("10.1.{}.{}:5000", i / 250, i % 250 + 1).parse().unwrap();
-                (addr, Client::new(Config::default(), server_addr, now), BotBrain::new(i as u64))
+                (addr, Client::new(Config::default(), server_addr, token(&cfg, i as u64), now), BotBrain::new(i as u64))
             })
             .collect();
         Self {

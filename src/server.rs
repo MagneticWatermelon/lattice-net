@@ -3,8 +3,10 @@
 //! Connections are partitioned into `Shard`s by a keyed hash of the peer
 //! address. A shard owns everything about its connections (address map,
 //! handshake, events, outgoing datagrams), so shards can run on different
-//! threads with no locking. The only cross-shard state is read-only config and
-//! keys plus an atomic client count that enforces `max_clients`.
+//! threads. The cross-shard state is read-only config and keys, an atomic
+//! client count that enforces `max_clients`, and a small registry (one lock,
+//! taken only when a connection is accepted or removed) of used connect tokens
+//! and connected user ids.
 //!
 //! This crate spawns no threads: callers that want parallelism route datagrams
 //! with `Router::shard`, then drive `shards_mut()` from their own thread pool.
@@ -15,11 +17,13 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::connection::{Channel, Config, Connection, SendError, Stats};
-use crate::packet::{self, session_from_cookie, DenyReason, Packet};
+use crate::connection::{Channel, Config, Connection, Sealed, SendError, Stats};
+use crate::crypto::Cipher;
+use crate::packet::{self, DenyReason, Handshake, T_DISCONNECT, T_PAYLOAD};
+use crate::token::{Key, TokenOpener, USER_DATA_BYTES};
 
 /// Encodes its shard: `id % shard_count == shard index`.
 pub type ClientId = u32;
@@ -29,11 +33,32 @@ pub enum DisconnectReason {
     TimedOut,
     ClientDisconnected,
     Kicked,
+    /// The same user connected again (with a new token), possibly from
+    /// another address; the new connection won.
+    Replaced,
+}
+
+/// Who this server is to the login service.
+#[derive(Clone)]
+pub struct ServerIdentity {
+    /// Tokens name the server they're for; others are refused.
+    pub server_id: u64,
+    /// Shared with the login service, which seals tokens with it.
+    pub token_key: Key,
+}
+
+impl std::fmt::Debug for ServerIdentity {
+    // Never print the key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerIdentity").field("server_id", &self.server_id).finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
 pub enum ServerEvent {
-    Connected { client: ClientId, addr: SocketAddr },
+    /// `user_id` and `user_data` come from the connect token, as the login
+    /// service wrote them.
+    Connected { client: ClientId, addr: SocketAddr, user_id: u64, user_data: [u8; USER_DATA_BYTES] },
     Disconnected { client: ClientId, reason: DisconnectReason },
     Message { client: ClientId, channel: Channel, data: Vec<u8> },
 }
@@ -64,8 +89,29 @@ impl Router {
     }
 }
 
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Server-wide, behind one lock taken only on accept and removal.
+#[derive(Default)]
+struct Registry {
+    /// Tokens that have connected (keyed by their tag), until they expire. A
+    /// token connects at most once: its keys are the connection's, and a
+    /// second connection would reuse their nonces.
+    used_tokens: HashMap<[u8; 16], u64>,
+    prune_at: usize,
+    /// Connected users: user id -> client.
+    users: HashMap<u64, ClientId>,
+}
+
 struct Shared {
     cfg: Config,
+    tokens: TokenOpener,
+    registry: Mutex<Registry>,
+    /// Per shard: clients another shard's accept has replaced, to remove on
+    /// that shard's next `update`.
+    replaced: Vec<Mutex<Vec<ClientId>>>,
     max_clients: usize,
     /// Randomly keyed SipHash: the server secret for handshake cookies.
     cookie_key: RandomState,
@@ -99,6 +145,7 @@ impl Shared {
 struct Slot {
     addr: SocketAddr,
     salt: u64,
+    user_id: u64,
     conn: Connection,
 }
 
@@ -118,6 +165,8 @@ pub struct Shard {
     pool: Vec<Connection>,
     events: VecDeque<ServerEvent>,
     outgoing: Vec<(SocketAddr, Vec<u8>)>,
+    /// Wall clock for token expiry, from `update`.
+    unix_now: u64,
     dropped_packets: u64,
     deferred_accepts: u64,
 }
@@ -131,41 +180,60 @@ impl Shard {
     /// address routed elsewhere are dropped, so a routing bug can't create a
     /// connection in the wrong shard.
     pub fn receive(&mut self, from: SocketAddr, data: &[u8], now: Instant) {
-        let Ok(pkt) = packet::decode(self.shared.cfg.protocol_id, data) else {
-            self.dropped_packets += 1;
+        if matches!(data.first(), Some(&(T_PAYLOAD | T_DISCONNECT))) {
+            self.receive_sealed(from, data, now);
             return;
-        };
-        match pkt {
-            Packet::ConnectionRequest { client_salt } => {
-                if self.by_addr.contains_key(&from) {
-                    return;
+        }
+        match packet::decode_handshake(data) {
+            Ok(Handshake::Request { token, salt }) => {
+                if self.by_addr.get(&from).is_some_and(|id| self.clients[id].salt == salt) {
+                    return; // connected already; the client will see our payloads
                 }
                 if !self.owns(&from) {
                     self.dropped_packets += 1;
                     return;
                 }
-                if self.shared.clients.load(Ordering::Relaxed) >= self.shared.max_clients {
-                    self.push(from, Packet::Denied { client_salt, reason: DenyReason::ServerFull });
+                // Stateless: the token is checked (so only holders of a valid
+                // token get a reply), and nothing is allocated until the cookie
+                // comes back.
+                if self.shared.tokens.open(token.server_id, token.expires, token.private, self.unix_now).is_err() {
+                    self.dropped_packets += 1;
                     return;
                 }
-                // Stateless: nothing is allocated until the cookie comes back.
-                let cookie = self.shared.cookie(&from, client_salt, self.shared.bucket(now));
-                self.push(from, Packet::Challenge { client_salt, cookie });
+                if self.shared.clients.load(Ordering::Relaxed) >= self.shared.max_clients {
+                    self.outgoing.push((from, packet::encode_denied(salt, DenyReason::ServerFull)));
+                    return;
+                }
+                let cookie = self.shared.cookie(&from, salt, self.shared.bucket(now));
+                self.outgoing.push((from, packet::encode_challenge(salt, cookie)));
             }
 
-            Packet::ChallengeResponse { client_salt, cookie } => {
-                if let Some(&id) = self.by_addr.get(&from) {
-                    // Our Accepted was probably lost: resend it (idempotent).
-                    if self.clients[&id].salt == client_salt {
-                        self.push(from, Packet::Accepted { client_salt, client_id: id });
+            Ok(Handshake::Response { token, salt, cookie }) => {
+                let existing = self.by_addr.get(&from).copied();
+                if let Some(id) = existing {
+                    let slot = &self.clients[&id];
+                    if slot.salt == salt {
+                        // Our Accepted was probably lost: resend it (idempotent).
+                        let pkt = packet::encode_accepted(self.shared.cfg.protocol_id, slot.conn.send_cipher(), salt, id);
+                        self.outgoing.push((from, pkt));
+                        return;
                     }
-                    return;
                 }
                 let b = self.shared.bucket(now);
-                let valid = cookie == self.shared.cookie(&from, client_salt, b)
-                    || (b > 0 && cookie == self.shared.cookie(&from, client_salt, b - 1));
+                let valid = cookie == self.shared.cookie(&from, salt, b)
+                    || (b > 0 && cookie == self.shared.cookie(&from, salt, b - 1));
                 if !valid || !self.owns(&from) {
                     self.dropped_packets += 1;
+                    return;
+                }
+                let Ok(contents) = self.shared.tokens.open(token.server_id, token.expires, token.private, self.unix_now)
+                else {
+                    self.dropped_packets += 1;
+                    return;
+                };
+                let c2s = Cipher::new(&contents.client_to_server_key);
+                if !packet::verify_response(self.shared.cfg.protocol_id, &c2s, data, cookie) {
+                    self.dropped_packets += 1; // has the token but not its keys
                     return;
                 }
                 if self.accepts_this_tick >= self.accept_budget {
@@ -173,57 +241,89 @@ impl Shard {
                     self.deferred_accepts += 1;
                     return;
                 }
-                if !self.shared.reserve_slot() {
-                    self.push(from, Packet::Denied { client_salt, reason: DenyReason::ServerFull });
-                    return;
-                }
+                let token_tag: [u8; 16] = token.private[token.private.len() - 16..].try_into().unwrap();
                 let id = self.next_local.wrapping_mul(self.shared.router.shards).wrapping_add(self.index);
+                let replaced = {
+                    let mut reg = self.shared.registry.lock().unwrap();
+                    if reg.used_tokens.contains_key(&token_tag) {
+                        drop(reg);
+                        self.dropped_packets += 1; // each token connects once
+                        return;
+                    }
+                    // A new client at the address of a connected one takes its slot.
+                    if existing.is_none() && !self.shared.reserve_slot() {
+                        drop(reg);
+                        self.outgoing.push((from, packet::encode_denied(salt, DenyReason::ServerFull)));
+                        return;
+                    }
+                    let unix_now = self.unix_now;
+                    if reg.used_tokens.len() >= reg.prune_at {
+                        reg.used_tokens.retain(|_, &mut exp| exp > unix_now);
+                        reg.prune_at = (reg.used_tokens.len() * 2).max(1024);
+                    }
+                    reg.used_tokens.insert(token_tag, token.expires);
+                    reg.users.insert(contents.user_id, id)
+                };
+                if let Some(old) = existing {
+                    self.remove_slot(old, DisconnectReason::Replaced, true, false);
+                }
+                if let Some(old) = replaced.filter(|&old| Some(old) != existing) {
+                    let shard = old as usize % self.shared.replaced.len();
+                    self.shared.replaced[shard].lock().unwrap().push(old);
+                }
                 self.next_local = self.next_local.wrapping_add(1);
                 self.accepts_this_tick += 1;
-                let session = session_from_cookie(cookie);
+                let (send, recv) = (&contents.server_to_client_key, &contents.client_to_server_key);
                 let conn = match self.pool.pop() {
                     Some(mut c) => {
-                        c.reset(session, now);
+                        c.reset(send, recv, now);
                         c
                     }
-                    None => Connection::new(self.shared.cfg.clone(), session, now),
+                    None => Connection::new(self.shared.cfg.clone(), send, recv, now),
                 };
+                let pkt = packet::encode_accepted(self.shared.cfg.protocol_id, conn.send_cipher(), salt, id);
+                self.outgoing.push((from, pkt));
                 self.by_addr.insert(from, id);
-                self.clients.insert(id, Slot { addr: from, salt: client_salt, conn });
-                self.push(from, Packet::Accepted { client_salt, client_id: id });
-                self.events.push_back(ServerEvent::Connected { client: id, addr: from });
+                self.clients.insert(id, Slot { addr: from, salt, user_id: contents.user_id, conn });
+                self.events.push_back(ServerEvent::Connected {
+                    client: id,
+                    addr: from,
+                    user_id: contents.user_id,
+                    user_data: contents.user_data,
+                });
             }
 
-            Packet::Payload { session, header, body } => {
-                let Some(&id) = self.by_addr.get(&from) else {
-                    self.dropped_packets += 1;
-                    return;
-                };
-                let slot = self.clients.get_mut(&id).expect("by_addr and clients in sync");
-                if slot.conn.session() != session || slot.conn.on_payload(header, body, now).is_err() {
-                    self.dropped_packets += 1;
-                    return;
-                }
-                while let Some((channel, data)) = slot.conn.recv() {
-                    self.events.push_back(ServerEvent::Message { client: id, channel, data });
-                }
-            }
-
-            Packet::Disconnect { session } => {
-                if let Some(&id) = self.by_addr.get(&from) {
-                    if self.clients[&id].conn.session() == session {
-                        self.remove(id, DisconnectReason::ClientDisconnected, false);
-                    }
-                }
-            }
-
+            // Server->client packets, or junk.
             _ => self.dropped_packets += 1,
         }
     }
 
+    fn receive_sealed(&mut self, from: SocketAddr, data: &[u8], now: Instant) {
+        let Some(&id) = self.by_addr.get(&from) else {
+            self.dropped_packets += 1;
+            return;
+        };
+        let slot = self.clients.get_mut(&id).expect("by_addr and clients in sync");
+        match slot.conn.receive_sealed(data, now) {
+            Ok(Sealed::Payload) => {
+                while let Some((channel, data)) = slot.conn.recv() {
+                    self.events.push_back(ServerEvent::Message { client: id, channel, data });
+                }
+            }
+            Ok(Sealed::Disconnect) => self.remove(id, DisconnectReason::ClientDisconnected, false),
+            Err(_) => self.dropped_packets += 1,
+        }
+    }
+
     /// Detect timeouts and start a new accept budget. Call once per tick.
-    pub fn update(&mut self, now: Instant) {
+    /// `unix_now` is wall-clock seconds, for token expiry.
+    pub fn update(&mut self, now: Instant, unix_now: u64) {
         self.accepts_this_tick = 0;
+        self.unix_now = unix_now;
+        let replaced = std::mem::take(&mut *self.shared.replaced[self.index as usize].lock().unwrap());
+        for id in replaced {
+            self.remove(id, DisconnectReason::Replaced, true);
+        }
         let timed_out: Vec<ClientId> = self
             .clients
             .iter()
@@ -295,7 +395,7 @@ impl Shard {
         self.clients.get(&client).map(|s| s.addr)
     }
 
-    /// Datagrams dropped for bad CRC, bad cookie, wrong session, misrouting, etc.
+    /// Datagrams dropped: failed authentication, bad or used tokens, bad cookies, misrouting, junk.
     pub fn dropped_packets(&self) -> u64 {
         self.dropped_packets
     }
@@ -311,22 +411,33 @@ impl Shard {
     }
 
     fn remove(&mut self, id: ClientId, reason: DisconnectReason, notify: bool) {
-        let Some(slot) = self.clients.remove(&id) else { return };
+        self.remove_slot(id, reason, notify, true);
+    }
+
+    /// `release`: give back its place under `max_clients` (not when a new
+    /// client at the same address takes it over).
+    fn remove_slot(&mut self, id: ClientId, reason: DisconnectReason, notify: bool, release: bool) {
+        let Some(mut slot) = self.clients.remove(&id) else { return };
         self.by_addr.remove(&slot.addr);
-        let session = slot.conn.session();
-        self.shared.clients.fetch_sub(1, Ordering::AcqRel);
+        {
+            let mut reg = self.shared.registry.lock().unwrap();
+            if reg.users.get(&slot.user_id) == Some(&id) {
+                reg.users.remove(&slot.user_id);
+            }
+        }
+        if release {
+            self.shared.clients.fetch_sub(1, Ordering::AcqRel);
+        }
         if notify {
-            // Redundant: this is fire-and-forget over UDP.
+            // Redundant: this is fire-and-forget over UDP. Each is sealed with
+            // its own sequence, so a forged or replayed one is ignored.
             for _ in 0..3 {
-                self.push(slot.addr, Packet::Disconnect { session });
+                let pkt = slot.conn.seal_disconnect();
+                self.outgoing.push((slot.addr, pkt));
             }
         }
         self.pool.push(slot.conn);
         self.events.push_back(ServerEvent::Disconnected { client: id, reason });
-    }
-
-    fn push(&mut self, to: SocketAddr, p: Packet<'_>) {
-        self.outgoing.push((to, packet::encode(self.shared.cfg.protocol_id, &p)));
     }
 }
 
@@ -337,20 +448,23 @@ pub struct Server {
 
 impl Server {
     /// A single-shard server.
-    pub fn new(cfg: Config, max_clients: usize, now: Instant) -> Self {
-        Self::with_shards(cfg, max_clients, 1, now)
+    pub fn new(cfg: Config, identity: &ServerIdentity, max_clients: usize, now: Instant) -> Self {
+        Self::with_shards(cfg, identity, max_clients, 1, now)
     }
 
     /// `shards` independent partitions of the connections. More shards than
     /// threads lets a work-stealing pool balance uneven shards.
-    pub fn with_shards(cfg: Config, max_clients: usize, shards: usize, now: Instant) -> Self {
+    pub fn with_shards(cfg: Config, identity: &ServerIdentity, max_clients: usize, shards: usize, now: Instant) -> Self {
         assert!((1..=u16::MAX as usize).contains(&shards), "shards must be 1..=65535");
         let accept_budget = match cfg.max_accepts_per_tick {
             0 => usize::MAX,
             n => n.div_ceil(shards),
         };
         let shared = Arc::new(Shared {
+            tokens: TokenOpener::new(&identity.token_key, cfg.protocol_id, identity.server_id),
             cfg,
+            registry: Mutex::new(Registry::default()),
+            replaced: (0..shards).map(|_| Mutex::new(Vec::new())).collect(),
             max_clients,
             cookie_key: RandomState::new(),
             epoch: now,
@@ -369,6 +483,8 @@ impl Server {
                 pool: Vec::new(),
                 events: VecDeque::new(),
                 outgoing: Vec::new(),
+                // Until the first `update`, so a token can't outlive its expiry.
+                unix_now: unix_now(),
                 dropped_packets: 0,
                 deferred_accepts: 0,
             })
@@ -385,7 +501,8 @@ impl Server {
         let cfg = &self.shared.cfg;
         let epoch = self.shared.epoch;
         for shard in &mut self.shards {
-            shard.pool.extend((0..per_shard).map(|_| Connection::new(cfg.clone(), 0, epoch)));
+            // Keys are set when a connection is handed out (`reset`).
+            shard.pool.extend((0..per_shard).map(|_| Connection::new(cfg.clone(), &[0; 32], &[0; 32], epoch)));
         }
         per_shard * self.shards.len()
     }
@@ -412,8 +529,9 @@ impl Server {
     }
 
     /// Detect timeouts and reset accept budgets in every shard. Call once per tick.
-    pub fn update(&mut self, now: Instant) {
-        self.shards.iter_mut().for_each(|s| s.update(now));
+    /// `unix_now` is wall-clock seconds, for token expiry.
+    pub fn update(&mut self, now: Instant, unix_now: u64) {
+        self.shards.iter_mut().for_each(|s| s.update(now, unix_now));
     }
 
     /// Build packets for every client. Call once per tick after queuing sends.

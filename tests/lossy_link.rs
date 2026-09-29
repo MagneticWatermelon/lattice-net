@@ -2,9 +2,28 @@
 //! Because the protocol is sans-IO, the whole thing runs in simulated time, deterministically.
 
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use lattice_net::{Channel, Client, ClientState, Config, Server, ServerEvent};
+use lattice_net::token::USER_DATA_BYTES;
+use lattice_net::{
+    Channel, Client, ClientState, Config, ConnectToken, DisconnectReason, Server, ServerEvent, ServerIdentity,
+};
+
+const SERVER_ID: u64 = 1;
+const TOKEN_KEY: [u8; 32] = [7; 32];
+
+fn identity() -> ServerIdentity {
+    ServerIdentity { server_id: SERVER_ID, token_key: TOKEN_KEY }
+}
+
+fn unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// What the login service would hand user `user`.
+fn token(cfg: &Config, user: u64) -> ConnectToken {
+    ConnectToken::mint(&TOKEN_KEY, cfg.protocol_id, SERVER_ID, unix() + 60, user, &[user as u8; USER_DATA_BYTES])
+}
 
 struct Rng(u64);
 impl Rng {
@@ -95,9 +114,9 @@ impl World {
     fn with_config(cfg: Config, n_clients: usize, shards: usize, max_clients: usize, profile: LinkProfile, seed: u64) -> Self {
         let now = Instant::now();
         let server_addr: SocketAddr = SERVER.parse().unwrap();
-        let server = Server::with_shards(cfg.clone(), max_clients, shards, now);
+        let server = Server::with_shards(cfg.clone(), &identity(), max_clients, shards, now);
         let clients = (0..n_clients)
-            .map(|i| (client_addr(i), Client::new(cfg.clone(), server_addr, now)))
+            .map(|i| (client_addr(i), Client::new(cfg.clone(), server_addr, token(&cfg, i as u64), now)))
             .collect();
         Self { now, link: Link::new(seed, profile), server, server_addr, clients }
     }
@@ -117,7 +136,7 @@ impl World {
         while let Some(e) = self.server.poll_event() {
             events.push(e);
         }
-        self.server.update(now);
+        self.server.update(now, unix());
         self.server.flush(now);
         for (to, pkt) in self.server.drain_outgoing() {
             self.link.send(now, self.server_addr, to, pkt);
@@ -317,9 +336,9 @@ fn server_full_is_denied() {
     let now = Instant::now();
     let cfg = Config::default();
     let server_addr: SocketAddr = SERVER.parse().unwrap();
-    let mut server = Server::new(cfg.clone(), 1, now);
-    let mut a = Client::new(cfg.clone(), server_addr, now);
-    let mut b = Client::new(cfg.clone(), server_addr, now);
+    let mut server = Server::new(cfg.clone(), &identity(), 1, now);
+    let mut a = Client::new(cfg.clone(), server_addr, token(&cfg, 0), now);
+    let mut b = Client::new(cfg.clone(), server_addr, token(&cfg, 1), now);
     let (aa, ba) = (client_addr(0), client_addr(1));
     let mut t = now;
     for _ in 0..20 {
@@ -354,21 +373,12 @@ fn spoofed_and_garbage_packets_are_ignored() {
 
     // 1) random garbage
     w.server.receive(attacker, &[0u8; 64], w.now);
-    // 2) a ChallengeResponse with a forged cookie
-    let forged = lattice_net::packet::encode(
-        Config::default().protocol_id,
-        &lattice_net::packet::Packet::ChallengeResponse { client_salt: 1, cookie: 12345 },
-    );
+    // 2) a padded request whose token is junk
+    let mut forged = vec![1u8; 256];
+    forged[10] = 99;
     w.server.receive(attacker, &forged, w.now);
-    // 3) a payload spoofing the real client's address but with a wrong session tag
-    let spoof = lattice_net::packet::encode(
-        Config::default().protocol_id,
-        &lattice_net::packet::Packet::Payload {
-            session: 0xDEAD_BEEF,
-            header: lattice_net::packet::AckHeader { seq: 999, ack: 0, ack_bits: 0, ack_delay: 0 },
-            body: &[0, 3, b'b', b'a', b'd'],
-        },
-    );
+    // 3) a payload spoofing the real client's address, not sealed with its key
+    let spoof = [6u8, 0xE7, 0x03, 0, 3, b'b', b'a', b'd', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let victim = w.clients[0].0;
     w.server.receive(victim, &spoof, w.now);
 
@@ -490,14 +500,14 @@ fn shards_run_on_separate_threads() {
 #[test]
 fn misrouted_handshake_is_dropped() {
     let now = Instant::now();
-    let mut server = Server::with_shards(Config::default(), 100, 4, now);
+    let cfg = Config::default();
+    let mut server = Server::with_shards(cfg.clone(), &identity(), 100, 4, now);
     let router = server.router();
     let addr = client_addr(3);
     let wrong = (router.shard(&addr) + 1) % 4;
-    let req = lattice_net::packet::encode(
-        Config::default().protocol_id,
-        &lattice_net::packet::Packet::ConnectionRequest { client_salt: 1 },
-    );
+    let mut c = Client::new(cfg.clone(), SERVER.parse().unwrap(), token(&cfg, 3), now);
+    c.update(now);
+    let req = c.drain_outgoing().next().unwrap();
     server.shards_mut()[wrong].receive(addr, &req, now);
     assert_eq!(server.shards()[wrong].dropped_packets(), 1);
     assert_eq!(server.drain_outgoing().count(), 0, "no challenge from the wrong shard");
@@ -539,7 +549,7 @@ fn pump(server: &mut Server, peers: &mut [(SocketAddr, &mut Client)], t: Instant
     while let Some(e) = server.poll_event() {
         events.push(e);
     }
-    server.update(t);
+    server.update(t, unix());
     server.flush(t);
     let out: Vec<_> = server.drain_outgoing().collect();
     for (to, p) in out {
@@ -555,13 +565,13 @@ fn recycled_connection_starts_clean() {
     let cfg = Config::default();
     let server_addr: SocketAddr = SERVER.parse().unwrap();
     let mut t = Instant::now();
-    let mut server = Server::with_shards(cfg.clone(), 10, 1, t);
+    let mut server = Server::with_shards(cfg.clone(), &identity(), 10, 1, t);
     assert_eq!(server.preallocate(1), 2, "25% headroom, rounded up");
     let (aa, ba) = (client_addr(0), client_addr(1));
 
     // A connects and leaves state behind in its connection: reliable messages
     // the server delivered (rx ids advanced) and ones A never got (tx in flight).
-    let mut a = Client::new(cfg.clone(), server_addr, t);
+    let mut a = Client::new(cfg.clone(), server_addr, token(&cfg, 0), t);
     for _ in 0..10 {
         t += TICK;
         pump(&mut server, &mut [(aa, &mut a)], t);
@@ -586,7 +596,7 @@ fn recycled_connection_starts_clean() {
     assert_eq!(server.client_count(), 0);
 
     // B gets A's recycled connection (the pool is LIFO).
-    let mut b = Client::new(cfg.clone(), server_addr, t);
+    let mut b = Client::new(cfg.clone(), server_addr, token(&cfg, 1), t);
     let mut server_got = Vec::new();
     let mut b_got = Vec::new();
     for step in 0..30 {
@@ -609,4 +619,122 @@ fn recycled_connection_starts_clean() {
     }
     assert_eq!(b_got, vec![b"b0".to_vec(), b"b1".to_vec()], "none of A's messages leak to B");
     assert_eq!(server_got, vec![b"hello".to_vec()], "B's message id 0 isn't mistaken for a duplicate");
+}
+
+/// Clients `peers` over a perfect link for `ticks` exchanges; the server's events.
+fn run(server: &mut Server, peers: &mut [(SocketAddr, &mut Client)], t: &mut Instant, ticks: usize) -> Vec<ServerEvent> {
+    let mut events = Vec::new();
+    for _ in 0..ticks {
+        *t += TICK;
+        events.extend(pump(server, peers, *t));
+    }
+    events
+}
+
+#[test]
+fn a_token_copied_off_the_wire_is_useless_without_its_keys() {
+    let cfg = Config::default();
+    let mut t = Instant::now();
+    let mut server = Server::new(cfg.clone(), &identity(), 10, t);
+    let real = token(&cfg, 5);
+    // The eavesdropper has every byte the client sends, not the keys the login
+    // service gave the client over TLS.
+    let mut stolen = real.clone();
+    stolen.client_to_server_key = [0; 32];
+    stolen.server_to_client_key = [0; 32];
+    let mut thief = Client::new(cfg.clone(), SERVER.parse().unwrap(), stolen, t);
+    run(&mut server, &mut [(client_addr(9), &mut thief)], &mut t, 30);
+    assert_eq!(thief.state(), ClientState::Connecting, "gets a challenge, but can't answer it");
+    assert_eq!(server.client_count(), 0);
+    assert!(server.dropped_packets() > 0);
+
+    // The real client still gets in with the token.
+    let mut owner = Client::new(cfg.clone(), SERVER.parse().unwrap(), real, t);
+    let events = run(&mut server, &mut [(client_addr(1), &mut owner)], &mut t, 10);
+    assert_eq!(owner.state(), ClientState::Connected);
+    assert!(events.iter().any(|e| matches!(e,
+        ServerEvent::Connected { user_id: 5, user_data, .. } if *user_data == [5; USER_DATA_BYTES])));
+}
+
+#[test]
+fn a_token_connects_once() {
+    let cfg = Config::default();
+    let mut t = Instant::now();
+    let mut server = Server::with_shards(cfg.clone(), &identity(), 10, 4, t);
+    let tok = token(&cfg, 5);
+    let mut first = Client::new(cfg.clone(), SERVER.parse().unwrap(), tok.clone(), t);
+    run(&mut server, &mut [(client_addr(1), &mut first)], &mut t, 10);
+    assert_eq!(first.state(), ClientState::Connected);
+    // Same token (so same keys) again, from elsewhere: its nonces would repeat.
+    let mut again = Client::new(cfg.clone(), SERVER.parse().unwrap(), tok, t);
+    run(&mut server, &mut [(client_addr(2), &mut again)], &mut t, 30);
+    assert_eq!(again.state(), ClientState::Connecting);
+    assert_eq!(server.client_count(), 1);
+}
+
+#[test]
+fn a_user_connecting_again_replaces_the_old_connection() {
+    let cfg = Config::default();
+    let mut t = Instant::now();
+    // Many shards, so the two addresses likely sit in different ones.
+    let mut server = Server::with_shards(cfg.clone(), &identity(), 10, 8, t);
+    let (a_addr, b_addr) = (client_addr(1), client_addr(2));
+    let mut a = Client::new(cfg.clone(), SERVER.parse().unwrap(), token(&cfg, 5), t);
+    run(&mut server, &mut [(a_addr, &mut a)], &mut t, 10);
+    let old = a.client_id().unwrap();
+    // The same user, with a new token from the login service, on another address.
+    let mut b = Client::new(cfg.clone(), SERVER.parse().unwrap(), token(&cfg, 5), t);
+    let events = run(&mut server, &mut [(a_addr, &mut a), (b_addr, &mut b)], &mut t, 10);
+    assert_eq!(b.state(), ClientState::Connected);
+    assert!(events.iter().any(|e| matches!(e,
+        ServerEvent::Disconnected { client, reason: DisconnectReason::Replaced } if *client == old)));
+    assert_eq!(a.state(), ClientState::Disconnected, "told by a sealed disconnect");
+    assert_eq!(server.client_count(), 1);
+
+    // A new client instance on the address of a connected one takes its place.
+    let mut c = Client::new(cfg.clone(), SERVER.parse().unwrap(), token(&cfg, 6), t);
+    let events = run(&mut server, &mut [(b_addr, &mut c)], &mut t, 10);
+    assert_eq!(c.state(), ClientState::Connected);
+    assert!(events.iter().any(|e| matches!(e, ServerEvent::Disconnected { reason: DisconnectReason::Replaced, .. })));
+    assert_eq!(server.client_count(), 1);
+}
+
+#[test]
+fn expired_and_foreign_tokens_get_no_reply() {
+    let cfg = Config::default();
+    let mut t = Instant::now();
+    let mut server = Server::new(cfg.clone(), &identity(), 10, t);
+    let blank = [0; USER_DATA_BYTES];
+    let expired = ConnectToken::mint(&TOKEN_KEY, cfg.protocol_id, SERVER_ID, unix() - 1, 1, &blank);
+    let other_server = ConnectToken::mint(&TOKEN_KEY, cfg.protocol_id, SERVER_ID + 1, unix() + 60, 2, &blank);
+    let forged = ConnectToken::mint(&[8; 32], cfg.protocol_id, SERVER_ID, unix() + 60, 3, &blank);
+    let old_protocol = ConnectToken::mint(&TOKEN_KEY, 1, SERVER_ID, unix() + 60, 4, &blank);
+    for (i, tok) in [expired, other_server, forged, old_protocol].into_iter().enumerate() {
+        let mut c = Client::new(cfg.clone(), SERVER.parse().unwrap(), tok, t);
+        run(&mut server, &mut [(client_addr(i), &mut c)], &mut t, 5);
+        assert_eq!(c.state(), ClientState::Connecting, "token {i}");
+    }
+    assert_eq!(server.drain_outgoing().count(), 0);
+    assert_eq!(server.dropped_packets(), 4, "each request dropped (one each: resends are 100 ms apart)");
+}
+
+#[test]
+fn forged_packets_from_a_clients_address_are_ignored() {
+    let cfg = Config::default();
+    let mut t = Instant::now();
+    let mut server = Server::new(cfg.clone(), &identity(), 10, t);
+    let addr = client_addr(1);
+    let mut c = Client::new(cfg.clone(), SERVER.parse().unwrap(), token(&cfg, 1), t);
+    run(&mut server, &mut [(addr, &mut c)], &mut t, 10);
+    // An off-path attacker spoofing the client's address: a disconnect, and a
+    // payload, for any sequence.
+    for seq in 0..50u16 {
+        let [a, b] = seq.to_le_bytes();
+        server.receive(addr, &[7, a, b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], t);
+        server.receive(addr, &[6, a, b, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19], t);
+    }
+    assert_eq!(server.dropped_packets(), 100);
+    assert!(server.poll_event().is_none());
+    run(&mut server, &mut [(addr, &mut c)], &mut t, 5);
+    assert_eq!((c.state(), server.client_count()), (ClientState::Connected, 1));
 }
