@@ -53,6 +53,11 @@ impl DebugMap {
     pub fn publish(&self, frame: DebugFrame) {
         self.shared.lock().unwrap().frame = Some(frame);
     }
+
+    /// Drops the last frame, so the page shows that nobody is connected.
+    pub fn clear(&self) {
+        self.shared.lock().unwrap().frame = None;
+    }
 }
 
 fn serve(stream: TcpStream, shared: &Mutex<Shared>) -> std::io::Result<()> {
@@ -180,7 +185,11 @@ function resize() { cv.width = innerWidth * devicePixelRatio; cv.height = innerH
 addEventListener('resize', resize);
 
 async function poll() {
-  try { const r = await fetch('/frame', { cache: 'no-store' }); frame = await r.json(); draw(); } catch (e) {}
+  try {
+    const r = await fetch('/frame', { cache: 'no-store' }); frame = await r.json(); draw();
+    if (!frame.watched) document.getElementById('stats').innerHTML =
+      'server is up, but no client is connected yet.<br>start bots, e.g. <code>lattice-bots --count 1000</code>';
+  } catch (e) { document.getElementById('stats').textContent = 'cannot reach the server'; }
   setTimeout(poll, 200);
 }
 

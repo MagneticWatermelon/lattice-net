@@ -298,7 +298,11 @@ fn main() -> std::io::Result<()> {
         std::mem::swap(&mut inbound, &mut *inbox.lock().unwrap());
 
         if let Some(map) = &debug_map {
-            let watch = map.watch().or_else(|| sim.any_entity());
+            // Fall back when the chosen client left (or nobody was chosen).
+            let watch = map.watch().filter(|&e| sim.is_client_entity(e)).or_else(|| sim.any_entity());
+            if watch.is_none() {
+                map.clear();
+            }
             sim.set_watch(watch);
         }
         let times = sim.tick(&mut inbound, now, &mut out);

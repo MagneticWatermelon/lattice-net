@@ -469,6 +469,11 @@ impl SimServer {
         self.debug.take()
     }
 
+    /// Whether a connected client controls `entity`.
+    pub fn is_client_entity(&self, entity: u16) -> bool {
+        self.by_client.values().any(|&e| e == entity)
+    }
+
     /// Some connected client's entity (to watch when none was chosen).
     pub fn any_entity(&self) -> Option<u16> {
         self.by_client.values().min().copied()
