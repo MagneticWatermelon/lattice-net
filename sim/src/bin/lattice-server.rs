@@ -735,6 +735,8 @@ fn summary_values(
         for (i, tier) in ["near", "mid", "far"].iter().enumerate() {
             kv.put(format!("{tier}_per_client_tick"), format!("{:.1}", (e.tier_sent[i] - w.tier_sent[i]) as f64 / snaps));
         }
+        kv.put("near_scanned_per_query", format!("{:.0}", (e.near_scanned - w.near_scanned) as f64 / snaps));
+        kv.put("mid_scanned_per_query", format!("{:.0}", (e.mid_scanned - w.mid_scanned) as f64 / snaps));
         kv.put("far_skipped", e.far_skipped - w.far_skipped);
         kv.put("far_starved", e.far_starved - w.far_starved);
         kv.put("repeated", e.repeated - w.repeated);

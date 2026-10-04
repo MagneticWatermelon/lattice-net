@@ -98,7 +98,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - one 25 m pile goes over the 33 ms tick at ~7.2k players;
     - a 200 m disk holds 10k (p99 19.3 ms);
     - uniform goes over at ~18k.
-    - The pile cost is the quadratic nearest-player search (`select_nth_unstable` 46% of CPU with 32 m cells), and the ladder can't cut it. Candidate fix: a finer grid where it's dense.
+    - The pile cost was the quadratic nearest-player search (`select_nth_unstable` 46% of CPU with 32 m cells), and the ladder can't cut it. **Fixed by `Grid::knn`** (below).
   - 256 shards don't help.
   - netem at 10k was invalid: netem on the server's interface throttled egress. Shape on the bot box only (egress + `ifb` ingress).
   - **Built since** (2026-10-04, not yet measured on bare metal):
@@ -108,9 +108,13 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - `SO_REUSEPORT` socket groups (`Server::with_socket_groups`, `lattice-server --sockets N`).
   - **Next:**
     - a short bare-metal session to measure these (`--sockets` 1/4/8/16 at 10k, and netem at 10k);
-    - the nearest-player search: a better algorithm, not a finer grid (decided 2026-10-04);
+    - ~~the nearest-player search~~ **done: `Grid::knn`** (2026-10-04, per `reports/Nearest player search algorithms.md`). Exact (oracle-tested), with packed keys and a running threshold, positions inline, sub-cells only in cells over 256 items, and a box-pruned walk. A 10k pile query scans ~490 candidates instead of 10,000 (30–40× faster single-threaded). The pile's assembly is now linear in its size: on WSL it crosses 33 ms at ~5,500 instead of ~2,800. Blob 3k assembly 9.0 → 5.9 ms; uniform 7% slower per query. Not yet on bare metal.
     - then M3 with a CPU budget.
-- **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
+- **M3:** combat with rewind, and the first playable client (decided 2026-10-04: the client is rolled into M3 instead of shipping a walk-only version first).
+  - Server: shooting with lag-compensated rewind, a heightmap, player collision.
+  - Client: Bevy test client on Windows, on an engine-agnostic `lattice-client-core` extracted from `BotBrain` (bots and humans run the same client code). Per-entity interpolation timelines blended through tier promotions. The client's interpolation delay feeds the server's rewind.
+  - Mid/far blobs carry no velocity today; decide extrapolation vs a coarse velocity in the blob.
+  - Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.
 

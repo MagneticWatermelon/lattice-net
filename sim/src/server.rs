@@ -25,7 +25,7 @@ use lattice_net::wire::Writer;
 use lattice_net::{Channel, ClientId, Config, Router, Server, ServerEvent, ServerIdentity};
 use rayon::prelude::*;
 
-use crate::grid::{Grid, Ring};
+use crate::grid::{Grid, Knn};
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{step, Input, MoveState, TICK_HZ, WORLD_SIZE};
@@ -220,6 +220,10 @@ pub struct Counters {
     pub near_bytes: u64,
     pub near_deltas: u64,
     pub near_full: u64,
+    /// Candidates whose distance the near and mid searches computed (the
+    /// k-nearest work), summed over client-ticks.
+    pub near_scanned: u64,
+    pub mid_scanned: u64,
     /// Ticks spent at each degradation level.
     pub level_ticks: [u64; MAX_LEVEL as usize + 1],
     /// Client-ticks with the client's own bandwidth level above 0.
@@ -261,9 +265,8 @@ struct Scratch {
     /// `stamp[e] == epoch` marks entity e as already taken for this client.
     stamp: Vec<u32>,
     epoch: u32,
-    /// (rank key, squared distance, entity): key is the squared distance, or -1
-    /// for squadmates so they always make the cut.
-    near_raw: Vec<(f32, f32, u16)>,
+    /// The k-nearest search's selection state.
+    knn: Knn,
     near: Vec<NearCandidate>,
     select: SelectScratch,
     /// This tick's near entities and their acked baselines.
@@ -291,6 +294,9 @@ struct Tally {
     near_bytes: u64,
     near_deltas: u64,
     near_full: u64,
+    /// Candidates the near and mid searches computed distances for.
+    near_scanned: u64,
+    mid_scanned: u64,
 }
 
 /// Per-entity input stream. Every tick consumes exactly one input seq, so each
@@ -800,6 +806,8 @@ impl SimServer {
             c.near_bytes += t.near_bytes;
             c.near_deltas += t.near_deltas;
             c.near_full += t.near_full;
+            c.near_scanned += t.near_scanned;
+            c.mid_scanned += t.mid_scanned;
         }
         lap(6);
 
@@ -985,82 +993,58 @@ impl View<'_> {
         // scan only computes squared distances; priorities and seeded ages are
         // computed for the <= near_candidates that make the cut.
         let (mid_radius, far_radius) = (cfg.mid_radius * slot.ladder.mid_scale(), cfg.far_radius * slot.ladder.far_scale());
-        let (r_near2, r_mid2, r_far2) = (cfg.near_radius.powi(2), mid_radius.powi(2), far_radius.powi(2));
-        // Non-squad candidates: a k-nearest ring walk, so a dense crowd costs
-        // a few cells instead of every entity within the radius.
+        let (r_mid2, r_far2) = (mid_radius.powi(2), far_radius.powi(2));
+        // Non-squad candidates: the exact k nearest (see `Grid::knn`), so a
+        // dense crowd costs a few hundred candidates instead of everyone in it.
         let k = cfg.near_candidates;
-        sc.near_raw.clear();
-        let mut capped = false;
-        let near_raw = &mut sc.near_raw;
-        self.grid.walk_rings(me.state.pos, cfg.near_radius, |v| match v {
-            Ring::Item(j) => {
-                let b = &self.bodies[j as usize];
-                let squad = me.squad != NO_SQUAD && b.squad == me.squad;
-                if j != e as u32 && !squad {
-                    let d2 = (b.state.pos[0] - me.state.pos[0]).powi(2) + (b.state.pos[1] - me.state.pos[1]).powi(2);
-                    if d2 <= r_near2 {
-                        near_raw.push((d2, d2, j as u16));
-                    }
-                }
-                false
-            }
-            Ring::Done(bound) if near_raw.len() >= k && k > 0 => {
-                near_raw.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
-                let kth = near_raw[k - 1].0;
-                capped = true;
-                kth <= bound * bound
-            }
-            Ring::Done(_) => false,
-        });
-        if sc.near_raw.len() > k {
-            sc.near_raw.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
-            sc.near_raw.truncate(k);
-        }
-        if capped {
+        let (bodies, my_squad) = (self.bodies, me.squad);
+        self.grid.knn(
+            me.state.pos,
+            cfg.near_radius,
+            k,
+            |j| j != e as u32 && (my_squad == NO_SQUAD || bodies[j as usize].squad != my_squad),
+            &mut sc.knn,
+        );
+        sc.tally.near_scanned += sc.knn.scanned;
+        if k > 0 && sc.knn.keys().len() >= k {
             sc.tally.near_capped += 1;
+        }
+        sc.near.clear();
+        for &key in sc.knn.keys() {
+            let (j, d2) = Knn::split(key);
+            let d = d2.sqrt();
+            sc.near.push(NearCandidate {
+                entity: j as u16,
+                base: near_base(d, false),
+                seed_age: interest::seed_age(j as u16, tick, d, cfg, fresh),
+            });
+            sc.stamp[j as usize] = epoch;
         }
         // Squadmates are near-tier at any distance.
         if let Some(members) = self.squads.get(&me.squad) {
             for &j in members {
                 if j != e {
-                    sc.near_raw.push((-1.0, self.dist2(me.state.pos, j), j));
+                    let d = self.dist2(me.state.pos, j).sqrt();
+                    sc.near.push(NearCandidate {
+                        entity: j,
+                        base: near_base(d, true),
+                        seed_age: interest::seed_age(j, tick, d, cfg, fresh),
+                    });
+                    sc.stamp[j as usize] = epoch;
                 }
             }
-        }
-        sc.near.clear();
-        for &(key, d2, j) in &sc.near_raw {
-            let d = d2.sqrt();
-            sc.near.push(NearCandidate {
-                entity: j,
-                base: near_base(d, key < 0.0),
-                seed_age: interest::seed_age(j, tick, d, cfg, fresh),
-            });
-            sc.stamp[j as usize] = epoch;
         }
         sc.picked.clear();
         slot.near.select(&sc.near, tick, cfg.near_per_tick, &mut sc.select, &mut sc.picked);
 
-        // Mid: due this tick, not near-tier, nearest first (by squared distance).
+        // Mid: due this tick, not near-tier, the nearest first.
+        let stamp = &sc.stamp;
+        self.mid_grid.knn(me.state.pos, mid_radius, cfg.mid_per_tick, |j| stamp[j as usize] != epoch, &mut sc.knn);
+        sc.tally.mid_scanned += sc.knn.scanned;
         sc.mid.clear();
-        let (mid, stamp, k) = (&mut sc.mid, &sc.stamp, cfg.mid_per_tick);
-        self.mid_grid.walk_rings(me.state.pos, mid_radius, |v| match v {
-            Ring::Item(j) => {
-                if stamp[j as usize] != epoch {
-                    let d2 = self.dist2(me.state.pos, j as u16);
-                    if d2 <= r_mid2 {
-                        mid.push((d2, j as u16));
-                    }
-                }
-                false
-            }
-            Ring::Done(bound) if mid.len() >= k && k > 0 => {
-                mid.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
-                mid[k - 1].0 <= bound * bound
-            }
-            Ring::Done(_) => false,
-        });
-        nearest(&mut sc.mid, cfg.mid_per_tick);
-        for &(_, j) in &sc.mid {
+        for &key in sc.knn.keys() {
+            let (j, d2) = Knn::split(key);
+            sc.mid.push((d2, j as u16));
             sc.stamp[j as usize] = epoch;
         }
 

@@ -241,13 +241,38 @@ Tick times in ms; two runs each, and they agree within ~0.5 ms.
    - The profile at 10k: `select_nth_unstable` (partial sorts of the candidates) is 46% of the CPU, the grid walk 14%.
    - With 32 m grid cells, every client starts from everyone in the pile and partially sorts them, twice per tick.
 3. **The ladder can't rescue a pile.** Its levers shrink radii and lower rates, and everyone is inside every radius.
-4. **Likely fix:** a finer grid where it's dense. With 4 m cells, a client in the pile would scan a few hundred neighbors instead of 10k.
+4. **Fixed since by a new search** (see the next section): the pile's cost is now linear in its size.
 
 **Shards:** 256 shards instead of 64 doesn't help at 10k (tick p50 12.6 vs 12.1 ms, the parallel phases identical; the serial events phase grows 2.4 → 3.1 ms). Uneven shards aren't the hidden serial cost (`2026-10-04-scaleway-shards`).
 
 **netem at 10k is invalid** (`2026-10-04-scaleway-netem-10k`, see its `NOTE.md`):
 - With netem on the server's own interface, its one locked queue throttled the server: egress 2.75 → 25 ms p50, tick 12 → 40 ms.
 - The fix: shape only on the bot box (its egress, plus an `ifb` device on its ingress).
+
+### Nearest-player search: `Grid::knn` (2026-10-04)
+
+Following `reports/Nearest player search algorithms.md`, the near and mid tiers' k-nearest search is now `Grid::knn`, in `grid.rs`.
+
+- **Exact:** it gives the same k nearest as brute force, with ties broken by id. Property tests check it against a brute-force oracle on a pile on a cell corner, a 200 m disk, blob + uniform, uniform, world corners, coincident stacks, filters, and k of 0, 1, 100 and above the population.
+- **Packed keys and a running threshold.** Candidates are `u64` keys (`d² bits << 32 | id`). Only keys below the current k-th are kept, and the buffer is cut back to k once it doubles, so most candidates cost one compare. Squadmates are appended after the selection.
+- **Positions inline in the grid.** `xs` and `ys` sit next to `items`, so the distance loop never reads the entity arrays.
+- **Sub-cells only where it's dense.** A cell holding more than 256 items is counting-sorted within its own slice into sub-cells of ~32 items (0.5 m minimum side). Every other reader of the grid is unaffected, so it stays the one shared index.
+- **A pruned walk.** Rings as before, but any cell or sub-cell whose box is farther than the current k-th is skipped, and a dense cell's sub-cells are walked nearest first. The walk stops when the k-th is closer than the exact edge of the searched box. An empty stretch of a ring's row costs one compare.
+
+**Candidates scanned per query and time, single-threaded on WSL** (`cargo run --release -p lattice-sim --example knn_bench`, 10k players, k = 100, 150 m):
+
+| crowd | before | after |
+|---|---|---|
+| 25 m pile | 10,000 candidates, 68–86 µs | **492 candidates, 2.1 µs (30–40×)** |
+| 200 m disk | 645, 4.3–5.5 µs | 510, 2.6 µs (1.7–2.1×) |
+| uniform | 26, 0.62 µs | 14, 0.67 µs (7% slower: per-cell overhead on sparse cells) |
+
+**The whole server on WSL** (8 threads, sharing the box with the bots):
+- **Pile ramp to 6,000, ladder off.** Assembly used to grow quadratically (4.5 / 25.8 / 58.6 / 75.6 ms at 1.5k / 3.5k / 5.5k / 6k). Now it grows linearly, ~2.8 ms per 1,000 players: 2.9 / 7.9 / 14.1 / 17.0 ms. The tick crosses 33 ms at ~5,500 players instead of ~2,800.
+- **Blob 3k:** assembly 9.0 → 5.9 ms, tick p99 22.7 → 19.2 ms.
+- **Uniform 5k:** assembly 4.00 → 4.29 ms, tick p99 unchanged.
+
+The server summary now reports `near_scanned_per_query` and `mid_scanned_per_query`. Not yet measured on bare metal. Still open from the report, if a profile asks for them: a temporal seed for the threshold, per-leaf shared candidate sets, and an approximate cap for coincident stacks.
 
 ### Network conditions: netem on WSL (`baselines/2026-10-04-wsl2-netem`)
 
