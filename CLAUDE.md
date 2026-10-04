@@ -110,11 +110,30 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - a short bare-metal session to measure these (`--sockets` 1/4/8/16 at 10k, and netem at 10k);
     - ~~the nearest-player search~~ **done: `Grid::knn`** (2026-10-04, per `reports/Nearest player search algorithms.md`). Exact (oracle-tested), with packed keys and a running threshold, positions inline, sub-cells only in cells over 256 items, and a box-pruned walk. A 10k pile query scans ~490 candidates instead of 10,000 (30–40× faster single-threaded). The pile's assembly is now linear in its size: on WSL it crosses 33 ms at ~5,500 instead of ~2,800. Blob 3k assembly 9.0 → 5.9 ms; uniform 7% slower per query. Not yet on bare metal.
     - then M3 with a CPU budget.
-- **M3:** combat with rewind, and the first playable client (decided 2026-10-04: the client is rolled into M3 instead of shipping a walk-only version first).
-  - Server: shooting with lag-compensated rewind, a heightmap, player collision.
-  - Client: Bevy test client on Windows, on an engine-agnostic `lattice-client-core` extracted from `BotBrain` (bots and humans run the same client code). Per-entity interpolation timelines blended through tier promotions. The client's interpolation delay feeds the server's rewind.
-  - Mid/far blobs carry no velocity today; decide extrapolation vs a coarse velocity in the blob.
-  - Run a fairness test: 20 ms vs 150 ms bots through netem.
+- **M3: combat and the first playable client** (scoped 2026-10-04). The client is part of M3; there's no walk-only release first.
+  - **Decided:**
+    - soft player separation (the server pushes overlapping players apart over a few ticks);
+    - a procedural heightmap plus simple static cover (axis-aligned boxes that block movement and shots);
+    - 3 factions;
+    - projectiles simulated on the server from a rewound origin;
+    - sub-tick shot timing;
+    - one render time for every entity on the client (~100–133 ms behind; mid/far smoothed or extrapolated to it);
+    - mid/far velocity derived on the client first, with velocity bytes in the blobs only if the bots' smoothness numbers ask.
+  - **Order:**
+    - **M3a world and movement:** a `lattice-game` crate for the shared deterministic rules and message formats; the heightmap (integer-only noise, bit-identical on both sides); 2.5D movement (pitch, jump, gravity, max slope); cover boxes; soft separation.
+    - **M3b `lattice-client-core`:** extracted from `BotBrain` (bots and humans run the same client code); the one render timeline; the render time in each input; the bots measure smoothness.
+    - **M3c Bevy client** on Windows (out of the workspace's default build): terrain, capsules, first-person and spectator cameras, net graph, server ghost, tier colors.
+    - **M3d combat:**
+      - health, death, respawn and teams;
+      - a parallel "shots" phase with lag-compensated projectiles: capsule + head sphere, 3D history capped at 200 ms, blocked by terrain and cover;
+      - shot events for tracers; hits, damage and kills on the reliable channel;
+      - bots that fight, in latency classes (port ranges + `tc` filters).
+    - **M3e** one bare-metal validation session.
+  - **Pass bars:**
+    - prediction stays bit-exact (0 corrections on a clean link, outside separation pushes);
+    - 10k at level 0 with heavy fire (~20% of players at 10 Hz), p99 < 25 ms on the 64-core box;
+    - a 3k blob all fighting, p99 < 25 ms;
+    - 20 ms and 150 ms bots hit at the same rate for the same aim error, and post-cover hits only within the 200 ms cap.
 - **M4:** vehicles.
 - **M5:** minimal playable client.
 
