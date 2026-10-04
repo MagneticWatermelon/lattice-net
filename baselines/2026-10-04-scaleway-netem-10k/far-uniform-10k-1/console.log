@@ -1,0 +1,31 @@
+== uniform, 10000 bots, 60s -> baselines/2026-10-04-scaleway-netem-10k/far-uniform-10k-1
+== summary: 1161 steady-state ticks (after warmup, before clients drain), peak 10000 clients ==
+  phase        p50 ms   p99 ms   max ms
+  ingress        2.51     3.23     4.24
+  events         3.83     4.58     5.13
+  movement       0.36     0.62     0.84
+  grid           0.40     0.46     0.50
+  history        0.01     0.01     0.02
+  serialize      0.20     0.33     0.38
+  assembly       3.65     4.69     6.21
+  transport      1.97     2.50     2.92
+  egress        27.04    28.30    28.68
+  tick          39.96    42.01    42.97
+  overruns 106 | spawns 10000 despawns 10000 (49069 joins deferred) | stand-ins: repeated 140909 frozen 23456 | late inputs 164246 discarded 0 | bad messages 0 | recv errors 0 send errors 0
+  egress (whole run): 12252437 datagrams in 12252437 sends (1.00 per send), 79548 syscalls
+  ticks per ladder level (whole run): L0: 100, L1: 31, L2: 31, L3: 31, L4: 31, L5: 31, L6: 1058
+  input wait on the server (datagram arrival -> applied): p50 54.2 p99 103.7 max 300.0 mean 54.5 ms
+  steady state: stand-ins repeated 139802 frozen 23427 | late inputs 163612 discarded 0
+== bots summary ==
+  started 10000 welcomed 10000 failed 0
+  join latency ms: p50 1032 p99 1934 max 2223 (n=10000)
+  corrections 24057 (2.41/bot-minute), mean error 0.106 m, max 0.687 m
+  snapshots 11977724 (entities per snapshot: near 15.6 mid 12.3 far 7.6), stale 7103, unmatched acks 0, resyncs 0
+  input -> applied on server (est. RTT/2 + server wait): p50 143.0 p99 337.0 max 486.0 mean 146.5 ms (n=11775326)
+    of which server wait (arrival -> applied): p50 54.8 p99 247.5 max 387.0 mean 58.2 ms (n=11775326)
+  input -> seen acked (round trip): p50 233.0 p99 433.0 max 600.0 mean 250.9 ms (n=11931452)
+  near entity update interval (tracked bots): p50 50.0 p99 100.0 max 850.0 mean 48.5 ms (n=9297497)
+  mid entity update interval (tracked bots): p50 250.0 p99 500.0 max 4500.0 mean 227.0 ms (n=7239136)
+  far entity update interval (tracked bots): p50 1500.0 p99 3000.0 max 58500.0 mean 1439.9 ms (n=4161177)
+  input clock: 128848 extra inputs, 429075 skipped ticks, 34732 backlog skips | near decode errors (tracked bots) 0
+  bytes down 4907.0 MB up 863.2 MB | swarm busy 17% of its threads' time, tick overruns 0

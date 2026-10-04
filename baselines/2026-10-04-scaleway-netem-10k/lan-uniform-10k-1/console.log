@@ -1,0 +1,31 @@
+== uniform, 10000 bots, 60s -> baselines/2026-10-04-scaleway-netem-10k/lan-uniform-10k-1
+== summary: 1166 steady-state ticks (after warmup, before clients drain), peak 10000 clients ==
+  phase        p50 ms   p99 ms   max ms
+  ingress        1.98     2.15     2.76
+  events         3.69     4.04     4.72
+  movement       0.35     0.42     0.55
+  grid           0.38     0.44     0.49
+  history        0.01     0.01     0.01
+  serialize      0.20     0.24     0.26
+  assembly       1.85     2.21     3.18
+  transport      1.38     1.59     1.65
+  egress        25.37    32.13    38.52
+  tick          34.97    41.96    48.49
+  overruns 100 | spawns 10000 despawns 10000 (53036 joins deferred) | stand-ins: repeated 7545 frozen 0 | late inputs 7540 discarded 0 | bad messages 0 | recv errors 0 send errors 0
+  egress (whole run): 12367257 datagrams in 12367257 sends (1.00 per send), 80128 syscalls
+  ticks per ladder level (whole run): L0: 60, L1: 31, L2: 31, L3: 31, L4: 31, L5: 31, L6: 1067
+  input wait on the server (datagram arrival -> applied): p50 52.6 p99 126.1 max 189.9 mean 53.1 ms
+  steady state: stand-ins repeated 7545 frozen 0 | late inputs 7540 discarded 0
+== bots summary ==
+  started 10000 welcomed 10000 failed 0
+  join latency ms: p50 794 p99 1648 max 2008 (n=10000)
+  corrections 204 (0.02/bot-minute), mean error 0.063 m, max 0.132 m
+  snapshots 12268737 (entities per snapshot: near 15.6 mid 12.3 far 7.7), stale 0, unmatched acks 0, resyncs 0
+  input -> applied on server (est. RTT/2 + server wait): p50 79.0 p99 154.0 max 222.0 mean 80.1 ms (n=12247259)
+    of which server wait (arrival -> applied): p50 52.7 p99 125.8 max 189.9 mean 53.1 ms (n=12247259)
+  input -> seen acked (round trip): p50 133.0 p99 200.0 max 267.0 mean 121.2 ms (n=12254799)
+  near entity update interval (tracked bots): p50 50.0 p99 50.0 max 250.0 mean 47.9 ms (n=9559488)
+  mid entity update interval (tracked bots): p50 250.0 p99 250.0 max 1500.0 mean 223.7 ms (n=7429998)
+  far entity update interval (tracked bots): p50 1500.0 p99 3000.0 max 60000.0 mean 1409.3 ms (n=4302415)
+  input clock: 117471 extra inputs, 268563 skipped ticks, 8962 backlog skips | near decode errors (tracked bots) 0
+  bytes down 4894.8 MB up 874.7 MB | swarm busy 17% of its threads' time, tick overruns 0

@@ -94,7 +94,18 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - run rayon with threads = physical cores (128 threads was slower than 64; idle-worker spinning is 35–45% of the CPU);
     - this Broadcom NIC has no UDP segmentation offload, so GSO is untested in hardware.
   - **netem on WSL done** (2026-10-04, `baselines/2026-10-04-wsl2-netem`, `scripts/baseline.sh netem`). Under every profile up to 5% loss and ±20 ms jitter, there were no decode errors, resyncs or discards, and corrections were ≤0.2 per bot-minute, ≤0.53 m. Input → applied is one-way delay + ~50 ms of spare. Loss and jitter make ~0.33% of inputs late, and the input clock hunts under jitter: candidate, a spare sized to each client's measured jitter.
-  - **Next:** one bare-metal session (the pile limits test, `--shards 256`, netem at 10k), then `SO_REUSEPORT` + physical-core default, then M3 with a CPU budget.
+  - **Limits on bare metal** (2026-10-04, 64 threads, `baselines/2026-10-04-scaleway-limits`):
+    - one 25 m pile goes over the 33 ms tick at ~7.2k players;
+    - a 200 m disk holds 10k (p99 19.3 ms);
+    - uniform goes over at ~18k.
+    - The pile cost is the quadratic nearest-player search (`select_nth_unstable` 46% of CPU with 32 m cells), and the ladder can't cut it. Candidate fix: a finer grid where it's dense.
+  - 256 shards don't help.
+  - netem at 10k was invalid: netem on the server's interface throttled egress. Shape on the bot box only (egress + `ifb` ingress).
+  - **Next:**
+    - fix the netem placement;
+    - `SO_REUSEPORT` + physical-core default;
+    - dense-crowd near search;
+    - then M3 with a CPU budget.
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.

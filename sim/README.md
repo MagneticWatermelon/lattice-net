@@ -215,12 +215,38 @@ Tick times in ms; two runs each, and they agree within ~0.5 ms.
 - Setup to teardown took about 1 h 5 min, roughly €3 at €2.82/h.
 - `cloud-up.sh --resume` finishes a setup that stopped partway.
 
+### Limits: crowds and counts (`baselines/2026-10-04-scaleway-limits`)
+
+`scripts/baseline.sh limits`, on the Scaleway pair with 64 server threads:
+- Players join at 50/s (100/s for 20k), then hold for 40 s.
+- `summary.md` shows the cost at each step of players.
+
+| ramp | where it breaks |
+|---|---|
+| everyone in a 25 m disk, ladder off | tick p99 over 33.3 ms at **7,217 players** (at 10k: p50 56 ms, p99 60 ms) |
+| everyone in 25 m, ladder on | leaves level 0 at 6,470, reaches level 8 (dilation 0.8), and is still over its 50 ms tick at **9,729** |
+| everyone in a 200 m disk, ladder off | **within budget to 10,000** (p99 19.3 ms) |
+| uniform, ladder off | over at **17,954 players** |
+
+1. **Density is the limit, not player count.** Uniform holds ~1.8× the 10k target. One capture point holds ~7k.
+2. **The nearest-player search is quadratic in a crowd.** In the 25 m pile, assembly goes 2.5 → 7.9 → 26 → 44 ms at 1.7k → 4k → 7.7k → 10k players.
+   - The profile at 10k: `select_nth_unstable` (partial sorts of the candidates) is 46% of the CPU, the grid walk 14%.
+   - With 32 m grid cells, every client starts from everyone in the pile and partially sorts them, twice per tick.
+3. **The ladder can't rescue a pile.** Its levers shrink radii and lower rates, and everyone is inside every radius.
+4. **Likely fix:** a finer grid where it's dense. With 4 m cells, a client in the pile would scan a few hundred neighbors instead of 10k.
+
+**Shards:** 256 shards instead of 64 doesn't help at 10k (tick p50 12.6 vs 12.1 ms, the parallel phases identical; the serial events phase grows 2.4 → 3.1 ms). Uneven shards aren't the hidden serial cost (`2026-10-04-scaleway-shards`).
+
+**netem at 10k is invalid** (`2026-10-04-scaleway-netem-10k`, see its `NOTE.md`):
+- With netem on the server's own interface, its one locked queue throttled the server: egress 2.75 → 25 ms p50, tick 12 → 40 ms.
+- The fix: shape only on the bot box (its egress, plus an `ifb` device on its ingress).
+
 ### Network conditions: netem on WSL (`baselines/2026-10-04-wsl2-netem`)
 
 `scripts/baseline.sh netem <name>` runs uniform 1k and a 1k blob under six links, 60 s each.
 - **Locally it needs no root.** It reruns itself in a private network namespace (`unshare -rn`) and puts netem on that namespace's loopback, which delays each direction once. Nothing outside the namespace is shaped.
 - **netem's queue limit is raised.** The default 1,000 packets would drop on its own at these rates.
-- **With `BOTS_SSH`,** netem goes on both machines' interfaces between them instead (`sudo tc`).
+- **With `BOTS_SSH`,** netem goes on both machines' interfaces between them instead (`sudo tc`). **Don't use that at 10k:** netem's single locked queue on the server's interface throttles the server's sends. It needs changing to shape the bot box only (see Limits above).
 
 This measures behavior, not capacity, so WSL is fine for it. The blob rows match the uniform ones. Times in ms.
 

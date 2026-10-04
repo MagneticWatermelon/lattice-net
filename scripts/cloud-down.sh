@@ -28,9 +28,26 @@ for s in json.load(sys.stdin):
     if "lattice-net" in (s.get("tags") or []):
         print(s["zone"], s["id"], s["name"])'
 }
+# Detach from Private Networks first: deleting a server that's still
+# attached left its attachment (and private IPs) stuck on the network, which
+# then made later attaches fail with HTTP 500 (2026-10-04).
+detach() { # zone server-id
+  scw baremetal private-network list server-id="$2" zone="$1" -o json | python3 -c '
+import json, sys
+for p in json.load(sys.stdin):
+    print(p["private_network_id"])' | while read -r pn; do
+    scw baremetal private-network delete server-id="$2" private-network-id="$pn" zone="$1" > /dev/null 2>&1 || true
+  done
+  for _ in $(seq 24); do
+    [ "$(scw baremetal private-network list server-id="$2" zone="$1" -o json)" = "[]" ] && return
+    sleep 5
+  done
+  echo "  $2 still lists a Private Network attachment; deleting anyway" >&2
+}
 while read -r zone id name; do
   [ -n "$id" ] || continue
-  echo "deleting $name $id ($zone)"
+  echo "detaching and deleting $name $id ($zone)"
+  detach "$zone" "$id"
   scw baremetal server delete "$id" zone="$zone" > /dev/null
 done < <(ours)
 
@@ -38,7 +55,8 @@ for _ in $(seq 60); do
   [ -z "$(ours)" ] && break
   sleep 5
 done
-rm -f "$state"
+# Public IPs get reused by the next servers, with new host keys.
+rm -f "$state" .cloud/known_hosts .cloud/known_hosts.old .cloud/ssh_config
 echo "== servers in the account now (should be none of ours):"
 scw baremetal server list zone=all
 if [ -n "$(ours)" ]; then
