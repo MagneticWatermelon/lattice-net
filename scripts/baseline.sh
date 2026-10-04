@@ -19,6 +19,7 @@
 #           shaped) with netem on its loopback, which delays each direction once;
 #           with BOTS_SSH, netem goes on both machines' interfaces between them
 #           (sudo tc).
+#           NETEM_BOTS=10000 runs it at full load instead of 1k.
 #   netem-quick   one short run on the typical profile: checks the harness
 #
 # Writes baselines/<date>-<name>/ (name defaults to the host name):
@@ -70,12 +71,15 @@ netem_profiles=(
   "jittery|delay 40ms 20ms distribution normal"
 )
 if [ "$mode" = netem ]; then
+  # NETEM_BOTS (1000) sets the load: 10000 checks behavior under the full load.
+  nb=${NETEM_BOTS:-1000}
+  tag=$(( nb / 1000 ))k
   runs=()
   for np in "${netem_profiles[@]}"; do
     IFS='|' read -r pname pargs <<< "$np"
-    runs+=("$pname-uniform-1k|uniform|1000||||$pargs" "$pname-blob-1k|blob|1000||||$pargs")
+    runs+=("$pname-uniform-$tag|uniform|$nb||||$pargs" "$pname-blob-$tag|blob|$nb||||$pargs")
   done
-  max_bots=1000
+  max_bots=$nb
 elif [ "$mode" = netem-quick ]; then
   runs=("typical-uniform-300|uniform|300||||delay 40ms 5ms distribution normal loss 0.5%")
   max_bots=300
