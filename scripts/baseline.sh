@@ -2,10 +2,15 @@
 # One comparable baseline: the scenario matrix, run the same way on any Linux
 # box, with the machine's setup recorded next to the numbers.
 #
-#   scripts/baseline.sh [full|quick] [name]
+#   scripts/baseline.sh [full|quick|limits|limits-quick] [name]
 #
-#   full   8 scenarios x REPEAT (2) runs of 60 s, interleaved: ~16 min
-#   quick  2 small scenarios x 1 run of 20 s: checks the harness, not the machine
+#   full    8 scenarios x REPEAT (2) runs of 60 s, interleaved: ~16 min
+#   quick   2 small scenarios x 1 run of 20 s: checks the harness, not the machine
+#   limits  ramps to find where it breaks: players join at a steady rate up to a
+#           peak, then hold 40 s, and summary.md shows the cost at each step
+#           (~18 min): everyone in a 25 m disk to 10k (ladder off: raw cost; and
+#           on), a 200 m disk to 10k, and uniform to 20k
+#   limits-quick  one small ramp: checks the harness
 #
 # Writes baselines/<date>-<name>/ (name defaults to the host name):
 #   env.txt      the machine and the preflight checks (scripts/preflight.sh)
@@ -31,11 +36,24 @@ port=${PORT:-40500}
 case $mode in
   full) repeat=${REPEAT:-2}; secs=60 ;;
   quick) repeat=${REPEAT:-1}; secs=20 ;;
-  *) echo "usage: $0 [full|quick] [name]" >&2; exit 2 ;;
+  limits | limits-quick) repeat=${REPEAT:-1}; secs=60 ;;
+  *) echo "usage: $0 [full|quick|limits|limits-quick] [name]" >&2; exit 2 ;;
 esac
 
-# id | scenario | bots | extra lattice-server args | profile it
-if [ "$mode" = full ]; then
+# id | scenario | bots | extra lattice-server args | profile it | joins per second
+# A run with a join rate is a ramp: bots join at that rate, then hold 40 s.
+if [ "$mode" = limits ]; then
+  runs=(
+    "pile-25m-10k-noladder|disk:25|10000|--ladder off|profile|50"
+    "pile-25m-10k|disk:25|10000||profile|50"
+    "disk-200m-10k-noladder|disk:200|10000|--ladder off||50"
+    "uniform-20k-noladder|uniform|20000|--ladder off --max-clients 20000||100"
+  )
+  max_bots=20000
+elif [ "$mode" = limits-quick ]; then
+  runs=("pile-25m-1500-noladder|disk:25|1500|--ladder off|profile|100")
+  max_bots=1500
+elif [ "$mode" = full ]; then
   runs=(
     "uniform-1k|uniform|1000||"
     "uniform-5k|uniform|5000||"
@@ -93,8 +111,16 @@ n=0
 # doesn't land on one scenario.
 for r in $(seq 1 "$repeat"); do
   for spec in "${runs[@]}"; do
-    IFS='|' read -r id scenario count extra prof <<< "$spec"
+    IFS='|' read -r id scenario count extra prof ramp <<< "$spec"
     n=$((n + 1))
+    run_secs=$secs
+    ramp_args=
+    profile_delay=15
+    if [ -n "$ramp" ]; then
+      run_secs=$(( count / ramp + 40 ))
+      ramp_args="--ramp $ramp"
+      profile_delay=$(( run_secs - 35 )) # during the hold at the peak
+    fi
     out=$dir/$id-$r
     mkdir -p "$out"
     printf '[%s] %d/%d %s run %d\n' "$(date +%T)" "$n" "$total" "$id" "$r"
@@ -102,9 +128,9 @@ for r in $(seq 1 "$repeat"); do
     [ -n "${PROFILE:-}" ] && [ -n "$prof" ] && [ "$r" = 1 ] && profile=1
     # shellcheck disable=SC2086 # $extra is a list of server flags
     # shellcheck disable=SC2086 # $key_args is empty or a flag and its value
-    if ! OUT=$out PROFILE=$profile SERVER_THREADS=$server_threads BOT_THREADS=$bot_threads BOTS_SSH=$remote \
-      BOT_ARGS="--server $server_ip:$port $key_args ${BOT_ARGS:-}" \
-      scripts/m1.sh "$scenario" "$count" "$secs" --bind "$server_ip:$port" $key_args $extra > "$out/console.log" 2>&1; then
+    if ! OUT=$out PROFILE=$profile PROFILE_DELAY=$profile_delay SERVER_THREADS=$server_threads BOT_THREADS=$bot_threads \
+      BOTS_SSH=$remote BOT_ARGS="--server $server_ip:$port $key_args $ramp_args ${BOT_ARGS:-}" \
+      scripts/m1.sh "$scenario" "$count" "$run_secs" --bind "$server_ip:$port" $key_args $extra > "$out/console.log" 2>&1; then
       echo "  failed: see $out/console.log"
     fi
     sleep 2 # let the last datagrams and sockets drain
@@ -186,6 +212,51 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
       echo "| $id #$r | $joined | $join_p99 | $(kv "$b" input_applied_p50_ms) / $(kv "$b" input_applied_p99_ms) | $(kv "$b" server_wait_p50_ms) | $(kv "$s" repeated) / $(kv "$s" frozen) | $(kv "$s" late_inputs) / $(kv "$s" discarded_inputs) | $(kv "$b" corrections) | $(kv "$b" near_decode_errors) | $(kv "$b" swarm_busy_pct)% |"
     done
   done
+  # Ramps: the cost at each step of players, from the per-window CSV.
+  ramps=0
+  for spec in "${runs[@]}"; do
+    IFS='|' read -r id _ count _ _ ramp <<< "$spec"
+    [ -n "$ramp" ] || continue
+    for r in $(seq 1 "$repeat"); do
+      csv=$dir/$id-$r/server.csv
+      [ -f "$csv" ] || continue
+      if [ "$ramps" = 0 ]; then
+        echo
+        echo "## Ramps"
+        echo
+        echo "Players join at a steady rate, then hold. One row per step of players (the first 5 s window that reaches it). Times in ms; phases are p50."
+        ramps=1
+      fi
+      echo
+      echo "### $id #$r ($count players, $ramp joins/s)"
+      echo
+      awk -F, -v count="$count" '
+        NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+        function ms(name) { return sprintf("%.1f", $col[name] / 1000) }
+        $col["clients"] > 0 {
+          c = $col["clients"]; lvl = $col["level"]; hz = $col["tick_hz"]
+          period = 1000 / hz
+          if (!over && $col["tick_p99_us"] / 1000 > period) { over = c; over_hz = hz }
+          if (!left && lvl > 0) left = c
+          if (c >= next_step) {
+            rows = rows sprintf("| %s | L%s (%s Hz) | %s / %s | %s | %s | %s | %s | %s |\n", c, lvl, hz, ms("tick_p50_us"), ms("tick_p99_us"), ms("ingress_p50_us"), ms("events_p50_us"), ms("assembly_p50_us"), ms("transport_p50_us"), ms("egress_p50_us"))
+            while (next_step <= c) next_step += step
+          }
+          if (c >= peak) { peak = c; peak_lvl = lvl; peak_p99 = ms("tick_p99_us"); peak_hz = hz }
+        }
+        BEGIN { step = (count > 10000) ? 2000 : 1000; next_step = step }
+        END {
+          print "| players | level | tick p50 / p99 | ingress | events | assembly | transport | egress |"
+          print "|---|---|---|---|---|---|---|---|"
+          printf "%s", rows
+          print ""
+          if (over) printf "- **Over budget:** tick p99 first exceeded its period (%.1f ms at %s Hz) with %s players.\n", 1000 / over_hz, over_hz, over
+          else printf "- **Within budget** all the way to %s players (p99 %s ms at the peak).\n", peak, peak_p99
+          if (left) printf "- **The ladder** left level 0 at %s players and was at level %s at the peak.\n", left, peak_lvl
+        }' "$csv"
+    done
+  done
+
   profiles=$(find "$dir" -name perf.txt | sort)
   if [ -n "$profiles" ]; then
     echo

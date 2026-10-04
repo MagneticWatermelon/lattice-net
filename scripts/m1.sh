@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # M1 scale-test scenarios: server + bot swarm on this machine, results in results/.
 #
-#   scripts/m1.sh <uniform|hotspots|blob|joins> <bots> [seconds] [extra lattice-server args...]
+#   scripts/m1.sh <uniform|hotspots|blob|disk:<m>|joins> <bots> [seconds] [extra lattice-server args...]
 #
 #   uniform   everyone spread over the 8x8 km continent
 #   hotspots  3 hotspots of ~800 (the first 2,400 bots), the rest uniform
 #   blob      3,000 bots in a 200 m disk, the rest uniform
+#   disk:<m>  everyone in one disk of radius <m> (disk:25 is everyone on one capture point)
 #   joins     <bots> uniform, then 500 more join at 50/s starting at t=15 s
 #
 # Env: SERVER_THREADS (rayon threads, default nproc/2), BOT_THREADS (default nproc/2, max 8),
@@ -29,7 +30,7 @@ server_threads=${SERVER_THREADS:-$(( cores / 2 ))}
 bot_threads=${BOT_THREADS:-$(( cores / 2 > 8 ? 8 : cores / 2 ))}
 
 case $scenario in
-  uniform|hotspots|blob) spawn=$scenario ;;
+  uniform|hotspots|blob|disk:*) spawn=$scenario ;;
   joins) spawn=uniform ;;
   *) echo "unknown scenario $scenario" >&2; exit 2 ;;
 esac

@@ -28,7 +28,8 @@ const USAGE: &str = "\
 lattice-server: M1 movement-only authoritative server
 
   --bind ADDR          [0.0.0.0:40000]
-  --spawn MODE         uniform | hotspots | blob | line:<meters>   [uniform]
+  --spawn MODE         uniform | hotspots | blob | line:<meters> | disk:<meters>   [uniform]
+                       disk: everyone in one disk of that radius (the density limit)
   --max-clients N      [10000]
   --near-radius M      near tier: 30 Hz, accumulator [150]
   --near-per-tick N    near entities sent per client per tick [64]

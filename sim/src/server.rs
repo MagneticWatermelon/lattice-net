@@ -109,6 +109,9 @@ pub enum SpawnMode {
     /// Player k stands still at (1000 + k * spacing, 4096): known distances,
     /// for checking tiers.
     Line(f32),
+    /// Everyone in one disk of this radius at the center: the density limit
+    /// (a 25 m disk is everyone on one capture point).
+    Disk(f32),
 }
 
 impl std::str::FromStr for SpawnMode {
@@ -118,10 +121,14 @@ impl std::str::FromStr for SpawnMode {
             "uniform" => Ok(Self::Uniform),
             "hotspots" => Ok(Self::Hotspots),
             "blob" => Ok(Self::Blob),
-            _ => match s.strip_prefix("line:").map(str::parse) {
-                Some(Ok(spacing)) => Ok(Self::Line(spacing)),
-                _ => Err(format!("unknown spawn mode {s:?} (uniform|hotspots|blob|line:<meters>)")),
-            },
+            _ => {
+                let arg = |prefix: &str| s.strip_prefix(prefix).and_then(|v| v.parse::<f32>().ok()).filter(|v| *v > 0.0);
+                match (arg("line:"), arg("disk:")) {
+                    (Some(spacing), _) => Ok(Self::Line(spacing)),
+                    (_, Some(radius)) => Ok(Self::Disk(radius)),
+                    _ => Err(format!("unknown spawn mode {s:?} (uniform|hotspots|blob|line:<meters>|disk:<meters>)")),
+                }
+            }
         }
     }
 }
@@ -860,6 +867,7 @@ impl SimServer {
         let (anchor, radius) = match self.cfg.spawn {
             SpawnMode::Hotspots if k < 2400 => (HOTSPOTS[k as usize % 3], 150.0),
             SpawnMode::Blob if k < 3000 => (CENTER, 200.0),
+            SpawnMode::Disk(radius) => (CENTER, radius),
             SpawnMode::Line(spacing) => {
                 let p = [(1000.0 + k as f32 * spacing).min(WORLD_SIZE), WORLD_SIZE / 2.0];
                 return (p, p, 1.0);
@@ -1216,6 +1224,23 @@ mod tests {
 
     fn fwd() -> Input {
         Input { move_x: 127, yaw: 777, ..Default::default() }
+    }
+
+    #[test]
+    fn spawn_modes_parse_and_disks_stay_inside() {
+        assert!(matches!("disk:25".parse(), Ok(SpawnMode::Disk(r)) if r == 25.0));
+        assert!(matches!("line:50".parse(), Ok(SpawnMode::Line(s)) if s == 50.0));
+        for bad in ["disk:", "disk:0", "disk:x", "ring:5"] {
+            assert!(bad.parse::<SpawnMode>().is_err(), "{bad}");
+        }
+        let mut sim = SimServer::new(SimConfig { spawn: SpawnMode::Disk(25.0), ..Default::default() }, Instant::now());
+        let c = WORLD_SIZE / 2.0;
+        for _ in 0..500 {
+            let (p, anchor, radius) = sim.pick_spawn(NO_SQUAD);
+            assert_eq!((anchor, radius), ([c, c], 25.0));
+            assert!((p[0] - c).hypot(p[1] - c) <= 25.0);
+            sim.counters.spawns += 1;
+        }
     }
 
     #[test]
