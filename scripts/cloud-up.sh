@@ -41,16 +41,17 @@ json() { python3 -c "import json, sys; d = json.load(sys.stdin); $1"; }
 say() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
 
 # --- what we'd rent -----------------------------------------------------------
-offer() { # TYPE -> "id price-per-hour stock" of its hourly offer, or nothing
+offer() { # TYPE -> "id price-per-hour stock name" of its hourly offer, or nothing
   scw baremetal offer list zone="$zone" subscription-period=hourly -o json | json "
 for o in d:
     if o['name'].upper() == '$1'.upper() and o.get('subscription_period') == 'hourly' and o.get('enable'):
         p = o.get('price_per_hour') or {}
-        print(o['id'], '%.3f' % (p.get('units', 0) + p.get('nanos', 0) / 1e9), o.get('stock'))
+        print(o['id'], '%.3f' % (p.get('units', 0) + p.get('nanos', 0) / 1e9), o.get('stock'), o['name'])
         break"
 }
-read -r srv_offer srv_price srv_stock < <(offer "$srv_type") || true
-read -r bot_offer bot_price bot_stock < <(offer "$bot_type") || true
+# server create resolves the type by its exact (case-sensitive) offer name.
+read -r srv_offer srv_price srv_stock srv_name < <(offer "$srv_type") || true
+read -r bot_offer bot_price bot_stock bot_name < <(offer "$bot_type") || true
 for t in srv bot; do
   o=${t}_offer s=${t}_stock ty=${t}_type
   if [ -z "${!o:-}" ]; then
@@ -62,6 +63,8 @@ for t in srv bot; do
     exit 1
   fi
 done
+srv_type=$srv_name
+bot_type=$bot_name
 os_id=$(scw baremetal os list zone="$zone" -o json | json "
 print(next(o['id'] for o in d if o['name'] == 'Ubuntu' and o['version'].startswith('24.04')))")
 pub=$(cut -d' ' -f2 "$key.pub")
@@ -81,9 +84,14 @@ if [ -z "$yes" ]; then
 fi
 
 # --- create (ids saved immediately) -------------------------------------------
-create() { # NAME TYPE -> server id
-  scw baremetal server create zone="$zone" name="$1" type="$2" tags.0=lattice-net \
-    install.os-id="$os_id" install.hostname="$1" install.ssh-key-ids.0="$key_id" -o json | json "print(d['id'])"
+create() { # NAME TYPE -> server id, or scw's error on stderr
+  local out
+  out=$(scw baremetal server create zone="$zone" name="$1" type="$2" tags.0=lattice-net \
+    install.os-id="$os_id" install.hostname="$1" install.ssh-key-ids.0="$key_id" -o json 2>&1) || {
+    echo "$out" >&2
+    return 1
+  }
+  echo "$out" | json "print(d['id'])"
 }
 {
   echo "ZONE=$zone"
@@ -91,9 +99,16 @@ create() { # NAME TYPE -> server id
   echo "PRICE_PER_HOUR=$total"
   echo "CREATED=$(date -Is)"
 } > "$state"
-srv_id=$(create lattice-srv "$srv_type")
+if ! srv_id=$(create lattice-srv "$srv_type"); then
+  rm -f "$state"
+  echo "creating lattice-srv failed (see above); nothing was created" >&2
+  exit 1
+fi
 echo "SRV_ID=$srv_id" >> "$state"
-bot_id=$(create lattice-bots "$bot_type")
+if ! bot_id=$(create lattice-bots "$bot_type"); then
+  echo "creating lattice-bots failed (see above); lattice-srv exists and is billing: run scripts/cloud-down.sh" >&2
+  exit 1
+fi
 echo "BOT_ID=$bot_id" >> "$state"
 say "created lattice-srv $srv_id and lattice-bots $bot_id; billing has started"
 
