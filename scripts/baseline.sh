@@ -12,9 +12,16 @@
 #   summary.md   server, phase and client tables, one row per run
 #   <run>/       each run's logs, per-window CSV and key=value summaries
 #
-# Server and bots share this machine and talk over loopback, like scripts/m1.sh.
+# Server and bots share this machine and talk over loopback, like scripts/m1.sh,
+# unless BOTS_SSH names a second machine (see Two machines below).
 # Env: REPEAT, PORT (40500), PROFILE=1 (perf profiles of the first 10k and GSO
 # blob runs), FORCE=1 (run despite failed checks), SERVER_THREADS, BOT_THREADS.
+#
+# Two machines: BOTS_SSH=user@host runs the bots there (from ~/lattice-net,
+# built), SERVER_IP=<this machine's address on the link between them> is where
+# the server listens, and TOKEN_KEY=<64 hex digits> replaces the public dev key
+# on both sides (a server on a reachable address must not take dev tokens).
+# scripts/cloud-run.sh sets all three.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -52,17 +59,33 @@ dir=baselines/$(date +%Y-%m-%d)-$name
 [ -e "$dir" ] && dir=$dir-$(date +%H%M)
 mkdir -p "$dir"
 
+server_ip=${SERVER_IP:-127.0.0.1}
+remote=${BOTS_SSH:-}
+key_args=
+[ -n "${TOKEN_KEY:-}" ] && key_args="--token-key $TOKEN_KEY"
+
 if ! scripts/preflight.sh "$port" "$max_bots" | tee "$dir/env.txt"; then
   if [ -z "${FORCE:-}" ]; then
     echo "preflight failed (see above); fix it, or FORCE=1 to run anyway" >&2
     exit 1
   fi
 fi
+if [ -n "$remote" ]; then
+  echo "== bot machine ($remote)" | tee -a "$dir/env.txt"
+  # The port check is about the server's machine; any free port will do here.
+  ssh -o BatchMode=yes "$remote" "source ~/.cargo/env 2> /dev/null; cd lattice-net && scripts/preflight.sh 40999 $max_bots" | tee -a "$dir/env.txt" || true
+fi
 cargo build --release -q -p lattice-sim
 
 cores=$(nproc)
-server_threads=${SERVER_THREADS:-$(( cores / 2 ))}
-bot_threads=${BOT_THREADS:-$(( cores / 2 > 8 ? 8 : cores / 2 ))}
+if [ -n "$remote" ]; then
+  # Alone on the machine: the server takes all of it, the bots half of theirs.
+  server_threads=${SERVER_THREADS:-$cores}
+  bot_threads=${BOT_THREADS:-$(( $(ssh -o BatchMode=yes "$remote" nproc) / 2 ))}
+else
+  server_threads=${SERVER_THREADS:-$(( cores / 2 ))}
+  bot_threads=${BOT_THREADS:-$(( cores / 2 > 8 ? 8 : cores / 2 ))}
+fi
 total=$(( repeat * ${#runs[@]} ))
 started=$(date +%s)
 n=0
@@ -78,9 +101,10 @@ for r in $(seq 1 "$repeat"); do
     profile=
     [ -n "${PROFILE:-}" ] && [ -n "$prof" ] && [ "$r" = 1 ] && profile=1
     # shellcheck disable=SC2086 # $extra is a list of server flags
-    if ! OUT=$out PROFILE=$profile SERVER_THREADS=$server_threads BOT_THREADS=$bot_threads \
-      BOT_ARGS="--server 127.0.0.1:$port ${BOT_ARGS:-}" \
-      scripts/m1.sh "$scenario" "$count" "$secs" --bind "127.0.0.1:$port" $extra > "$out/console.log" 2>&1; then
+    # shellcheck disable=SC2086 # $key_args is empty or a flag and its value
+    if ! OUT=$out PROFILE=$profile SERVER_THREADS=$server_threads BOT_THREADS=$bot_threads BOTS_SSH=$remote \
+      BOT_ARGS="--server $server_ip:$port $key_args ${BOT_ARGS:-}" \
+      scripts/m1.sh "$scenario" "$count" "$secs" --bind "$server_ip:$port" $key_args $extra > "$out/console.log" 2>&1; then
       echo "  failed: see $out/console.log"
     fi
     sleep 2 # let the last datagrams and sockets drain
@@ -100,7 +124,12 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
   echo
   echo "- **Machine:** $(env_line cpu), $(env_line threads); $(env_line os), kernel $(env_line kernel), virt: $(env_line virt)"
   echo "- **Commit:** $(env_line commit)"
-  echo "- **Runs:** ${#runs[@]} scenarios x $repeat, ${secs} s each, interleaved. Server $server_threads threads, bots $bot_threads threads, on the same machine over loopback. Took $(( ($(date +%s) - started) / 60 )) min."
+  if [ -n "$remote" ]; then
+    where="bots on a second machine ($(awk '/^== bot machine/ {f=1} f && $1 == "cpu" {sub(/^ +[^ ]+ +/, ""); print; exit}' "$dir/env.txt")), server listening on $server_ip"
+  else
+    where="on the same machine over loopback"
+  fi
+  echo "- **Runs:** ${#runs[@]} scenarios x $repeat, ${secs} s each, interleaved. Server $server_threads threads, bots $bot_threads threads, $where. Took $(( ($(date +%s) - started) / 60 )) min."
   echo "- **Setup and checks:** \`env.txt\`. Raw logs, per-window CSVs and key=value summaries: one directory per run."
   echo
   echo "Steady state: from 3 s after the first client until clients start leaving. Times in ms."

@@ -103,7 +103,12 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 - Performance numbers only count from bare-metal Linux: a dual-boot on the desktop, then a rented 10/25 GbE server for 5k–10k runs.
   - `scripts/baseline.sh full <name>` runs the scenario matrix into `baselines/<date>-<name>/`, with the machine recorded in `env.txt`. Run `scripts/preflight.sh` first. Baselines are committed.
   - The WSL reference is `baselines/2026-09-29-wsl2`. sim/README has the dual-boot procedure (the repo travels as a git bundle; there's no remote).
-  - For the two-machine runs: a bare-metal server with 32–96 cores and a 10–25 GbE NIC (ConnectX or E810), plus a 16–32-core bot machine on the same private link. Hourly metal (AWS `*.metal`, Latitude.sh, Vultr, Cherry) suits a test day; Hetzner or OVH suit a box kept for months. `baseline.sh` can't split server and bots across machines yet.
+  - **Two-machine runs on Scaleway Elastic Metal** (hourly, fr-par-2): EM-I620E server (EPYC 8534P, 64C/128T) + EM-I320E bots (EPYC 8224P, 24C/48T), joined by the `lattice-test` Private Network (25 Gbps per the API), about €2.82/h for the pair.
+    - `scripts/cloud-up.sh` rents both and sets them up (VLAN, toolchain, build, iperf3 check, session token key). Billing starts at creation.
+    - `scripts/cloud-run.sh full <name> [SERVER_THREADS=8 ...]` runs `baseline.sh` with the server on one box and the bots on the other, and copies `baselines/` back.
+    - `scripts/cloud-down.sh` copies back, deletes every server tagged `lattice-net`, and shows the server list.
+    - `.claude/settings.json` asks before `cloud-up.sh` or any `scw` call that creates, changes or deletes; listing, `cloud-run.sh` and `cloud-down.sh` (which only deletes our tagged servers) are allowed.
+    - **Never end a session with Scaleway servers running: always finish with `scripts/cloud-down.sh` and show the empty server list.** A €20/month budget alert exists, but alerts don't stop spending.
 
 ## Conventions
 

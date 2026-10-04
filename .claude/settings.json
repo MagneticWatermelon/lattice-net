@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(scw baremetal offer list:*)",
+      "Bash(scw baremetal os list:*)",
+      "Bash(scw baremetal server list:*)",
+      "Bash(scw baremetal server get:*)",
+      "Bash(scw baremetal private-network list:*)",
+      "Bash(scripts/cloud-run.sh:*)",
+      "Bash(scripts/cloud-down.sh:*)"
+    ],
+    "ask": [
+      "Bash(scripts/cloud-up.sh:*)",
+      "Bash(./scripts/cloud-up.sh:*)",
+      "Bash(bash scripts/cloud-up.sh:*)",
+      "Bash(scw baremetal server create:*)",
+      "Bash(scw baremetal server delete:*)",
+      "Bash(scw baremetal server install:*)",
+      "Bash(scw baremetal server update:*)",
+      "Bash(scw baremetal server reboot:*)",
+      "Bash(scw baremetal server start:*)",
+      "Bash(scw baremetal private-network add:*)",
+      "Bash(scw baremetal private-network set:*)",
+      "Bash(scw baremetal private-network delete:*)"
+    ]
+  }
+}

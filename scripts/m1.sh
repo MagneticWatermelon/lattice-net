@@ -12,7 +12,10 @@
 #      BOT_ARGS (extra lattice-bots flags, e.g. "--full-every 30"),
 #      OUT (results directory, default results/m1-<scenario>-<bots>-<time>),
 #      PROFILE=1 (perf-record the server from PROFILE_DELAY=15 s for PROFILE_SECS=15 s
-#      into $OUT/perf.txt; needs perf and kernel.perf_event_paranoid <= 1).
+#      into $OUT/perf.txt; needs perf and kernel.perf_event_paranoid <= 1),
+#      BOTS_SSH=user@host (run the bots on that machine, from ~/lattice-net there,
+#      built; this machine runs only the server; pass --bind <reachable ip:port> and
+#      BOT_ARGS="--server <same>").
 # Each run leaves server.log, server.csv (one row per report window), server.summary and
 # bots.summary (key=value, what scripts/baseline.sh reads).
 # Only bare-metal Linux numbers count; on WSL2 this checks behavior, not capacity.
@@ -57,16 +60,29 @@ if [ -n "${PROFILE:-}" ]; then
   fi
 fi
 
-# BOT_ARGS: extra lattice-bots flags, e.g. BOT_ARGS="--full-every 30" for sink bots.
-bots() { "$bin/lattice-bots" --threads "$bot_threads" ${BOT_ARGS:-} "$@"; }
+# bots NAME ARGS...: one swarm, logging to $out/NAME.log and NAME.summary, here
+# or (BOTS_SSH) on the bot machine. BOT_ARGS: extra lattice-bots flags, e.g.
+# BOT_ARGS="--full-every 30" for sink bots.
+bots() {
+  local name=$1
+  shift
+  if [ -n "${BOTS_SSH:-}" ]; then
+    ssh -o BatchMode=yes "$BOTS_SSH" \
+      "cd lattice-net && exec target/release/lattice-bots --threads $bot_threads ${BOT_ARGS:-} $* --summary /tmp/lattice-$name.summary" \
+      > "$out/$name.log" 2>&1
+    ssh -o BatchMode=yes "$BOTS_SSH" "cat /tmp/lattice-$name.summary" > "$out/$name.summary"
+  else
+    "$bin/lattice-bots" --threads "$bot_threads" ${BOT_ARGS:-} "$@" --summary "$out/$name.summary" > "$out/$name.log" 2>&1
+  fi
+}
 if [ "$scenario" = joins ]; then
-  bots --count "$count" --duration "$secs" --summary "$out/bots.summary" > "$out/bots.log" &
+  bots bots --count "$count" --duration "$secs" &
   base=$!
   sleep 15
-  bots --count 500 --ramp 50 --duration $(( secs - 15 )) --seed 2 --summary "$out/joiners.summary" > "$out/joiners.log"
+  bots joiners --count 500 --ramp 50 --duration $(( secs - 15 )) --seed 2
   wait $base
 else
-  bots --count "$count" --duration "$secs" --summary "$out/bots.summary" > "$out/bots.log"
+  bots bots --count "$count" --duration "$secs"
 fi
 wait $srv || true
 

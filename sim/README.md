@@ -189,15 +189,42 @@ The repo has no remote, so carry it over as a git bundle.
 
 The WSL reference to compare against is `baselines/2026-09-29-wsl2`: the same commit, script and matrix.
 
-### Two machines (next)
+### Two machines (Scaleway Elastic Metal)
 
-On one box, the bots compete with the server for the same cores, and loopback isn't a NIC. So the dual-boot run can't settle whether 10k needs level 6, or what a real NIC does with GSO. That takes two machines in one datacenter on a private link:
+On one box, the bots compete with the server for the same cores, and loopback isn't a NIC. So a single-box run can't settle whether 10k needs level 6, or what a real NIC does with GSO. The two-machine rig:
 
-- **Server:** bare metal, a current single-socket EPYC or Xeon with 32–96 cores (the design targets 64–96), 64 GB RAM, and a 10–25 GbE NIC (NVIDIA ConnectX or Intel E810 offload UDP segmentation).
-- **Bots:** 16–32 cores, the same NIC speed. A VM is fine: at 10k the swarm uses about 4 of this Ryzen's threads.
-- **Link:** 10 GbE covers today's traffic. 10k moves ~0.7 Gbps down at level 6 (~2.5 Gbps if it held 30 Hz), the blob ~1 Gbps, at 0.2–0.6 million packets/s each way. 25 GbE is for the full game's 0.7–1.5 Mbps per client.
+| role | Scaleway model | CPU | price |
+|---|---|---|---|
+| server | EM-I620E-NVMe | EPYC 8534P, 64 cores / 128 threads, Zen 4c | €1.863/h |
+| bots | EM-I320E-NVMe | EPYC 8224P, 24 cores / 48 threads | €0.959/h |
 
-`baseline.sh` doesn't split server and bots across machines yet.
+Both are hourly bare metal in one zone, joined by a Private Network (25 Gbps per the API).
+
+```
+scripts/cloud-up.sh                                  # rents both, sets them up, measures the link
+scripts/cloud-run.sh full scaleway-8t SERVER_THREADS=8    # the matrix with the dev box's thread count
+scripts/cloud-run.sh full scaleway-64t PROFILE=1          # the server on every core
+scripts/cloud-down.sh                                # copies baselines back, deletes both, shows the list
+```
+
+- **Billing runs from creation until `cloud-down.sh` deletes them.** Stopping a server doesn't stop the bill.
+- **`cloud-up.sh`:**
+  - checks that both offers are hourly and in stock, and asks before creating;
+  - saves the server ids as soon as they exist, so `cloud-down.sh` can always clean up;
+  - after the OS install (10–20 min), configures the Private Network's VLAN inside Linux and installs the toolchain;
+  - copies this working tree over, builds, and lets the server box ssh to the bot box;
+  - measures the link with `iperf3` (warns below 5 Gbps), generates a session token key, and preflights both machines.
+- **`cloud-run.sh`** syncs the working tree, rebuilds, and runs `baseline.sh` on the server box:
+  - the server listens on its Private Network address only;
+  - the bots run on the other box over ssh;
+  - both use the session key, never the public dev key.
+- **`baseline.sh` two-machine mode** works on any pair: `BOTS_SSH=user@host SERVER_IP=<address> TOKEN_KEY=<hex>`. The server then takes every core and the bots half of theirs. The bot machine's preflight goes into `env.txt` too.
+- **What to read in the results:**
+  - the 8-thread run against the WSL reference: was the blob's p99 WSL, or the code?
+  - 8 against 64 threads: does the tick scale with cores, and does 10k fit at level 0?
+  - the blob with GSO on a real NIC;
+  - `swarm busy` above ~70% means the bot box is the limit.
+- **Per-core speed:** the Zen 4c parts run at 3.0–3.1 GHz against 4.1 GHz on the dev box, so expect slower per-core numbers.
 
 ## M2a: tiered interest on the WSL2 dev box
 

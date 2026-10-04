@@ -63,6 +63,12 @@ echo "  ports      $port_lo-$port_hi"
 echo "  nofile     soft $(ulimit -Sn), hard $nofile_hard"
 echo "  conntrack  $([ "$conntrack" = "?" ] && echo "not loaded" || echo "$conntrack flows tracked (max $(file /proc/sys/net/netfilter/nf_conntrack_max))")"
 echo "  loopback   mtu $(file /sys/class/net/lo/mtu)$(have ethtool && ethtool -k lo 2> /dev/null | awk -F': ' '/^(tx-udp-segmentation|generic-segmentation-offload):/ {printf ", %s %s", $1, $2}')"
+for nic in $(ip -o link show up 2> /dev/null | awk -F': ' '{sub(/@.*/, "", $2); print $2}' | grep -v '^lo$'); do
+  speed=$(file "/sys/class/net/$nic/speed")
+  driver=$(have ethtool && ethtool -i "$nic" 2> /dev/null | awk '/^driver:/ {print $2}')
+  uso=$(have ethtool && ethtool -k "$nic" 2> /dev/null | awk -F': ' '/^tx-udp-segmentation:/ {print $2}')
+  echo "  nic        $nic: $(ip -o -4 addr show "$nic" 2> /dev/null | awk '{print $4}' | paste -sd, -), speed ${speed} Mb/s, driver ${driver:-?}, tx-udp-segmentation ${uso:-?}"
+done
 echo "  rust       $(rustc -V 2> /dev/null || echo missing)"
 echo "  cc         $(cc --version 2> /dev/null | head -1 || echo missing)"
 echo "  perf       $(have perf && perf --version 2> /dev/null || echo "not installed"), perf_event_paranoid $(file /proc/sys/kernel/perf_event_paranoid)"
