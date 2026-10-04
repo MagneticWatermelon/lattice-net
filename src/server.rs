@@ -137,7 +137,7 @@ impl Shared {
     /// Takes a slot if one is free.
     fn reserve_slot(&self) -> bool {
         self.clients
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.max_clients).then_some(n + 1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.max_clients).then_some(n + 1))
             .is_ok()
     }
 }

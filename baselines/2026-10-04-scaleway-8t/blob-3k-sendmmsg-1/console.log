@@ -1,0 +1,44 @@
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> src/server.rs:140:14
+    |
+140 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.max_clients).then_some(n + 1))
+    |              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+140 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.max_clients).then_some(n + 1))
+140 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.max_clients).then_some(n + 1))
+    |
+
+== blob, 3000 bots, 60s -> baselines/2026-10-04-scaleway-8t/blob-3k-sendmmsg-1
+== summary: 1709 steady-state ticks (after warmup, before clients drain), peak 3000 clients ==
+  phase        p50 ms   p99 ms   max ms
+  ingress        0.92     0.96     1.01
+  events         0.67     0.71     0.73
+  movement       0.12     0.15     0.17
+  grid           0.12     0.13     0.14
+  history        0.00     0.00     0.00
+  serialize      0.09     0.12     0.13
+  assembly       8.98     9.33    10.08
+  transport      3.83     4.54     4.95
+  egress         3.86     4.01     4.15
+  tick          18.59    19.40    19.74
+  overruns 0 | spawns 3000 despawns 3000 (6430 joins deferred) | stand-ins: repeated 0 frozen 0 | late inputs 0 discarded 0 | bad messages 0 | recv errors 0 send errors 0
+  egress (whole run): 10754082 datagrams in 10754082 sends (1.00 per send), 115264 syscalls
+  ticks per ladder level (whole run): L0: 1820
+  input wait on the server (datagram arrival -> applied): p50 50.0 p99 66.1 max 68.8 mean 50.0 ms
+  steady state: stand-ins repeated 0 frozen 0 | late inputs 0 discarded 0
+== bots summary ==
+  started 3000 welcomed 3000 failed 0
+  join latency ms: p50 309 p99 787 max 926 (n=3000)
+  corrections 0 (0.00/bot-minute), mean error 0.000 m, max 0.000 m
+  snapshots 5366508 (entities per snapshot: near 64.0 mid 86.0 far 0.0), stale 0, unmatched acks 0, resyncs 0
+  input -> applied on server (est. RTT/2 + server wait): p50 59.0 p99 75.0 max 78.0 mean 58.7 ms (n=5365711)
+    of which server wait (arrival -> applied): p50 50.0 p99 66.1 max 68.8 mean 50.0 ms (n=5365711)
+  input -> seen acked (round trip): p50 67.0 p99 100.0 max 100.0 mean 83.4 ms (n=5365711)
+  near entity update interval (tracked bots): p50 66.0 p99 66.0 max 133.0 mean 53.2 ms (n=17154938)
+  mid entity update interval (tracked bots): p50 100.0 p99 100.0 max 59700.0 mean 155.2 ms (n=22958789)
+  far entity update interval (tracked bots): p50 0.0 p99 0.0 max 0.0 mean 0.0 ms (n=0)
+  input clock: 3004 extra inputs, 108 skipped ticks, 0 backlog skips | near decode errors (tracked bots) 0
+  bytes down 7591.2 MB up 268.5 MB | swarm busy 5% of its threads' time, tick overruns 0

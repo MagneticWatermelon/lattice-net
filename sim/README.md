@@ -170,6 +170,51 @@ The dev box under WSL2, with the server on 8 threads and the bots on the other 8
   - WSL can't show clock speeds, so bare metal has to tell these apart.
 - **Kernel receive drops only at 10k:** 0–1,666 per run. WSL caps socket buffers at 4 MiB.
 
+### Bare metal: Scaleway, 2026-10-04 (`baselines/2026-10-04-scaleway-*`)
+
+- **Server:** EM-I620E (EPYC 8534P, 64 cores / 128 threads, Zen 4c).
+- **Bots:** EM-I320E (EPYC 8224P, 24 cores), on the other end of a Private Network that `iperf3` measured at 23.5 Gbps each way.
+- **Bot box load:** at most 14% busy, so the bots never limited a run.
+
+Tick times in ms; two runs each, and they agree within ~0.5 ms.
+
+| run | 8 server threads (dev box's count) | 128 threads (whole box) | WSL reference |
+|---|---|---|---|
+| uniform 1k | L0, 2.8–2.9 / 3.0–3.1 | L0, 2.9 / 3.3 | L0, 3.5–3.7 / 4.4–4.8 |
+| uniform 5k | L0, 15.5–15.6 / 16.4 | L0, 7.0–7.1 / 8.0–8.1 | L0, 17.2–17.5 / 21.2–23.4 |
+| uniform 10k | **L6**, 31.7–31.9 / 33.3–33.7 | **L0**, 14.1 / 15.4–15.5 | L6–L8, 34.6–34.9 / 46.4–48.5 |
+| uniform 10k, ladder off | every tick over, 42.4–43.0 / 44.5–45.4 | 13.9 / 15.4–15.6 | 47.2–47.8 / 62.5–63.6 |
+| hotspots 5k | L0, 19.5–19.6 / 20.6 | L0, 7.8 / 8.9–9.1 | L0–L2, 22.2 / 26.9–29.4 |
+| blob 3k, `sendmmsg` | L0, 18.6–18.7 / **19.4** | L0, 7.7 / 8.5–8.6 | mostly L1, 22.8–23.2 / 27.0–28.1 |
+| blob 3k, GSO | L0, 18.6 / **19.5** | L0, 8.2–8.3 / 9.0–9.4 | mostly L0, 21.4–21.6 / 27.6–28.5 |
+| joins 5k + 500 | L0, 17.1–17.2 / 18.2 | L0, 7.3–7.5 / 8.3 | L0, 18.4–18.7 / 21.5–24.0 |
+
+**10k with the ladder off** (one 45 s run per thread count, `2026-10-04-scaleway-scaling`), tick p50 / p99 in ms:
+
+| server threads | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|
+| tick | 42.4 / 44.5 | 24.9 / 25.9 | 16.3 / 17.4 | **12.2 / 13.0** | 13.9 / 15.6 |
+
+**Findings:**
+
+1. **The blob passes M1's bar on bare metal:** p99 19.4–19.5 ms with the dev box's 8 threads (27–28.5 ms on WSL), and 8.5–9.4 ms on the whole box.
+   - WSL mostly cost tails: the medians are only 15% lower here, but p99 sits ~1 ms above p50 instead of 6–7 ms.
+   - Zero stand-ins, corrections or kernel drops in any run.
+2. **10k fits at full rate (level 0, 30 Hz, full radii) on the 64-core box,** with p99 15.4 ms, under half the 33 ms budget. With 8 threads it settles at level 6 (20 Hz), as on WSL but without the dilation.
+3. **The tick scales to the physical cores, not the SMT threads.**
+   - From 8 to 64 threads it's 3.5× faster, and 128 threads is slower than 64.
+   - Profiles at 128 threads: 35–45% of the CPU is rayon's scheduler (idle workers spinning and stealing, `crossbeam_epoch`).
+   - Run with threads = physical cores. The serial events phase (~2.4 ms at 10k) is the floor.
+4. **One socket is now a lock.** In the blob profile at 128 threads, 8.5% of the CPU is a kernel spinlock on the send path (`native_queued_spin_lock_slowpath` next to `fq_codel_enqueue`): every shard sends through the same UDP socket. This is the case for `SO_REUSEPORT` socket groups (transport step 5).
+5. **GSO doesn't help on this NIC.** Broadcom `bnxt_en` has no UDP segmentation offload (`tx-udp-segmentation off [fixed]`), so the kernel segments in software. GSO ties `sendmmsg` at 8 threads and is slightly slower at 128 (egress 2.6 vs 2.1 ms p50). The hardware verdict needs a NIC with offload (ConnectX or E810).
+6. **Encryption is cheap:** `ring`'s ChaCha20-Poly1305 seal is under 2% of the CPU at 10k.
+
+**Session notes:**
+- The OS install took 10 min.
+- SSH came up ~8 min after Scaleway reported the servers ready: big EPYC boxes take a while to boot.
+- Setup to teardown took about 1 h 5 min, roughly €3 at €2.82/h.
+- `cloud-up.sh --resume` finishes a setup that stopped partway.
+
 ### Running it on bare metal (the desktop, dual-booted)
 
 The repo has no remote, so carry it over as a git bundle.

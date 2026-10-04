@@ -3,6 +3,7 @@
 # bot box, bare metal, hourly billing, joined by a Private Network.
 #
 #   scripts/cloud-up.sh [--yes]
+#   scripts/cloud-up.sh --resume     (finish setting up a session whose servers exist)
 #
 # BILLING STARTS WHEN THE SERVERS ARE CREATED and runs until they're deleted
 # (stopping isn't enough): end every session with scripts/cloud-down.sh.
@@ -28,17 +29,30 @@ bot_type=${BOT_TYPE:-EM-I320E-NVMe}
 pn_name=${PN_NAME:-lattice-test}
 key=${SSH_KEY:-$HOME/.ssh/id_ed25519_scaleway}
 yes=
+resume=
 [ "${1:-}" = --yes ] && yes=1
+[ "${1:-}" = --resume ] && resume=1
 
 state=.cloud/session.env
 mkdir -p .cloud
-if [ -s "$state" ]; then
-  echo "a session is already up ($state): use it, or end it with scripts/cloud-down.sh" >&2
-  exit 1
-fi
-
 json() { python3 -c "import json, sys; d = json.load(sys.stdin); $1"; }
 say() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
+pn_id=$(scw vpc private-network list name="$pn_name" region="$region" -o json | json "
+print(next(p['id'] for p in d if p['name'] == '$pn_name'))")
+
+if [ -n "$resume" ]; then
+  # shellcheck source=/dev/null
+  . "$state"
+  zone=$ZONE
+  srv_id=$SRV_ID
+  bot_id=$BOT_ID
+  total=$PRICE_PER_HOUR
+  sed -i '/^\(SRV_PUB\|BOT_PUB\|SRV_PRIV\|BOT_PRIV\|LINK_GBPS\|TOKEN_KEY\)=/d' "$state"
+  say "resuming the session of lattice-srv $srv_id and lattice-bots $bot_id"
+elif [ -s "$state" ]; then
+  echo "a session is already up ($state): use it, --resume its setup, or end it with scripts/cloud-down.sh" >&2
+  exit 1
+else
 
 # --- what we'd rent -----------------------------------------------------------
 offer() { # TYPE -> "id price-per-hour stock name" of its hourly offer, or nothing
@@ -70,9 +84,6 @@ print(next(o['id'] for o in d if o['name'] == 'Ubuntu' and o['version'].startswi
 pub=$(cut -d' ' -f2 "$key.pub")
 key_id=$(scw iam ssh-key list -o json | json "
 print(next(k['id'] for k in d if k['public_key'].split()[1] == '$pub'))")
-pn_id=$(scw vpc private-network list name="$pn_name" region="$region" -o json | json "
-print(next(p['id'] for p in d if p['name'] == '$pn_name'))")
-
 total=$(python3 -c "print('%.2f' % ($srv_price + $bot_price))")
 echo "server: $srv_type, EUR $srv_price/h (stock: $srv_stock)"
 echo "bots:   $bot_type, EUR $bot_price/h (stock: $bot_stock)"
@@ -121,6 +132,8 @@ for id in "$srv_id" "$bot_id"; do
   fi
 done
 
+fi # creation
+
 say "waiting for the OS installs (often 10-20 min)"
 scw baremetal server wait "$srv_id" zone="$zone" timeout=60m > /dev/null &
 w1=$!
@@ -158,8 +171,11 @@ for h in lattice-srv lattice-bots; do
 done
 
 # --- Private Network: attach, then the VLAN interface inside Linux ------------
-scw baremetal private-network add server-id="$srv_id" private-network-id="$pn_id" zone="$zone" > /dev/null
-scw baremetal private-network add server-id="$bot_id" private-network-id="$pn_id" zone="$zone" > /dev/null
+for id in "$srv_id" "$bot_id"; do
+  attached=$(scw baremetal private-network list server-id="$id" zone="$zone" -o json | json "
+print(any(p['private_network_id'] == '$pn_id' for p in d))")
+  [ "$attached" = True ] || scw baremetal private-network add server-id="$id" private-network-id="$pn_id" zone="$zone" > /dev/null
+done
 vlan() { # server id -> its VLAN on the Private Network, once attached
   for _ in $(seq 60); do
     v=$(scw baremetal private-network list server-id="$1" zone="$zone" -o json | json "
@@ -174,24 +190,37 @@ join_pn() { # HOST VLAN -> the host's IPv4 on the Private Network (DHCP)
   on "$1" "sudo bash -s $2" << 'EOF'
 set -e
 vlan=$1
+# The VLAN links to the public NIC by its netplan id (cloud-init calls it eth0
+# and matches it by MAC), and its name must fit in 15 characters.
 nic=$(ip -o route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}')
+mac=$(cat "/sys/class/net/$nic/address")
+parent=$(python3 -c "
+import glob, yaml
+for f in sorted(glob.glob('/etc/netplan/*.yaml')):
+    eths = ((yaml.safe_load(open(f)) or {}).get('network') or {}).get('ethernets') or {}
+    for name, e in eths.items():
+        if name == '$nic' or str(((e or {}).get('match') or {}).get('macaddress', '')).lower() == '$mac':
+            print(name)
+            raise SystemExit
+" 2> /dev/null || true)
+parent=${parent:-$nic}
 cat > /etc/netplan/60-lattice-pn.yaml << YAML
 network:
   version: 2
   vlans:
-    $nic.$vlan:
+    vlan$vlan:
       id: $vlan
-      link: $nic
+      link: $parent
       dhcp4: true
 YAML
 chmod 600 /etc/netplan/60-lattice-pn.yaml
 netplan apply
 for _ in $(seq 30); do
-  ip=$(ip -o -4 addr show "$nic.$vlan" | awk '{split($4, a, "/"); print a[1]}')
+  ip=$(ip -o -4 addr show "vlan$vlan" | awk '{split($4, a, "/"); print a[1]}')
   [ -n "$ip" ] && { echo "$ip"; exit 0; }
   sleep 2
 done
-echo "no DHCP address on $nic.$vlan" >&2
+echo "no DHCP address on vlan$vlan" >&2
 exit 1
 EOF
 }

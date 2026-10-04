@@ -63,7 +63,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 ## Milestones
 
 - **M0: protocol.** Done: this crate, 18 tests.
-- **M1: headless scale test.** The pass bar was met on the WSL2 dev box at M1 (blob p99 13 ms). With M2's interest management and deltas, the WSL baseline (2026-09-29, sustained load) has the blob at p99 27–28.5 ms, over the ~25 ms bar; assembly (10.7 ms p50) is the biggest phase. Bare-metal confirmation is still pending. Lives in `sim/` (`lattice-sim`, which may have deps: rayon, socket2). See `sim/README.md` for the WSL baseline.
+- **M1: headless scale test.** The pass bar was met on the WSL2 dev box at M1 (blob p99 13 ms). On WSL with M2 (2026-09-29) the blob was at p99 27–28.5 ms, over the ~25 ms bar. **On bare metal (Scaleway, 2026-10-04) it passes:** p99 19.4 ms with 8 server threads, 8.5–9.4 ms on 64 cores; WSL mostly cost tail latency. **10k runs at level 0 (30 Hz, full radii) with p99 15.4 ms on the 64-core box.** The tick scales to physical cores (8 → 64 threads: 42.4 → 12.2 ms at 10k), not SMT threads; the serial events phase (~2.4 ms) is the floor. See sim/README. Lives in `sim/` (`lattice-sim`, which may have deps: rayon, socket2). See `sim/README.md` for the WSL baseline.
   - Server does movement only. A Rust bot swarm (`lattice-bots`, real `lattice_net::Client`s, one socket per bot, ≤8 threads) drives it at 1k, 5k and 10k. It's Rust, not Go, so there's one protocol implementation to change when crypto lands.
   - Measure p50/p99 per-phase tick time, bytes per client, pps, and prediction corrections.
   - Scenarios: uniform spread; 3 hotspots of ~800; a 3,000-player blob within 200 m; 500 joins within 10 s.
@@ -89,7 +89,11 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - **M2c (debug map) is built:** `lattice-server --debug-http 0.0.0.0:8080` serves a top-down map of what one client receives (`sim/src/debugmap.rs`, std only).
   - **GSO is built** (see Transport decisions, Done). Mid and far messages are split to fill packets rather than fragmented; real fragmentation stays transport step 3.
   - **Transport step 1 (tokens + encryption) is done** (see Transport decisions, Done).
-  - **Next:** the bare-metal baseline (the harness is ready; it needs Linux booted natively), then M3.
+  - **Bare-metal baseline done** (2026-10-04, `baselines/2026-10-04-scaleway-*`). What it pointed at:
+    - one UDP socket is a kernel lock at high thread counts (8.5% spinlock in the blob profile), so `SO_REUSEPORT` socket groups come next;
+    - run rayon with threads = physical cores (128 threads was slower than 64; idle-worker spinning is 35–45% of the CPU);
+    - this Broadcom NIC has no UDP segmentation offload, so GSO is untested in hardware.
+  - **Next:** M3, plus `SO_REUSEPORT` egress.
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.
@@ -109,6 +113,11 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - `scripts/cloud-down.sh` copies back, deletes every server tagged `lattice-net`, and shows the server list.
     - `.claude/settings.json` asks before `cloud-up.sh` or any `scw` call that creates, changes or deletes; listing, `cloud-run.sh` and `cloud-down.sh` (which only deletes our tagged servers) are allowed.
     - **Never end a session with Scaleway servers running: always finish with `scripts/cloud-down.sh` and show the empty server list.** A €20/month budget alert exists, but alerts don't stop spending.
+    - Quirks, already handled:
+      - offer names are case-sensitive (`EM-I620E-NVME`);
+      - SSH comes up ~8 min after "ready";
+      - the VLAN must link to cloud-init's netplan id (`eth0`) and be named `vlan<id>` (15-character limit);
+      - `cloud-up.sh --resume` finishes a setup that stopped partway.
 
 ## Conventions
 

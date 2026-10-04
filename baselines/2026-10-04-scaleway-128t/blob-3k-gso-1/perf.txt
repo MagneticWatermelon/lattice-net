@@ -1,0 +1,47 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 239K of event 'cycles:P'
+# Event count (approx.): 687066408259
+#
+# Overhead  Shared Object      Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+# ........  .................  ...........................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    24.53%  lattice-server     [.] _RINvNtCs55WorZP0KrC_15crossbeam_epoch7default11with_handleNCNvB2_3pin0NtNtB4_5guard5GuardECs3vC16yCeARf_10rayon_core
+    10.27%  lattice-server     [.] _RNvMs5_NtCs55WorZP0KrC_15crossbeam_epoch8internalNtB5_6Global11try_advance
+     8.49%  [kernel.kallsyms]  [k] native_queued_spin_lock_slowpath
+     4.44%  lattice-server     [.] _RNvMs8_NtCs15lsxgxFusm_15crossbeam_deque5dequeINtB5_7StealerNtNtCs3vC16yCeARf_10rayon_core3job6JobRefE5stealB10_
+     3.38%  lattice-server     [.] _RINvNtNtNtNtCsevLNFiNqfJP_4core5slice4sort8unstable9quicksort9partitionTfftENCINvMB8_SB17_22select_nth_unstable_byNCNCNvMs3_NtCs3rqPvQwbGDW_11lattice_sim6serverNtB1Y_4View8assembles_00E0EB20_
+     2.73%  lattice-server     [.] _RNvXs_NtNtNtCsevLNFiNqfJP_4core3ops8function5implsRNCNvMs2_NtCs3rqPvQwbGDW_11lattice_sim6serverNtBV_9SimServer4ticksc_0INtB6_5FnMutTTTTQINtNtCs1C1lLj4PWSY_5alloc3vec3VecNtBV_10ClientSlotEQIB2b_TmIB2b_hEINtNtBa_6option6OptionmEEEEQNtBV_7ScratchEQNtNtCsf05KgXYLGQf_11lattice_net6server5ShardEEE8call_mutBX_
+     2.06%  lattice-server     [.] _RINvNtNtNtNtCsevLNFiNqfJP_4core5slice4sort8unstable9quicksort9partitionTftENCINvMB8_SB17_22select_nth_unstable_byNCNCNvMs3_NtCs3rqPvQwbGDW_11lattice_sim6serverNtB1X_4View8assembles1_00E0EB1Z_
+     1.63%  lattice-server     [.] _RINvXs_NtNtNtCsevLNFiNqfJP_4core4iter8adapters5chainINtB5_5ChainINtNtNtBb_3ops5range5RangejEB10_ENtNtNtB9_6traits8iterator8Iterator8try_folduNCINvNtB7_6filter15filter_try_foldjuINtNtB15_12control_flow11ControlFlowNtNtCs3vC16yCeARf_10rayon_core3job6JobRefENCNvMs8_NtB3t_8registryNtB4d_12WorkerThread5steal0NCINvNvB1x_8find_map5checkjB3p_NCB47_s_0E0E0B2P_EB3t_
+     1.37%  lattice-server     [.] _RINvMs_NtCs3rqPvQwbGDW_11lattice_sim4gridNtB5_4Grid10walk_ringsNCNvMs3_NtB7_6serverNtB17_4View8assembles_0EB7_
+     1.27%  lattice-server     [.] _RINvMs_NtCs3rqPvQwbGDW_11lattice_sim4gridNtB5_4Grid10walk_ringsNCNvMs3_NtB7_6serverNtB17_4View8assembles1_0EB7_
+     1.23%  lattice-server     [.] _RNvNtCs3rqPvQwbGDW_11lattice_sim5delta7put_var
+     1.07%  lattice-server     [.] _RNvMs0_NtCs3rqPvQwbGDW_11lattice_sim8interestNtB5_9NearState6select
+     0.95%  [kernel.kallsyms]  [k] perf_adjust_freq_unthr_context
+     0.93%  [kernel.kallsyms]  [k] update_curr
+     0.89%  [kernel.kallsyms]  [k] pick_next_task_fair
+     0.89%  lattice-server     [.] _RNvMNtNtNtNtCsgHYyB3hU8Ec_3std3sys4sync5mutex5futexNtB2_5Mutex14lock_contended
+     0.87%  lattice-server     [.] _RNvMs1_NtCs3rqPvQwbGDW_11lattice_sim8interestNtB5_13SelectScratch5index.llvm.2296020646405824362
+     0.83%  lattice-server     [.] ring_core_0_17_14__chacha20_poly1305_seal_avx2
+     0.69%  lattice-server     [.] _RNvMs3_NtCsf05KgXYLGQf_11lattice_net10connectionNtB5_10Connection14receive_sealed
+     0.65%  [kernel.kallsyms]  [k] srso_alias_safe_ret
+     0.62%  lattice-server     [.] _RNvNtCs3rqPvQwbGDW_11lattice_sim5delta11encode_near
+     0.58%  lattice-server     [.] _RNvMNtCs3vC16yCeARf_10rayon_core5sleepNtB2_5Sleep20wake_specific_thread.llvm.6651350577235341498
+     0.57%  [kernel.kallsyms]  [k] srso_alias_return_thunk
+     0.54%  [kernel.kallsyms]  [k] entry_SYSCALL_64
+     0.51%  [kernel.kallsyms]  [k] update_sg_lb_stats
+     0.49%  [kernel.kallsyms]  [k] __schedule
+     0.47%  [kernel.kallsyms]  [k] yield_task_fair
+     0.41%  [kernel.kallsyms]  [k] do_syscall_64
+     0.40%  lattice-server     [.] _RNvMs3_NtCsf05KgXYLGQf_11lattice_net10connectionNtB5_10Connection4emit
+     0.36%  lattice-server     [.] _RINvMNtCs3rqPvQwbGDW_11lattice_sim4gridNtB3_4Grid13for_each_nearNCNvMs3_NtB5_6serverNtB18_4View8assembles2_0EB5_
+     0.31%  [kernel.kallsyms]  [k] syscall_exit_to_user_mode
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
