@@ -10,3 +10,4 @@ pub mod delta;
 pub mod movement;
 pub mod msg;
 pub mod tier;
+pub mod world;

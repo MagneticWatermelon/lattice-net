@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lattice_net::wire::Writer;
@@ -26,6 +27,7 @@ use lattice_net::{Channel, ClientId, Config, Router, Server, ServerEvent, Server
 use rayon::prelude::*;
 
 use crate::grid::{Grid, Knn};
+use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{step, Input, MoveState, TICK_HZ, WORLD_SIZE};
@@ -162,6 +164,9 @@ pub struct SimConfig {
     pub preallocate: bool,
     pub ladder: LadderConfig,
     pub seed: u64,
+    /// The world (terrain and cover) everyone plays in; sent in the Welcome so
+    /// clients build the same one.
+    pub world_seed: u64,
     /// Server id and token key, shared with whatever mints the clients'
     /// tokens (the bots, standing in for a login service).
     pub identity: ServerIdentity,
@@ -180,6 +185,7 @@ impl Default for SimConfig {
             preallocate: false,
             ladder: LadderConfig::default(),
             seed: 1,
+            world_seed: 1,
             identity: ServerIdentity { server_id: 1, token_key: lattice_net::token::DEV_TOKEN_KEY },
         }
     }
@@ -235,6 +241,7 @@ struct Body {
     alive: bool,
     state: MoveState,
     yaw: u16,
+    pitch: i16,
     squad: u32,
     /// Tick this entity (slot) spawned: an older baseline belongs to a previous occupant.
     spawned: u32,
@@ -242,7 +249,7 @@ struct Body {
 
 impl Default for Body {
     fn default() -> Self {
-        Self { alive: false, state: MoveState::default(), yaw: 0, squad: NO_SQUAD, spawned: 0 }
+        Self { alive: false, state: MoveState::default(), yaw: 0, pitch: 0, squad: NO_SQUAD, spawned: 0 }
     }
 }
 
@@ -370,7 +377,7 @@ impl InputQueue {
     }
 
     /// Advance one tick, consuming seq `last_seq + 1`. `now` is the tick's time.
-    fn advance(&mut self, body: &mut Body, now: Instant) -> Step {
+    fn advance(&mut self, body: &mut Body, now: Instant, world: &World) -> Step {
         self.depth = self.pending.len().min(u8::MAX as usize) as u8;
         let next = self.last_seq + 1;
         let (input, kind) = if self.pending.front().is_some_and(|&(s, _, _)| s == next) {
@@ -381,7 +388,7 @@ impl InputQueue {
             self.starved_run = 0;
             (input, Step::Applied)
         } else if self.last_seq == 0 {
-            body.state = step(body.state, Input::default());
+            body.state = step(world, body.state, Input::default());
             return Step::Waiting;
         } else {
             // The input for `next` is late or lost: a stand-in takes its seq, and
@@ -395,8 +402,9 @@ impl InputQueue {
                 (Input { yaw: self.last.yaw, ..Default::default() }, Step::Frozen)
             }
         };
-        body.state = step(body.state, input);
+        body.state = step(world, body.state, input);
         body.yaw = input.yaw;
+        body.pitch = input.pitch;
         self.consume(next, kind != Step::Applied);
         kind
     }
@@ -439,6 +447,7 @@ pub struct SimServer {
     rng: Rng,
     counters: Counters,
     ladder: Ladder,
+    world: Arc<World>,
     pace: PaceMeter,
     /// Pace advertised in this tick's snapshots.
     pace_now: f32,
@@ -463,6 +472,7 @@ impl SimServer {
         }
         let (ladder, interest) = (Ladder::new(cfg.ladder.clone()), cfg.interest.clone());
         Self {
+            world: World::shared(cfg.world_seed),
             net,
             shard_clients: (0..cfg.shards).map(|_| Vec::new()).collect(),
             scratch: (0..cfg.shards).map(|_| Scratch::default()).collect(),
@@ -665,6 +675,7 @@ impl SimServer {
         lap(1);
 
         // 2. movement
+        let world = &*self.world;
         let [applied, repeated, frozen] = self
             .bodies
             .par_iter_mut()
@@ -676,7 +687,7 @@ impl SimServer {
                 let queued = q.pending.len();
                 let mut n = [0u64; 3];
                 for _ in 0..steps {
-                    match q.advance(b, now) {
+                    match q.advance(b, now, world) {
                         Step::Applied => n[0] += 1,
                         Step::Repeated => n[1] += 1,
                         Step::Frozen => n[2] += 1,
@@ -727,7 +738,7 @@ impl SimServer {
             .filter(|(_, (_, b))| b.alive)
             .for_each(|(i, ((near, far), b))| {
                 let e = i as u16;
-                *near = NearQ::new(b.state.pos, b.state.vel, b.yaw);
+                *near = NearQ::new(&b.state, b.yaw, b.pitch);
                 let prev = tick.wrapping_sub(1);
                 if due(e, tick, mid_period) || due(e, tick, far_period) || due(e, prev, far_period) {
                     *far = msg::encode_blob(e, b.state.pos, b.yaw);
@@ -855,7 +866,7 @@ impl SimServer {
         };
         let i = e as usize;
         self.bodies[i] =
-            Body { alive: true, state: MoveState { pos: spawn, vel: [0.0; 2] }, yaw: 0, squad, spawned: self.tick };
+            Body { alive: true, state: MoveState::standing(&self.world, spawn), yaw: 0, pitch: 0, squad, spawned: self.tick };
         self.inputs[i] = InputQueue::default();
         if squad != NO_SQUAD {
             self.squads.entry(squad).or_default().push(e);
@@ -871,7 +882,7 @@ impl SimServer {
         };
         self.shard_clients[self.net.shard_of_client(client)].push(slot);
         self.counters.spawns += 1;
-        let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius });
+        let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius, world_seed: self.cfg.world_seed });
         let _ = self.net.send(client, Channel::Reliable, welcome);
     }
 
@@ -1248,6 +1259,10 @@ fn nearest(v: &mut Vec<(f32, u16)>, k: usize) {
 mod tests {
     use super::*;
 
+    fn tw() -> Arc<World> {
+        World::shared(1)
+    }
+
     fn fwd() -> Input {
         Input { move_x: 127, yaw: 777, ..Default::default() }
     }
@@ -1278,11 +1293,11 @@ mod tests {
         q.push(1, fwd(), ms(0));
         q.push(1, fwd(), ms(20)); // a redundant copy doesn't reset the clock
         q.push(2, fwd(), ms(20));
-        assert_eq!(q.advance(&mut b, ms(33)), Step::Applied);
+        assert_eq!(q.advance(&mut b, ms(33), &tw()), Step::Applied);
         assert_eq!(q.wait, 330, "33 ms in 0.1 ms units");
-        assert_eq!(q.advance(&mut b, ms(66)), Step::Applied);
+        assert_eq!(q.advance(&mut b, ms(66), &tw()), Step::Applied);
         assert_eq!(q.wait, 460);
-        assert_eq!(q.advance(&mut b, ms(99)), Step::Repeated);
+        assert_eq!(q.advance(&mut b, ms(99), &tw()), Step::Repeated);
         assert_eq!(q.wait, WAIT_STAND_IN);
     }
 
@@ -1292,15 +1307,15 @@ mod tests {
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
 
-        assert_eq!(q.advance(&mut b, t), Step::Waiting, "no input yet consumes nothing");
+        assert_eq!(q.advance(&mut b, t, &tw()), Step::Waiting, "no input yet consumes nothing");
         assert_eq!(q.last_seq, 0);
         assert_eq!(q.push(2, fwd(), t), Push::Queued);
         assert_eq!(q.push(1, fwd(), t), Push::Queued);
         assert_eq!(q.push(2, fwd(), t), Push::Duplicate);
-        assert_eq!(q.advance(&mut b, t), Step::Applied);
+        assert_eq!(q.advance(&mut b, t, &tw()), Step::Applied);
         assert_eq!((q.last_seq, q.depth), (1, 2));
         assert_eq!(q.push(1, fwd(), t), Push::Duplicate, "already applied");
-        assert_eq!(q.advance(&mut b, t), Step::Applied);
+        assert_eq!(q.advance(&mut b, t, &tw()), Step::Applied);
         assert_eq!(q.last_seq, 2);
 
         // A backlog drains one per tick; overflow discards the oldest unapplied.
@@ -1309,7 +1324,7 @@ mod tests {
         }
         assert_eq!(q.pending.len(), MAX_QUEUED_INPUTS);
         assert_eq!(q.last_seq, 3, "seq 3 was discarded");
-        assert_eq!(q.advance(&mut b, t), Step::Applied);
+        assert_eq!(q.advance(&mut b, t, &tw()), Step::Applied);
         assert_eq!(q.last_seq, 4);
     }
 
@@ -1319,10 +1334,10 @@ mod tests {
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
         q.push(1, fwd(), t);
-        assert_eq!(q.advance(&mut b, t), Step::Applied);
+        assert_eq!(q.advance(&mut b, t, &tw()), Step::Applied);
 
         // Lag switch: nothing arrives for 10 ticks.
-        let kinds: Vec<Step> = (0..10).map(|_| q.advance(&mut b, t)).collect();
+        let kinds: Vec<Step> = (0..10).map(|_| q.advance(&mut b, t, &tw())).collect();
         assert_eq!(&kinds[..2], &[Step::Repeated; 2]);
         assert!(kinds[2..].iter().all(|&k| k == Step::Frozen));
         assert_eq!(q.last_seq, 11, "every stand-in consumes a seq");
@@ -1336,13 +1351,13 @@ mod tests {
         }
         assert!(q.pending.is_empty());
         for _ in 0..30 {
-            q.advance(&mut b, t);
+            q.advance(&mut b, t, &tw());
         }
         assert!(b.state.vel == [0.0, 0.0] && b.state.pos[0] - frozen_at[0] < 0.5, "{:?}", b.state);
 
         // Fresh input for the next seq resumes movement and resets the grace.
         assert_eq!(q.push(q.last_seq + 1, fwd(), t), Push::Queued);
-        assert_eq!(q.advance(&mut b, t), Step::Applied);
+        assert_eq!(q.advance(&mut b, t, &tw()), Step::Applied);
         assert_eq!(q.starved_run, 0);
         assert!(b.state.vel[0] > 0.0);
     }

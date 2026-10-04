@@ -62,7 +62,8 @@ lattice-server: M1 movement-only authoritative server
   --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
                        connect tokens, standing in for a login service) [the public dev key]
   --server-id N        the server id tokens are minted for [1]
-  --seed N             spawn RNG seed [1]";
+  --seed N             spawn RNG seed [1]
+  --world-seed N       the world's terrain and cover (clients build it from the Welcome) [1]";
 
 /// Columns of per-tick timing samples: the sim phases, then egress and total.
 const COLS: usize = PHASES.len() + 2;
@@ -352,6 +353,7 @@ fn main() -> std::io::Result<()> {
             LadderConfig { enabled, high: a.get("ladder-high", d.high), low: a.get("ladder-low", d.low) }
         },
         seed: a.get("seed", 1),
+        world_seed: a.get("world-seed", 1),
         identity: lattice_net::ServerIdentity {
             token_key: a.get("token-key", HexKey::default()).0,
             server_id: a.get("server-id", 1),

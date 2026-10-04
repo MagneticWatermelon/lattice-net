@@ -1,9 +1,10 @@
 //! Game messages carried in lattice-net channels. Each starts with a tag byte.
 //!
 //! ```text
-//! C->S unreliable  Input    tag | newest_seq:4 | n:1 | n × (move_x:1 move_y:1 yaw:2 buttons:1)   newest first
-//! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32
-//! S->C unreliable  Snapshot tag | server_tick:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1 | own pos:2×f32 vel:2×f32
+//! C->S unreliable  Input    tag | newest_seq:4 | n:1 | n × (move_x:1 move_y:1 yaw:2 pitch:2 buttons:1)   newest first
+//! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32 | world_seed:8
+//! S->C unreliable  Snapshot tag | server_tick:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
+//!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 grounded:1
 //! S->C unreliable  Near     see delta.rs: deltas against acked baselines, one per tick, tagged
 //! S->C unreliable  Entities tag | server_tick:4 | tier:1 | n:1 | n × blob         (mid and far; one or more per tier per tick)
 //! far blob  (11 B) := entity:2 | cell:1 | 8 B bitpacked far-tier state (see bitpack.rs); used for mid and far
@@ -33,7 +34,7 @@ pub const MSG_ENTITIES: u8 = 4;
 pub const INPUT_REDUNDANCY: usize = 3;
 /// Mid- and far-tier blob.
 pub const FAR_BLOB: usize = 11;
-pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 16;
+pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1;
 pub const ENTITIES_HEADER: usize = 1 + 4 + 1 + 1;
 
 /// `SnapshotHeader::wait` when `ack_seq` was consumed by a stand-in, not a real input.
@@ -98,7 +99,7 @@ impl PacketFill {
 }
 
 pub fn encode_inputs(newest_seq: u32, newest_first: &[Input]) -> Vec<u8> {
-    let mut w = Writer::with_capacity(6 + newest_first.len() * 5);
+    let mut w = Writer::with_capacity(6 + newest_first.len() * 7);
     w.u8(MSG_INPUT);
     w.u32(newest_seq);
     w.u8(newest_first.len() as u8);
@@ -106,6 +107,7 @@ pub fn encode_inputs(newest_seq: u32, newest_first: &[Input]) -> Vec<u8> {
         w.u8(i.move_x as u8);
         w.u8(i.move_y as u8);
         w.u16(i.yaw);
+        w.u16(i.pitch as u16);
         w.u8(i.buttons);
     }
     w.into_inner()
@@ -123,7 +125,8 @@ pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input)) -> Result<(), D
         return Err(DecodeError::Invalid); // seq 0 is never a real input
     }
     for k in 0..n {
-        let input = Input { move_x: r.u8()? as i8, move_y: r.u8()? as i8, yaw: r.u16()?, buttons: r.u8()? };
+        let input =
+            Input { move_x: r.u8()? as i8, move_y: r.u8()? as i8, yaw: r.u16()?, pitch: r.u16()? as i16, buttons: r.u8()? };
         f(newest - k, input);
     }
     r.finish()
@@ -136,15 +139,18 @@ pub struct Welcome {
     /// The bot wanders within `radius` of `anchor` (scenario hotspot/blob center).
     pub anchor: [f32; 2],
     pub radius: f32,
+    /// The client builds the same world from it (`World::shared`).
+    pub world_seed: u64,
 }
 
 pub fn encode_welcome(m: &Welcome) -> Vec<u8> {
-    let mut w = Writer::with_capacity(23);
+    let mut w = Writer::with_capacity(31);
     w.u8(MSG_WELCOME);
     w.u16(m.entity);
     for v in [m.spawn[0], m.spawn[1], m.anchor[0], m.anchor[1], m.radius] {
         w.u32(v.to_bits());
     }
+    w.u64(m.world_seed);
     w.into_inner()
 }
 
@@ -180,9 +186,10 @@ pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
     w.u16(h.pace);
     w.u8(h.level);
     w.u8(h.client_level);
-    for v in [h.own.pos[0], h.own.pos[1], h.own.vel[0], h.own.vel[1]] {
+    for v in [h.own.pos[0], h.own.pos[1], h.own.vel[0], h.own.vel[1], h.own.z, h.own.vz] {
         w.u32(v.to_bits());
     }
+    w.u8(h.own.grounded as u8);
 }
 
 /// Starts an Entities message; append exactly `count` blobs of `tier` after it.
@@ -209,8 +216,9 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             let spawn = [read_f32(&mut r)?, read_f32(&mut r)?];
             let anchor = [read_f32(&mut r)?, read_f32(&mut r)?];
             let radius = read_f32(&mut r)?;
+            let world_seed = r.u64()?;
             r.finish()?;
-            Ok(ServerMsg::Welcome(Welcome { entity, spawn, anchor, radius }))
+            Ok(ServerMsg::Welcome(Welcome { entity, spawn, anchor, radius, world_seed }))
         }
         MSG_SNAPSHOT => {
             let server_tick = r.u32()?;
@@ -218,7 +226,15 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             let buffered = r.u8()?;
             let wait = r.u16()?;
             let (pace, level, client_level) = (r.u16()?, r.u8()?, r.u8()?);
-            let own = MoveState { pos: [read_f32(&mut r)?, read_f32(&mut r)?], vel: [read_f32(&mut r)?, read_f32(&mut r)?] };
+            let pos = [read_f32(&mut r)?, read_f32(&mut r)?];
+            let vel = [read_f32(&mut r)?, read_f32(&mut r)?];
+            let (z, vz) = (read_f32(&mut r)?, read_f32(&mut r)?);
+            let grounded = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(DecodeError::Invalid),
+            };
+            let own = MoveState { pos, vel, z, vz, grounded };
             r.finish()?;
             Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, ack_seq, buffered, wait, pace, level, client_level, own }))
         }
@@ -286,8 +302,8 @@ mod tests {
     #[test]
     fn inputs_roundtrip() {
         let ins = [
-            Input { move_x: -127, move_y: 5, yaw: 40000, buttons: 1 },
-            Input { move_x: 3, move_y: 127, yaw: 1, buttons: 0 },
+            Input { move_x: -127, move_y: 5, yaw: 40000, pitch: -32767, buttons: 3 },
+            Input { move_x: 3, move_y: 127, yaw: 1, pitch: 1200, buttons: 0 },
         ];
         let bytes = encode_inputs(10, &ins);
         let mut got = Vec::new();
@@ -299,7 +315,7 @@ mod tests {
 
     #[test]
     fn welcome_snapshot_and_entities_roundtrip() {
-        let w = Welcome { entity: 7, spawn: [1.5, 2.5], anchor: [4096.0, 4096.0], radius: 200.0 };
+        let w = Welcome { entity: 7, spawn: [1.5, 2.5], anchor: [4096.0, 4096.0], radius: 200.0, world_seed: u64::MAX - 3 };
         assert!(matches!(decode_server_msg(&encode_welcome(&w)), Ok(ServerMsg::Welcome(x)) if x == w));
 
         let h = SnapshotHeader {
@@ -310,7 +326,7 @@ mod tests {
             pace: 800,
             level: 7,
             client_level: 1,
-            own: MoveState { pos: [1.0, 2.0], vel: [-3.0, 0.125] },
+            own: MoveState { pos: [1.0, 2.0], vel: [-3.0, 0.125], z: 87.25, vz: -1.5, grounded: false },
         };
         let mut wr = Writer::default();
         write_snapshot(&mut wr, &h);

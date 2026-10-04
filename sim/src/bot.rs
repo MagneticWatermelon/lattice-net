@@ -5,7 +5,11 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::movement::{step, Input, MoveState, BUTTON_SPRINT};
+use std::sync::Arc;
+
+use lattice_game::world::World;
+
+use crate::movement::{step, Input, MoveState, BUTTON_JUMP, BUTTON_SPRINT};
 use crate::delta::{self, NearHistory, NearQ};
 use crate::interest::Tier;
 use crate::msg::{self, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
@@ -100,6 +104,8 @@ struct Predicted {
 pub struct BotBrain {
     rng: Rng,
     welcome: Option<Welcome>,
+    /// Built from the Welcome's seed (shared by every bot in the process).
+    world: Option<Arc<World>>,
     heading: f32,
     sprint: bool,
     seq: u32,
@@ -131,6 +137,7 @@ impl BotBrain {
             heading: rng.range(0.0, std::f32::consts::TAU),
             rng,
             welcome: None,
+            world: None,
             sprint: false,
             seq: 0,
             state: MoveState::default(),
@@ -222,7 +229,10 @@ impl BotBrain {
         }
         match msg::decode_server_msg(data) {
             Ok(ServerMsg::Welcome(w)) if self.welcome.is_none() => {
-                self.state = MoveState { pos: w.spawn, vel: [0.0; 2] };
+                let world = World::shared(w.world_seed);
+                // The server starts us exactly here too.
+                self.state = MoveState::standing(&world, w.spawn);
+                self.world = Some(world);
                 self.welcome = Some(w);
                 // Start with the spare already queued: at depth 1 every input
                 // arrives just in time and any jitter makes it late.
@@ -324,10 +334,11 @@ impl BotBrain {
 
         // Rebase on the server's state and replay everything it hasn't seen yet.
         let mut s = h.own;
+        let world = self.world.as_ref().expect("welcomed");
         self.history[h.ack_seq as usize % HISTORY].state = s;
         for seq in h.ack_seq + 1..=self.seq {
             let p = &mut self.history[seq as usize % HISTORY];
-            s = step(s, p.input);
+            s = step(world, s, p.input);
             p.state = s;
         }
         self.state = s;
@@ -347,7 +358,7 @@ impl BotBrain {
             self.clock -= 1.0;
             let input = self.think(&w);
             self.seq += 1;
-            self.state = step(self.state, input);
+            self.state = step(self.world.as_ref().expect("welcomed"), self.state, input);
             self.history[self.seq as usize % HISTORY] =
                 Predicted { seq: self.seq, input, state: self.state, sent_at: Some(now) };
             made += 1;
@@ -375,9 +386,11 @@ impl BotBrain {
         Some(msg::encode_inputs(self.seq, &batch[..n]))
     }
 
-    /// Random walk that stays within the scenario radius around the anchor.
+    /// Random walk that stays within the scenario radius around the anchor,
+    /// turning away when cover or a slope stops it, and jumping now and then.
     fn think(&mut self, w: &Welcome) -> Input {
-        if self.rng.chance(1.0 / 45.0) {
+        let stopped = self.state.grounded && self.state.vel[0] * self.state.vel[0] + self.state.vel[1] * self.state.vel[1] < 0.25;
+        if self.rng.chance(1.0 / 45.0) || (stopped && self.rng.chance(0.3)) {
             self.heading = self.rng.range(0.0, std::f32::consts::TAU);
             self.sprint = self.rng.chance(0.3);
         }
@@ -390,7 +403,8 @@ impl BotBrain {
             move_x: (cos * 127.0) as i8,
             move_y: (sin * 127.0) as i8,
             yaw: (self.heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16,
-            buttons: if self.sprint { BUTTON_SPRINT } else { 0 },
+            pitch: 0,
+            buttons: if self.sprint { BUTTON_SPRINT } else { 0 } | if self.rng.chance(1.0 / 90.0) { BUTTON_JUMP } else { 0 },
         }
     }
 }
