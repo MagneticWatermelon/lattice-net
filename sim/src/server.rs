@@ -39,6 +39,20 @@ pub type Datagram = (SocketAddr, Vec<u8>);
 /// An inbound datagram with its arrival time, as the receive thread saw it.
 pub type InDatagram = (SocketAddr, Instant, Vec<u8>);
 pub type PhaseTimes = [Duration; PHASES.len()];
+/// For a phase split by shard: its longest single task (the critical path)
+/// and the total of all its tasks. Zero for phases not split by shard.
+pub type Span = (Duration, Duration);
+pub type PhaseSpans = [Span; PHASES.len()];
+
+fn span(d: Duration) -> Span {
+    (d, d)
+}
+
+fn join_spans(a: Span, b: Span) -> Span {
+    (a.0.max(b.0), a.1 + b.1)
+}
+
+const NO_SPAN: Span = (Duration::ZERO, Duration::ZERO);
 
 /// Lag-compensation window: 200 ms.
 const HISTORY_TICKS: usize = (TICK_HZ as usize) / 5;
@@ -141,6 +155,9 @@ pub struct SimConfig {
     pub interest: InterestConfig,
     /// Transport shards. More than the thread count lets rayon balance them.
     pub shards: usize,
+    /// Receiving sockets (`SO_REUSEPORT`), each owning an equal run of the
+    /// shards (see `lattice_net::Router`). `shards` must divide evenly.
+    pub socket_groups: usize,
     /// Allocate `max_clients` connections at startup so accepts reuse them.
     pub preallocate: bool,
     pub ladder: LadderConfig,
@@ -159,6 +176,7 @@ impl Default for SimConfig {
             spawn: SpawnMode::Uniform,
             interest: InterestConfig::default(),
             shards: 64,
+            socket_groups: 1,
             preallocate: false,
             ladder: LadderConfig::default(),
             seed: 1,
@@ -425,12 +443,15 @@ pub struct SimServer {
     /// Debug map: the entity whose client to watch, and the last capture.
     watch: Option<u16>,
     debug: Option<DebugFrame>,
+    /// The last tick's per-shard task spans (see `tasks`).
+    spans: PhaseSpans,
 }
 
 impl SimServer {
     pub fn new(cfg: SimConfig, now: Instant) -> Self {
         assert!(cfg.max_clients <= u16::MAX as usize, "entity ids are u16");
-        let mut net = Server::with_shards(cfg.net.clone(), &cfg.identity, cfg.max_clients, cfg.shards, now);
+        let mut net =
+            Server::with_socket_groups(cfg.net.clone(), &cfg.identity, cfg.max_clients, cfg.shards, cfg.socket_groups, now);
         if cfg.preallocate {
             net.preallocate(cfg.max_clients);
         }
@@ -466,6 +487,7 @@ impl SimServer {
             interest,
             watch: None,
             debug: None,
+            spans: [NO_SPAN; PHASES.len()],
         }
     }
 
@@ -476,6 +498,13 @@ impl SimServer {
     }
 
     /// The latest capture, if one was taken since the last call.
+    /// For the last tick's phases split by shard (ingress, assembly, transport):
+    /// the longest shard task and the total of all of them. With the phase's
+    /// wall time this separates serial work, imbalance and dispatch overhead.
+    pub fn tasks(&self) -> &PhaseSpans {
+        &self.spans
+    }
+
     pub fn take_debug_frame(&mut self) -> Option<DebugFrame> {
         self.debug.take()
     }
@@ -588,12 +617,15 @@ impl SimServer {
         // 1. ingress: the per-packet transport work, one task per shard
         // (wall-clock time only matters for connect-token expiry)
         let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        self.net
+        self.spans = [NO_SPAN; PHASES.len()];
+        self.spans[0] = self
+            .net
             .shards_mut()
             .par_iter_mut()
             .zip(inbound.par_iter_mut())
             .zip(self.shard_events.par_iter_mut())
-            .for_each(|((shard, bucket), events)| {
+            .map(|((shard, bucket), events)| {
+                let t0 = Instant::now();
                 for (from, arrived, data) in bucket.drain(..) {
                     shard.receive(from, &data, arrived);
                     while let Some(ev) = shard.poll_event() {
@@ -604,7 +636,9 @@ impl SimServer {
                 while let Some(ev) = shard.poll_event() {
                     events.push((now, ev));
                 }
-            });
+                span(t0.elapsed())
+            })
+            .reduce(|| NO_SPAN, join_spans);
         lap(0);
 
         // 1b. events: these touch the world, so they're applied on one thread
@@ -717,12 +751,14 @@ impl SimServer {
             max_message,
             packet_body,
         };
-        self.shard_clients
+        self.spans[6] = self
+            .shard_clients
             .par_iter_mut()
             .zip(self.snapshots.par_iter_mut())
             .zip(self.scratch.par_iter_mut())
             .zip(self.net.shards_mut().par_iter_mut())
-            .for_each(|(((clients, snaps), scratch), shard)| {
+            .map(|(((clients, snaps), scratch), shard)| {
+                let t0 = Instant::now();
                 scratch.tally = Tally::default();
                 if scratch.stamp.len() < view.bodies.len() {
                     scratch.stamp.resize(view.bodies.len(), 0);
@@ -733,7 +769,9 @@ impl SimServer {
                     shard.take_acked(slot.client, &mut scratch.acked);
                     view.assemble(slot, scratch, snaps);
                 }
-            });
+                span(t0.elapsed())
+            })
+            .reduce(|| NO_SPAN, join_spans);
         if let Some(watched) = self.scratch.iter_mut().find_map(|sc| sc.watched.take()) {
             let rung = self.ladder.rung();
             self.debug = Some(DebugFrame {
@@ -766,12 +804,14 @@ impl SimServer {
         lap(6);
 
         // 8b. transport: queue, frame, ack and checksum, one task per shard
-        self.net
+        self.spans[7] = self
+            .net
             .shards_mut()
             .par_iter_mut()
             .zip(self.snapshots.par_iter_mut())
             .zip(out.par_iter_mut())
-            .for_each(|((shard, snaps), out)| {
+            .map(|((shard, snaps), out)| {
+                let t0 = Instant::now();
                 for (client, snap, tag) in snaps.drain(..) {
                     let _ = match tag {
                         Some(tag) => shard.send_tagged(client, snap, tag),
@@ -780,7 +820,9 @@ impl SimServer {
                 }
                 shard.flush(now);
                 out.extend(shard.drain_outgoing());
-            });
+                span(t0.elapsed())
+            })
+            .reduce(|| NO_SPAN, join_spans);
         lap(7);
 
         self.tick = self.tick.wrapping_add(1);

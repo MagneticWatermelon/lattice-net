@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 lattice-net = { path = ".." }
 rayon = "1"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] } # all: SO_REUSEPORT
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

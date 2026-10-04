@@ -738,3 +738,54 @@ fn forged_packets_from_a_clients_address_are_ignored() {
     run(&mut server, &mut [(addr, &mut c)], &mut t, 5);
     assert_eq!((c.state(), server.client_count()), (ClientState::Connected, 1));
 }
+
+#[test]
+fn socket_groups_keep_each_client_in_its_sockets_shards() {
+    let cfg = Config::default();
+    let server_addr: SocketAddr = SERVER.parse().unwrap();
+    let mut t = Instant::now();
+    // 3 receiving sockets, 2 shards each. Client i's datagrams always arrive
+    // on socket i % 3, as SO_REUSEPORT's stable 4-tuple hash would deliver them.
+    let mut server = Server::with_socket_groups(cfg.clone(), &identity(), 100, 6, 3, t);
+    let router = server.router();
+    let mut clients: Vec<(SocketAddr, usize, Client)> = (0..30)
+        .map(|i| (client_addr(i), i % 3, Client::new(cfg.clone(), server_addr, token(&cfg, i as u64), t)))
+        .collect();
+    let mut got = 0;
+    for step in 0..40 {
+        t += TICK;
+        for (addr, group, c) in clients.iter_mut() {
+            c.update(t);
+            if step == 20 {
+                c.send(Channel::Reliable, b"hi".to_vec()).unwrap();
+            }
+            c.flush(t);
+            for p in c.drain_outgoing() {
+                server.receive_in(*group, *addr, &p, t);
+            }
+        }
+        while let Some(e) = server.poll_event() {
+            if let ServerEvent::Message { client, data, .. } = e {
+                assert_eq!(data, b"hi");
+                server.send(client, Channel::Reliable, b"back".to_vec()).unwrap();
+                got += 1;
+            }
+        }
+        server.update(t, unix());
+        server.flush(t);
+        let out: Vec<_> = server.drain_outgoing().collect();
+        for (to, p) in out {
+            if let Some((_, _, c)) = clients.iter_mut().find(|(a, _, _)| *a == to) {
+                c.receive(server_addr, &p, t);
+            }
+        }
+    }
+    assert_eq!(got, 30, "every client's message reached the server");
+    for (addr, group, c) in &mut clients {
+        let id = c.client_id().expect("connected");
+        let shard = server.shard_of_client(id);
+        assert_eq!(router.group_of(shard), *group, "{addr} is served by its socket's shards");
+        assert_eq!(router.shard_in(*group, addr), shard);
+        assert_eq!(c.recv(), Some((Channel::Reliable, b"back".to_vec())));
+    }
+}

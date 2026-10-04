@@ -66,26 +66,47 @@ pub enum ServerEvent {
 /// Cookies are valid for the current and previous bucket (10-20 s).
 const COOKIE_BUCKET_SECS: u64 = 10;
 
-/// Maps a peer address to its shard. Cheap to clone; hand one to the thread
+/// Maps a peer address to its shard. Cheap to clone; hand one to each thread
 /// that receives datagrams so it can bucket them per shard.
+///
+/// With several receiving sockets (`SO_REUSEPORT`), the kernel picks the
+/// socket by hashing the 4-tuple, and that choice is stable while the socket
+/// set is. So the shards are split into one equal run (group) per socket: the
+/// socket that receives a peer's datagrams decides the group, and the keyed
+/// hash picks the shard within it. No receive thread ever hands a datagram to
+/// another socket's shards.
 #[derive(Clone)]
 pub struct Router {
     /// Keyed, so remote peers can't aim many addresses at one shard.
     key: RandomState,
     shards: u32,
+    groups: u32,
 }
 
 impl Router {
+    /// The shard for `addr` with a single receiving socket (group 0).
     pub fn shard(&self, addr: &SocketAddr) -> usize {
-        if self.shards == 1 {
-            0
-        } else {
-            (self.key.hash_one(addr) % self.shards as u64) as usize
-        }
+        self.shard_in(0, addr)
+    }
+
+    /// The shard for `addr` when its datagrams arrive on socket `group`.
+    pub fn shard_in(&self, group: usize, addr: &SocketAddr) -> usize {
+        let per = (self.shards / self.groups) as usize;
+        let within = if per == 1 { 0 } else { (self.key.hash_one(addr) % per as u64) as usize };
+        group * per + within
+    }
+
+    /// The socket group (receiving socket) a shard belongs to.
+    pub fn group_of(&self, shard: usize) -> usize {
+        shard / (self.shards / self.groups) as usize
     }
 
     pub fn shard_count(&self) -> usize {
         self.shards as usize
+    }
+
+    pub fn group_count(&self) -> usize {
+        self.groups as usize
     }
 }
 
@@ -407,7 +428,8 @@ impl Shard {
     }
 
     fn owns(&self, addr: &SocketAddr) -> bool {
-        self.shared.router.shard(addr) == self.index as usize
+        let r = &self.shared.router;
+        r.shard_in(r.group_of(self.index as usize), addr) == self.index as usize
     }
 
     fn remove(&mut self, id: ClientId, reason: DisconnectReason, notify: bool) {
@@ -455,7 +477,22 @@ impl Server {
     /// `shards` independent partitions of the connections. More shards than
     /// threads lets a work-stealing pool balance uneven shards.
     pub fn with_shards(cfg: Config, identity: &ServerIdentity, max_clients: usize, shards: usize, now: Instant) -> Self {
+        Self::with_socket_groups(cfg, identity, max_clients, shards, 1, now)
+    }
+
+    /// Shards split into `groups` equal runs, one per receiving socket (see
+    /// `Router`): route each datagram with `Router::shard_in(socket, from)`,
+    /// or `receive_in`, and send each shard's datagrams from its group's socket.
+    pub fn with_socket_groups(
+        cfg: Config,
+        identity: &ServerIdentity,
+        max_clients: usize,
+        shards: usize,
+        groups: usize,
+        now: Instant,
+    ) -> Self {
         assert!((1..=u16::MAX as usize).contains(&shards), "shards must be 1..=65535");
+        assert!(groups >= 1 && shards.is_multiple_of(groups), "shards must split evenly into socket groups");
         let accept_budget = match cfg.max_accepts_per_tick {
             0 => usize::MAX,
             n => n.div_ceil(shards),
@@ -468,7 +505,7 @@ impl Server {
             max_clients,
             cookie_key: RandomState::new(),
             epoch: now,
-            router: Router { key: RandomState::new(), shards: shards as u32 },
+            router: Router { key: RandomState::new(), shards: shards as u32, groups: groups as u32 },
             clients: AtomicUsize::new(0),
         });
         let shards = (0..shards as u32)
@@ -523,8 +560,14 @@ impl Server {
         client as usize % self.shards.len()
     }
 
+    /// A datagram from the single receiving socket (group 0).
     pub fn receive(&mut self, from: SocketAddr, data: &[u8], now: Instant) {
-        let s = self.shared.router.shard(&from);
+        self.receive_in(0, from, data, now);
+    }
+
+    /// A datagram that arrived on socket `group` (see `with_socket_groups`).
+    pub fn receive_in(&mut self, group: usize, from: SocketAddr, data: &[u8], now: Instant) {
+        let s = self.shared.router.shard_in(group, &from);
         self.shards[s].receive(from, data, now);
     }
 

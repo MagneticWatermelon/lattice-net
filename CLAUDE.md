@@ -40,7 +40,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   2. per-connection bandwidth budget (token bucket)
   3. fragmentation for >1.2 KB messages
   4. serialize-once fan-out without copying bodies
-  5. syscall batching: `recvmmsg`, then `SO_REUSEPORT` (still the biggest phase at 10k)
+  5. syscall batching: `recvmmsg` (`SO_REUSEPORT` socket groups are built)
 - **Done:**
   - **Connect tokens and sealed packets (protocol `LATTICE3`).**
     - **Tokens:** netcode.io-style (`token.rs`). ChaCha20-Poly1305 under a key the login service shares with the servers, holding the user id, both connection keys and 32 B of user data. Server id and expiry are clear associated data.
@@ -101,10 +101,14 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - The pile cost is the quadratic nearest-player search (`select_nth_unstable` 46% of CPU with 32 m cells), and the ladder can't cut it. Candidate fix: a finer grid where it's dense.
   - 256 shards don't help.
   - netem at 10k was invalid: netem on the server's interface throttled egress. Shape on the bot box only (egress + `ifb` ingress).
+  - **Built since** (2026-10-04, not yet measured on bare metal):
+    - netem shapes the bot box only (egress + `ifb` ingress);
+    - `--threads` defaults to physical cores;
+    - a per-phase breakdown (wall vs longest shard task vs work ÷ threads);
+    - `SO_REUSEPORT` socket groups (`Server::with_socket_groups`, `lattice-server --sockets N`).
   - **Next:**
-    - fix the netem placement;
-    - `SO_REUSEPORT` + physical-core default;
-    - dense-crowd near search;
+    - a short bare-metal session to measure these (`--sockets` 1/4/8/16 at 10k, and netem at 10k);
+    - the nearest-player search: a better algorithm, not a finer grid (decided 2026-10-04);
     - then M3 with a CPU budget.
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.

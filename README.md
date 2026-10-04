@@ -102,7 +102,12 @@ RustCrypto's `chacha20poly1305` was tried first: 0.43 and 1.26 µs even with AVX
 
 ## Sharding
 
-`Server::with_shards(cfg, max_clients, n, now)` partitions connections into `n` independent `Shard`s. The crate still spawns no threads: the caller drives the shards from its own pool.
+`Server::with_shards(cfg, identity, max_clients, n, now)` partitions connections into `n` independent `Shard`s. The crate still spawns no threads: the caller drives the shards from its own pool.
+
+**Socket groups.** `Server::with_socket_groups(.., shards, groups, now)` is for several receiving sockets on one port (`SO_REUSEPORT`).
+- The kernel picks each datagram's socket by hashing the 4-tuple, and keeps that choice while the socket set is fixed.
+- So the shards are split into one equal run per socket. The receiving socket decides the run, and the keyed hash picks the shard within it: `Router::shard_in(socket, from)`, or `Server::receive_in`.
+- No receive thread hands datagrams to another socket's shards. Each shard sends from its own group's socket, which spreads sends over the NIC's transmit queues instead of one.
 
 - **Routing.** `Router::shard(addr)` is a keyed hash of the peer address. A given address always lands in the same shard, so the "already connected?" check never leaves the shard. The key is random per server, so remote peers can't aim many addresses at one shard. Hand a cloned `Router` to the receive thread so it buckets datagrams per shard.
 - **Ids encode their shard.** `id % n == shard`, so `send`, `stats` and `disconnect` for an id need no lookup table.
@@ -164,7 +169,7 @@ The simulated link does loss, duplication, and base delay + jitter (which causes
 4. **Serialize-once fan-out.** Right now `flush` copies the body into the packet. For 10k clients, write headers in place and assemble per-client packets from shared, pre-encoded entity blobs.
 5. **Syscall batching.** `sendmmsg` egress is done in the sim server (10k: 10.8 → 8.3 ms p50 on WSL). Still to do:
     - **`recvmmsg`.**
-    - **`SO_REUSEPORT` with N network threads.** The kernel, not our keyed hash, picks the socket by hashing the 4-tuple. So at handshake time, take the shard from the socket that received the request: socket k owns a fixed group of shards, the keyed hash picks one within the group, and the client id encodes it. The kernel's hash is stable while the socket set is fixed, so no receive thread ever re-buckets. `SO_ATTACH_REUSEPORT_CBPF` is the fallback if exact control is needed.
+    - **`SO_REUSEPORT` socket groups: built** (see Sharding; `lattice-server --sockets N`). `SO_ATTACH_REUSEPORT_CBPF` is the fallback if exact control over the kernel's choice is ever needed.
     - **`UDP_SEGMENT` GSO is done** in the sim server (`--egress gso`): each client's padded packets go out as one `sendmmsg` entry. In the 3,000-player blob (2 packets per client-tick), egress falls ~25% on WSL for ~0.3% more bytes. Clients with one packet per tick gain nothing.
 
     Hand datagrams to the sim via SPSC rings. Move to AF_XDP only if pps becomes the bottleneck. Do the deep egress tuning on bare metal, since WSL's syscall and vswitch overhead distorts it. Because the protocol is sans-IO, none of this touches protocol code.

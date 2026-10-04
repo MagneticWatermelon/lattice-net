@@ -102,6 +102,14 @@ Stand-ins can exceed bot corrections: a stand-in whose input matches what the bo
 - **Input wait**: from an input's datagram arriving (stamped by the receive thread) to the tick that applies it.
 - **The ladder**: level, tick rate, dilation and pace per window, the share of clients degraded by their own bandwidth ladder, and ticks spent at each level.
 
+**Threads and sockets:**
+- `--threads` defaults to one per physical core; SMT siblings only add scheduler overhead.
+- `--sockets N` opens N receiving sockets on the port (`SO_REUSEPORT`). Each has its own receive thread and an equal run of the shards, and each shard sends from its group's socket.
+
+**Phase breakdown:**
+- For the phases split by shard (ingress, assembly, transport, egress), the server records the longest shard task and the total work each tick.
+- `summary.md`'s "Phase breakdown" table compares each phase's wall time with what perfect scheduling would take, max(longest task, work ÷ threads). The difference is dispatch, waiting and imbalance.
+
 With `--summary PATH`, the server and the bots also write their end-of-run results as `key=value` lines. The server's cover the steady state: phase times, ladder levels, pps, bytes per client-tick, stand-ins and kernel drops. `scripts/m1.sh` passes it, and `scripts/baseline.sh` reads it.
 
 The server preallocates `max-clients` connections at startup (`--no-prealloc` to skip). Egress uses `sendmmsg` on Linux (`--egress sendto` for comparison). `--egress gso` sends each client's packets for the tick as one `UDP_SEGMENT` send, and the summary counts datagrams, sends and syscalls.
@@ -246,7 +254,7 @@ Tick times in ms; two runs each, and they agree within ~0.5 ms.
 `scripts/baseline.sh netem <name>` runs uniform 1k and a 1k blob under six links, 60 s each.
 - **Locally it needs no root.** It reruns itself in a private network namespace (`unshare -rn`) and puts netem on that namespace's loopback, which delays each direction once. Nothing outside the namespace is shaped.
 - **netem's queue limit is raised.** The default 1,000 packets would drop on its own at these rates.
-- **With `BOTS_SSH`,** netem goes on both machines' interfaces between them instead (`sudo tc`). **Don't use that at 10k:** netem's single locked queue on the server's interface throttles the server's sends. It needs changing to shape the bot box only (see Limits above).
+- **With `BOTS_SSH`,** only the bot machine is shaped (`sudo tc`): netem on its egress delays bots → server, and its ingress is redirected through an `ifb` device with the same netem for server → bots. Never shape the server: at 10k a netem queue on its own interface throttled its sends (see Limits above).
 
 This measures behavior, not capacity, so WSL is fine for it. The blob rows match the uniform ones. Times in ms.
 

@@ -17,8 +17,10 @@
 #           latency, jitter and loss. Locally it runs in a private network
 #           namespace (unshare -rn: no sudo, nothing else on the machine is
 #           shaped) with netem on its loopback, which delays each direction once;
-#           with BOTS_SSH, netem goes on both machines' interfaces between them
-#           (sudo tc).
+#           with BOTS_SSH, only the bot machine is shaped (sudo tc): netem on its
+#           egress delays bots -> server, and its ingress is redirected through
+#           an ifb device with the same netem for server -> bots. Never on the
+#           server: at 10k a netem queue on its interface throttled its sends.
 #           NETEM_BOTS=10000 runs it at full load instead of 1k.
 #   netem-quick   one short run on the typical profile: checks the harness
 #
@@ -30,7 +32,8 @@
 # Server and bots share this machine and talk over loopback, like scripts/m1.sh,
 # unless BOTS_SSH names a second machine (see Two machines below).
 # Env: REPEAT, PORT (40500), PROFILE=1 (perf profiles of the first 10k and GSO
-# blob runs), FORCE=1 (run despite failed checks), SERVER_THREADS, BOT_THREADS.
+# blob runs), FORCE=1 (run despite failed checks), SERVER_THREADS, BOT_THREADS,
+# SERVER_ARGS (extra lattice-server flags for every run, e.g. "--sockets 8").
 #
 # Two machines: BOTS_SSH=user@host runs the bots there (from ~/lattice-net,
 # built), SERVER_IP=<this machine's address on the link between them> is where
@@ -140,19 +143,28 @@ cargo build --release -q -p lattice-sim
 # Its queue limit is raised: the default 1,000 packets would itself drop at
 # these rates (packets per second x the delay).
 if [ -n "$remote" ]; then
-  srv_dev=$(ip -o route get "${remote#*@}" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}')
   bot_dev=$(ssh -o BatchMode=yes "$remote" "ip -o route get $server_ip" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}')
 fi
 netem() { # "" (clean) or netem arguments
   local args="$1"
   if [ -n "$remote" ]; then
-    if [ -z "$args" ]; then
-      sudo tc qdisc del dev "$srv_dev" root 2> /dev/null || true
-      ssh -o BatchMode=yes "$remote" "sudo tc qdisc del dev $bot_dev root 2> /dev/null || true"
-    else
-      sudo tc qdisc replace dev "$srv_dev" root netem limit 1000000 $args
-      ssh -o BatchMode=yes "$remote" "sudo tc qdisc replace dev $bot_dev root netem limit 1000000 $args"
-    fi
+    # The bot machine only: egress for bots -> server, ingress via ifb0 for
+    # server -> bots.
+    ssh -o BatchMode=yes "$remote" "sudo bash -s" << EOF
+tc qdisc del dev $bot_dev root 2> /dev/null
+tc qdisc del dev $bot_dev ingress 2> /dev/null
+tc qdisc del dev ifb0 root 2> /dev/null
+if [ -n "$args" ]; then
+  set -e
+  modprobe ifb numifbs=1
+  ip link set ifb0 up
+  tc qdisc add dev $bot_dev root netem limit 1000000 $args
+  tc qdisc add dev $bot_dev handle ffff: ingress
+  tc filter add dev $bot_dev parent ffff: protocol all prio 1 u32 match u32 0 0 action mirred egress redirect dev ifb0
+  tc qdisc add dev ifb0 root netem limit 1000000 $args
+fi
+true
+EOF
   elif [ -n "${LATTICE_NETNS:-}" ]; then
     if [ -z "$args" ]; then
       tc qdisc del dev lo root 2> /dev/null || true
@@ -170,8 +182,9 @@ trap clear_netem EXIT
 
 cores=$(nproc)
 if [ -n "$remote" ]; then
-  # Alone on the machine: the server takes all of it, the bots half of theirs.
-  server_threads=${SERVER_THREADS:-$cores}
+  # Alone on the machine: the server takes a thread per physical core (SMT
+  # siblings only add overhead), the bots half of their machine's threads.
+  server_threads=${SERVER_THREADS:-$(lscpu -p=core,socket | grep -v '^#' | sort -u | wc -l)}
   bot_threads=${BOT_THREADS:-$(( $(ssh -o BatchMode=yes "$remote" nproc) / 2 ))}
 else
   server_threads=${SERVER_THREADS:-$(( cores / 2 ))}
@@ -204,7 +217,7 @@ for r in $(seq 1 "$repeat"); do
     # shellcheck disable=SC2086 # $key_args is empty or a flag and its value
     if ! OUT=$out PROFILE=$profile PROFILE_DELAY=$profile_delay SERVER_THREADS=$server_threads BOT_THREADS=$bot_threads \
       BOTS_SSH=$remote BOT_ARGS="--server $server_ip:$port $key_args $ramp_args ${BOT_ARGS:-}" \
-      scripts/m1.sh "$scenario" "$count" "$run_secs" --bind "$server_ip:$port" $key_args $extra > "$out/console.log" 2>&1; then
+      scripts/m1.sh "$scenario" "$count" "$run_secs" --bind "$server_ip:$port" $key_args $extra ${SERVER_ARGS:-} > "$out/console.log" 2>&1; then
       echo "  failed: see $out/console.log"
     fi
     sleep 2 # let the last datagrams and sockets drain
@@ -263,6 +276,30 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
       printf '| %s #%s |' "$id" "$r"
       for p in "${phases[@]}"; do printf ' %s / %s |' "$(kv "$s" "${p}_p50_ms")" "$(kv "$s" "${p}_p99_ms")"; done
       echo
+    done
+  done
+  echo
+  echo "## Phase breakdown (p50)"
+  echo
+  echo "For each phase split by shard: **wall / longest shard task / total work ÷ threads**, in ms. With perfect scheduling a phase would take max(longest, work ÷ threads); **overhead** sums wall minus that over the four phases (rayon dispatch, waiting, imbalance). Serial is events + grid + history, which run on one thread."
+  echo
+  echo "| run | threads | tick | ingress | assembly | transport | egress | overhead | serial |"
+  echo "|---|---|---|---|---|---|---|---|---|"
+  for r in $(seq 1 "$repeat"); do
+    for spec in "${runs[@]}"; do
+      IFS='|' read -r id _ _ _ _ <<< "$spec"
+      s=$dir/$id-$r/server.summary
+      [ -f "$s" ] || continue
+      th=$(kv "$s" threads)
+      cell() { awk -v w="$(kv "$s" "${1}_p50_ms")" -v l="$(kv "$s" "${1}_longest_p50_ms")" -v k="$(kv "$s" "${1}_work_p50_ms")" -v t="$th" \
+        'BEGIN {if (l == "-") print w; else printf "%s / %s / %.2f", w, l, k / t}'; }
+      serial=$(awk -v a="$(kv "$s" events_p50_ms)" -v b="$(kv "$s" grid_p50_ms)" -v c="$(kv "$s" history_p50_ms)" 'BEGIN {printf "%.2f", a + b + c}')
+      over=0
+      for p in ingress assembly transport egress; do
+        over=$(awk -v o="$over" -v w="$(kv "$s" "${p}_p50_ms")" -v l="$(kv "$s" "${p}_longest_p50_ms")" -v k="$(kv "$s" "${p}_work_p50_ms")" -v t="$th" \
+          'BEGIN {if (l == "-") {print o; exit} i = (l > k / t) ? l : k / t; printf "%.2f", o + w - i}')
+      done
+      echo "| $id #$r | $th | $(kv "$s" tick_p50_ms) | $(cell ingress) | $(cell assembly) | $(cell transport) | $(cell egress) | $over | $serial |"
     done
   done
   echo

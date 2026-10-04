@@ -40,8 +40,12 @@ lattice-server: M1 movement-only authoritative server
   --ladder on|off      degrade under load: radii, rates, 20 Hz, dilation [on]
   --ladder-high F      step down when the p90 of work/period exceeds this [0.85]
   --ladder-low F       step up after 3 s with work/period below this [0.6]
-  --threads N          rayon threads [all cores]
+  --threads N          rayon threads [one per physical core: SMT siblings only add
+                       scheduler overhead (on 64 cores, 128 threads ran slower than 64)]
   --shards N           transport shards [64]
+  --sockets N          receiving sockets on the port (SO_REUSEPORT), each with its own receive
+                       thread and an equal run of the shards; each shard sends from its
+                       group's socket. N must divide --shards (Linux) [1]
   --accepts-per-tick N new connections accepted per tick, server-wide (0 = no limit) [256]
   --no-prealloc        allocate connections on accept instead of pooling max-clients at startup
   --egress MODE        gso | sendmmsg | sendto   [sendmmsg on Linux, else sendto]
@@ -336,6 +340,7 @@ fn main() -> std::io::Result<()> {
             }
         },
         shards: a.get("shards", 64),
+        socket_groups: a.get("sockets", 1),
         preallocate: !a.flag("no-prealloc"),
         ladder: {
             let d = LadderConfig::default();
@@ -357,7 +362,7 @@ fn main() -> std::io::Result<()> {
             ..SimConfig::default().net
         },
     };
-    let threads: Option<usize> = a.opt("threads");
+    let threads: usize = a.get("threads", physical_cores());
     let duration = Duration::from_secs_f64(a.get("duration", 0.0));
     let until_empty = a.flag("until-empty");
     let report = Duration::from_secs_f64(a.get("report", 5.0));
@@ -367,23 +372,35 @@ fn main() -> std::io::Result<()> {
     let debug_http: Option<SocketAddr> = a.opt("debug-http");
     a.finish();
 
-    if let Some(n) = threads {
-        rayon::ThreadPoolBuilder::new().num_threads(n).build_global().expect("rayon pool");
-    }
+    rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().expect("rayon pool");
 
-    let sock = Socket::new(Domain::for_address(bind), Type::DGRAM, Some(Protocol::UDP))?;
-    // Capped by net.core.{r,w}mem_max; raise those for big runs.
-    sock.set_recv_buffer_size(16 << 20)?;
-    sock.set_send_buffer_size(16 << 20)?;
-    sock.bind(&bind.into())?;
-    let (rcvbuf, sndbuf) = (sock.recv_buffer_size()?, sock.send_buffer_size()?);
-    let sock: UdpSocket = sock.into();
-    #[cfg(target_os = "linux")]
-    if egress == Egress::Gso && !gso_supported(&sock) {
-        return Err(std::io::Error::other("--egress gso: this kernel has no UDP_SEGMENT (needs Linux 4.18+)"));
+    let groups = cfg.socket_groups;
+    if groups == 0 || !cfg.shards.is_multiple_of(groups) {
+        return Err(std::io::Error::other(format!("--sockets {groups} must divide --shards {}", cfg.shards)));
     }
-    sock.set_read_timeout(Some(Duration::from_millis(50)))?;
-    let sock = Arc::new(sock);
+    let mut socks = Vec::with_capacity(groups);
+    let (mut rcvbuf, mut sndbuf) = (0, 0);
+    for _ in 0..groups {
+        let sock = Socket::new(Domain::for_address(bind), Type::DGRAM, Some(Protocol::UDP))?;
+        // Capped by net.core.{r,w}mem_max; raise those for big runs.
+        sock.set_recv_buffer_size(16 << 20)?;
+        sock.set_send_buffer_size(16 << 20)?;
+        if groups > 1 {
+            #[cfg(unix)]
+            sock.set_reuse_port(true)?;
+            #[cfg(not(unix))]
+            return Err(std::io::Error::other("--sockets above 1 needs SO_REUSEPORT (Unix)"));
+        }
+        sock.bind(&bind.into())?;
+        (rcvbuf, sndbuf) = (sock.recv_buffer_size()?, sock.send_buffer_size()?);
+        let sock: UdpSocket = sock.into();
+        #[cfg(target_os = "linux")]
+        if egress == Egress::Gso && !gso_supported(&sock) {
+            return Err(std::io::Error::other("--egress gso: this kernel has no UDP_SEGMENT (needs Linux 4.18+)"));
+        }
+        sock.set_read_timeout(Some(Duration::from_millis(50)))?;
+        socks.push(Arc::new(sock));
+    }
 
     let t0 = Instant::now();
     let mut sim = SimServer::new(cfg.clone(), t0);
@@ -394,7 +411,7 @@ fn main() -> std::io::Result<()> {
     let start = Instant::now();
 
     println!(
-        "listening on {bind} | spawn {:?} | tiers near {}@{} m, mid {} m, far {} m, budget {} B/tick, squads of {} | {} rayon threads, {shards} shards, {} accepts/tick, egress {egress:?} | socket buffers rcv {} KiB snd {} KiB",
+        "listening on {bind} | spawn {:?} | tiers near {}@{} m, mid {} m, far {} m, budget {} B/tick, squads of {} | {} rayon threads, {shards} shards, {groups} socket(s), {} accepts/tick, egress {egress:?} | socket buffers rcv {} KiB snd {} KiB",
         cfg.spawn,
         cfg.interest.near_per_tick,
         cfg.interest.near_radius,
@@ -412,12 +429,17 @@ fn main() -> std::io::Result<()> {
     }
 
     let net = Arc::new(NetCounters::default());
-    let inbox: Arc<Mutex<Vec<Vec<InDatagram>>>> = Arc::new(Mutex::new(vec![Vec::new(); shards]));
+    // One receive thread and inbox per socket: a socket's datagrams only ever
+    // go to its own group of shards, so the threads share no lock.
+    let per_group = shards / groups;
+    let inboxes: Vec<Arc<Mutex<Vec<Vec<InDatagram>>>>> =
+        (0..groups).map(|_| Arc::new(Mutex::new(vec![Vec::new(); per_group]))).collect();
     let stop = Arc::new(AtomicBool::new(false));
-    let receiver = {
-        let (sock, net, inbox, stop) = (sock.clone(), net.clone(), inbox.clone(), stop.clone());
+    let mut receivers = Vec::with_capacity(groups);
+    for (group, sock) in socks.iter().enumerate() {
+        let (sock, net, inbox, stop) = (sock.clone(), net.clone(), inboxes[group].clone(), stop.clone());
         let router = sim.router();
-        std::thread::Builder::new().name("ingress".into()).spawn(move || {
+        receivers.push(std::thread::Builder::new().name(format!("ingress-{group}")).spawn(move || {
             let mut buf = [0u8; 1500];
             while !stop.load(Relaxed) {
                 match sock.recv_from(&mut buf) {
@@ -427,7 +449,7 @@ fn main() -> std::io::Result<()> {
                         let arrived = Instant::now();
                         net.in_pkts.fetch_add(1, Relaxed);
                         net.in_bytes.fetch_add(n as u64, Relaxed);
-                        let shard = router.shard(&from);
+                        let shard = router.shard_in(group, &from) - group * per_group;
                         inbox.lock().unwrap()[shard].push((from, arrived, buf[..n].to_vec()));
                     }
                     Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
@@ -436,8 +458,8 @@ fn main() -> std::io::Result<()> {
                     }
                 }
             }
-        })?
-    };
+        })?);
+    }
 
     let mut csv = csv_path.map(open_csv).transpose()?;
     let debug_map = match debug_http {
@@ -455,6 +477,9 @@ fn main() -> std::io::Result<()> {
     let mut out: Vec<Vec<Datagram>> = vec![Vec::new(); shards];
     let mut window = Window::new(start, &sim, &net);
     let mut kept: Vec<Row> = Vec::new();
+    // Per steady tick, for ingress, assembly, transport and egress: the longest
+    // shard task and the total of all tasks, in microseconds.
+    let mut kept_spans: Vec<[[u32; 2]; 4]> = Vec::new();
     let mut first_client: Option<Instant> = None;
     // Counters as of the end of warmup, so the summary can separate the join burst.
     let mut warm: Option<Counters> = None;
@@ -467,7 +492,12 @@ fn main() -> std::io::Result<()> {
 
     loop {
         let now = Instant::now();
-        std::mem::swap(&mut inbound, &mut *inbox.lock().unwrap());
+        for (group, inbox) in inboxes.iter().enumerate() {
+            let mut inbox = inbox.lock().unwrap();
+            for (bucket, held) in inbound[group * per_group..].iter_mut().zip(inbox.iter_mut()) {
+                std::mem::swap(bucket, held);
+            }
+        }
 
         if let Some(map) = &debug_map {
             // Fall back when the chosen client left (or nobody was chosen).
@@ -484,20 +514,27 @@ fn main() -> std::io::Result<()> {
         }
 
         let t_egress = Instant::now();
-        let (pkts, bytes) = out
+        let (pkts, bytes, egress_span) = out
             .par_iter_mut()
-            .map(|bucket| {
+            .enumerate()
+            .map(|(shard, bucket)| {
+                let t0 = Instant::now();
+                let sock = &socks[shard / per_group];
                 let (n, bytes) = (bucket.len(), bucket.iter().map(|(_, p)| p.len()).sum::<usize>());
-                let sent = send_all(&sock, bucket, egress);
+                let sent = send_all(sock, bucket, egress);
                 if sent.errors > 0 {
                     net.send_errors.fetch_add(sent.errors as u64, Relaxed);
                 }
                 net.sends.fetch_add(sent.sends as u64, Relaxed);
                 net.send_syscalls.fetch_add(sent.syscalls as u64, Relaxed);
                 bucket.clear();
-                (n, bytes)
+                let d = t0.elapsed();
+                (n, bytes, (d, d))
             })
-            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            .reduce(
+                || (0, 0, (Duration::ZERO, Duration::ZERO)),
+                |a, b| (a.0 + b.0, a.1 + b.1, (a.2 .0.max(b.2 .0), a.2 .1 + b.2 .1)),
+            );
         net.out_pkts.fetch_add(pkts as u64, Relaxed);
         window.out_pkts += pkts as u64;
         window.out_bytes += bytes as u64;
@@ -539,6 +576,9 @@ fn main() -> std::io::Result<()> {
                 steady_state.out_bytes += bytes as u64;
                 steady_state.level_ticks[level as usize] += 1;
                 kept.push(row);
+                let t = sim.tasks();
+                let us = |s: (Duration, Duration)| [s.0.as_micros() as u32, s.1.as_micros() as u32];
+                kept_spans.push([us(t[0]), us(t[6]), us(t[7]), us(egress_span)]);
                 kept_overruns += (done - now > period) as u64;
             }
         }
@@ -574,11 +614,22 @@ fn main() -> std::io::Result<()> {
         window.report(Instant::now() - start, &sim, &wait, &net, csv.as_mut())?;
     }
     stop.store(true, Relaxed);
-    let _ = receiver.join();
+    for r in receivers {
+        let _ = r.join();
+    }
     if let Some(path) = summary_path {
         steady_state.net_end.get_or_insert_with(|| net_snapshot(&net));
         let run = RunInfo { egress, peak_clients, overruns: kept_overruns };
-        summary_values(&kept, &run, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net, &steady_state).write(&path)?;
+        let mut kv = summary_values(&kept, &run, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net, &steady_state);
+        // Where a split phase's time goes: wall = longest task + dispatch and
+        // waiting; longest - work / threads = imbalance.
+        for (i, name) in ["ingress", "assembly", "transport", "egress"].iter().enumerate() {
+            let mut longest: Vec<u32> = kept_spans.iter().map(|s| s[i][0]).collect();
+            let mut work: Vec<u32> = kept_spans.iter().map(|s| s[i][1]).collect();
+            kv.put_ms(format!("{name}_longest_p50_ms"), summarize(&mut longest).p50);
+            kv.put_ms(format!("{name}_work_p50_ms"), summarize(&mut work).p50);
+        }
+        kv.write(&path)?;
     }
     print_summary(&mut kept, kept_overruns, peak_clients, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net);
     Ok(())
@@ -631,6 +682,7 @@ fn summary_values(
     kv.put("ladder", if cfg.ladder.enabled { "on" } else { "off" });
     kv.put("threads", rayon::current_num_threads());
     kv.put("shards", cfg.shards);
+    kv.put("sockets", cfg.socket_groups);
     kv.put("peak_clients", run.peak_clients);
     kv.put("steady_ticks", kept.len());
     let secs = match (steady.first, steady.last) {
@@ -986,4 +1038,22 @@ mod tests {
         let many: Vec<Datagram> = (0..70).map(|_| d(a, 1200)).collect();
         assert_eq!(gso_runs(&many), [(0, 54), (54, 16)]);
     }
+}
+
+/// Physical cores: CPUs that share a core (SMT siblings) count once. Falls
+/// back to all CPUs where the topology isn't readable.
+fn physical_cores() -> usize {
+    let all = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let Ok(dir) = std::fs::read_dir("/sys/devices/system/cpu") else { return all };
+    let mut cores = std::collections::HashSet::new();
+    for e in dir.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.strip_prefix("cpu").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            if let Ok(s) = std::fs::read_to_string(e.path().join("topology/core_cpus_list")) {
+                cores.insert(s.trim().to_string());
+            }
+        }
+    }
+    if cores.is_empty() { all } else { cores.len() }
 }
