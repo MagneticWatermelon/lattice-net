@@ -11,6 +11,15 @@
 #           (~18 min): everyone in a 25 m disk to 10k (ladder off: raw cost; and
 #           on), a 200 m disk to 10k, and uniform to 20k
 #   limits-quick  one small ramp: checks the harness
+#   netem   the network matrix (~13 min): uniform 1k and a 1k blob under six
+#           network profiles (clean, LAN, typical, far, lossy, jittery), for the
+#           spare input, input -> applied, stand-ins and prediction under
+#           latency, jitter and loss. Locally it runs in a private network
+#           namespace (unshare -rn: no sudo, nothing else on the machine is
+#           shaped) with netem on its loopback, which delays each direction once;
+#           with BOTS_SSH, netem goes on both machines' interfaces between them
+#           (sudo tc).
+#   netem-quick   one short run on the typical profile: checks the harness
 #
 # Writes baselines/<date>-<name>/ (name defaults to the host name):
 #   env.txt      the machine and the preflight checks (scripts/preflight.sh)
@@ -37,12 +46,40 @@ case $mode in
   full) repeat=${REPEAT:-2}; secs=60 ;;
   quick) repeat=${REPEAT:-1}; secs=20 ;;
   limits | limits-quick) repeat=${REPEAT:-1}; secs=60 ;;
-  *) echo "usage: $0 [full|quick|limits|limits-quick] [name]" >&2; exit 2 ;;
+  netem) repeat=${REPEAT:-1}; secs=60 ;;
+  netem-quick) repeat=${REPEAT:-1}; secs=20 ;;
+  *) echo "usage: $0 [full|quick|limits|limits-quick|netem|netem-quick] [name]" >&2; exit 2 ;;
 esac
 
-# id | scenario | bots | extra lattice-server args | profile it | joins per second
+# Local netem: rerun inside a private network namespace, where we may shape
+# its loopback without root and nothing outside it is affected.
+if [[ $mode == netem* ]] && [ -z "${BOTS_SSH:-}" ] && [ -z "${LATTICE_NETNS:-}" ]; then
+  exec unshare -rn env LATTICE_NETNS=1 "$0" "$@"
+fi
+[ -n "${LATTICE_NETNS:-}" ] && ip link set lo up
+
+# id | scenario | bots | extra lattice-server args | profile it | joins per second | netem
 # A run with a join rate is a ramp: bots join at that rate, then hold 40 s.
-if [ "$mode" = limits ]; then
+# A run with netem arguments runs with them on the link (one-way delay; see above).
+netem_profiles=(
+  "clean|"
+  "lan|delay 15ms 2ms distribution normal"
+  "typical|delay 40ms 5ms distribution normal loss 0.5%"
+  "far|delay 75ms 10ms distribution normal loss 1%"
+  "lossy|delay 40ms 5ms distribution normal loss 5%"
+  "jittery|delay 40ms 20ms distribution normal"
+)
+if [ "$mode" = netem ]; then
+  runs=()
+  for np in "${netem_profiles[@]}"; do
+    IFS='|' read -r pname pargs <<< "$np"
+    runs+=("$pname-uniform-1k|uniform|1000||||$pargs" "$pname-blob-1k|blob|1000||||$pargs")
+  done
+  max_bots=1000
+elif [ "$mode" = netem-quick ]; then
+  runs=("typical-uniform-300|uniform|300||||delay 40ms 5ms distribution normal loss 0.5%")
+  max_bots=300
+elif [ "$mode" = limits ]; then
   runs=(
     "pile-25m-10k-noladder|disk:25|10000|--ladder off|profile|50"
     "pile-25m-10k|disk:25|10000||profile|50"
@@ -95,6 +132,38 @@ if [ -n "$remote" ]; then
 fi
 cargo build --release -q -p lattice-sim
 
+# netem on the link: loopback here, or both machines' interfaces between them.
+# Its queue limit is raised: the default 1,000 packets would itself drop at
+# these rates (packets per second x the delay).
+if [ -n "$remote" ]; then
+  srv_dev=$(ip -o route get "${remote#*@}" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}')
+  bot_dev=$(ssh -o BatchMode=yes "$remote" "ip -o route get $server_ip" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}')
+fi
+netem() { # "" (clean) or netem arguments
+  local args="$1"
+  if [ -n "$remote" ]; then
+    if [ -z "$args" ]; then
+      sudo tc qdisc del dev "$srv_dev" root 2> /dev/null || true
+      ssh -o BatchMode=yes "$remote" "sudo tc qdisc del dev $bot_dev root 2> /dev/null || true"
+    else
+      sudo tc qdisc replace dev "$srv_dev" root netem limit 1000000 $args
+      ssh -o BatchMode=yes "$remote" "sudo tc qdisc replace dev $bot_dev root netem limit 1000000 $args"
+    fi
+  elif [ -n "${LATTICE_NETNS:-}" ]; then
+    if [ -z "$args" ]; then
+      tc qdisc del dev lo root 2> /dev/null || true
+    else
+      tc qdisc replace dev lo root netem limit 1000000 $args
+    fi
+  elif [ -n "$args" ]; then
+    echo "netem needs a netem mode (local) or BOTS_SSH" >&2
+    exit 1
+  fi
+}
+# shellcheck disable=SC2329 # used by the trap
+clear_netem() { netem "" > /dev/null 2>&1 || true; }
+trap clear_netem EXIT
+
 cores=$(nproc)
 if [ -n "$remote" ]; then
   # Alone on the machine: the server takes all of it, the bots half of theirs.
@@ -111,8 +180,9 @@ n=0
 # doesn't land on one scenario.
 for r in $(seq 1 "$repeat"); do
   for spec in "${runs[@]}"; do
-    IFS='|' read -r id scenario count extra prof ramp <<< "$spec"
+    IFS='|' read -r id scenario count extra prof ramp link <<< "$spec"
     n=$((n + 1))
+    netem "$link"
     run_secs=$secs
     ramp_args=
     profile_delay=15
@@ -212,10 +282,30 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
       echo "| $id #$r | $joined | $join_p99 | $(kv "$b" input_applied_p50_ms) / $(kv "$b" input_applied_p99_ms) | $(kv "$b" server_wait_p50_ms) | $(kv "$s" repeated) / $(kv "$s" frozen) | $(kv "$s" late_inputs) / $(kv "$s" discarded_inputs) | $(kv "$b" corrections) | $(kv "$b" near_decode_errors) | $(kv "$b" swarm_busy_pct)% |"
     done
   done
+  # Network: how play holds up on each link (netem modes).
+  if [[ $mode == netem* ]]; then
+    echo
+    echo "## Network"
+    echo
+    echo "netem delays each direction once, so the round trip is about twice the delay. Times in ms."
+    echo
+    echo "| run | link (one way) | input -> applied p50 / p99 | round trip p50 / p99 | server wait p50 | stand-ins repeated / frozen | late / discarded inputs | corrections (per bot-minute) | near decode errors | resyncs | input clock extra / skipped |"
+    echo "|---|---|---|---|---|---|---|---|---|---|---|"
+    for r in $(seq 1 "$repeat"); do
+      for spec in "${runs[@]}"; do
+        IFS='|' read -r id _ _ _ _ _ link <<< "$spec"
+        b=$dir/$id-$r/bots.summary
+        s=$dir/$id-$r/server.summary
+        [ -f "$b" ] || { echo "| $id #$r | failed | | | | | | | | | |"; continue; }
+        echo "| $id #$r | ${link:-clean} | $(kv "$b" input_applied_p50_ms) / $(kv "$b" input_applied_p99_ms) | $(kv "$b" round_trip_p50_ms) / $(kv "$b" round_trip_p99_ms) | $(kv "$b" server_wait_p50_ms) | $(kv "$s" repeated) / $(kv "$s" frozen) | $(kv "$s" late_inputs) / $(kv "$s" discarded_inputs) | $(kv "$b" corrections) ($(kv "$b" corrections_per_bot_minute)) | $(kv "$b" near_decode_errors) | $(kv "$b" resyncs) | $(kv "$b" clock_extra) / $(kv "$b" clock_skipped) |"
+      done
+    done
+  fi
+
   # Ramps: the cost at each step of players, from the per-window CSV.
   ramps=0
   for spec in "${runs[@]}"; do
-    IFS='|' read -r id _ count _ _ ramp <<< "$spec"
+    IFS='|' read -r id _ count _ _ ramp _ <<< "$spec"
     [ -n "$ramp" ] || continue
     for r in $(seq 1 "$repeat"); do
       csv=$dir/$id-$r/server.csv

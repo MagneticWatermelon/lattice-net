@@ -93,7 +93,8 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - one UDP socket is a kernel lock at high thread counts (8.5% spinlock in the blob profile), so `SO_REUSEPORT` socket groups come next;
     - run rayon with threads = physical cores (128 threads was slower than 64; idle-worker spinning is 35–45% of the CPU);
     - this Broadcom NIC has no UDP segmentation offload, so GSO is untested in hardware.
-  - **Next:** M3, plus `SO_REUSEPORT` egress.
+  - **netem on WSL done** (2026-10-04, `baselines/2026-10-04-wsl2-netem`, `scripts/baseline.sh netem`). Under every profile up to 5% loss and ±20 ms jitter, there were no decode errors, resyncs or discards, and corrections were ≤0.2 per bot-minute, ≤0.53 m. Input → applied is one-way delay + ~50 ms of spare. Loss and jitter make ~0.33% of inputs late, and the input clock hunts under jitter: candidate, a spare sized to each client's measured jitter.
+  - **Next:** one bare-metal session (the pile limits test, `--shards 256`, netem at 10k), then `SO_REUSEPORT` + physical-core default, then M3 with a CPU budget.
 - **M3:** combat with rewind. Run a fairness test: 20 ms vs 150 ms bots through netem.
 - **M4:** vehicles.
 - **M5:** minimal playable client.

@@ -215,6 +215,29 @@ Tick times in ms; two runs each, and they agree within ~0.5 ms.
 - Setup to teardown took about 1 h 5 min, roughly €3 at €2.82/h.
 - `cloud-up.sh --resume` finishes a setup that stopped partway.
 
+### Network conditions: netem on WSL (`baselines/2026-10-04-wsl2-netem`)
+
+`scripts/baseline.sh netem <name>` runs uniform 1k and a 1k blob under six links, 60 s each.
+- **Locally it needs no root.** It reruns itself in a private network namespace (`unshare -rn`) and puts netem on that namespace's loopback, which delays each direction once. Nothing outside the namespace is shaped.
+- **netem's queue limit is raised.** The default 1,000 packets would drop on its own at these rates.
+- **With `BOTS_SSH`,** netem goes on both machines' interfaces between them instead (`sudo tc`).
+
+This measures behavior, not capacity, so WSL is fine for it. The blob rows match the uniform ones. Times in ms.
+
+| link (one way) | input → applied p50 / p99 | round trip p50 / p99 | stand-ins (share of input ticks) | corrections per bot-minute, largest |
+|---|---|---|---|---|
+| clean | 52 / 69 | 67 / 100 | 0 | 0 |
+| LAN: 15 ± 2 | 68 / 85 | 100 / 133 | 0 | 0 |
+| typical: 40 ± 5, 0.5% loss | 93 / 117 | 167 / 167 | 0.025% | 0.014, 0.11 m |
+| far: 75 ± 10, 1% loss | 129 / 166 | 233 / 267 | 0.10% | 0.04, 0.13 m |
+| lossy: 40 ± 5, 5% loss | 96 / 138 | 167 / 200 | 0.34% | 0.20, 0.53 m |
+| jittery: 40 ± 20 (σ) | 92 / 144 | 167 / 200 | 0.32% | 0.18, 0.24 m |
+
+1. **Nothing breaks.** There were no near-delta decode errors, resyncs or discarded inputs on any link, including 5% loss and ±20 ms jitter (which reorders packets). A player sees a prediction correction at most every ~5 minutes, of at most half a meter.
+2. **Input → applied is one-way delay plus ~50 ms.** That ~50 ms is the spare: the server-side wait, about 1.5 ticks, constant across links. It's the controllable part of how late others see you. The tuning options CLAUDE.md lists (process inputs faster than the tick, a fractional spare) act on exactly it.
+3. **Loss and jitter turn inputs late, not lost.** Inputs go out three times, so almost every stand-in is an input that arrived after its tick. With 5% loss, a lost packet's inputs come one packet (33 ms) later. With ±20 ms jitter, the tail outruns the spare. Either way it's ~0.33% of input ticks.
+4. **Under jitter the input clock hunts.** At ±20 ms it sends ~13 extra inputs and skips ~13 ticks per bot-minute (about 2 of each on a clean link), with 300 backlog skips. A spare sized to each client's measured jitter (a jitter buffer) would settle it, and cut stand-ins on bad links while keeping the spare small on good ones.
+
 ### Running it on bare metal (the desktop, dual-booted)
 
 The repo has no remote, so carry it over as a git bundle.

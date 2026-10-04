@@ -1,0 +1,31 @@
+== blob, 1000 bots, 60s -> baselines/2026-10-04-wsl2-netem/lossy-blob-1k-1
+== summary: 1707 steady-state ticks (after warmup, before clients drain), peak 1000 clients ==
+  phase        p50 ms   p99 ms   max ms
+  ingress        0.35     0.77     1.09
+  events         0.09     0.22     0.40
+  movement       0.17     0.37     0.53
+  grid           0.05     0.13     0.23
+  history        0.00     0.00     0.04
+  serialize      0.04     0.10     0.25
+  assembly       2.31     2.75     4.16
+  transport      0.92     1.24     1.34
+  egress         3.67     4.45     5.59
+  tick           7.62     8.97    10.37
+  overruns 0 | spawns 1000 despawns 1000 (317 joins deferred) | stand-ins: repeated 6224 frozen 18 | late inputs 5959 discarded 6 | bad messages 0 | recv errors 0 send errors 0
+  egress (whole run): 3592026 datagrams in 3592026 sends (1.00 per send), 115191 syscalls
+  ticks per ladder level (whole run): L0: 1813
+  input wait on the server (datagram arrival -> applied): p50 54.1 p99 96.7 max 542.6 mean 54.3 ms
+  steady state: stand-ins repeated 5884 frozen 18 | late inputs 5636 discarded 0
+== bots summary ==
+  started 1000 welcomed 1000 failed 0
+  join latency ms: p50 379 p99 658 max 891 (n=1000)
+  corrections 190 (0.19/bot-minute), mean error 0.075 m, max 0.397 m
+  snapshots 1698724 (entities per snapshot: near 64.1 mid 86.1 far 0.0), stale 4, unmatched acks 0, resyncs 0
+  input -> applied on server (est. RTT/2 + server wait): p50 96.0 p99 139.0 max 584.0 mean 96.4 ms (n=1690214)
+    of which server wait (arrival -> applied): p50 54.1 p99 96.8 max 542.6 mean 54.3 ms (n=1690214)
+  input -> seen acked (round trip): p50 167.0 p99 200.0 max 633.0 mean 158.1 ms (n=1696117)
+  near entity update interval (tracked bots): p50 66.0 p99 133.0 max 400.0 mean 55.9 ms (n=5446800)
+  mid entity update interval (tracked bots): p50 100.0 p99 200.0 max 59700.0 mean 132.4 ms (n=7303139)
+  far entity update interval (tracked bots): p50 0.0 p99 0.0 max 0.0 mean 0.0 ms (n=0)
+  input clock: 9477 extra inputs, 8520 skipped ticks, 35 backlog skips | near decode errors (tracked bots) 0
+  bytes down 2418.9 MB up 89.0 MB | swarm busy 9% of its threads' time, tick overruns 0
