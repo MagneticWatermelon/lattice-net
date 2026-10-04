@@ -678,3 +678,44 @@ fn packets_fill_up_so_gso_padding_is_small() {
     assert!(share < 0.02, "padding is {:.1}% of bytes", share * 100.0);
     assert_eq!(s.corrections(), 0);
 }
+
+/// Pairs of players closer than `d`, by the server's positions.
+fn close_pairs(s: &Swarm, d: f32) -> usize {
+    let pos: Vec<[f32; 2]> =
+        s.bots.iter().filter_map(|(_, _, b)| s.server.entity_state(b.welcome()?.entity)).map(|m| m.pos).collect();
+    let mut n = 0;
+    for i in 0..pos.len() {
+        for j in i + 1..pos.len() {
+            n += ((pos[i][0] - pos[j][0]).powi(2) + (pos[i][1] - pos[j][1]).powi(2) < d * d) as usize;
+        }
+    }
+    n
+}
+
+#[test]
+fn crowds_are_pushed_apart_and_clients_tell_pushes_from_mispredictions() {
+    // 150 players walking around inside a 3 m disk, far denser than they fit,
+    // with and without separation (the bots are identical).
+    let run = |separation: bool| {
+        let cfg = SimConfig { spawn: SpawnMode::Disk(3.0), separation, ..Default::default() };
+        let mut s = Swarm::with_config(150, cfg);
+        let mut pairs = 0;
+        for t in 0..5 * TICK_HZ {
+            s.step();
+            if t >= 2 * TICK_HZ {
+                pairs += close_pairs(&s, 0.4);
+            }
+        }
+        (s, pairs)
+    };
+    let (_, without) = run(false);
+    let (s, with) = run(true);
+    // Soft by design (at most 3 m/s): it can't stop players who keep walking
+    // into an over-full crowd at 6 m/s, but it cuts the overlap by ~2x.
+    assert!(with * 3 < without * 2, "separation keeps players apart: {without} -> {with} overlapping pairs");
+    let pushes: u64 = s.bots.iter().map(|(_, _, b)| b.stats.push_corrections).sum();
+    let max_push = s.bots.iter().map(|(_, _, b)| b.stats.push_error_max).fold(0.0f32, f32::max);
+    assert!(pushes > 0, "pushes reach the clients");
+    assert!(max_push < 0.25, "a push correction is a couple of ticks of push at most: {max_push} m");
+    assert_eq!(s.corrections(), 0, "and nothing else mispredicts");
+}

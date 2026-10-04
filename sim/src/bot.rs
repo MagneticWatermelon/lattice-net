@@ -47,8 +47,13 @@ pub struct BotStats {
     pub stale_snapshots: u64,
     /// Entity updates received per tier (near, mid, far).
     pub tier_seen: [u64; 3],
-    /// Snapshots whose authoritative state disagreed with our prediction.
+    /// Snapshots whose authoritative state disagreed with our prediction,
+    /// other than by a crowd's push.
     pub corrections: u64,
+    /// Snapshots that disagreed because the server pushed us apart from a
+    /// crowd (unpredictable by design), and the largest such error, in meters.
+    pub push_corrections: u64,
+    pub push_error_max: f32,
     /// Sum and max of those position errors, in meters.
     pub correction_error_sum: f64,
     pub correction_error_max: f32,
@@ -104,6 +109,9 @@ struct Predicted {
 pub struct BotBrain {
     rng: Rng,
     welcome: Option<Welcome>,
+    /// The push counter in the last snapshot (see `SnapshotHeader::pushes`);
+    /// the server starts it at 0 when we spawn.
+    last_pushes: u8,
     /// Built from the Welcome's seed (shared by every bot in the process).
     world: Option<Arc<World>>,
     heading: f32,
@@ -137,6 +145,7 @@ impl BotBrain {
             heading: rng.range(0.0, std::f32::consts::TAU),
             rng,
             welcome: None,
+            last_pushes: 0,
             world: None,
             sprint: false,
             seq: 0,
@@ -323,14 +332,28 @@ impl BotBrain {
             }
             self.last_acked = h.ack_seq;
         }
-        let err = ((slot.state.pos[0] - h.own.pos[0]).powi(2) + (slot.state.pos[1] - h.own.pos[1]).powi(2)).sqrt();
-        let vel_err = (slot.state.vel[0] - h.own.vel[0]).abs() + (slot.state.vel[1] - h.own.vel[1]).abs();
-        if err <= CORRECTION_EPSILON && vel_err <= CORRECTION_EPSILON {
+        // The server pushed us apart from a crowd since the last snapshot:
+        // a miss now is that push, which we couldn't have predicted.
+        let pushed = self.last_pushes != h.pushes;
+        self.last_pushes = h.pushes;
+        let (s, o) = (&slot.state, &h.own);
+        let err = ((s.pos[0] - o.pos[0]).powi(2) + (s.pos[1] - o.pos[1]).powi(2) + (s.z - o.z).powi(2)).sqrt();
+        let vel_err = (s.vel[0] - o.vel[0]).abs() + (s.vel[1] - o.vel[1]).abs() + (s.vz - o.vz).abs();
+        // Below the epsilon a miss is left alone, but never after a push: a
+        // push can be under a millimeter, and left alone it would grow into
+        // a "misprediction" later, with no push to explain it.
+        let tiny = err <= CORRECTION_EPSILON && vel_err <= CORRECTION_EPSILON && s.grounded == o.grounded;
+        if *s == *o || (tiny && !pushed) {
             return;
         }
-        self.stats.corrections += 1;
-        self.stats.correction_error_sum += err as f64;
-        self.stats.correction_error_max = self.stats.correction_error_max.max(err);
+        if pushed {
+            self.stats.push_corrections += 1;
+            self.stats.push_error_max = self.stats.push_error_max.max(err);
+        } else {
+            self.stats.corrections += 1;
+            self.stats.correction_error_sum += err as f64;
+            self.stats.correction_error_max = self.stats.correction_error_max.max(err);
+        }
 
         // Rebase on the server's state and replay everything it hasn't seen yet.
         let mut s = h.own;

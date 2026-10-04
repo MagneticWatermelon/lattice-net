@@ -402,6 +402,44 @@ impl Grid {
         }
     }
 
+    /// Calls `f(id, x, y)` for every item within `r` of `q`, using the dense
+    /// cells' sub-cells so a crowd costs only its near part. For short-range
+    /// queries such as player separation.
+    pub fn for_each_within(&self, q: [f32; 2], r: f32, mut f: impl FnMut(u32, f32, f32)) {
+        let r2 = r * r;
+        let mut scan = |a: usize, b: usize| {
+            for i in a..b {
+                let (dx, dy) = (self.xs[i] - q[0], self.ys[i] - q[1]);
+                if dx * dx + dy * dy <= r2 {
+                    f(self.items[i], self.xs[i], self.ys[i]);
+                }
+            }
+        };
+        let (x0, x1) = (self.coord((q[0] - r).max(0.0)), self.coord(q[0] + r));
+        let (y0, y1) = (self.coord((q[1] - r).max(0.0)), self.coord(q[1] + r));
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let c = (y * self.dim + x) as usize;
+                let (a, b) = (self.start[c] as usize, self.start[c + 1] as usize);
+                if b - a <= DENSE as usize {
+                    scan(a, b);
+                    continue;
+                }
+                let sub = &self.subs[self.dense[c] as usize];
+                let (ox, oy) = (sub.cx as f32 * self.cell, sub.cy as f32 * self.cell);
+                let s = sub.s as i32;
+                let cl = |v: f32| ((v / sub.side).floor() as i32).clamp(0, s - 1);
+                let starts = &self.sub_start[sub.at as usize..];
+                for sy in cl(q[1] - r - oy)..=cl(q[1] + r - oy) {
+                    for sx in cl(q[0] - r - ox)..=cl(q[0] + r - ox) {
+                        let si = (sy * s + sx) as usize;
+                        scan(starts[si] as usize, starts[si + 1] as usize);
+                    }
+                }
+            }
+        }
+    }
+
     /// Calls `f` with every item in cells overlapping the square of half-size `r`
     /// around `p`. Callers filter by exact distance.
     pub fn for_each_near(&self, p: [f32; 2], r: f32, mut f: impl FnMut(u32)) {
@@ -652,5 +690,25 @@ mod tests {
         // Rebuilding sparse clears the split.
         g.rebuild([(0, [10.0, 10.0])].into_iter());
         assert!(g.subs.is_empty() && g.dense.iter().all(|&d| d == NOT_DENSE));
+    }
+
+    #[test]
+    fn within_matches_brute_force_in_crowds() {
+        let mut pts = disk(10_000, [4096.0, 4096.0], 25.0, 11);
+        pts.extend(disk(2_000, [1000.0, 1000.0], 300.0, 12));
+        let mut g = Grid::new(32.0);
+        g.rebuild(pts.iter().enumerate().map(|(i, &p)| (i as u32, p)));
+        for &q in pts.iter().step_by(131) {
+            let mut got = Vec::new();
+            g.for_each_within(q, 0.8, |id, _, _| got.push(id));
+            got.sort_unstable();
+            let want: Vec<u32> = (0..pts.len() as u32)
+                .filter(|&i| {
+                    let (dx, dy) = (pts[i as usize][0] - q[0], pts[i as usize][1] - q[1]);
+                    dx * dx + dy * dy <= 0.64
+                })
+                .collect();
+            assert_eq!(got, want);
+        }
     }
 }

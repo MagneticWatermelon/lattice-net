@@ -249,6 +249,43 @@ Tick times in ms; two runs each, and they agree within ~0.5 ms.
 - With netem on the server's own interface, its one locked queue throttled the server: egress 2.75 → 25 ms p50, tick 12 → 40 ms.
 - The fix: shape only on the bot box (its egress, plus an `ifb` device on its ingress).
 
+### M3a: a world, 2.5D movement and soft separation (2026-10-04)
+
+The game rules both sides run now live in the `lattice-game` crate (`game/`): movement, the world, the message formats and the near codec. The server, the bots and the coming client all depend on it.
+
+**The world** (`game/src/world.rs`) is built from a seed, identically on every machine.
+- **Terrain:** an 8 km heightmap at 4 m. It's integer value noise in fixed point, about 160 m of relief, heights in cm, 8 MB.
+- **Cover:** boxes in about a quarter of the 32 m cells. Thin walls are 2.5–4 m tall; crates are under 1 m.
+- **`World::shared`** keeps one copy per seed per process. Generating it takes a fraction of a second.
+- **The seed travels in the Welcome** (`--world-seed`).
+
+**Movement** (`game/src/movement.rs`) is 2.5D and still bit-exact:
+- players walk on the terrain, jump and fall, and can't climb slopes over 45°;
+- they step onto ledges up to 0.45 m, and slide along cover;
+- when falling, they catch a ledge within a step, which is how a jump gets onto a crate.
+
+**On the wire:**
+- inputs carry pitch (7 B each);
+- the snapshot's own state adds height, vertical speed, grounded, and a push counter;
+- the near codec sends height as a 1 cm delta (0 bits on the flat), pitch on its own changed-flag, and an airborne flag;
+- mid and far are unchanged: clients put those players on the terrain.
+
+**Soft separation** is server-only and a pipeline phase of its own (`separate`, after the grid).
+- **The rule:** players closer than 0.8 m are pushed apart, half each, by half the overlap per tick, at most 0.1 m a tick (3 m/s). Coincident players get a direction from their ids.
+- **Computed, then applied:** all pushes are computed from the same positions before any is applied. Neighbors come through the grid's sub-cells (`Grid::for_each_within`).
+- **Snapshots count pushes,** so clients can tell a push correction (unpredictable by design) from a real misprediction. After a push the client rebases on any difference at all: a sub-millimeter push left alone would grow into a "misprediction" later.
+- **It's soft:** it can't stop players who keep walking into an over-full crowd at 6 m/s, but it halves the overlap (swarm test: 150 players in 3 m). `--no-separation` turns it off for comparisons.
+
+**WSL cost, before → after M3a** (8 threads, sharing the box with the bots):
+
+| run | tick p50 / p99 | movement | `separate` | real corrections | push corrections (largest) |
+|---|---|---|---|---|---|
+| pile 4k, ladder off | 24.3 / 27.6 → 24.9 / 28.5 ms | 0.47 → 0.52 ms | 0.98 ms | 0 | 4.6M (0.39 m) |
+| blob 3k | 16.7 / 19.4 → 17.5 / 22.5 ms | 0.46 → 0.50 ms | 0.85 ms | 0 | 162k (0.30 m) |
+| uniform 5k | 15.1 / 17.7 → 15.9 / 19.9 ms | 0.35 → 0.64 ms | 0.50 ms | 0 | 1.2k |
+
+Prediction stays bit-exact (the swarm test `clean_link_predicts_bit_exactly` runs on terrain, with cover and jumps). Over UDP, the only corrections outside pushes come from stand-ins when the box is overloaded.
+
 ### Nearest-player search: `Grid::knn` (2026-10-04)
 
 Following `reports/Nearest player search algorithms.md`, the near and mid tiers' k-nearest search is now `Grid::knn`, in `grid.rs`.

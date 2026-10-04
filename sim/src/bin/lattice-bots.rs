@@ -61,6 +61,8 @@ struct Totals {
     corrections: u64,
     correction_err_sum: f64,
     correction_err_max: f32,
+    push_corrections: u64,
+    push_err_max: f32,
     bytes_down: u64,
     bytes_up: u64,
     rtt_sum: f64,
@@ -92,6 +94,8 @@ impl Totals {
         self.backlog_skips += o.backlog_skips;
         self.near_decode_errors += o.near_decode_errors;
         self.corrections += o.corrections;
+        self.push_corrections += o.push_corrections;
+        self.push_err_max = self.push_err_max.max(o.push_err_max);
         self.correction_err_sum += o.correction_err_sum;
         self.correction_err_max = self.correction_err_max.max(o.correction_err_max);
         self.bytes_down += o.bytes_down;
@@ -302,6 +306,8 @@ impl Bot {
         t.corrections += s.corrections;
         t.correction_err_sum += s.correction_error_sum;
         t.correction_err_max = t.correction_err_max.max(s.correction_error_max);
+        t.push_corrections += s.push_corrections;
+        t.push_err_max = t.push_err_max.max(s.push_error_max);
         t.bytes_down += self.bytes.0;
         t.bytes_up += self.bytes.1;
     }
@@ -601,6 +607,9 @@ fn summary_values(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) -
     kv.put("corrections", t.corrections);
     kv.put("corrections_per_bot_minute", format!("{:.3}", t.corrections as f64 / bot_secs * 60.0));
     kv.put("correction_max_m", format!("{:.3}", t.correction_err_max));
+    kv.put("push_corrections", t.push_corrections);
+    kv.put("push_corrections_per_bot_minute", format!("{:.3}", t.push_corrections as f64 / bot_secs * 60.0));
+    kv.put("push_max_m", format!("{:.3}", t.push_err_max));
     let snaps = t.snapshots.max(1) as f64;
     kv.put("snapshots", t.snapshots);
     for (i, tier) in ["near", "mid", "far"].iter().enumerate() {
@@ -694,6 +703,12 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
         t.corrections as f64 / bot_secs * 60.0,
         t.correction_err_sum / t.corrections.max(1) as f64,
         t.correction_err_max
+    );
+    println!(
+        "  push corrections (the server pushed us apart from a crowd) {} ({:.2}/bot-minute), max {:.3} m",
+        t.push_corrections,
+        t.push_corrections as f64 / bot_secs * 60.0,
+        t.push_err_max
     );
     println!(
         "  snapshots {} (entities per snapshot: near {:.1} mid {:.1} far {:.1}), stale {}, unmatched acks {}, resyncs {}",

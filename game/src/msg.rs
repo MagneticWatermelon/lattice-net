@@ -4,7 +4,7 @@
 //! C->S unreliable  Input    tag | newest_seq:4 | n:1 | n × (move_x:1 move_y:1 yaw:2 pitch:2 buttons:1)   newest first
 //! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32 | world_seed:8
 //! S->C unreliable  Snapshot tag | server_tick:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
-//!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 grounded:1
+//!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 grounded:1 | pushes:1
 //! S->C unreliable  Near     see delta.rs: deltas against acked baselines, one per tick, tagged
 //! S->C unreliable  Entities tag | server_tick:4 | tier:1 | n:1 | n × blob         (mid and far; one or more per tier per tick)
 //! far blob  (11 B) := entity:2 | cell:1 | 8 B bitpacked far-tier state (see bitpack.rs); used for mid and far
@@ -34,7 +34,7 @@ pub const MSG_ENTITIES: u8 = 4;
 pub const INPUT_REDUNDANCY: usize = 3;
 /// Mid- and far-tier blob.
 pub const FAR_BLOB: usize = 11;
-pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1;
+pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1;
 pub const ENTITIES_HEADER: usize = 1 + 4 + 1 + 1;
 
 /// `SnapshotHeader::wait` when `ack_seq` was consumed by a stand-in, not a real input.
@@ -175,6 +175,9 @@ pub struct SnapshotHeader {
     pub level: u8,
     pub client_level: u8,
     pub own: MoveState,
+    /// Counts (wrapping) the ticks the server pushed this player apart from
+    /// a crowd. A prediction miss when it changed is a push, not a bug.
+    pub pushes: u8,
 }
 
 pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
@@ -190,6 +193,7 @@ pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
         w.u32(v.to_bits());
     }
     w.u8(h.own.grounded as u8);
+    w.u8(h.pushes);
 }
 
 /// Starts an Entities message; append exactly `count` blobs of `tier` after it.
@@ -235,8 +239,9 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
                 _ => return Err(DecodeError::Invalid),
             };
             let own = MoveState { pos, vel, z, vz, grounded };
+            let pushes = r.u8()?;
             r.finish()?;
-            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, ack_seq, buffered, wait, pace, level, client_level, own }))
+            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, ack_seq, buffered, wait, pace, level, client_level, own, pushes }))
         }
         MSG_ENTITIES => {
             let server_tick = r.u32()?;
@@ -327,6 +332,7 @@ mod tests {
             level: 7,
             client_level: 1,
             own: MoveState { pos: [1.0, 2.0], vel: [-3.0, 0.125], z: 87.25, vz: -1.5, grounded: false },
+            pushes: 9,
         };
         let mut wr = Writer::default();
         write_snapshot(&mut wr, &h);

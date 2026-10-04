@@ -120,7 +120,11 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - one render time for every entity on the client (~100–133 ms behind; mid/far smoothed or extrapolated to it);
     - mid/far velocity derived on the client first, with velocity bytes in the blobs only if the bots' smoothness numbers ask.
   - **Order:**
-    - **M3a world and movement:** a `lattice-game` crate for the shared deterministic rules and message formats; the heightmap (integer-only noise, bit-identical on both sides); 2.5D movement (pitch, jump, gravity, max slope); cover boxes; soft separation.
+    - **M3a world and movement: done** (2026-10-04).
+      - `lattice-game` (`game/`) holds movement, `world.rs` (8 km heightmap at 4 m from integer noise, plus cover boxes), the message formats and the near codec.
+      - Movement is 2.5D: pitch, jump, gravity, 45° max slope, 0.45 m steps, sliding along cover, ledge catch when falling.
+      - Soft separation is a server phase (`separate`). Snapshots carry a push counter, so bots count push corrections apart from real ones.
+      - Prediction stays bit-exact; on WSL there are 0 real corrections in the pile and blob, and the cost is +0.3–1 ms of tick. See sim/README.
     - **M3b `lattice-client-core`:** extracted from `BotBrain` (bots and humans run the same client code); the one render timeline; the render time in each input; the bots measure smoothness.
     - **M3c Bevy client** on Windows (out of the workspace's default build): terrain, capsules, first-person and spectator cameras, net graph, server ghost, tier colors.
     - **M3d combat:**

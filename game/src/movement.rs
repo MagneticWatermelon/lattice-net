@@ -135,6 +135,25 @@ pub fn step(world: &World, s: MoveState, input: Input) -> MoveState {
     n
 }
 
+/// The server moving a player by `delta` outside of their inputs (a crowd's
+/// separation push): kept in the world and out of cover, and on the ground if
+/// they were on it. Clients can't predict these; they reconcile.
+pub fn nudge(world: &World, s: MoveState, delta: [f32; 2]) -> MoveState {
+    let mut n = s;
+    n.pos = [(s.pos[0] + delta[0]).clamp(0.0, WORLD_SIZE), (s.pos[1] + delta[1]).clamp(0.0, WORLD_SIZE)];
+    collide(world, &mut n);
+    if n.grounded {
+        let g = world.ground(n.pos[0], n.pos[1], n.z, STEP_UP);
+        if g >= n.z - STEP_DOWN {
+            n.z = g;
+        } else {
+            n.grounded = false;
+            n.vz = 0.0;
+        }
+    }
+    n
+}
+
 /// Pushes the player's circle out of every cover box their body overlaps in
 /// height and can't step onto, taking away the velocity into the box (so they
 /// slide along it). Boxes come in the index's fixed order.

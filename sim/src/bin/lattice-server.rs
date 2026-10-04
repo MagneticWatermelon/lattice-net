@@ -63,7 +63,8 @@ lattice-server: M1 movement-only authoritative server
                        connect tokens, standing in for a login service) [the public dev key]
   --server-id N        the server id tokens are minted for [1]
   --seed N             spawn RNG seed [1]
-  --world-seed N       the world's terrain and cover (clients build it from the Welcome) [1]";
+  --world-seed N       the world's terrain and cover (clients build it from the Welcome) [1]
+  --no-separation      don't push overlapping players apart (for comparisons)";
 
 /// Columns of per-tick timing samples: the sim phases, then egress and total.
 const COLS: usize = PHASES.len() + 2;
@@ -354,6 +355,7 @@ fn main() -> std::io::Result<()> {
         },
         seed: a.get("seed", 1),
         world_seed: a.get("world-seed", 1),
+        separation: !a.flag("no-separation"),
         identity: lattice_net::ServerIdentity {
             token_key: a.get("token-key", HexKey::default()).0,
             server_id: a.get("server-id", 1),
@@ -580,7 +582,7 @@ fn main() -> std::io::Result<()> {
                 kept.push(row);
                 let t = sim.tasks();
                 let us = |s: (Duration, Duration)| [s.0.as_micros() as u32, s.1.as_micros() as u32];
-                kept_spans.push([us(t[0]), us(t[6]), us(t[7]), us(egress_span)]);
+                kept_spans.push([us(t[0]), us(t[7]), us(t[8]), us(egress_span)]);
                 kept_overruns += (done - now > period) as u64;
             }
         }

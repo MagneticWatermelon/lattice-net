@@ -30,13 +30,13 @@ use crate::grid::{Grid, Knn};
 use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
-use crate::movement::{step, Input, MoveState, TICK_HZ, WORLD_SIZE};
+use crate::movement::{self, step, Input, MoveState, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
 use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
 use crate::msg::{self, Blob, PacketFill, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
 use crate::rng::Rng;
 use crate::stats::Histogram;
 
-pub const PHASES: [&str; 8] = ["ingress", "events", "movement", "grid", "history", "serialize", "assembly", "transport"];
+pub const PHASES: [&str; 9] = ["ingress", "events", "movement", "grid", "separate", "history", "serialize", "assembly", "transport"];
 pub type Datagram = (SocketAddr, Vec<u8>);
 /// An inbound datagram with its arrival time, as the receive thread saw it.
 pub type InDatagram = (SocketAddr, Instant, Vec<u8>);
@@ -64,6 +64,11 @@ pub const GRACE_TICKS: u32 = 2;
 /// are discarded unapplied rather than letting latency grow.
 const MAX_QUEUED_INPUTS: usize = 16;
 const GRID_CELL: f32 = 32.0;
+/// Players closer than this (two radii) are pushed apart: by `SEP_RATE` of the
+/// overlap per tick, split between them, at most `MAX_PUSH` a tick (3 m/s).
+const SEP_DIST: f32 = 2.0 * RADIUS;
+const SEP_RATE: f32 = 0.5;
+const MAX_PUSH: f32 = 0.1;
 /// Cells of the mid- and far-tier due-set grids, sized to their query radii.
 /// Mid is a k-nearest ring walk: fine enough to stop early in a crowd, coarse
 /// enough that a sparse 500 m query stays under ~300 cells.
@@ -167,6 +172,8 @@ pub struct SimConfig {
     /// The world (terrain and cover) everyone plays in; sent in the Welcome so
     /// clients build the same one.
     pub world_seed: u64,
+    /// Push overlapping players apart (soft separation). Off only for comparisons.
+    pub separation: bool,
     /// Server id and token key, shared with whatever mints the clients'
     /// tokens (the bots, standing in for a login service).
     pub identity: ServerIdentity,
@@ -186,6 +193,7 @@ impl Default for SimConfig {
             ladder: LadderConfig::default(),
             seed: 1,
             world_seed: 1,
+            separation: true,
             identity: ServerIdentity { server_id: 1, token_key: lattice_net::token::DEV_TOKEN_KEY },
         }
     }
@@ -242,6 +250,8 @@ struct Body {
     state: MoveState,
     yaw: u16,
     pitch: i16,
+    /// Ticks this player was pushed apart from a crowd (wrapping), for the snapshot.
+    pushes: u8,
     squad: u32,
     /// Tick this entity (slot) spawned: an older baseline belongs to a previous occupant.
     spawned: u32,
@@ -249,7 +259,7 @@ struct Body {
 
 impl Default for Body {
     fn default() -> Self {
-        Self { alive: false, state: MoveState::default(), yaw: 0, pitch: 0, squad: NO_SQUAD, spawned: 0 }
+        Self { alive: false, state: MoveState::default(), yaw: 0, pitch: 0, pushes: 0, squad: NO_SQUAD, spawned: 0 }
     }
 }
 
@@ -448,6 +458,8 @@ pub struct SimServer {
     counters: Counters,
     ladder: Ladder,
     world: Arc<World>,
+    /// This tick's separation push per entity.
+    pushes: Vec<[f32; 2]>,
     pace: PaceMeter,
     /// Pace advertised in this tick's snapshots.
     pace_now: f32,
@@ -473,6 +485,7 @@ impl SimServer {
         let (ladder, interest) = (Ladder::new(cfg.ladder.clone()), cfg.interest.clone());
         Self {
             world: World::shared(cfg.world_seed),
+            pushes: Vec::new(),
             net,
             shard_clients: (0..cfg.shards).map(|_| Vec::new()).collect(),
             scratch: (0..cfg.shards).map(|_| Scratch::default()).collect(),
@@ -718,11 +731,68 @@ impl SimServer {
         self.far_grid.rebuild(alive().filter(|&(i, _)| due(i as u16, tick, far_period)));
         lap(3);
 
+        // 5b. soft separation: players closer than SEP_DIST are pushed apart,
+        // half each, a fraction of the overlap per tick. All pushes are
+        // computed from this tick's positions first, then applied, so the
+        // result doesn't depend on thread order. (The grid keeps the
+        // pre-push positions: a few cm off, for this tick's interest only.)
+        let (grid, bodies, on) = (&self.grid, &self.bodies, self.cfg.separation);
+        let pushed: usize = self
+            .pushes
+            .par_iter_mut()
+            .enumerate()
+            .with_min_len(256)
+            .map(|(i, push)| {
+                *push = [0.0; 2];
+                let b = &bodies[i];
+                if !b.alive || !on {
+                    return 0;
+                }
+                let p = b.state.pos;
+                grid.for_each_within(p, SEP_DIST, |j, x, y| {
+                    let o = &bodies[j as usize];
+                    if j as usize == i || (o.state.z - b.state.z).abs() >= HEIGHT {
+                        return;
+                    }
+                    let (dx, dy) = (p[0] - x, p[1] - y);
+                    let d = (dx * dx + dy * dy).sqrt();
+                    let (nx, ny) = if d > 1e-4 {
+                        (dx / d, dy / d)
+                    } else {
+                        // Coincident: a direction from the pair, opposite for each.
+                        let (lo, hi) = ((i as u32).min(j), (i as u32).max(j));
+                        let a = (lo.wrapping_mul(0x9E37_79B9) ^ hi.wrapping_mul(0x85EB_CA6B)) as f32 * (std::f32::consts::TAU / 4_294_967_296.0);
+                        let sign = if (i as u32) < j { 1.0 } else { -1.0 };
+                        (a.cos() * sign, a.sin() * sign)
+                    };
+                    let k = (SEP_DIST - d) * 0.5 * SEP_RATE;
+                    push[0] += nx * k;
+                    push[1] += ny * k;
+                });
+                let len = (push[0] * push[0] + push[1] * push[1]).sqrt();
+                if len > MAX_PUSH {
+                    *push = [push[0] / len * MAX_PUSH, push[1] / len * MAX_PUSH];
+                }
+                (*push != [0.0; 2]) as usize
+            })
+            .sum();
+        // Most ticks of a spread-out crowd push nobody: skip the second pass.
+        if pushed > 0 {
+            let world = &*self.world;
+            self.bodies.par_iter_mut().zip(self.pushes.par_iter()).with_min_len(256).for_each(|(b, &push)| {
+                if b.alive && push != [0.0; 2] {
+                    b.state = movement::nudge(world, b.state, push);
+                    b.pushes = b.pushes.wrapping_add(1);
+                }
+            });
+        }
+        lap(4);
+
         // 6. lag-comp history
         let slot = &mut self.history[self.tick as usize % HISTORY_TICKS];
         slot.clear();
         slot.extend(self.bodies.iter().map(|b| b.state.pos));
-        lap(4);
+        lap(5);
 
         // 7. serialize each entity once per tier. Far blobs are needed for this
         // tick's due entities and last tick's far-due ones (budget carries).
@@ -744,7 +814,7 @@ impl SimServer {
                     *far = msg::encode_blob(e, b.state.pos, b.yaw);
                 }
             });
-        lap(5);
+        lap(6);
 
         // 8. per-client assembly, grouped by shard so each shard's snapshots
         // are ready for its transport task
@@ -768,7 +838,7 @@ impl SimServer {
             max_message,
             packet_body,
         };
-        self.spans[6] = self
+        self.spans[7] = self
             .shard_clients
             .par_iter_mut()
             .zip(self.snapshots.par_iter_mut())
@@ -820,10 +890,10 @@ impl SimServer {
             c.near_scanned += t.near_scanned;
             c.mid_scanned += t.mid_scanned;
         }
-        lap(6);
+        lap(7);
 
         // 8b. transport: queue, frame, ack and checksum, one task per shard
-        self.spans[7] = self
+        self.spans[8] = self
             .net
             .shards_mut()
             .par_iter_mut()
@@ -842,7 +912,7 @@ impl SimServer {
                 span(t0.elapsed())
             })
             .reduce(|| NO_SPAN, join_spans);
-        lap(7);
+        lap(8);
 
         self.tick = self.tick.wrapping_add(1);
         self.counters.ticks += 1;
@@ -859,6 +929,7 @@ impl SimServer {
             Some(e) => e,
             None => {
                 self.bodies.push(Body::default());
+                self.pushes.push([0.0; 2]);
                 self.inputs.push(InputQueue::default());
                 self.far_blobs.push([0; FAR_BLOB]);
                 (self.bodies.len() - 1) as u16
@@ -866,7 +937,7 @@ impl SimServer {
         };
         let i = e as usize;
         self.bodies[i] =
-            Body { alive: true, state: MoveState::standing(&self.world, spawn), yaw: 0, pitch: 0, squad, spawned: self.tick };
+            Body { alive: true, state: MoveState::standing(&self.world, spawn), yaw: 0, pitch: 0, pushes: 0, squad, spawned: self.tick };
         self.inputs[i] = InputQueue::default();
         if squad != NO_SQUAD {
             self.squads.entry(squad).or_default().push(e);
@@ -1165,6 +1236,7 @@ impl View<'_> {
                 level: self.level,
                 client_level: slot.ladder.level(),
                 own: me.state,
+                pushes: me.pushes,
             },
         );
         let mut bytes = w.len() + near_bytes;

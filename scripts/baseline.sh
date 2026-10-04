@@ -265,7 +265,7 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
   echo
   echo "## Phases (p50 / p99)"
   echo
-  phases=(ingress events movement grid serialize assembly transport egress)
+  phases=(ingress events movement grid separate serialize assembly transport egress)
   printf '| run |'; printf ' %s |' "${phases[@]}"; echo
   printf '|---|'; printf '%s' "$(printf -- '---|%.0s' "${phases[@]}")"; echo
   for r in $(seq 1 "$repeat"); do
@@ -305,22 +305,22 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
   echo
   echo "## Clients"
   echo
-  echo "| run | welcomed / started | join p99 | input -> applied p50 / p99 | server wait p50 | stand-ins repeated / frozen | late / discarded inputs | corrections | near decode errors | swarm busy |"
-  echo "|---|---|---|---|---|---|---|---|---|---|"
+  echo "| run | welcomed / started | join p99 | input -> applied p50 / p99 | server wait p50 | stand-ins repeated / frozen | late / discarded inputs | corrections | push corrections | near decode errors | swarm busy |"
+  echo "|---|---|---|---|---|---|---|---|---|---|---|"
   for r in $(seq 1 "$repeat"); do
     for spec in "${runs[@]}"; do
       IFS='|' read -r id _ _ _ _ <<< "$spec"
       b=$dir/$id-$r/bots.summary
       s=$dir/$id-$r/server.summary
       j=$dir/$id-$r/joiners.summary
-      [ -f "$b" ] || { echo "| $id #$r | failed | | | | | | | | |"; continue; }
+      [ -f "$b" ] || { echo "| $id #$r | failed | | | | | | | | | |"; continue; }
       joined="$(kv "$b" welcomed) / $(kv "$b" started)"
       join_p99=$(kv "$b" join_p99_ms)
       if [ -f "$j" ]; then
         joined="$joined + $(kv "$j" welcomed) / $(kv "$j" started) joiners"
         join_p99="$join_p99 (joiners $(kv "$j" join_p99_ms))"
       fi
-      echo "| $id #$r | $joined | $join_p99 | $(kv "$b" input_applied_p50_ms) / $(kv "$b" input_applied_p99_ms) | $(kv "$b" server_wait_p50_ms) | $(kv "$s" repeated) / $(kv "$s" frozen) | $(kv "$s" late_inputs) / $(kv "$s" discarded_inputs) | $(kv "$b" corrections) | $(kv "$b" near_decode_errors) | $(kv "$b" swarm_busy_pct)% |"
+      echo "| $id #$r | $joined | $join_p99 | $(kv "$b" input_applied_p50_ms) / $(kv "$b" input_applied_p99_ms) | $(kv "$b" server_wait_p50_ms) | $(kv "$s" repeated) / $(kv "$s" frozen) | $(kv "$s" late_inputs) / $(kv "$s" discarded_inputs) | $(kv "$b" corrections) | $(kv "$b" push_corrections) | $(kv "$b" near_decode_errors) | $(kv "$b" swarm_busy_pct)% |"
     done
   done
   # Network: how play holds up on each link (netem modes).
