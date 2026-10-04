@@ -22,7 +22,7 @@ use lattice_net::bitpack::{dequantize, dequantize_angle, quantize, BitReader, Bi
 use lattice_net::wire::{DecodeError, Reader, Writer};
 use lattice_net::Config;
 
-use crate::interest::Tier;
+use crate::tier::Tier;
 use crate::movement::{Input, MoveState, WORLD_SIZE};
 
 pub const MSG_INPUT: u8 = 1;

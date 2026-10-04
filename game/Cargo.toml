@@ -1,0 +1,10 @@
+[package]
+name = "lattice-game"
+version = "0.1.0"
+edition = "2021"
+description = "The game rules both sides run: deterministic movement, terrain and cover, and the game's message formats. Shared by the server, the bots and the client."
+license = "MIT"
+publish = false
+
+[dependencies]
+lattice-net = { path = ".." }

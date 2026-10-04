@@ -7,13 +7,14 @@
 
 pub mod bot;
 pub mod debugmap;
-pub mod delta;
 pub mod cli;
 pub mod grid;
 pub mod interest;
 pub mod ladder;
-pub mod movement;
-pub mod msg;
 pub mod rng;
 pub mod server;
 pub mod stats;
+
+// The shared game rules live in `lattice-game`; re-exported so the server and
+// bots keep their paths.
+pub use lattice_game::{delta, movement, msg};

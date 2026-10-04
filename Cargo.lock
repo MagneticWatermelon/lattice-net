@@ -67,6 +67,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-game"
+version = "0.1.0"
+dependencies = [
+ "lattice-net",
+]
+
+[[package]]
 name = "lattice-net"
 version = "0.1.0"
 dependencies = [
@@ -77,6 +84,7 @@ dependencies = [
 name = "lattice-sim"
 version = "0.1.0"
 dependencies = [
+ "lattice-game",
  "lattice-net",
  "libc",
  "rayon",

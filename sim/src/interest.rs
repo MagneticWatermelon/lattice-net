@@ -36,20 +36,7 @@ pub const FAR_PERIOD: u32 = TICK_HZ / 2;
 /// Seeded age for an entity this client was never sent: it outranks everything.
 pub const NEVER_SENT_AGE: u32 = 2 * FAR_PERIOD;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tier {
-    Near = 0,
-    Mid = 1,
-    Far = 2,
-}
-
-impl Tier {
-    pub const ALL: [Tier; 3] = [Tier::Near, Tier::Mid, Tier::Far];
-
-    pub fn from_u8(v: u8) -> Option<Tier> {
-        Self::ALL.get(v as usize).copied()
-    }
-}
+pub use lattice_game::tier::Tier;
 
 #[derive(Debug, Clone)]
 pub struct InterestConfig {
