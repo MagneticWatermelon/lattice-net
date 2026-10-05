@@ -434,6 +434,18 @@ One 100 ms timeline was too long for near players (it added 33 ms to every rewin
 - **The blob's refused shots** (1,184) are bots that died on the server before they heard.
 - **The Windows client** fires on the left mouse button, with a cosmetic tracer. It was self-checked with `--autoplay --autofire`: 122 shots, 0 corrections.
 
+**M3d.3: hit feedback and others' shots** (`game/src/events.rs`).
+- **Reliable `Events`,** one message per client per tick:
+  - `Hit` to the shooter (target, damage, head, killed);
+  - `Hurt` to the target (shooter, amount, and the direction to the shooter, computed on the server so it works when the shooter isn't drawn);
+  - `Kill` to both and their squads.
+- **Unreliable `Shots`:** each tick, the shots fired by a client's near-tier players (7 B each: shooter, aim, and how long before the tick's step). The client starts each tracer when it draws the shooter at that moment. Its bytes count in the client's budget before mid and far.
+- **Contacts:** a hit makes shooter and target near-tier for each other for 5 s (up to 4 contacts each, priced like squadmates).
+- **Swarm tests:**
+  - every damaging hit gives the shooter one marker and the target one Hurt from the right direction (within 2/256 of a turn);
+  - kills reach both and not a bystander, who does see the shooter's tracers;
+  - a shooter 200 m away (mid tier) joins its target's near tier on hitting, and drops back 5 s after.
+
 ### Nearest-player search: `Grid::knn` (2026-10-04)
 
 Following `reports/Nearest player search algorithms.md`, the near and mid tiers' k-nearest search is now `Grid::knn`, in `grid.rs`.

@@ -172,7 +172,8 @@ fn main() {
     let now = Instant::now();
     let token = net::dev_token(&args.key, args.server_id, args.user);
     let cfg = ClientConfig { near_delay: args.delays.0, near_delay_max: args.delays.1, mid_delay: args.delays.2, track_entities: true };
-    let session = Session::connect(args.server, token, cfg, now).unwrap_or_else(|e| die(&format!("socket: {e}")));
+    let mut session = Session::connect(args.server, token, cfg, now).unwrap_or_else(|e| die(&format!("socket: {e}")));
+    session.core.keep_news(true);
     println!("connecting to {} as user {}", args.server, args.user);
     let mut view = View::new(args.mode);
     if let Some((eye, yaw, pitch)) = args.spectate {
@@ -208,6 +209,7 @@ fn main() {
         .init_resource::<scene::Scene>()
         .init_resource::<hud::Rates>()
         .init_resource::<controls::Tracers>()
+        .init_resource::<hud::Combat>()
         .add_systems(Startup, (setup_camera, scene::setup_looks, hud::setup))
         .add_systems(First, begin_frame)
         .add_systems(PreUpdate, poll)
@@ -224,6 +226,7 @@ fn main() {
                 controls::tracers,
                 hud::update,
                 hud::vitals,
+                hud::combat,
                 shots,
             )
                 .chain(),
@@ -317,6 +320,10 @@ fn summary(s: &Session, times: &FrameTimes) {
             );
         }
     }
+    println!(
+        "  hits confirmed {} (kills {}) | hit {} times for {} damage | kills heard {} | others' shots seen {}",
+        st.hits_confirmed, st.kills_confirmed, st.hurts, st.damage_taken, st.kills_heard, st.shots_seen
+    );
     let delay = st.render_delay_sum / st.render_frames.max(1) as f64 * 1000.0 / 30.0;
     let mid = s.core.entities().map_or(0.0, |e| e.mid_lag()) * 1000.0 / 30.0;
     println!("  render delay near {delay:.1} ms, mid/far +{mid:.0} ms, clock snaps {}", s.core.render_clock().snaps);

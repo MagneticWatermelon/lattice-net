@@ -31,6 +31,12 @@ In WSL itself, `cargo run` in `client/` opens a window under WSLg, but it render
 |---|---|
 | click / Esc | grab / release the mouse |
 | left mouse (held) | fire the rifle: 10 shots/s, with a tracer (the grabbing click doesn't fire) |
+
+**Combat feedback:**
+- **The hit marker** is an X on the crosshair: white for a body hit, orange for a head hit, larger and red for a kill.
+- **Red marks around the crosshair** point where hits came from, relative to your view.
+- **The kill feed** is top right, as "Faction #id > Faction #id (head)".
+- **Other players' tracers** are orange. Each starts when its shooter is drawn firing.
 | WASD, Shift, Space | move, sprint, jump |
 | V | view: first person → chase → spectator (free flight: WASD, Space/C, Shift) |
 | G | server ghosts: blue = each player's newest server sample (no delay, no smoothing); pink = our own last server state |

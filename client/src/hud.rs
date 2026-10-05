@@ -25,6 +25,30 @@ pub struct FrameBar(usize);
 #[derive(Component)]
 pub struct HealthFill;
 #[derive(Component)]
+pub struct HitMark;
+#[derive(Component)]
+pub struct DamageArrow(usize);
+#[derive(Component)]
+pub struct KillFeed;
+
+/// What the combat UI shows, from the news.
+#[derive(Resource, Default)]
+pub struct Combat {
+    /// The last hit marker: (when, head, killed).
+    mark: Option<(f32, bool, bool)>,
+    /// Hits taken: (when, direction in 1/256 turns, as the game's yaw).
+    hurt: Vec<(f32, u8)>,
+    /// Kills heard of: (when, killer, victim, head).
+    feed: Vec<(f32, u16, u16, bool)>,
+}
+
+const FACTION_NAMES: [&str; 3] = ["Red", "Blue", "Purple"];
+/// How long marks, arrows and feed lines stay, in seconds.
+const MARK_SECS: f32 = 0.25;
+const ARROW_SECS: f32 = 1.2;
+const FEED_SECS: f32 = 6.0;
+const ARROW_RADIUS: f32 = 70.0;
+#[derive(Component)]
 pub struct DeathText;
 #[derive(Component)]
 pub struct GapBar(usize);
@@ -86,6 +110,28 @@ pub fn setup(mut commands: Commands) {
         TextFont { font_size: FontSize::Px(24.0), ..default() },
         TextColor(Color::srgb(1.0, 0.85, 0.8)),
     ));
+    // Hit marker over the crosshair; damage arrows around it; the kill feed.
+    commands.spawn((
+        HitMark,
+        Node { position_type: PositionType::Absolute, left: Val::Percent(50.0), top: Val::Percent(50.0), margin: UiRect { left: Val::Px(-9.0), top: Val::Px(-16.0), ..default() }, ..default() },
+        Text::new(""),
+        TextFont { font_size: FontSize::Px(26.0), ..default() },
+        TextColor(Color::WHITE),
+    ));
+    for i in 0..4 {
+        commands.spawn((
+            DamageArrow(i),
+            Node { position_type: PositionType::Absolute, left: Val::Percent(50.0), top: Val::Percent(50.0), width: Val::Px(12.0), height: Val::Px(12.0), ..default() },
+            BackgroundColor(Color::srgba(0.95, 0.15, 0.1, 0.0)),
+        ));
+    }
+    commands.spawn((
+        KillFeed,
+        Node { position_type: PositionType::Absolute, right: Val::Px(12.0), top: Val::Px(10.0), ..default() },
+        Text::new(""),
+        TextFont { font_size: FontSize::Px(15.0), ..default() },
+        TextColor(Color::WHITE),
+    ));
     // Crosshair and help.
     commands.spawn((
         Node { position_type: PositionType::Absolute, left: Val::Percent(50.0), top: Val::Percent(50.0), margin: UiRect { left: Val::Px(-2.0), top: Val::Px(-2.0), ..default() }, width: Val::Px(4.0), height: Val::Px(4.0), ..default() },
@@ -97,6 +143,81 @@ pub fn setup(mut commands: Commands) {
         TextFont { font_size: FontSize::Px(12.0), ..default() },
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
     ));
+}
+
+type MarkText<'a> = (&'a mut Text, &'a mut TextColor, &'a mut TextFont);
+
+/// Takes the news: hit markers, damage arrows and the kill feed; others'
+/// shots go to the tracers.
+#[allow(clippy::too_many_arguments)]
+pub fn combat(
+    mut net: ResMut<Net>,
+    frame: Res<crate::Frame>,
+    view: Res<crate::View>,
+    mut combat: ResMut<Combat>,
+    mut tracers: ResMut<crate::controls::Tracers>,
+    mut mark: Query<MarkText, (With<HitMark>, Without<KillFeed>)>,
+    mut arrows: Query<(&DamageArrow, &mut Node, &mut BackgroundColor)>,
+    mut feed: Query<&mut Text, (With<KillFeed>, Without<HitMark>)>,
+) {
+    use lattice_game::events::Event;
+    let (mut events, mut shots) = (Vec::new(), Vec::new());
+    net.0.core.drain_news(&mut events, &mut shots);
+    let now = frame.secs;
+    tracers.pending.extend(shots.into_iter().map(|s| (s, now)));
+    for ev in events {
+        match ev {
+            Event::Hit { head, killed, .. } => combat.mark = Some((now, head, killed)),
+            Event::Hurt { dir, .. } => {
+                combat.hurt.push((now, dir));
+                if combat.hurt.len() > 4 {
+                    combat.hurt.remove(0);
+                }
+            }
+            Event::Kill { killer, victim, head } => {
+                combat.feed.push((now, killer, victim, head));
+                if combat.feed.len() > 5 {
+                    combat.feed.remove(0);
+                }
+            }
+        }
+    }
+    // Hit marker: white body, orange head, a bigger red one for a kill.
+    if let Ok((mut t, mut c, mut f)) = mark.single_mut() {
+        match combat.mark.filter(|m| now - m.0 < MARK_SECS) {
+            Some((at, head, killed)) => {
+                let a = 1.0 - (now - at) / MARK_SECS;
+                t.0 = "X".into();
+                c.0 = if killed { Color::srgba(1.0, 0.2, 0.15, a) } else if head { Color::srgba(1.0, 0.6, 0.1, a) } else { Color::srgba(1.0, 1.0, 1.0, a) };
+                f.font_size = FontSize::Px(if killed { 34.0 } else { 26.0 });
+            }
+            None => t.0.clear(),
+        }
+    }
+    // Damage arrows: around the crosshair, toward the shooter as we face now
+    // (straight up is ahead).
+    combat.hurt.retain(|h| now - h.0 < ARROW_SECS);
+    for (a, mut n, mut c) in &mut arrows {
+        match combat.hurt.get(a.0) {
+            Some(&(at, dir)) => {
+                let rel = dir as f32 / 256.0 * std::f32::consts::TAU - view.yaw;
+                n.margin = UiRect { left: Val::Px(-rel.sin() * ARROW_RADIUS - 6.0), top: Val::Px(-rel.cos() * ARROW_RADIUS - 6.0), ..default() };
+                c.0 = Color::srgba(0.95, 0.15, 0.1, 0.85 * (1.0 - (now - at) / ARROW_SECS));
+            }
+            None => c.0 = Color::srgba(0.0, 0.0, 0.0, 0.0),
+        }
+    }
+    // Kill feed: the last five, for six seconds each.
+    combat.feed.retain(|k| now - k.0 < FEED_SECS);
+    let me = net.0.core.welcome().map(|w| w.entity);
+    let name = |e: u16| if Some(e) == me { "you".to_string() } else { format!("{} #{e}", FACTION_NAMES[lattice_game::faction::faction(e) as usize]) };
+    let text: Vec<String> = combat.feed.iter().map(|&(_, k, v, head)| format!("{} > {}{}", name(k), name(v), if head { " (head)" } else { "" })).collect();
+    if let Ok(mut t) = feed.single_mut() {
+        let joined = text.join("\n");
+        if t.0 != joined {
+            t.0 = joined;
+        }
+    }
 }
 
 /// The health bar, and while dead, the time to respawn (from when we heard).

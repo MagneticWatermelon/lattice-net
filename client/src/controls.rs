@@ -126,11 +126,14 @@ pub fn toggles(
     }
 }
 
-/// Cosmetic tracers of our own shots, flown with the server's kinematics.
+/// Cosmetic tracers (ours and others'), flown with the server's kinematics.
 #[derive(Resource, Default)]
 pub struct Tracers {
-    /// (flight, seconds flown, seconds not yet flown).
-    pub flying: Vec<(Flight, f32, f32)>,
+    /// (flight, seconds flown, seconds not yet flown, ours).
+    pub flying: Vec<(Flight, f32, f32, bool)>,
+    /// Others' shots waiting for their shooter to be drawn firing:
+    /// (shot, when it arrived).
+    pub pending: Vec<(lattice_game::events::SeenShot, f32)>,
 }
 
 /// Mouse look, then this frame's input (and shot) to the input clock.
@@ -199,7 +202,7 @@ pub fn play(
         let (yaw, pitch) = (yaw_u16(view.yaw), pitch_i16(view.pitch));
         if net.0.core.fire(frame.now, yaw, pitch) {
             let f = view.feet;
-            tracers.flying.push((Flight::new([f[0], f[1], f[2] + EYE], aim(yaw, pitch)), 0.0, 0.0));
+            tracers.flying.push((Flight::new([f[0], f[1], f[2] + EYE], aim(yaw, pitch)), 0.0, 0.0, true));
         }
     }
     net.0.send_inputs(frame.now, input);
@@ -215,14 +218,30 @@ pub fn play(
     }
 }
 
-/// Flies and draws our tracers: a streak along each one's last segments,
-/// until it hits the ground or cover, or runs out of range.
+/// Flies and draws tracers: a streak along each one's last segments, until
+/// it hits the ground or cover, or runs out of range. Others' shots start
+/// when their shooter is drawn at the moment it fired, from its drawn eye.
 pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, mut gizmos: Gizmos) {
     let Some(w) = net.0.core.welcome() else { return };
     let world = lattice_game::world::World::shared(w.world_seed);
+    let core = &net.0.core;
+    if let (Some(r), Some(ents)) = (core.render_clock().last_render(), core.entities()) {
+        let tracers = &mut *tracers;
+        tracers.pending.retain(|(shot, at)| {
+            match ents.render_one(shot.shooter, r) {
+                Some(st) if st.at >= shot.step => {
+                    let o = [st.pos[0], st.pos[1], st.pos[2] + EYE];
+                    tracers.flying.push((Flight::new(o, aim(shot.yaw, shot.pitch)), 0.0, 0.0, false));
+                    false
+                }
+                // Not drawn (yet): wait up to a second.
+                _ => frame.secs - *at < 1.0,
+            }
+        });
+    }
     let seg = 1.0 / (SUBSTEPS * 30) as f32;
     let range = RANGE_STEPS as f32 / 30.0;
-    tracers.flying.retain_mut(|(f, age, owed)| {
+    tracers.flying.retain_mut(|(f, age, owed, ours)| {
         *owed += frame.dt;
         let tail = f.pos;
         while *owed >= seg {
@@ -239,7 +258,8 @@ pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, m
             }
             *f = next;
         }
-        gizmos.line(to_bevy(tail[0], tail[1], tail[2]), to_bevy(f.pos[0], f.pos[1], f.pos[2]), Color::srgb(1.0, 0.85, 0.4));
+        let color = if *ours { Color::srgb(1.0, 0.85, 0.4) } else { Color::srgb(1.0, 0.5, 0.3) };
+        gizmos.line(to_bevy(tail[0], tail[1], tail[2]), to_bevy(f.pos[0], f.pos[1], f.pos[2]), color);
         true
     });
 }
