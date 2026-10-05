@@ -6,7 +6,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 
 - **One authoritative server process per continent**, with every player on the continent in that one process. Initial hard ceiling: **10k players**. Don't split one battle across servers: cross-server hit resolution means two clocks and two rewind histories.
 - **Server is authoritative for movement and hits.**
-  - Lag-compensated rewind is capped at ~150–200 ms. (To revisit in M3d: the rewind's fixed part, render delay + spare + tick wait, is already ~134 ms for near targets, so that cap compensates only very low RTTs. See the M3 decisions.)
+  - Lag-compensated rewind is capped at **300 ms for near targets and 367 ms for mid/far** (decided 2026-10-05, was ~150–200 ms). It fully covers RTT ≤ 100 ms; beyond that, shooters lead. The rewind's fixed part (render delay + spare + tick wait) is already ~134–200 ms.
   - Projectiles are simulated on the server from a rewound origin.
   - Hit detection is not client-side (PS2's model).
 - **Per-client downstream is O(k), not O(N).** Interest management uses tiers:
@@ -122,7 +122,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
       - mid and far are drawn 200 ms behind (two 10 Hz updates, so a lost one is bridged; far is mostly extrapolated on it);
       - an entity changing tier glides between delays at 25% (133 ms over ~0.5 s);
       - lag compensation rewinds each target by its own tier's delay, so inputs carry the near render step plus the batch's mid lag;
-    - **the rewind cap is "the highest RTT we fully compensate" + the fixed part:** a near target is rewound by RTT + 67 ms render + ~33 ms spare + ~33 ms tick wait, about 134 ms of fixed part (~115 with a spare sized to measured jitter). For 120–150 ms of RTT that's a cap of ~250–285 ms; players beyond it lead their shots. A deliberate fairness tradeoff (shots behind cover), decided in M3d;
+    - **the rewind cap is "the highest RTT we fully compensate" + the fixed part:** a near target is rewound by RTT + 67–133 ms render + ~33 ms spare + ~33 ms tick wait. **Decided in M3d: RTT ≤ 100 ms**, so caps of 300 ms (near) and 367 ms (mid/far); players beyond lead their shots. A deliberate fairness tradeoff against shots landing behind cover;
     - mid/far velocity derived on the client first, with velocity bytes in the blobs only if the bots' smoothness numbers ask.
   - **Order:**
     - **M3a world and movement: done** (2026-10-04).
@@ -199,17 +199,58 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
         - net-graph smoothness matches the bots on the same link;
         - frame time p99 under the display's refresh with a 1k blob in view on the Windows box;
         - other players move without visible pops, judged by eye.
-    - **M3d combat:**
-      - health, death, respawn and teams;
-      - a parallel "shots" phase with lag-compensated projectiles: capsule + head sphere, 3D history capped at 200 ms, blocked by terrain and cover;
-      - shot events for tracers; hits, damage and kills on the reliable channel;
-      - bots that fight, in latency classes (port ranges + `tc` filters).
+    - **M3d combat** (scoped 2026-10-05).
+      - **Decided (the user):**
+        - **Rewind fully covers RTT ≤ 100 ms.** The caps are 300 ms for near targets and 367 ms for mid/far (100 ms RTT + the largest render delay + ~67 ms of spare and tick wait). Beyond a cap, the target is taken at the cap and the shooter leads.
+        - **One automatic rifle:** projectile ~600 m/s with gravity, 10 rounds/s, ~1 km range.
+        - **100 HP, 20 body / 40 head** (~0.5 s time-to-kill).
+        - **Respawn back into the scenario's fight after 5 s,** on the faction's side, so load tests keep fighting at a steady size.
+      - **Factions (3):** the faction is `entity id % 3`, allocated from per-faction free lists: zero bytes on the wire. Assigned by squad, round-robin. No friendly fire.
+      - **Health and death:**
+        - near states carry health (7 bits) and mid/far blobs a 4-bit bucket; one spare flag bit in each is `dead`;
+        - the dead don't move, aren't pushed, don't block, and respawn after 5 s;
+        - snapshots carry own health and a `life` counter, so a respawn teleport isn't a misprediction (like `pushes`).
+      - **Shots ride the input batch.**
+        - `BUTTON_FIRE`, plus each shot as `{seq, frac:u8, yaw:2, pitch:2, render:2}` (8 B), sent redundantly with its inputs;
+        - `frac` is when in its 1/30 s step the trigger fired (sub-tick timing). The origin is the shooter's eye between its server states for seq−1 and seq. The aim is the view at that frame; the target time is that frame's render step (near), plus the batch's mid lag;
+        - the server enforces the fire rate; there's no ammo or reload in M3d.
+      - **Projectiles live in the shooter's timeline.**
+        - each keeps its per-tier rewind for its whole flight and is tested against targets at (now − rewind);
+        - it moves ~20 m a tick with gravity; each tick's segment is tested against terrain (heightmap march ≤ 2 m), cover boxes (slab test) and players. Player candidates come from the shared grid, padded by max speed × rewind: a capsule (r 0.4) plus a head sphere (r 0.15 at 1.65 m), positioned from history. The first hit wins;
+        - a target's tier is the server's own record of what it sent the shooter (its current near set).
+      - **History** is 3D positions per tick with their step: 16 ticks (≥ 0.53 s), tick-major (was 6 ticks, 2D).
+      - **Shots phase:**
+        - placed after history; parallel over projectiles (rayon);
+        - hits are collected, then applied serially (damage, deaths, events).
+      - **Events:**
+        - reliable: hit confirms to the shooter (target, damage, head, killed); damage taken to the victim (from, amount); kills to both and their squads;
+        - unreliable: a per-tick shots message for tracers (shooters in the client's near set, ~7 B each);
+        - attackers and victims become near-tier candidates for a few seconds (the interest "interaction" clause).
+      - **Client:**
+        - left mouse fires, with the frame's sub-tick fraction;
+        - cosmetic tracers and muzzle flash at once; hit markers from confirms;
+        - a health bar, damage direction, a death view with a respawn timer, and a kill feed;
+        - faction colors, with tier colors on T.
+      - **Bots fight:**
+        - tracked bots aim at the nearest enemy they render, with Gaussian aim error, in bursts; sink bots fire along their heading, for load;
+        - latency classes: per-bot delay in the swarm harness (a deterministic fairness test), and port-range `tc` classes on the bot side for UDP runs.
+      - **Measured:**
+        - the shots phase (wall / longest / work), projectiles alive, segment and candidate tests, hits, event bytes;
+        - hit rate by latency class;
+        - post-cover hits (target occluded from the shooter's present eye at hit time) with their rewind.
+      - **Order:**
+        1. M3d.1: factions, health, death, respawn.
+        2. M3d.2: shots, 3D history, projectiles, damage (server and swarm tests).
+        3. M3d.3: events, tracers, client combat.
+        4. M3d.4: fighting bots, latency classes, measurements.
     - **M3e** one bare-metal validation session.
   - **Pass bars:**
     - prediction stays bit-exact (0 corrections on a clean link, outside separation pushes);
     - 10k at level 0 with heavy fire (~20% of players at 10 Hz), p99 < 25 ms on the 64-core box;
     - a 3k blob all fighting, p99 < 25 ms;
-    - 20 ms and 150 ms bots hit at the same rate for the same aim error, and post-cover hits only within the 200 ms cap.
+    - 20 ms and 100 ms RTT bots hit at the same rate (±10%) for the same aim error; 150 ms bots measurably less (they lead ~50 ms);
+    - no hit lands with a rewind beyond its cap (300 / 367 ms); post-cover hits are measured;
+    - corrections only from separation pushes and respawns, both flagged.
 - **M4:** vehicles.
 - **M5:** minimal playable client.
 
