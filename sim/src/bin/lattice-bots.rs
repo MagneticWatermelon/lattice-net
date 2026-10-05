@@ -29,7 +29,8 @@ lattice-bots: M1 bot swarm
   --report S           report interval, seconds [5]
   --track-every N      every Nth bot tracks entities and draws a frame every tick, to measure
                        update intervals and smoothness per tier [20]
-  --interp-ms MS       render delay behind the newest server step [100]
+  --near-ms MS         render delay of near entities behind the newest server step [67]
+  --mid-ms MS          render delay of mid and far entities [200]
   --full-every K       only every Kth bot measures (prediction, latency, tracking); the
                        rest are sink bots that play but only count what they're sent [1]
   --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
@@ -219,7 +220,7 @@ struct Bot {
     seed: u64,
     track: bool,
     sink: bool,
-    interp: Duration,
+    delays: (Duration, Duration),
     /// Bound up front, before the clock starts: creating thousands of sockets
     /// inside the first tick overran the swarm and delivered its inputs late.
     sock: Option<UdpSocket>,
@@ -244,7 +245,7 @@ impl Bot {
             };
             let token = login.token(self.seed, clocks.system);
             self.net = Some((sock, Client::new(Config::default(), server, token, now)));
-            let client = ClientConfig { interp_delay: self.interp, track_entities: false };
+            let client = ClientConfig { near_delay: self.delays.0, mid_delay: self.delays.1, track_entities: false };
             let mut brain = BotBrain::with_config(self.seed, client);
             if self.track {
                 brain.enable_tracking();
@@ -479,7 +480,8 @@ fn main() -> std::io::Result<()> {
     let report = Duration::from_secs_f64(a.get("report", 5.0));
     let seed: u64 = a.get("seed", 1);
     let track_every: usize = a.get("track-every", 20);
-    let interp = Duration::from_secs_f64(a.get::<f64>("interp-ms", 100.0) / 1000.0);
+    let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
+    let delays = (ms(a.get::<f64>("near-ms", 2000.0 / 30.0)), ms(a.get::<f64>("mid-ms", 200.0)));
     let full_every: usize = a.get::<usize>("full-every", 1).max(1);
     let key: HexKey = a.get("token-key", HexKey::default());
     let summary_path: Option<String> = a.opt("summary");
@@ -516,7 +518,7 @@ fn main() -> std::io::Result<()> {
                 seed: seed.wrapping_mul(1_000_003).wrapping_add(i as u64),
                 track: track_every > 0 && i % track_every == 0 && i % full_every == 0,
                 sink: i % full_every != 0,
-                interp,
+                delays,
                 sock: sockets[i].take(),
                 net: None,
                 brain: None,
@@ -821,7 +823,7 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
         );
     }
     println!(
-        "  render delay {:.1} ms behind the newest step, clock snaps {} (backwards {})",
+        "  render delay (near) {:.1} ms behind the newest step, clock snaps {} (backwards {})",
         render_delay_ms(t),
         t.render_snaps,
         t.render_backwards

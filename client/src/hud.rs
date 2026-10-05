@@ -154,7 +154,11 @@ pub fn update(
         format!("{state}  rtt {rtt:.1} ms  loss {loss:.2}%  down {:.0} up {:.0} kbps", rates.down_kbps, rates.up_kbps),
         format!("server step {step}  level {}  pace {:.2}  bandwidth level {}", st.level, st.pace as f32 / 1000.0, st.client_level),
         format!("input -> applied ~{:.0} ms (rtt/2 + server wait {wait:.0})", rtt / 2.0 + wait as f32),
-        format!("render delay {delay:.0} ms  clock snaps {}", core.render_clock().snaps),
+        format!(
+            "render delay near {delay:.0} ms, mid/far +{:.0} ms  clock snaps {}",
+            core.entities().map_or(0.0, |e| e.mid_lag()) * 1000.0 / 30.0,
+            core.render_clock().snaps
+        ),
         format!(
             "drawn near {} mid {} far {}  interpolated {:.1}% / {:.1}% / {:.1}%",
             scene.drawn[0],

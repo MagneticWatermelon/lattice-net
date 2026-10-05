@@ -1,9 +1,10 @@
 //! Game messages carried in lattice-net channels. Each starts with a tag byte.
 //!
 //! ```text
-//! C->S unreliable  Input    tag | newest_seq:4 | n:1 | n × (move_x:1 move_y:1 yaw:2 pitch:2 buttons:1 [render:2])   newest first
-//!                           n's top bit: every input carries `render`, the client's render step
-//!                           when it was made (1/64 steps, wrapping; see RENDER_UNITS)
+//! C->S unreliable  Input    tag | newest_seq:4 | n:1 | [mid_lag:1] | n × (move_x:1 move_y:1 yaw:2 pitch:2 buttons:1 [render:2])
+//!                           newest first. n's top bit: render times follow. `render` is the client's
+//!                           near render step when the input was made (1/64 steps, wrapping; see
+//!                           RENDER_UNITS); mid and far entities were drawn `mid_lag` (1/8 steps) earlier
 //! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32 | world_seed:8
 //! S->C unreliable  Snapshot tag | server_tick:4 | step:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
 //!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 grounded:1 | pushes:1
@@ -45,6 +46,8 @@ pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1;
 /// Render times in inputs are in 1/`RENDER_UNITS` steps, as a wrapping u16:
 /// unambiguous within ±512 steps (±17 s) of the server's step.
 pub const RENDER_UNITS: f64 = 64.0;
+/// `RenderTime::mid_lag` is in 1/`MID_LAG_UNITS` steps (up to ~1 s).
+pub const MID_LAG_UNITS: f64 = 8.0;
 const RENDER_FLAG: u8 = 0x80;
 pub const ENTITIES_HEADER: usize = 1 + 4 + 1 + 1;
 
@@ -121,14 +124,34 @@ pub fn render_age(step: u32, render: u16) -> f64 {
     now.wrapping_sub(render) as i16 as f64 / RENDER_UNITS
 }
 
-/// Each input with its render time (`render_units`). Render times are sent
-/// only when every input in the batch has one.
-pub fn encode_inputs(newest_seq: u32, newest_first: &[(Input, Option<u16>)]) -> Vec<u8> {
+/// What the player saw when it made an input: near entities at render step
+/// `near` (`render_units`), mid and far ones `mid_lag` / `MID_LAG_UNITS`
+/// steps before that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderTime {
+    pub near: u16,
+    pub mid_lag: u8,
+}
+
+impl RenderTime {
+    /// How far behind `step` the near and mid render steps were (`render_age`).
+    pub fn ages(&self, step: u32) -> (f64, f64) {
+        let near = render_age(step, self.near);
+        (near, near + self.mid_lag as f64 / MID_LAG_UNITS)
+    }
+}
+
+/// Each input with its near render step (`render_units`), and the batch's mid
+/// lag. Render times are sent only when every input in the batch has one.
+pub fn encode_inputs(newest_seq: u32, newest_first: &[(Input, Option<u16>)], mid_lag: u8) -> Vec<u8> {
     let timed = newest_first.iter().all(|(_, r)| r.is_some());
-    let mut w = Writer::with_capacity(6 + newest_first.len() * 9);
+    let mut w = Writer::with_capacity(7 + newest_first.len() * 9);
     w.u8(MSG_INPUT);
     w.u32(newest_seq);
     w.u8(newest_first.len() as u8 | if timed { RENDER_FLAG } else { 0 });
+    if timed {
+        w.u8(mid_lag);
+    }
     for (i, render) in newest_first {
         w.u8(i.move_x as u8);
         w.u8(i.move_y as u8);
@@ -143,7 +166,7 @@ pub fn encode_inputs(newest_seq: u32, newest_first: &[(Input, Option<u16>)]) -> 
 }
 
 /// Calls `f(seq, input, render)` for each input in the batch, newest first.
-pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input, Option<u16>)) -> Result<(), DecodeError> {
+pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input, Option<RenderTime>)) -> Result<(), DecodeError> {
     let mut r = Reader::new(data);
     if r.u8()? != MSG_INPUT {
         return Err(DecodeError::Invalid);
@@ -154,10 +177,11 @@ pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input, Option<u16>)) ->
     if n > newest {
         return Err(DecodeError::Invalid); // seq 0 is never a real input
     }
+    let mid_lag = if timed { r.u8()? } else { 0 };
     for k in 0..n {
         let input =
             Input { move_x: r.u8()? as i8, move_y: r.u8()? as i8, yaw: r.u16()?, pitch: r.u16()? as i16, buttons: r.u8()? };
-        let render = if timed { Some(r.u16()?) } else { None };
+        let render = if timed { Some(RenderTime { near: r.u16()?, mid_lag }) } else { None };
         f(newest - k, input, render);
     }
     r.finish()
@@ -366,20 +390,22 @@ mod tests {
             (Input { move_x: -127, move_y: 5, yaw: 40000, pitch: -32767, buttons: 3 }, Some(65535)),
             (Input { move_x: 3, move_y: 127, yaw: 1, pitch: 1200, buttons: 0 }, Some(7)),
         ];
-        let bytes = encode_inputs(10, &ins);
-        assert_eq!(bytes.len(), 6 + 2 * 9);
+        let bytes = encode_inputs(10, &ins, 32);
+        assert_eq!(bytes.len(), 7 + 2 * 9);
         let mut got = Vec::new();
         decode_inputs(&bytes, |s, i, r| got.push((s, i, r))).unwrap();
-        assert_eq!(got, vec![(10, ins[0].0, ins[0].1), (9, ins[1].0, ins[1].1)]);
+        let rt = |near| Some(RenderTime { near, mid_lag: 32 });
+        assert_eq!(got, vec![(10, ins[0].0, rt(65535)), (9, ins[1].0, rt(7))]);
+        assert_eq!(rt(render_units(1000.0)).unwrap().ages(1002), (2.0, 6.0), "mid: 4 steps further back");
         // Without a render time on every input, none is sent.
         let untimed = [ins[0], (ins[1].0, None)];
-        let bytes = encode_inputs(10, &untimed);
+        let bytes = encode_inputs(10, &untimed, 32);
         assert_eq!(bytes.len(), 6 + 2 * 7);
         got.clear();
         decode_inputs(&bytes, |s, i, r| got.push((s, i, r))).unwrap();
         assert_eq!(got, vec![(10, ins[0].0, None), (9, ins[1].0, None)]);
         // a batch reaching back past seq 1 is malformed
-        assert!(decode_inputs(&encode_inputs(1, &ins), |_, _, _| {}).is_err());
+        assert!(decode_inputs(&encode_inputs(1, &ins, 0), |_, _, _| {}).is_err());
     }
 
     #[test]

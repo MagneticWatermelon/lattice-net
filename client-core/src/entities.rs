@@ -2,7 +2,17 @@
 //!
 //! Every entity has one timeline of samples, whatever tier they came from:
 //! near states (30 Hz, with velocity) and mid/far blobs (10 and 2 Hz, without),
-//! each stamped with its game step. Drawing at render step `r`:
+//! each stamped with its game step.
+//!
+//! **Each tier has its own render delay.** The render clock runs at the near
+//! delay (~67 ms: two 30 Hz updates). Mid and far entities are drawn a fixed
+//! `mid_lag` later (at ~200 ms in all: two 10 Hz updates, so a lost one is
+//! bridged). 200 ms in the past is invisible at 150 m and beyond, and lag
+//! compensation rewinds each target by its own tier's delay. When an entity
+//! changes tier its lag glides to the new one at `LAG_SLEW` (133 ms over
+//! ~0.5 s): it plays 25% fast or slow for a moment instead of skipping.
+//!
+//! Drawing an entity at its render step `t` (render step minus its lag):
 //!
 //! - between two samples: interpolate;
 //! - past the newest: extrapolate, with the near tier's velocity or one derived
@@ -44,8 +54,15 @@ pub const SMOOTH: f64 = 3.0;
 /// An offset longer than this is a teleport, not an error: dropped, in meters.
 /// (A far entity extrapolated for 1.5 s can be off by several meters.)
 pub const TELEPORT: f32 = 10.0;
-/// Samples kept per entity.
-const SAMPLES: usize = 8;
+/// Samples kept per entity. A mid entity is drawn ~6 steps behind its
+/// newest sample, and while it changes tier its near samples come one a
+/// step: 16 leaves room for late ones.
+const SAMPLES: usize = 16;
+/// How fast an entity's lag follows its tier's, in steps of lag per step.
+pub const LAG_SLEW: f64 = 0.25;
+/// The default lag of mid and far entities behind near ones, in steps
+/// (200 ms - 67 ms).
+pub const MID_LAG: f64 = 4.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
@@ -110,6 +127,8 @@ pub struct RenderState {
     /// The tier of its newest sample.
     pub tier: Tier,
     pub how: How,
+    /// The game step it's drawn at: the render step minus its tier's lag.
+    pub at: f64,
 }
 
 /// An entity's latest update, by server tick.
@@ -127,9 +146,13 @@ struct Track {
     /// Ascending by step.
     samples: [Sample; SAMPLES],
     len: usize,
-    /// Visual offset, as of render step `offset_at`.
-    offset: [f32; 3],
-    offset_at: f64,
+    /// Visual offset, as of render step `visual_at`.
+    visual: [f32; 3],
+    visual_at: f64,
+    /// How far behind the render step it's drawn, in steps, as of render
+    /// step `lag_at` (it slews toward its tier's lag).
+    lag: f64,
+    lag_at: f64,
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -143,8 +166,35 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
 }
 
 impl Track {
-    fn new(known: Known, s: Sample) -> Self {
-        Self { known, samples: [s; SAMPLES], len: 1, offset: [0.0; 3], offset_at: 0.0 }
+    fn new(known: Known, s: Sample, lag: f64, at: f64) -> Self {
+        Self { known, samples: [s; SAMPLES], len: 1, visual: [0.0; 3], visual_at: at, lag, lag_at: at }
+    }
+
+    /// The lag its tier asks for: near none, mid and far `mid_lag`.
+    fn target(&self, mid_lag: f64) -> f64 {
+        if self.newest().tier == Tier::Near {
+            0.0
+        } else {
+            mid_lag
+        }
+    }
+
+    /// Its lag at render step `r`.
+    fn lag(&self, r: f64, mid_lag: f64) -> f64 {
+        let (target, d) = (self.target(mid_lag), LAG_SLEW * (r - self.lag_at).max(0.0));
+        if self.lag < target {
+            (self.lag + d).min(target)
+        } else {
+            (self.lag - d).max(target)
+        }
+    }
+
+    /// `lag`, kept as the new starting point (the target can change after).
+    fn settle_lag(&mut self, r: f64, mid_lag: f64) -> f64 {
+        if r > self.lag_at {
+            (self.lag, self.lag_at) = (self.lag(r, mid_lag), r);
+        }
+        self.lag
     }
 
     fn samples(&self) -> &[Sample] {
@@ -185,6 +235,7 @@ impl Track {
             airborne: x.airborne,
             tier: self.newest().tier,
             how,
+            at: r,
         };
         if r < s[0].step {
             return state(&s[0], s[0].pos, How::New);
@@ -201,6 +252,7 @@ impl Track {
                 airborne: if t < 0.5 { a.airborne } else { b.airborne },
                 tier: self.newest().tier,
                 how: How::Interpolated,
+                at: r,
             };
         }
         let last = &s[n - 1];
@@ -227,22 +279,24 @@ impl Track {
         state(last, pos, if ahead <= limit { How::Extrapolated } else { How::Held })
     }
 
-    /// Whether it's overdue enough to forget at render step `r`.
-    fn gone(&self, r: f64) -> bool {
+    /// Whether it's overdue enough to forget at its own render step `t`.
+    fn gone(&self, t: f64) -> bool {
         let s = self.samples();
         let n = s.len();
         let interval = if n >= 2 { s[n - 1].step - s[n - 2].step } else { FORGET };
-        r - s[n - 1].step > (2.0 * interval).clamp(FORGET_MIN, FORGET)
+        t - s[n - 1].step > (2.0 * interval).clamp(FORGET_MIN, FORGET)
     }
 
-    fn offset(&self, r: f64) -> [f32; 3] {
-        let k = (-(r - self.offset_at).max(0.0) / SMOOTH).exp() as f32;
-        self.offset.map(|o| o * k)
+    /// What's left of the visual offset at render step `r`.
+    fn visual(&self, r: f64) -> [f32; 3] {
+        let k = (-(r - self.visual_at).max(0.0) / SMOOTH).exp() as f32;
+        self.visual.map(|o| o * k)
     }
 
-    fn render(&self, r: f64) -> RenderState {
-        let mut s = self.raw(r);
-        let o = self.offset(r);
+    /// Where it's drawn at render step `r`, lagging `lag` steps.
+    fn render(&self, r: f64, lag: f64) -> RenderState {
+        let mut s = self.raw(r - lag);
+        let o = self.visual(r);
         for (p, o) in s.pos.iter_mut().zip(o) {
             *p += o;
         }
@@ -250,21 +304,23 @@ impl Track {
     }
 
     /// Adds a sample. With the render step it arrived at, the change it makes
-    /// on screen is absorbed into the offset; returns that change, in meters.
-    fn add(&mut self, s: Sample, at: Option<f64>) -> Option<f32> {
+    /// on screen is absorbed into the visual offset; returns that change, in
+    /// meters.
+    fn add(&mut self, s: Sample, at: Option<f64>, mid_lag: f64) -> Option<f32> {
         let Some(r) = at else {
             self.insert(s);
             return None;
         };
-        let before = self.raw(r).pos;
+        let t = r - self.settle_lag(r, mid_lag);
+        let before = self.raw(t).pos;
         self.insert(s);
-        let after = self.raw(r).pos;
-        let cur = self.offset(r);
+        let after = self.raw(t).pos;
+        let cur = self.visual(r);
         let d = [before[0] - after[0], before[1] - after[1], before[2] - after[2]];
         let o = [cur[0] + d[0], cur[1] + d[1], cur[2] + d[2]];
         let len = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
-        self.offset = if len > TELEPORT { [0.0; 3] } else { o };
-        self.offset_at = r;
+        self.visual = if len > TELEPORT { [0.0; 3] } else { o };
+        self.visual_at = r;
         Some((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt())
     }
 }
@@ -280,9 +336,11 @@ pub struct SmoothStats {
 }
 
 /// Every entity this client has heard about.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Entities {
     tracks: HashMap<u16, Track>,
+    /// Mid and far entities are drawn this many steps behind near ones.
+    mid_lag: f64,
     /// Near states by entity and tick: the baselines near deltas refer to.
     near: NearHistory,
     /// Update intervals per tier in server ticks, until drained.
@@ -291,7 +349,29 @@ pub struct Entities {
     pub smooth: SmoothStats,
 }
 
+impl Default for Entities {
+    fn default() -> Self {
+        Self::new(MID_LAG)
+    }
+}
+
 impl Entities {
+    /// Mid and far entities drawn `mid_lag` steps behind near ones.
+    pub fn new(mid_lag: f64) -> Self {
+        Self {
+            tracks: HashMap::new(),
+            mid_lag: mid_lag.max(0.0),
+            near: NearHistory::default(),
+            intervals: Default::default(),
+            bad_blobs: 0,
+            smooth: SmoothStats::default(),
+        }
+    }
+
+    pub fn mid_lag(&self) -> f64 {
+        self.mid_lag
+    }
+
     /// A near message: `step` maps its server tick to a game step (`None` if
     /// unknown yet), `render` is the render step it arrived at.
     pub(crate) fn on_near(
@@ -331,28 +411,31 @@ impl Entities {
                     t.known = now;
                 }
                 if let Some(s) = sample {
-                    if let Some(pop) = t.add(s, render) {
+                    if let Some(pop) = t.add(s, render, self.mid_lag) {
                         self.smooth.pops[tier as usize].push((pop * 1000.0).round().min(u16::MAX as f32) as u16);
                     }
                 }
             }
             None => {
                 if let Some(s) = sample {
-                    self.tracks.insert(entity, Track::new(now, s));
+                    let lag = if s.tier == Tier::Near { 0.0 } else { self.mid_lag };
+                    self.tracks.insert(entity, Track::new(now, s, lag, render.unwrap_or(0.0)));
                 }
             }
         }
     }
 
-    /// Draws every entity at render step `r`: calls `f(entity, state)`,
-    /// counts how each was drawn, and forgets entities that stopped coming.
+    /// Draws every entity at render step `r` (each behind it by its tier's
+    /// lag): calls `f(entity, state)`, counts how each was drawn, and forgets
+    /// entities that stopped coming.
     pub fn render(&mut self, r: f64, mut f: impl FnMut(u16, &RenderState)) {
-        let frames = &mut self.smooth.frames;
+        let (frames, mid_lag) = (&mut self.smooth.frames, self.mid_lag);
         self.tracks.retain(|&e, t| {
-            if t.gone(r) {
+            let lag = t.settle_lag(r, mid_lag);
+            if t.gone(r - lag) {
                 return false;
             }
-            let s = t.render(r);
+            let s = t.render(r, lag);
             frames[s.tier as usize][s.how as usize] += 1;
             f(e, &s);
             true
@@ -361,7 +444,7 @@ impl Entities {
 
     /// Where entity `entity` is drawn at render step `r`, without counting it.
     pub fn render_one(&self, entity: u16, r: f64) -> Option<RenderState> {
-        self.tracks.get(&entity).map(|t| t.render(r))
+        self.tracks.get(&entity).map(|t| t.render(r, t.lag(r, self.mid_lag)))
     }
 
     /// The newest sample of `entity`: where the server last said it was,
@@ -392,6 +475,18 @@ impl Entities {
 mod tests {
     use super::*;
 
+    impl Track {
+        /// A near-timeline track (no lag) for the timeline tests.
+        fn new_test(k: Known, s: Sample) -> Self {
+            Track::new(k, s, 0.0, 0.0)
+        }
+
+        /// `add` with no mid lag: every tier on the near timeline.
+        fn add_test(&mut self, s: Sample, at: Option<f64>) -> Option<f32> {
+            self.add(s, at, 0.0)
+        }
+    }
+
     fn s(step: f64, x: f32, vel: Option<[f32; 2]>) -> Sample {
         Sample { step, tier: if vel.is_some() { Tier::Near } else { Tier::Far }, pos: [x, 0.0, 10.0], vel, yaw: 0.0, pitch: 0.0, airborne: false }
     }
@@ -399,32 +494,32 @@ mod tests {
     #[test]
     fn interpolates_between_samples_and_keeps_them_in_order() {
         let k = Known { tick: 0, tier: Tier::Near, pos: [0.0; 2] };
-        let mut t = Track::new(k, s(10.0, 0.0, Some([0.0; 2])));
-        t.add(s(12.0, 2.0, Some([0.0; 2])), None);
-        t.add(s(11.0, 0.5, Some([0.0; 2])), None); // late, out of order
+        let mut t = Track::new_test(k, s(10.0, 0.0, Some([0.0; 2])));
+        t.add_test(s(12.0, 2.0, Some([0.0; 2])), None);
+        t.add_test(s(11.0, 0.5, Some([0.0; 2])), None); // late, out of order
         assert_eq!(t.samples().iter().map(|x| x.step).collect::<Vec<_>>(), [10.0, 11.0, 12.0]);
         let r = t.raw(11.5);
         assert_eq!((r.pos[0], r.how), (1.25, How::Interpolated));
         assert_eq!(t.raw(9.0).how, How::New, "before the first sample");
         for i in 13..30 {
-            t.add(s(i as f64, i as f32, None), None);
+            t.add_test(s(i as f64, i as f32, None), None);
         }
         assert_eq!(t.len, SAMPLES);
-        assert_eq!(t.samples()[0].step, 22.0, "the oldest are dropped");
+        assert_eq!(t.samples()[0].step, 14.0, "the oldest are dropped");
     }
 
     #[test]
     fn extrapolates_with_velocity_for_a_while_then_holds() {
         let k = Known { tick: 0, tier: Tier::Near, pos: [0.0; 2] };
         // Near: 6 m/s, so 0.2 m per step.
-        let t = Track::new(k, s(10.0, 0.0, Some([6.0, 0.0])));
+        let t = Track::new_test(k, s(10.0, 0.0, Some([6.0, 0.0])));
         let r = t.raw(12.0);
         assert!((r.pos[0] - 0.4).abs() < 1e-5 && r.how == How::Extrapolated);
         let r = t.raw(30.0);
         assert!((r.pos[0] - 0.2 * MAX_EXTRAPOLATION as f32).abs() < 1e-5 && r.how == How::Held);
         // Far: velocity derived from the two newest samples (3 m over 15 steps).
-        let mut t = Track::new(k, s(0.0, 0.0, None));
-        t.add(s(15.0, 3.0, None), None);
+        let mut t = Track::new_test(k, s(0.0, 0.0, None));
+        t.add_test(s(15.0, 3.0, None), None);
         let r = t.raw(20.0);
         assert!((r.pos[0] - 4.0).abs() < 1e-5 && r.how == How::Extrapolated, "{r:?}");
         assert!((r.pos[2] - 10.0).abs() < 1e-5, "flat: height stays");
@@ -437,22 +532,22 @@ mod tests {
     #[test]
     fn a_correction_is_smoothed_not_popped() {
         let k = Known { tick: 0, tier: Tier::Near, pos: [0.0; 2] };
-        let mut t = Track::new(k, s(10.0, 0.0, Some([6.0, 0.0])));
+        let mut t = Track::new_test(k, s(10.0, 0.0, Some([6.0, 0.0])));
         // Drawn at 12 while extrapolating: 0.4 m. Then the sample for 11
         // arrives: the entity had stopped at 0.1.
-        let before = t.render(12.0).pos[0];
-        let pop = t.add(s(11.0, 0.1, Some([0.0; 2])), Some(12.0)).unwrap();
+        let before = t.render(12.0, 0.0).pos[0];
+        let pop = t.add_test(s(11.0, 0.1, Some([0.0; 2])), Some(12.0)).unwrap();
         assert!((pop - 0.3).abs() < 1e-5, "pop {pop}");
-        assert!((t.render(12.0).pos[0] - before).abs() < 1e-6, "no jump on screen");
-        let later = t.render(12.0 + 4.0 * SMOOTH).pos[0];
+        assert!((t.render(12.0, 0.0).pos[0] - before).abs() < 1e-6, "no jump on screen");
+        let later = t.render(12.0 + 4.0 * SMOOTH, 0.0).pos[0];
         assert!((later - 0.1).abs() < 0.3 * 0.02, "the offset decays: {later}");
         // A sample beyond the render step doesn't change what's drawn: no pop.
-        let mut t = Track::new(k, s(10.0, 0.0, Some([6.0, 0.0])));
-        t.add(s(11.0, 0.2, Some([6.0, 0.0])), None);
-        assert_eq!(t.add(s(12.0, 0.4, Some([6.0, 0.0])), Some(10.5)), Some(0.0));
+        let mut t = Track::new_test(k, s(10.0, 0.0, Some([6.0, 0.0])));
+        t.add_test(s(11.0, 0.2, Some([6.0, 0.0])), None);
+        assert_eq!(t.add_test(s(12.0, 0.4, Some([6.0, 0.0])), Some(10.5)), Some(0.0));
         // A teleport isn't smoothed.
-        t.add(s(13.0, 150.0, Some([6.0, 0.0])), Some(12.9));
-        assert_eq!(t.offset, [0.0; 3]);
+        t.add_test(s(13.0, 150.0, Some([6.0, 0.0])), Some(12.9));
+        assert_eq!(t.visual, [0.0; 3]);
     }
 
     #[test]
@@ -465,7 +560,7 @@ mod tests {
 
     #[test]
     fn entities_that_stop_coming_are_forgotten() {
-        let mut e = Entities::default();
+        let mut e = Entities::new(0.0);
         let k = Known { tick: 0, tier: Tier::Far, pos: [0.0; 2] };
         // Far, every 15 steps: forgotten 30 steps after its last.
         e.record(1, k, Some(s(0.0, 0.0, None)), None);
@@ -486,5 +581,53 @@ mod tests {
         assert_eq!(count(&mut e, 45.0 + FORGET_MIN + 0.1), 1);
         assert_eq!(count(&mut e, 10.0 + FORGET + 0.1), 0);
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn tiers_draw_at_their_own_delay_and_glide_between_them() {
+        // An entity running east at 6 m/s (0.2 m a step), one sample a step.
+        let mut e = Entities::new(MID_LAG);
+        let k = |tier| Known { tick: 0, tier, pos: [0.0; 2] };
+        let at = |step: f64, tier| Sample { step, tier, pos: [step as f32 * 0.2, 0.0, 0.0], vel: Some([6.0, 0.0]), yaw: 0.0, pitch: 0.0, airborne: false };
+        let draw = |e: &mut Entities, r: f64| {
+            let mut got = None;
+            e.render(r, |_, s| got = Some(*s));
+            got.unwrap()
+        };
+        // Mid: drawn MID_LAG behind the render step.
+        for step in 0..40 {
+            e.record(1, k(Tier::Mid), Some(at(step as f64, Tier::Mid)), Some(step as f64 - 2.0));
+        }
+        let s = draw(&mut e, 37.0);
+        assert_eq!((s.at, s.how), (37.0 - MID_LAG, How::Interpolated));
+        // It becomes near: the lag glides to 0 at LAG_SLEW, never jumping.
+        // One sample a step, two frames a step.
+        let mut last = s;
+        let mut r = 37.0;
+        for step in 40..80 {
+            e.record(1, k(Tier::Near), Some(at(step as f64, Tier::Near)), Some(r));
+            for _ in 0..2 {
+                r += 0.5;
+                let s = draw(&mut e, r);
+                let moved = (s.pos[0] - last.pos[0]) as f64;
+                assert!((0.0..=0.2 * 0.5 * (1.0 + LAG_SLEW) + 1e-4).contains(&moved), "at most 25% fast: {moved} m in half a step");
+                assert_eq!(s.how, How::Interpolated);
+                last = s;
+            }
+        }
+        assert_eq!(last.at, r, "settled on the near timeline");
+        // And back to mid: slower, never backwards.
+        for step in 80..120 {
+            e.record(1, k(Tier::Mid), Some(at(step as f64, Tier::Mid)), Some(r));
+            for _ in 0..2 {
+                r += 0.5;
+                let s = draw(&mut e, r);
+                let moved = (s.pos[0] - last.pos[0]) as f64;
+                assert!(moved >= 0.2 * 0.5 * (1.0 - LAG_SLEW) - 1e-4, "at most 25% slow: {moved}");
+                assert_eq!(s.how, How::Interpolated);
+                last = s;
+            }
+        }
+        assert!((last.at - (r - MID_LAG)).abs() < 1e-9);
     }
 }

@@ -32,7 +32,7 @@ use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearS
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{self, step, Input, MoveState, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
 use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
-use crate::msg::{self, Blob, PacketFill, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
+use crate::msg::{self, Blob, PacketFill, RenderTime, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
 use crate::rng::Rng;
 use crate::stats::Histogram;
 
@@ -337,12 +337,12 @@ struct InputQueue {
     /// Wait of the newest consumed seq, arrival to applied, in 0.1 ms, or
     /// `WAIT_STAND_IN`. Set by `advance`; reported in the snapshot.
     wait: u16,
-    /// How far behind its step the newest applied input's render time was,
-    /// in steps: what lag compensation would rewind for it. Set by `advance`
-    /// when the input carried a render time.
-    rewind: Option<f64>,
+    /// How far behind its step the newest applied input's render steps were
+    /// (near, mid/far), in steps: what lag compensation would rewind a target
+    /// in that tier by. Set by `advance` when the input carried render times.
+    rewind: Option<(f64, f64)>,
     /// Sorted by seq, all > last_seq, each with its render time and first arrival.
-    pending: VecDeque<(u32, Input, Option<u16>, Instant)>,
+    pending: VecDeque<(u32, Input, Option<RenderTime>, Instant)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,7 +366,7 @@ enum Step {
 }
 
 impl InputQueue {
-    fn push(&mut self, seq: u32, input: Input, render: Option<u16>, arrived: Instant) -> Push {
+    fn push(&mut self, seq: u32, input: Input, render: Option<RenderTime>, arrived: Instant) -> Push {
         if seq <= self.last_seq {
             let age = self.last_seq - seq;
             if age < 32 && self.stand_ins & (1 << age) != 0 {
@@ -402,7 +402,7 @@ impl InputQueue {
         let next = self.last_seq + 1;
         let (input, kind) = if self.pending.front().is_some_and(|&(s, ..)| s == next) {
             let (_, input, render, arrived) = self.pending.pop_front().unwrap();
-            self.rewind = render.map(|r| msg::render_age(step_no, r));
+            self.rewind = render.map(|r| r.ages(step_no));
             let waited = now.saturating_duration_since(arrived).as_micros() / 100;
             self.wait = waited.min(WAIT_STAND_IN as u128 - 1) as u16;
             self.last = input;
@@ -429,6 +429,30 @@ impl InputQueue {
         self.consume(next, kind != Step::Applied);
         kind
     }
+}
+
+/// How far player `i` at `p`, feet at `z`, is pushed this tick by player `j`
+/// at `q`, feet at `qz` (before the `MAX_PUSH` cap). Only bodies that
+/// overlap push: within `SEP_DIST` across, and less than a body height apart
+/// vertically (one standing on a crate beside another still overlaps it; one
+/// on a floor above doesn't).
+fn separation(i: u32, p: [f32; 2], z: f32, j: u32, q: [f32; 2], qz: f32) -> [f32; 2] {
+    let (dx, dy) = (p[0] - q[0], p[1] - q[1]);
+    let d = (dx * dx + dy * dy).sqrt();
+    if d >= SEP_DIST || (qz - z).abs() >= HEIGHT {
+        return [0.0; 2];
+    }
+    let (nx, ny) = if d > 1e-4 {
+        (dx / d, dy / d)
+    } else {
+        // Coincident: a direction from the pair, opposite for each.
+        let (lo, hi) = (i.min(j), i.max(j));
+        let a = (lo.wrapping_mul(0x9E37_79B9) ^ hi.wrapping_mul(0x85EB_CA6B)) as f32 * (std::f32::consts::TAU / 4_294_967_296.0);
+        let sign = if i < j { 1.0 } else { -1.0 };
+        (a.cos() * sign, a.sin() * sign)
+    };
+    let k = (SEP_DIST - d) * 0.5 * SEP_RATE;
+    [nx * k, ny * k]
 }
 
 pub struct SimServer {
@@ -462,8 +486,9 @@ pub struct SimServer {
     shard_events: Vec<Vec<(Instant, ServerEvent)>>,
     /// Input waits (arrival -> applied) since the last `take_input_wait`, in 0.1 ms.
     input_wait: Histogram,
-    /// Rewinds (see `InputQueue::rewind`) since the last `take_rewind`, in ms of game time.
-    rewind: Histogram,
+    /// Rewinds (see `InputQueue::rewind`) for near and for mid/far targets
+    /// since the last `take_rewind`, in ms of game time.
+    rewind: [Histogram; 2],
     /// The shared spatial index (all entities).
     grid: Grid,
     /// Networking's views of it: entities due this tick for mid and for far.
@@ -509,7 +534,7 @@ impl SimServer {
             snapshots: vec![Vec::new(); cfg.shards],
             shard_events: (0..cfg.shards).map(|_| Vec::new()).collect(),
             input_wait: Histogram::new(INPUT_WAIT_CAP),
-            rewind: Histogram::new(REWIND_CAP_MS),
+            rewind: [Histogram::new(REWIND_CAP_MS), Histogram::new(REWIND_CAP_MS)],
             rng: Rng::new(cfg.seed),
             cfg,
             tick: 0,
@@ -623,10 +648,11 @@ impl SimServer {
         std::mem::replace(&mut self.input_wait, Histogram::new(INPUT_WAIT_CAP))
     }
 
-    /// How far back each applied input's render time was (what lag
-    /// compensation rewinds), in ms of game time, since the last call.
-    pub fn take_rewind(&mut self) -> Histogram {
-        std::mem::replace(&mut self.rewind, Histogram::new(REWIND_CAP_MS))
+    /// How far back each applied input's render steps were, for near and
+    /// for mid/far targets (what lag compensation rewinds each by), in ms of
+    /// game time, since the last call.
+    pub fn take_rewind(&mut self) -> [Histogram; 2] {
+        std::mem::replace(&mut self.rewind, [Histogram::new(REWIND_CAP_MS), Histogram::new(REWIND_CAP_MS)])
     }
 
     /// Game time of the last tick's states, in movement steps.
@@ -749,11 +775,13 @@ impl SimServer {
             if b.alive && q.last_seq > 0 && q.wait != WAIT_STAND_IN {
                 self.input_wait.record(q.wait as u32);
             }
-            if let (true, Some(r)) = (b.alive, q.rewind) {
+            if let (true, Some((near, mid))) = (b.alive, q.rewind) {
                 // A render time ahead of the server is bogus (a client can't
                 // see the future): counted, and treated as no rewind.
-                self.counters.render_ahead += (r < 0.0) as u64;
-                self.rewind.record((r.max(0.0) * 1000.0 / TICK_HZ as f64).round() as u32);
+                self.counters.render_ahead += (near < 0.0) as u64;
+                for (h, r) in self.rewind.iter_mut().zip([near, mid]) {
+                    h.record((r.max(0.0) * 1000.0 / TICK_HZ as f64).round() as u32);
+                }
             }
         }
         lap(2);
@@ -786,24 +814,12 @@ impl SimServer {
                 }
                 let p = b.state.pos;
                 grid.for_each_within(p, SEP_DIST, |j, x, y| {
-                    let o = &bodies[j as usize];
-                    if j as usize == i || (o.state.z - b.state.z).abs() >= HEIGHT {
+                    if j as usize == i {
                         return;
                     }
-                    let (dx, dy) = (p[0] - x, p[1] - y);
-                    let d = (dx * dx + dy * dy).sqrt();
-                    let (nx, ny) = if d > 1e-4 {
-                        (dx / d, dy / d)
-                    } else {
-                        // Coincident: a direction from the pair, opposite for each.
-                        let (lo, hi) = ((i as u32).min(j), (i as u32).max(j));
-                        let a = (lo.wrapping_mul(0x9E37_79B9) ^ hi.wrapping_mul(0x85EB_CA6B)) as f32 * (std::f32::consts::TAU / 4_294_967_296.0);
-                        let sign = if (i as u32) < j { 1.0 } else { -1.0 };
-                        (a.cos() * sign, a.sin() * sign)
-                    };
-                    let k = (SEP_DIST - d) * 0.5 * SEP_RATE;
-                    push[0] += nx * k;
-                    push[1] += ny * k;
+                    let d = separation(i as u32, p, b.state.z, j, [x, y], bodies[j as usize].state.z);
+                    push[0] += d[0];
+                    push[1] += d[1];
                 });
                 let len = (push[0] * push[0] + push[1] * push[1]).sqrt();
                 if len > MAX_PUSH {
@@ -1369,6 +1385,23 @@ fn nearest(v: &mut Vec<(f32, u16)>, k: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn separation_pushes_bodies_that_overlap_in_height_too() {
+        let push = |dz: f32, dx: f32| separation(0, [100.0, 100.0], 10.0, 1, [100.0 + dx, 100.0], 10.0 + dz);
+        // Side by side on the ground: pushed apart, away from the other.
+        assert!(push(0.0, 0.5)[0] < 0.0);
+        // One on a 1 m crate beside the other: their bodies still overlap.
+        assert!(push(1.0, 0.5)[0] < 0.0);
+        // One a storey up (a floor, or a tall wall's top): no contact.
+        assert_eq!(push(HEIGHT, 0.5), [0.0; 2]);
+        assert_eq!(push(-3.0, 0.0), [0.0; 2]);
+        // Not touching across.
+        assert_eq!(push(0.0, SEP_DIST), [0.0; 2]);
+        // Coincident: opposite directions for each of the pair.
+        let (a, b) = (separation(3, [5.0, 5.0], 0.0, 9, [5.0, 5.0], 0.0), separation(9, [5.0, 5.0], 0.0, 3, [5.0, 5.0], 0.0));
+        assert!((a[0] + b[0]).abs() < 1e-6 && (a[1] + b[1]).abs() < 1e-6 && a != [0.0; 2]);
+    }
 
     fn tw() -> Arc<World> {
         World::shared(1)

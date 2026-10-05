@@ -327,10 +327,10 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
   echo
   echo "## Smoothness"
   echo
-  echo "Tracked bots draw a frame every tick, 100 ms behind the newest server step (lattice-bots --interp-ms). Shares of entity-frames interpolated / extrapolated / held (updates stopped); pops are what an arriving update moved on screen before smoothing. Rewind is applied step - the input's render step: what lag compensation would rewind."
+  echo "Tracked bots draw a frame every tick: near players 67 ms behind the newest server step, mid and far 200 ms (lattice-bots --near-ms, --mid-ms). Shares of entity-frames interpolated / extrapolated / held (updates stopped); pops are what an arriving update moved on screen before smoothing. Rewind is applied step - the input's render step for that tier: what lag compensation would rewind a near or a mid/far target by."
   echo
-  echo "| run | near % | mid % | far % | pops p99 near / mid / far (mm) | render delay | clock snaps | rewind p50 / p99 (ms) |"
-  echo "|---|---|---|---|---|---|---|---|"
+  echo "| run | near % | mid % | far % | pops p99 near / mid / far (mm) | near render delay | clock snaps | rewind near p50 / p99 | rewind mid p50 / p99 |"
+  echo "|---|---|---|---|---|---|---|---|---|"
   for r in $(seq 1 "$repeat"); do
     for spec in "${runs[@]}"; do
       IFS='|' read -r id _ _ _ _ <<< "$spec"
@@ -338,7 +338,7 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
       s=$dir/$id-$r/server.summary
       [ -f "$b" ] || continue
       tier() { echo "$(kv "$b" "${1}_interpolated_pct") / $(kv "$b" "${1}_extrapolated_pct") / $(kv "$b" "${1}_held_pct")"; }
-      echo "| $id #$r | $(tier near) | $(tier mid) | $(tier far) | $(kv "$b" near_pop_p99_mm) / $(kv "$b" mid_pop_p99_mm) / $(kv "$b" far_pop_p99_mm) | $(kv "$b" render_delay_ms) | $(kv "$b" render_snaps) | $(kv "$s" rewind_p50_ms) / $(kv "$s" rewind_p99_ms) |"
+      echo "| $id #$r | $(tier near) | $(tier mid) | $(tier far) | $(kv "$b" near_pop_p99_mm) / $(kv "$b" mid_pop_p99_mm) / $(kv "$b" far_pop_p99_mm) | $(kv "$b" render_delay_ms) | $(kv "$b" render_snaps) | $(kv "$s" rewind_near_p50_ms) / $(kv "$s" rewind_near_p99_ms) | $(kv "$s" rewind_mid_p50_ms) / $(kv "$s" rewind_mid_p99_ms) |"
     done
   done
 

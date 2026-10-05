@@ -148,7 +148,8 @@ impl Swarm {
                         self.render_backwards += last.is_some_and(|l| r < l) as u64;
                         let (truth, err) = (&self.truth, &mut self.render_err);
                         core.render(now, |e, st| {
-                            if let (true, Some(t)) = (measuring, truth_at(truth, e, r)) {
+                            // Each entity is drawn at its own step (mid and far lag near).
+                            if let (true, Some(t)) = (measuring, truth_at(truth, e, st.at)) {
                                 let d = [0, 1, 2].map(|k| st.pos[k] - t[k]);
                                 err[st.tier as usize].push((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt());
                             }
@@ -888,19 +889,22 @@ fn render_timeline_on_a_clean_link() {
     let r = measure_render(&mut s, 3 * TICK_HZ, 8);
     assert_eq!(s.render_backwards, 0, "render time never goes backwards");
     assert_eq!(s.corrections(), 0);
-    assert!((r.delay - 3.0).abs() < 0.05, "100 ms behind the newest step: {}", r.delay);
+    assert!((r.delay - 2.0).abs() < 0.05, "near: 67 ms behind the newest step: {}", r.delay);
     // Near and mid are drawn between samples, to their quantization (near
     // ~8 mm; mid 16 mm across and 16 cm in height).
-    assert!(r.interpolated[0] >= 0.999 && r.interpolated[1] >= 0.99, "{:?}", r.interpolated);
+    assert!(r.interpolated[0] >= 0.999 && r.interpolated[1] >= 0.999, "{:?}", r.interpolated);
     assert!(r.err[0].1 < 0.02 && r.err[1].1 < 0.2, "{:?}", r.err);
     assert_eq!((r.pops[0].1, r.pops[1].1), (0.0, 0.0), "nothing near or mid pops");
-    // Far (2 Hz) is mostly extrapolated: errors of a few meters at 500+ m.
-    assert!(r.err[2].0 < 1.0 && r.err[2].1 < 8.0, "{:?}", r.err[2]);
-    // Lag compensation's rewind on a zero-latency link: the render delay
-    // (100 ms) + the spare input (33 ms) + waiting for the next tick (33 ms).
-    let rewind = s.server.take_rewind().summary();
-    eprintln!("rewind p50 {} p99 {} max {} ms", rewind.p50, rewind.p99, rewind.max);
-    assert_eq!((rewind.p50, rewind.max), (167, 167));
+    // Far (2 Hz) on the mid timeline: interpolated about half the time,
+    // extrapolated the rest; errors of a few meters at 500+ m.
+    assert!(r.interpolated[2] >= 0.4, "{:?}", r.interpolated);
+    assert!(r.err[2].0 < 0.5 && r.err[2].1 < 5.0, "{:?}", r.err[2]);
+    // Lag compensation's rewind on a zero-latency link: near targets, the
+    // render delay (67 ms) + the spare input (33 ms) + waiting for the next
+    // tick (33 ms); mid and far targets 133 ms more.
+    let [near_rw, mid_rw] = s.server.take_rewind().map(|h| h.summary());
+    eprintln!("rewind near p50 {} p99 {} max {}, mid p50 {} p99 {} max {} ms", near_rw.p50, near_rw.p99, near_rw.max, mid_rw.p50, mid_rw.p99, mid_rw.max);
+    assert_eq!((near_rw.p50, near_rw.max, mid_rw.p50, mid_rw.max), (133, 133, 267, 267));
     assert_eq!(s.server.counters().render_ahead, 0);
 }
 
@@ -914,31 +918,32 @@ fn render_timeline_rides_out_loss_and_jitter() {
     assert_eq!(s.render_backwards, 0);
     let snaps: u64 = s.bots.iter().map(|(_, _, b)| b.core().render_clock().snaps).sum();
     assert_eq!(snaps, 0, "jitter and loss are slewed through, never jumped");
-    // 5% loss with a step of jitter: near still interpolates (a lost update
-    // is bridged by the next), mid extrapolates over its lost updates.
-    assert!(r.interpolated[0] >= 0.99 && r.interpolated[1] >= 0.9, "{:?}", r.interpolated);
-    assert!(r.err[0].1 < 0.05 && r.err[1].1 < 0.5, "{:?}", r.err);
-    let rewind = s.server.take_rewind().summary();
-    eprintln!("rewind p50 {} p99 {} max {} ms", rewind.p50, rewind.p99, rewind.max);
-    assert!(rewind.p50 == 167 && rewind.p99 <= 233, "{rewind:?}");
+    // 5% loss with a step of jitter: a lost update is bridged by the next in
+    // both tiers (each is drawn two updates behind), so both interpolate.
+    assert!(r.interpolated[0] >= 0.999 && r.interpolated[1] >= 0.99, "{:?}", r.interpolated);
+    assert!(r.err[0].1 < 0.05 && r.err[1].1 < 0.3, "{:?}", r.err);
+    let [near_rw, mid_rw] = s.server.take_rewind().map(|h| h.summary());
+    eprintln!("rewind near p50 {} p99 {} max {}, mid p50 {} p99 {} max {} ms", near_rw.p50, near_rw.p99, near_rw.max, mid_rw.p50, mid_rw.p99, mid_rw.max);
+    assert!(near_rw.p50 == 133 && near_rw.p99 <= 167 && mid_rw.p50 == 267 && mid_rw.p99 <= 300, "{near_rw:?} {mid_rw:?}");
 }
 
 #[test]
 #[ignore = "measurement: cargo test --release --test swarm render_delay_sweep -- --ignored --nocapture"]
 fn render_delay_sweep() {
-    for ms in [67, 100, 133] {
+    for (near, mid) in [(33, 133), (67, 133), (67, 200), (100, 267)] {
         for (loss, jitter) in [(0.0, 0), (0.05, 1)] {
             let cfg = SimConfig { spawn: SpawnMode::Disk(500.0), ..Default::default() };
             let mut s = render_swarm(60, cfg, Duration::from_secs(3));
-            let client = lattice_sim::bot::ClientConfig { interp_delay: Duration::from_millis(ms), track_entities: true };
+            let ms = Duration::from_millis;
+            let client = lattice_sim::bot::ClientConfig { near_delay: ms(near), mid_delay: ms(mid), track_entities: true };
             for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
                 *b = BotBrain::with_config(i as u64, client.clone());
             }
             (s.loss, s.down_jitter) = (loss, jitter);
-            eprintln!("== delay {ms} ms, loss {loss}, jitter {jitter} step");
+            eprintln!("== near {near} ms, mid {mid} ms, loss {loss}, jitter {jitter} step");
             measure_render(&mut s, 3 * TICK_HZ, 8);
-            let rewind = s.server.take_rewind().summary();
-            eprintln!("rewind p50 {} p99 {} ms", rewind.p50, rewind.p99);
+            let [n, m] = s.server.take_rewind().map(|h| h.summary());
+            eprintln!("rewind near p50 {} p99 {}, mid p50 {} p99 {} ms", n.p50, n.p99, m.p50, m.p99);
         }
     }
 }
@@ -952,10 +957,10 @@ fn render_timeline_at_20_hz_and_dilation() {
     let r = measure_render(&mut s, 32 * TICK_HZ, 6);
     assert_eq!(s.server.level(), lattice_sim::ladder::MAX_LEVEL);
     assert_eq!(s.render_backwards, 0);
-    assert!((r.delay - 3.0).abs() < 0.05, "{}", r.delay);
-    // Rendering on steps, not ticks: near moves as smoothly as at 30 Hz.
-    // (On ticks, 1-or-2-step ticks would be off by ~10 cm at a run.) Mid and
-    // far update every 5 and 30 ticks down here: mostly extrapolated.
-    assert!(r.interpolated[0] >= 0.99 && r.err[0].1 < 0.02, "{:?} {:?}", r.interpolated, r.err);
+    assert!((r.delay - 2.0).abs() < 0.05, "{}", r.delay);
+    // Rendering on steps, not ticks: near keeps interpolating. (Two steps of
+    // delay against ticks of up to 2 steps: a few cm of extrapolation at
+    // p99.) Mid and far update every 5 and 30 ticks down here.
+    assert!(r.interpolated[0] >= 0.99 && r.err[0].1 < 0.06, "{:?} {:?}", r.interpolated, r.err);
     assert!(r.err[1].1 < 3.0, "{:?}", r.err);
 }

@@ -27,7 +27,8 @@ lattice-client: play on a lattice-server
   --user N             user id for the dev connect token [random]
   --token-key HEX      the server's --token-key [the public dev key]
   --server-id N        [1]
-  --interp-ms MS       render delay behind the newest server step [100]
+  --near-ms MS         render delay of near players behind the newest server step [67]
+  --mid-ms MS          render delay of mid and far players [200]
   --view first|chase|spectator   starting view [first]
   --spectate X,Y,Z,YAW,PITCH     start in free flight there (meters, degrees)
   --no-vsync           present as fast as possible (frame times in the net graph)
@@ -77,7 +78,7 @@ struct Args {
     user: u64,
     key: [u8; 32],
     server_id: u64,
-    interp: Duration,
+    delays: (Duration, Duration),
     mode: Mode,
     spectate: Option<([f32; 3], f32, f32)>,
     vsync: bool,
@@ -99,7 +100,7 @@ fn parse_args() -> Args {
         user: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |d| d.as_nanos() as u64) | 1 << 40,
         key: lattice_net::token::DEV_TOKEN_KEY,
         server_id: 1,
-        interp: Duration::from_millis(100),
+        delays: (Duration::from_secs(2) / 30, Duration::from_millis(200)),
         mode: Mode::FirstPerson,
         spectate: None,
         vsync: true,
@@ -126,7 +127,8 @@ fn parse_args() -> Args {
                     *k = u8::from_str_radix(&v[2 * i..2 * i + 2], 16).unwrap_or_else(|e| die(&format!("--token-key: {e}")));
                 }
             }
-            "--interp-ms" => a.interp = Duration::from_secs_f64(val().parse::<f64>().unwrap_or_else(|e| die(&format!("--interp-ms: {e}"))) / 1000.0),
+            "--near-ms" => a.delays.0 = Duration::from_secs_f64(val().parse::<f64>().unwrap_or_else(|e| die(&format!("--near-ms: {e}"))) / 1000.0),
+            "--mid-ms" => a.delays.1 = Duration::from_secs_f64(val().parse::<f64>().unwrap_or_else(|e| die(&format!("--mid-ms: {e}"))) / 1000.0),
             "--view" => {
                 a.mode = match val().as_str() {
                     "first" => Mode::FirstPerson,
@@ -160,7 +162,7 @@ fn main() {
     let args = parse_args();
     let now = Instant::now();
     let token = net::dev_token(&args.key, args.server_id, args.user);
-    let cfg = ClientConfig { interp_delay: args.interp, track_entities: true };
+    let cfg = ClientConfig { near_delay: args.delays.0, mid_delay: args.delays.1, track_entities: true };
     let session = Session::connect(args.server, token, cfg, now).unwrap_or_else(|e| die(&format!("socket: {e}")));
     println!("connecting to {} as user {}", args.server, args.user);
     let mut view = View::new(args.mode);
@@ -303,5 +305,6 @@ fn summary(s: &Session, times: &FrameTimes) {
         }
     }
     let delay = st.render_delay_sum / st.render_frames.max(1) as f64 * 1000.0 / 30.0;
-    println!("  render delay {delay:.1} ms, clock snaps {}", s.core.render_clock().snaps);
+    let mid = s.core.entities().map_or(0.0, |e| e.mid_lag()) * 1000.0 / 30.0;
+    println!("  render delay near {delay:.1} ms, mid/far +{mid:.0} ms, clock snaps {}", s.core.render_clock().snaps);
 }

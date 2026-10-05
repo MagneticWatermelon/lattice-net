@@ -8,11 +8,13 @@
 //! - **Own player:** the input clock (paced by the server, steering its input
 //!   queue to one spare), prediction, and reconciliation against each
 //!   snapshot. `own_render` is where to draw it between input steps.
-//! - **Everyone else** (`entities`): one render timeline (`clock`), a fixed
-//!   delay behind the newest game step the server sent, with each entity
-//!   interpolated, extrapolated or held on it, whatever its tier.
-//! - Every input carries the render step it was made at, so the server knows
-//!   what the player saw (lag compensation's rewind).
+//! - **Everyone else** (`entities`): a render timeline (`clock`) a fixed
+//!   delay behind the newest game step the server sent (near: 67 ms), with
+//!   mid and far entities a further lag behind (200 ms in all), each entity
+//!   interpolated, extrapolated or held on its own.
+//! - Every input carries the render steps it was made at (near, and mid/far
+//!   as a lag behind near), so the server knows what the player saw: lag
+//!   compensation rewinds each target by its own tier's delay.
 
 pub mod clock;
 pub mod entities;
@@ -60,9 +62,12 @@ const OWN_SMOOTH: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// How far behind the newest server state other entities are drawn.
-    /// Near updates come every 33 ms, so 100 ms rides out ~2 late or lost ones.
-    pub interp_delay: Duration,
+    /// How far behind the newest server state near entities are drawn: two
+    /// of their 30 Hz updates, so one late or lost update is ridden out.
+    pub near_delay: Duration,
+    /// The same for mid and far entities: two 10 Hz updates. (Far updates at
+    /// 2 Hz are mostly extrapolated on this timeline.)
+    pub mid_delay: Duration,
     /// Keep the entity store (interpolation, smoothness stats). Off for most
     /// of a bot swarm, which only counts what it's sent.
     pub track_entities: bool,
@@ -70,7 +75,7 @@ pub struct ClientConfig {
 
 impl Default for ClientConfig {
     fn default() -> Self {
-        Self { interp_delay: Duration::from_millis(100), track_entities: true }
+        Self { near_delay: Duration::from_secs(2) / TICK_HZ, mid_delay: Duration::from_millis(200), track_entities: true }
     }
 }
 
@@ -176,6 +181,8 @@ pub struct ClientCore {
     render_clock: RenderClock,
     tick_steps: TickSteps,
     entities: Option<Entities>,
+    /// Mid and far entities are drawn this many steps behind near ones.
+    mid_lag: f64,
     /// The newest snapshot's own state and its step: the server's view of us.
     server_own: Option<(MoveState, u32)>,
     /// Own-player correction being smoothed away, as of `own_offset_at`.
@@ -185,6 +192,11 @@ pub struct ClientCore {
     /// are kept. Inputs, prediction and pacing still run.
     sink: bool,
     pub stats: ClientStats,
+}
+
+/// Steps mid and far entities are drawn behind near ones.
+fn mid_lag(cfg: &ClientConfig) -> f64 {
+    (cfg.mid_delay.saturating_sub(cfg.near_delay)).as_secs_f64() * TICK_HZ as f64
 }
 
 impl Default for ClientCore {
@@ -214,9 +226,10 @@ impl ClientCore {
             last_server_tick: None,
             last_acked: 0,
             latency: Vec::new(),
-            render_clock: RenderClock::new(cfg.interp_delay),
+            render_clock: RenderClock::new(cfg.near_delay),
             tick_steps: TickSteps::default(),
-            entities: cfg.track_entities.then(Entities::default),
+            entities: cfg.track_entities.then(|| Entities::new(mid_lag(&cfg))),
+            mid_lag: mid_lag(&cfg),
             server_own: None,
             own_offset: [0.0; 3],
             own_offset_at: None,
@@ -252,7 +265,8 @@ impl ClientCore {
     /// Starts keeping the entity store (a map per bot, so a swarm enables it
     /// on a sample).
     pub fn enable_tracking(&mut self) {
-        self.entities.get_or_insert_with(Entities::default);
+        let lag = self.mid_lag;
+        self.entities.get_or_insert_with(|| Entities::new(lag));
     }
 
     pub fn entities(&self) -> Option<&Entities> {
@@ -299,8 +313,9 @@ impl ClientCore {
         self.render_clock.render_at(now)
     }
 
-    /// One frame: draws every entity at the render step for `now`, calling
-    /// `f(entity, state)`, and returns the step. Counts how each entity was
+    /// One frame: draws every entity at the render step for `now` (mid and
+    /// far `mid_lag` steps behind it), calling `f(entity, state)`, and
+    /// returns the step. Counts how each entity was
     /// drawn (`Entities::smooth`).
     pub fn render(&mut self, now: Instant, f: impl FnMut(u16, &RenderState)) -> Option<f64> {
         let r = self.render_clock.render_at(now)?;
@@ -576,12 +591,13 @@ impl ClientCore {
         let mut ends: Vec<u32> = (0..made.div_ceil(INPUT_REDUNDANCY)).map(|k| self.seq - (k * INPUT_REDUNDANCY) as u32).collect();
         ends.reverse();
         debug_assert!(ends[0] < first + INPUT_REDUNDANCY as u32);
-        ends.into_iter().map(|end| self.batch(end)).collect()
+        let lag = (self.mid_lag * msg::MID_LAG_UNITS).round().min(u8::MAX as f64) as u8;
+        ends.into_iter().map(|end| self.batch(end, lag)).collect()
     }
 
     /// The batch whose newest input is `end`: newest first, stopping at a gap
     /// (a resync skips seqs we never generated).
-    fn batch(&self, end: u32) -> Vec<u8> {
+    fn batch(&self, end: u32, mid_lag: u8) -> Vec<u8> {
         let mut batch = [(Input::default(), None); INPUT_REDUNDANCY];
         let mut n = 0;
         while n < INPUT_REDUNDANCY && (n as u32) < end {
@@ -592,7 +608,7 @@ impl ClientCore {
             batch[n] = (p.input, p.render);
             n += 1;
         }
-        msg::encode_inputs(end, &batch[..n])
+        msg::encode_inputs(end, &batch[..n], mid_lag)
     }
 }
 
