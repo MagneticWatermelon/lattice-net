@@ -24,7 +24,7 @@ export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=x86_64-w64-mingw32-clang
 rustup target add "$target" > /dev/null
 # Without debug info: the workspace keeps it for profiling, and it makes the
 # exe ~850 MB.
-CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=true cargo build --release --target "$target"
+CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=true cargo build --release --target "$target" --bin lattice-client
 
 exe=target/$target/release/lattice-client.exe
 dest=${1:-/mnt/c/lattice}
@@ -35,5 +35,8 @@ for dll in $(llvm-objdump -p "$exe" | awk '/DLL Name:/ {print $3}'); do
   src="$LLVM_MINGW/x86_64-w64-mingw32/bin/$dll"
   [ -f "$src" ] && cp "$src" "$dest/"
 done
+# The models: Bevy looks for assets/ beside the exe.
+mkdir -p "$dest/assets/models"
+cp assets/models/*.glb "$dest/assets/models/"
 echo "built $(du -h "$exe" | cut -f1) -> $dest ($(ls "$dest" | tr '\n' ' '))"
 echo "server's address from Windows: $(hostname -I | awk '{print $1}'):40000"

@@ -1,4 +1,5 @@
-//! What's drawn: terrain chunks, cover, and every player the core knows.
+//! What's drawn: terrain chunks, cover (as its models), and every player
+//! the core knows: soldiers near the camera, capsules farther out.
 
 use std::collections::HashMap;
 
@@ -9,6 +10,7 @@ use lattice_game::movement::{HEIGHT, RADIUS};
 use lattice_game::world::World;
 
 use crate::coords::{look_rotation, to_bevy, yaw_rotation};
+use crate::models::{self, Models, Motion, Pose, Soldier};
 use crate::terrain::{self, CHUNKS, COARSE, FINE};
 use crate::{Frame, Net, Settings, View};
 
@@ -48,19 +50,32 @@ pub struct Looks {
 
 /// Faction colors (red, blue, purple), by `faction(entity)`.
 pub const FACTION_COLORS: [Color; 3] = [Color::srgb(0.85, 0.25, 0.2), Color::srgb(0.25, 0.45, 0.9), Color::srgb(0.6, 0.3, 0.85)];
+/// With tier colors on (T): near, mid, far; held and new.
+const TIER_COLORS: [Color; 3] = [Color::srgb(0.25, 0.85, 0.35), Color::srgb(0.95, 0.75, 0.2), Color::srgb(0.9, 0.3, 0.25)];
+const HELD_COLOR: Color = Color::srgb(0.5, 0.5, 0.5);
+const NEW_COLOR: Color = Color::srgb(0.95, 0.95, 0.95);
+const DEAD_COLOR: Color = Color::srgb(0.25, 0.25, 0.27);
 
-/// A drawn player; its nose (a child) shows where it looks.
+/// A drawn player: a root at its feet, turned to its facing, with a capsule
+/// child (and a nose on it, showing where it looks), and a soldier child
+/// while it's near the camera.
 #[derive(Component)]
 pub struct Player;
 #[derive(Component)]
+pub struct Capsule;
+#[derive(Component)]
 pub struct Nose;
+
+/// `Scene::players`' key for our own body (drawn in the chase and spectator
+/// views).
+const OWN: u16 = u16::MAX;
 
 pub fn setup_looks(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut mats: ResMut<Assets<StandardMaterial>>) {
     let mut mat = |c: Color| mats.add(StandardMaterial { base_color: c, perceptual_roughness: 0.8, ..default() });
-    let tiers = [mat(Color::srgb(0.25, 0.85, 0.35)), mat(Color::srgb(0.95, 0.75, 0.2)), mat(Color::srgb(0.9, 0.3, 0.25))];
+    let tiers = TIER_COLORS.map(&mut mat);
     let factions = FACTION_COLORS.map(&mut mat);
-    let dead = mat(Color::srgb(0.25, 0.25, 0.27));
-    let (held, new, plain, nose_mat) = (mat(Color::srgb(0.5, 0.5, 0.5)), mat(Color::srgb(0.95, 0.95, 0.95)), mat(Color::srgb(0.35, 0.5, 0.85)), mat(Color::srgb(0.1, 0.1, 0.12)));
+    let dead = mat(DEAD_COLOR);
+    let (held, new, plain, nose_mat) = (mat(HELD_COLOR), mat(NEW_COLOR), mat(Color::srgb(0.35, 0.5, 0.85)), mat(Color::srgb(0.1, 0.1, 0.12)));
     let mut ghost = |c: Color| {
         mats.add(StandardMaterial { base_color: c, alpha_mode: AlphaMode::Blend, unlit: true, ..default() })
     };
@@ -81,7 +96,8 @@ pub fn setup_looks(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut
 }
 
 /// Once welcomed: the world from its seed, the terrain at the coarse level
-/// everywhere, every cover box, and the light.
+/// everywhere, every cover box, rocks, and the light.
+#[allow(clippy::too_many_arguments)]
 pub fn build_world(
     mut commands: Commands,
     net: Res<Net>,
@@ -89,6 +105,7 @@ pub fn build_world(
     mut meshes: ResMut<Assets<Mesh>>,
     mut mats: ResMut<Assets<StandardMaterial>>,
     settings: Res<Settings>,
+    models: Res<Models>,
 ) {
     if scene.world.is_some() {
         return;
@@ -107,19 +124,13 @@ pub fn build_world(
     let unit = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
     let wall = mats.add(StandardMaterial { base_color: Color::srgb(0.62, 0.62, 0.6), perceptual_roughness: 0.9, ..default() });
     let crate_ = mats.add(StandardMaterial { base_color: Color::srgb(0.55, 0.38, 0.2), perceptual_roughness: 0.9, ..default() });
-    for b in world.boxes() {
-        let size = [b.max[0] - b.min[0], b.max[1] - b.min[1], b.top - b.bottom];
-        let center = to_bevy((b.min[0] + b.max[0]) / 2.0, (b.min[1] + b.max[1]) / 2.0, (b.bottom + b.top) / 2.0);
-        let low = b.top - world.terrain((b.min[0] + b.max[0]) / 2.0, (b.min[1] + b.max[1]) / 2.0) < 1.5;
-        commands.spawn((
-            Mesh3d(unit.clone()),
-            MeshMaterial3d(if low { crate_.clone() } else { wall.clone() }),
-            Transform::from_translation(center).with_scale(Vec3::new(size[0], size[2], size[1])),
-        ));
-    }
+    models::spawn_cover(&mut commands, &models, &world, &unit, [&wall, &crate_]);
+    models::spawn_rocks(&mut commands, &models, &world);
+    // The sun lights the first-person rifle too.
     commands.spawn((
         DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: settings.shadows, ..default() },
         Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.6, -0.9, 0.0)),
+        bevy::camera::visibility::RenderLayers::from_layers(&[0, models::VIEWMODEL_LAYER]),
     ));
     scene.world = Some(world);
 }
@@ -169,68 +180,162 @@ fn material<'a>(looks: &'a Looks, entity: u16, s: &RenderState, tier_colors: boo
     }
 }
 
-/// Centered capsule transform for feet at game (x, y, z), facing `yaw`;
-/// the dead lie on the ground, along where they faced.
-fn body(pos: [f32; 3], yaw: f32, dead: bool) -> Transform {
-    if dead {
-        let rot = yaw_rotation(yaw) * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-        return Transform::from_translation(to_bevy(pos[0], pos[1], pos[2] + RADIUS)).with_rotation(rot);
+/// The same, as a color (a soldier's armor takes it).
+fn tint(entity: u16, s: &RenderState, tier_colors: bool) -> Color {
+    if s.dead {
+        return DEAD_COLOR;
     }
-    Transform::from_translation(to_bevy(pos[0], pos[1], pos[2] + HEIGHT / 2.0)).with_rotation(yaw_rotation(yaw))
+    if !tier_colors {
+        return FACTION_COLORS[faction(entity) as usize];
+    }
+    match s.how {
+        How::Held => HELD_COLOR,
+        How::New => NEW_COLOR,
+        _ => TIER_COLORS[s.tier as usize],
+    }
 }
 
-type BodyParts<'a> = (&'a mut Transform, &'a mut MeshMaterial3d<StandardMaterial>, &'a Children);
+/// Centered capsule transform for feet at game (x, y, z), facing `yaw`;
+/// the dead lie on the ground, along where they faced. (For the ghosts.)
+fn body(pos: [f32; 3], yaw: f32, dead: bool) -> Transform {
+    let root = Transform::from_translation(to_bevy(pos[0], pos[1], pos[2])).with_rotation(yaw_rotation(yaw));
+    root.mul_transform(capsule(dead))
+}
 
-/// Draws every entity at the render step: spawns, moves and despawns
-/// capsules to match, and the server ghosts when they're on.
+/// The capsule in its player's frame (feet, facing -z).
+fn capsule(dead: bool) -> Transform {
+    if dead {
+        Transform::from_xyz(0.0, RADIUS, 0.0).with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
+    } else {
+        Transform::from_xyz(0.0, HEIGHT / 2.0, 0.0)
+    }
+}
+
+/// One body to draw this frame.
+struct Drawn {
+    key: u16,
+    feet: [f32; 3],
+    yaw: f32,
+    pitch: f32,
+    airborne: bool,
+    dead: bool,
+    mat: Handle<StandardMaterial>,
+    tint: Color,
+}
+
+type Roots<'w, 's> = Query<'w, 's, (&'static mut Transform, &'static mut Motion, &'static Children), (With<Player>, Without<Capsule>, Without<Nose>)>;
+type Capsules<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Transform, &'static mut MeshMaterial3d<StandardMaterial>, &'static mut Visibility, &'static Children),
+    (With<Capsule>, Without<Player>, Without<Nose>),
+>;
+type Noses<'w, 's> = Query<'w, 's, &'static mut Transform, (With<Nose>, Without<Player>, Without<Capsule>)>;
+type SoldierMats<'w, 's> = Query<'w, 's, &'static mut MeshMaterial3d<StandardMaterial>, (Without<Capsule>, Without<Nose>)>;
+
+/// Draws every entity at the render step (and our own body in the chase
+/// and spectator views): spawns, moves and despawns bodies to match, gives
+/// the nearest ones animated soldiers, and the server ghosts when they're
+/// on.
 #[allow(clippy::too_many_arguments)]
 pub fn sync_players(
     mut commands: Commands,
     mut net: ResMut<Net>,
     frame: Res<Frame>,
     settings: Res<Settings>,
+    view: Res<View>,
     looks: Res<Looks>,
     mut scene: ResMut<Scene>,
-    mut bodies: Query<BodyParts, (With<Player>, Without<Nose>)>,
-    mut noses: Query<&mut Transform, (With<Nose>, Without<Player>)>,
+    mut models: ResMut<Models>,
+    mut mats: ResMut<Assets<StandardMaterial>>,
+    mut roots: Roots,
+    mut capsules: Capsules,
+    mut noses: Noses,
+    mut soldiers: Query<&mut Soldier>,
+    mut anim: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
+    mut soldier_mats: SoldierMats,
 ) {
     if scene.world.is_none() {
         return;
     }
     let own = net.0.core.welcome().map(|w| w.entity);
-    let mut drawn = Vec::new();
+    let mut states = Vec::new();
     net.0.core.render(frame.now, |e, s| {
         if Some(e) != own {
-            drawn.push((e, *s));
+            states.push((e, *s));
         }
     });
     scene.drawn = [0; 3];
-    let mut seen = std::collections::HashSet::with_capacity(drawn.len());
-    for (e, s) in &drawn {
-        seen.insert(*e);
+    let mut drawn: Vec<Drawn> = Vec::with_capacity(states.len() + 1);
+    for (e, s) in &states {
         scene.drawn[s.tier as usize] += 1;
-        let t = body(s.pos, s.yaw, s.dead);
         let mat = material(&looks, *e, s, settings.tier_colors).clone();
-        match scene.players.get(e).copied() {
-            Some(id) => {
-                if let Ok((mut tf, mut m, children)) = bodies.get_mut(id) {
-                    *tf = t;
-                    if m.0 != mat {
-                        m.0 = mat;
-                    }
-                    for c in children.iter() {
-                        if let Ok(mut n) = noses.get_mut(c) {
-                            *n = nose(s.pitch);
-                        }
+        drawn.push(Drawn { key: *e, feet: s.pos, yaw: s.yaw, pitch: s.pitch, airborne: s.airborne, dead: s.dead, mat, tint: tint(*e, s, settings.tier_colors) });
+    }
+    if view.mode != crate::controls::Mode::FirstPerson && view.has_body {
+        let dead = net.0.core.is_dead();
+        let (mat, tint) = match own {
+            _ if dead => (looks.dead.clone(), DEAD_COLOR),
+            Some(e) => (looks.factions[faction(e) as usize].clone(), FACTION_COLORS[faction(e) as usize]),
+            None => (looks.plain.clone(), Color::WHITE),
+        };
+        let airborne = !net.0.core.predicted().grounded;
+        drawn.push(Drawn { key: OWN, feet: view.feet, yaw: view.yaw, pitch: view.pitch, airborne, dead, mat, tint });
+    }
+
+    // Soldiers for the nearest, capsules for the rest.
+    let eye = Vec3::from(view.eye);
+    let near: Vec<(f32, u16, bool)> = drawn
+        .iter()
+        .map(|d| {
+            let has = scene.players.get(&d.key).and_then(|&r| roots.get(r).ok()).is_some_and(|(_, _, ch)| ch.iter().any(|c| soldiers.contains(c)));
+            let dist = if d.key == OWN { 0.0 } else { eye.distance(Vec3::from(d.feet)) };
+            (dist, d.key, has)
+        })
+        .collect();
+    let want = models::soldier_set(near);
+
+    let mut seen = std::collections::HashSet::with_capacity(drawn.len());
+    for d in &drawn {
+        seen.insert(d.key);
+        let root_tf = Transform::from_translation(to_bevy(d.feet[0], d.feet[1], d.feet[2])).with_rotation(yaw_rotation(d.yaw));
+        let Some(&root) = scene.players.get(&d.key) else {
+            let root = commands
+                .spawn((Player, root_tf, Visibility::default(), Motion::default()))
+                .with_children(|p| {
+                    p.spawn((Capsule, Mesh3d(looks.capsule.clone()), MeshMaterial3d(d.mat.clone()), capsule(d.dead))).with_child((
+                        Nose,
+                        Mesh3d(looks.nose.clone()),
+                        MeshMaterial3d(looks.nose_mat.clone()),
+                        nose(d.pitch),
+                    ));
+                })
+                .id();
+            scene.players.insert(d.key, root);
+            continue;
+        };
+        let Ok((mut tf, mut motion, children)) = roots.get_mut(root) else { continue };
+        *tf = root_tf;
+        let pose = Pose { feet: tf.translation, yaw: d.yaw, airborne: d.airborne, dead: d.dead, tint: d.tint };
+        let child = children.iter().find(|&c| soldiers.contains(c));
+        let mut soldier = child.and_then(|c| soldiers.get_mut(c).ok().map(|s| (c, s)));
+        let arg = soldier.as_mut().map(|(c, s)| (*c, &mut **s));
+        let shown = models::drive(&mut commands, &mut models, &mut mats, root, want.contains(&d.key), &pose, frame.dt, &mut motion, arg, &mut anim, &mut soldier_mats);
+        for c in children.iter() {
+            if let Ok((mut ctf, mut m, mut vis, kids)) = capsules.get_mut(c) {
+                *ctf = capsule(d.dead);
+                if m.0 != d.mat {
+                    m.0 = d.mat.clone();
+                }
+                let v = if shown { Visibility::Hidden } else { Visibility::Inherited };
+                if *vis != v {
+                    *vis = v;
+                }
+                for k in kids.iter() {
+                    if let Ok(mut n) = noses.get_mut(k) {
+                        *n = nose(d.pitch);
                     }
                 }
-            }
-            None => {
-                let id = commands
-                    .spawn((Player, Mesh3d(looks.capsule.clone()), MeshMaterial3d(mat), t))
-                    .with_child((Nose, Mesh3d(looks.nose.clone()), MeshMaterial3d(looks.nose_mat.clone()), nose(s.pitch)))
-                    .id();
-                scene.players.insert(*e, id);
             }
         }
     }
@@ -246,7 +351,7 @@ pub fn sync_players(
     // server has us.
     let wanted: Vec<(u16, [f32; 3], f32, bool)> = if settings.ghosts {
         let ents = net.0.core.entities();
-        drawn.iter().filter_map(|(e, _)| ents.and_then(|x| x.newest(*e)).map(|n| (*e, n.pos, n.yaw, n.dead))).collect()
+        states.iter().filter_map(|(e, _)| ents.and_then(|x| x.newest(*e)).map(|n| (*e, n.pos, n.yaw, n.dead))).collect()
     } else {
         Vec::new()
     };
@@ -292,40 +397,4 @@ pub fn sync_players(
 fn nose(pitch: f32) -> Transform {
     let rot = look_rotation(std::f32::consts::FRAC_PI_2, pitch); // facing local -z
     Transform::from_translation(Vec3::new(0.0, HEIGHT / 2.0 - 0.3, 0.0) + rot * Vec3::new(0.0, 0.0, -0.35)).with_rotation(rot)
-}
-
-/// Our own body, drawn in the chase and spectator views.
-#[derive(Component)]
-pub struct OwnBody;
-
-pub fn own_body(
-    mut commands: Commands,
-    view: Res<View>,
-    looks: Res<Looks>,
-    net: Res<Net>,
-    mut q: Query<(Entity, &mut Transform, &mut MeshMaterial3d<StandardMaterial>), With<OwnBody>>,
-) {
-    let show = view.mode != crate::controls::Mode::FirstPerson && view.has_body;
-    let dead = net.0.core.is_dead();
-    let t = body(view.feet, view.yaw, dead);
-    let mat = match net.0.core.welcome() {
-        _ if dead => looks.dead.clone(),
-        Some(w) => looks.factions[faction(w.entity) as usize].clone(),
-        None => looks.plain.clone(),
-    };
-    match (q.single_mut(), show) {
-        (Ok((_, mut tf, mut m)), true) => {
-            *tf = t;
-            if m.0 != mat {
-                m.0 = mat;
-            }
-        }
-        (Ok((e, _, _)), false) => commands.entity(e).despawn(),
-        (Err(_), true) => {
-            commands
-                .spawn((OwnBody, Mesh3d(looks.capsule.clone()), MeshMaterial3d(mat), t))
-                .with_child((Nose, Mesh3d(looks.nose.clone()), MeshMaterial3d(looks.nose_mat.clone()), nose(view.pitch)));
-        }
-        (Err(_), false) => {}
-    }
 }

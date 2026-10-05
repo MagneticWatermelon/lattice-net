@@ -314,8 +314,27 @@ pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, m
     });
 }
 
+/// The first-person rifle.
+#[derive(Component)]
+pub struct ViewModel;
+
+/// The world camera (the first-person rifle has its own, as its child).
+#[derive(Component)]
+pub struct MainCamera;
+
+/// Shows the first-person rifle in the first-person view, while alive.
+pub fn viewmodel(view: Res<View>, net: Res<Net>, mut q: Query<&mut Visibility, With<ViewModel>>) {
+    let show = view.mode == Mode::FirstPerson && view.has_body && !net.0.core.is_dead();
+    for mut v in &mut q {
+        let want = if show { Visibility::Inherited } else { Visibility::Hidden };
+        if *v != want {
+            *v = want;
+        }
+    }
+}
+
 /// Places the camera for the view, on our player's drawn position.
-pub fn place_camera(frame: Res<Frame>, net: Res<Net>, mut view: ResMut<View>, mut cam: Query<&mut Transform, With<Camera3d>>) {
+pub fn place_camera(frame: Res<Frame>, net: Res<Net>, mut view: ResMut<View>, mut cam: Query<&mut Transform, With<MainCamera>>) {
     let core = &net.0.core;
     if core.welcome().is_some() {
         view.feet = core.own_render(frame.now);

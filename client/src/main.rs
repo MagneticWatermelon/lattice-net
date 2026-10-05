@@ -4,6 +4,7 @@
 mod controls;
 mod coords;
 mod hud;
+mod models;
 mod net;
 mod scene;
 mod terrain;
@@ -211,7 +212,7 @@ fn main() {
         .init_resource::<controls::Tracers>()
         .init_gizmo_group::<controls::TracerGizmos>()
         .init_resource::<hud::Combat>()
-        .add_systems(Startup, (setup_camera, scene::setup_looks, hud::setup, controls::setup_tracer_gizmos))
+        .add_systems(Startup, ((models::load, setup_camera).chain(), scene::setup_looks, hud::setup, controls::setup_tracer_gizmos))
         .add_systems(First, begin_frame)
         .add_systems(PreUpdate, poll)
         .add_systems(
@@ -223,7 +224,7 @@ fn main() {
                 controls::place_camera,
                 scene::stream_terrain,
                 scene::sync_players,
-                scene::own_body,
+                controls::viewmodel,
                 controls::tracers,
                 hud::update,
                 hud::vitals,
@@ -236,17 +237,30 @@ fn main() {
         .run();
 }
 
-fn setup_camera(mut commands: Commands) {
-    commands.spawn((
-        Camera3d::default(),
-        Projection::Perspective(PerspectiveProjection { fov: 80f32.to_radians(), far: 6000.0, ..default() }),
-        DistanceFog {
-            color: Color::srgb(0.62, 0.74, 0.86),
-            falloff: FogFalloff::Linear { start: 900.0, end: 5000.0 },
-            ..default()
-        },
-        Transform::from_xyz(4096.0, 300.0, -4096.0),
-    ));
+fn setup_camera(mut commands: Commands, models: Res<models::Models>) {
+    commands
+        .spawn((
+            controls::MainCamera,
+            Camera3d::default(),
+            Projection::Perspective(PerspectiveProjection { fov: 80f32.to_radians(), far: 6000.0, ..default() }),
+            DistanceFog {
+                color: Color::srgb(0.62, 0.74, 0.86),
+                falloff: FogFalloff::Linear { start: 900.0, end: 5000.0 },
+                ..default()
+            },
+            Transform::from_xyz(4096.0, 300.0, -4096.0),
+        ))
+        .with_children(|cam| {
+            // The first-person rifle, drawn after the world by its own
+            // camera (depth cleared), so it never sinks into a wall.
+            cam.spawn((
+                Camera3d::default(),
+                Camera { order: 1, clear_color: ClearColorConfig::None, ..default() },
+                Projection::Perspective(PerspectiveProjection { fov: 70f32.to_radians(), near: 0.01, far: 10.0, ..default() }),
+                bevy::camera::visibility::RenderLayers::layer(models::VIEWMODEL_LAYER),
+            ))
+            .with_child((controls::ViewModel, models::viewmodel(&models)));
+        });
 }
 
 fn begin_frame(mut frame: ResMut<Frame>, mut times: ResMut<FrameTimes>) {
