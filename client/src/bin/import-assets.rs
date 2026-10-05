@@ -7,7 +7,9 @@
 //!   body filling [-0.5, 0.5] x [0, 1] x [-0.5, 0.5], so the client scales a
 //!   prop straight to its cover box (antennas and such may stick out above);
 //! - the rifle centered and 1 m long, its muzzle at -x;
-//! - the soldier as rigged; each animation clip cut down to its skeleton
+//! - the soldier as rigged, plus two lighter meshes for the distance
+//!   (vertices clustered on 4 and 8 cm grids: same vertices and skin, fewer
+//!   triangles); each animation clip cut down to its skeleton
 //!   and keyframes, the two clips that run forward made to run in place, and
 //!   the jump's own rise taken out (the game moves the body up).
 //!
@@ -253,6 +255,65 @@ impl Glb {
         (lo, hi)
     }
 
+    /// A lighter level of detail: vertices merged on a grid of `cell`
+    /// meters (each cell's first vertex stands for it), triangles that
+    /// collapse dropped. The vertices (and their skin weights) stay as they
+    /// are, so the same skeleton drives it. Only the mesh is kept.
+    fn lod(&self, cell: f32) -> Glb {
+        let mut g = Glb { json: self.json.clone(), bin: self.bin.clone() };
+        let pos = g.read(g.attribute("POSITION").unwrap());
+        let ia = g.json["meshes"][0]["primitives"][0]["indices"].as_u64().unwrap() as usize;
+        let acc = g.json["accessors"][ia].clone();
+        let bv = acc["bufferView"].as_u64().unwrap() as usize;
+        let start = g.json["bufferViews"][bv]["byteOffset"].as_u64().unwrap_or(0) as usize + acc["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let wide = acc["componentType"] == 5125;
+        let index = |k: usize| -> u32 {
+            if wide {
+                u32::from_le_bytes(g.bin[start + 4 * k..][..4].try_into().unwrap())
+            } else {
+                u16::from_le_bytes(g.bin[start + 2 * k..][..2].try_into().unwrap()) as u32
+            }
+        };
+        let mut rep: HashMap<[i32; 3], u32> = HashMap::new();
+        let merged: Vec<u32> = pos
+            .iter()
+            .enumerate()
+            .map(|(i, p)| *rep.entry([0, 1, 2].map(|k| (p[k] / cell).floor() as i32)).or_insert(i as u32))
+            .collect();
+        let mut out = Vec::new();
+        for t in 0..acc["count"].as_u64().unwrap() as usize / 3 {
+            let [a, b, c] = [0, 1, 2].map(|k| merged[index(3 * t + k) as usize]);
+            if a != b && b != c && a != c {
+                out.extend([a, b, c]);
+            }
+        }
+        let mut bytes = Vec::with_capacity(out.len() * 4);
+        for &i in &out {
+            if wide {
+                bytes.extend_from_slice(&i.to_le_bytes());
+            } else {
+                bytes.extend_from_slice(&(i as u16).to_le_bytes());
+            }
+        }
+        g.json["accessors"][ia]["count"] = json!(out.len());
+        g.json["accessors"][ia]["byteOffset"] = json!(0);
+        // Just the mesh: no material, textures or animation.
+        for key in ["materials", "textures", "images", "samplers", "animations"] {
+            if let Some(o) = g.json.as_object_mut() {
+                o.remove(key);
+            }
+        }
+        if let Some(p) = g.json["meshes"][0]["primitives"][0].as_object_mut() {
+            p.remove("material");
+        }
+        let mut views: Vec<usize> = g.arr("accessors").iter().map(|a| a["bufferView"].as_u64().unwrap() as usize).collect();
+        views.sort_unstable();
+        views.dedup();
+        g.rebuild(&views, &HashMap::from([(bv, bytes)]));
+        println!("  lod {:.0} cm: {} triangles", cell * 100.0, out.len() / 3);
+        g
+    }
+
     /// Keeps only the skeleton and the animations: no meshes, skins or
     /// textures (the soldier's own file has those).
     fn strip_to_animation(&mut self) {
@@ -371,6 +432,8 @@ fn main() {
     let mut g = read_glb(&find(&raw, "soldier_rigged.glb"));
     g.shrink_textures();
     save("soldier", &g);
+    save("soldier_lod1", &g.lod(0.04));
+    save("soldier_lod2", &g.lod(0.08));
 
     for (meshy, name, fix) in CLIPS {
         let mut g = read_glb(&find(&raw, &format!("{meshy}.glb")));

@@ -332,9 +332,14 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
            - **WSL cost:** 1k blob, 5.6 B per client per tick (tick unchanged, p50 8.6 ms); uniform 5k at 20% firing, 42 B (~10 kbps, ~120 cells per window). Worst case, every map cell active: 3.1 µs gather per client per window, and a 0.25 ms serial finish per window.
     - **Models and bases** (2026-10-06, made with Meshy; see client/README):
       - **The world has bases** (`game/src/world.rs`, shared by server and clients): 16 walled bases (one per 2 km region, on its flattest of 8 candidate spots) and ~35 open outposts, each on ground flattened in integer math (smoothstep blend over 40 m). Base: a 90 m compound, four 10 m gates, a command building, bunkers, containers (some stacked: floating boxes), guard posts, sandbags, crates. Every piece is an AABB with a `Kind` (for drawing) and a facing; scattered cover stays off the sites. Tested: flat to 2 cm, walkable blends, players walk in through every gate.
-      - **The client draws models:** cover and buildings fitted exactly to their collision boxes (walls tiled with blocks), plain boxes beyond 700 m; rocks; an animated, faction-tinted soldier with a rifle in hand for each player within 120 m (at most 160), capsules beyond; a first-person rifle on its own camera.
-      - **Measured on Windows,** 1k blob in view: frame p50 6.5 / p99 8.0 ms (capsules: 3.5 / 4.7 ms).
-      - **Meshy:** 185 credits for 10 models, a rig and 5 clips; task ids in client/README. Raw output stays out of git (`client/assets/meshy_output`, 152 MB); `import-assets` makes `client/assets/models` (7.9 MB) from it.
+      - **The client draws models:**
+        - cover and buildings fitted exactly to their collision boxes (walls tiled with blocks), plain boxes beyond 700 m; rocks;
+        - every drawn player as an animated, faction-tinted soldier, with lighter meshes, no shadows and a frozen pose with distance;
+        - rifles that follow the right hand but point where the player aims;
+        - a first-person rifle on its own camera.
+      - **The first soldier was replaced** (the user saw it "skinny"): Meshy's auto-rig gave its collarbones 31% of the vertices and ran the spine along the belly, so the torso squeezed whenever the arms moved. Check a rig's weights and joints before buying clips.
+      - **Measured on Windows:** a 1k blob in view, frame p50 6.5 / p99 8.0 ms (capsules: 3.5 / 4.7 ms). All 291 players of a 300-bot fight drawn as soldiers: 6.6 / 7.8 ms.
+      - **Meshy:** 235 credits for 10 models, a replacement soldier, rigs and clips; task ids are in client/README. Raw output stays out of git (`client/assets/meshy_output`); `import-assets` makes `client/assets/models` (~11 MB) from it.
     - **M3e** one bare-metal validation session. It also runs a lethal 3k blob at mixed RTTs, and records `rewinds_trimmed`, which should be 0.
   - **Pass bars:**
     - prediction stays bit-exact (0 corrections on a clean link, outside separation pushes);

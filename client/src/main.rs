@@ -39,6 +39,8 @@ lattice-client: play on a lattice-server
   --ghosts             start with the server ghosts on (G)
   --autoplay           wander instead of reading the keyboard
   --autofire           hold the trigger (with --autoplay: a self-check)
+  --viewer             no game: a row of soldiers (bind pose, then each animation) beside
+                       their collision capsules, to look at the models
   --screenshot PATH    save a frame to PATH after --after seconds [5], then
   --exit-after S       quit after S seconds, printing a summary";
 
@@ -64,6 +66,7 @@ pub struct Settings {
     pub shadows: bool,
     pub autoplay: bool,
     pub autofire: bool,
+    pub viewer: bool,
     screenshot: Option<(String, f32)>,
     exit_after: Option<f32>,
 }
@@ -92,6 +95,7 @@ struct Args {
     ghosts: bool,
     autoplay: bool,
     autofire: bool,
+    viewer: bool,
     screenshot: Option<(String, f32)>,
     exit_after: Option<f32>,
 }
@@ -115,6 +119,7 @@ fn parse_args() -> Args {
         ghosts: false,
         autoplay: false,
         autofire: false,
+        viewer: false,
         screenshot: None,
         exit_after: None,
     };
@@ -152,6 +157,7 @@ fn parse_args() -> Args {
             "--ghosts" => a.ghosts = true,
             "--autoplay" => a.autoplay = true,
             "--autofire" => a.autofire = true,
+            "--viewer" => a.viewer = true,
             "--screenshot" => a.screenshot = Some((val(), 0.0)),
             "--after" => after = val().parse().unwrap_or_else(|e| die(&format!("--after: {e}"))),
             "--exit-after" => a.exit_after = Some(val().parse().unwrap_or_else(|e| die(&format!("--exit-after: {e}")))),
@@ -179,6 +185,9 @@ fn main() {
     let mut view = View::new(args.mode);
     if let Some((eye, yaw, pitch)) = args.spectate {
         view.spectate(eye, yaw, pitch);
+    } else if args.viewer {
+        // In front of the row of soldiers, at eye height.
+        view.spectate([0.0, -7.0, 1.5], std::f32::consts::FRAC_PI_2, -0.08);
     }
 
     App::new()
@@ -202,6 +211,7 @@ fn main() {
             shadows: args.shadows,
             autoplay: args.autoplay,
             autofire: args.autofire,
+            viewer: args.viewer,
             screenshot: args.screenshot,
             exit_after: args.exit_after,
         })
@@ -212,7 +222,15 @@ fn main() {
         .init_resource::<controls::Tracers>()
         .init_gizmo_group::<controls::TracerGizmos>()
         .init_resource::<hud::Combat>()
-        .add_systems(Startup, ((models::load, setup_camera).chain(), scene::setup_looks, hud::setup, controls::setup_tracer_gizmos))
+        .add_systems(
+            Startup,
+            (
+                (models::load, setup_camera, models::spawn_viewer.run_if(|s: Res<Settings>| s.viewer)).chain(),
+                scene::setup_looks,
+                hud::setup,
+                controls::setup_tracer_gizmos,
+            ),
+        )
         .add_systems(First, begin_frame)
         .add_systems(PreUpdate, poll)
         .add_systems(
@@ -234,6 +252,13 @@ fn main() {
                 .chain(),
         )
         .add_systems(PostUpdate, flush)
+        // Rifles go to their hands once the skeletons are posed.
+        .add_systems(
+            PostUpdate,
+            models::hold_rifles
+                .after(bevy::transform::TransformSystems::Propagate)
+                .before(bevy::camera::visibility::VisibilitySystems::CheckVisibility),
+        )
         .run();
 }
 

@@ -7,6 +7,11 @@
 //! prop exactly in its collision box: what you see is what blocks you.
 //! Walls are tiled with concrete blocks. Far away (where a model is a few
 //! pixels) the plain boxes take over again.
+//!
+//! Every drawn player is a soldier (up to `MAX_SOLDIERS`, nearest first).
+//! Farther out they get lighter meshes (same skeleton), then stop casting
+//! shadows, then stop animating and drop their rifles, where all of that is
+//! a few pixels.
 
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -26,10 +31,21 @@ const ROCK_RANGE: f32 = 300.0;
 /// The wall block's front, width over height: walls are tiled with blocks
 /// of about this shape.
 const WALL_ASPECT: f32 = 1.28;
-/// Players nearer than this get a soldier (with hysteresis), at most
-/// `MAX_SOLDIERS` of them, nearest first; the rest stay capsules.
-pub const SOLDIER_RANGE: f32 = 120.0;
-const MAX_SOLDIERS: usize = 160;
+/// The nearest this many drawn players are soldiers; the rest (rare, or
+/// while a soldier loads) capsules.
+const MAX_SOLDIERS: usize = 1200;
+/// Soldier detail by distance (meters): the full mesh, then the 4 cm and
+/// 8 cm meshes; shadows; animation and the rifle.
+const LOD_DISTANCES: [f32; 2] = [35.0, 110.0];
+const SHADOW_RANGE: f32 = 90.0;
+const ANIMATE_RANGE: f32 = 250.0;
+const RIFLE_RANGE: f32 = 150.0;
+/// Hysteresis on all of those, so nothing flickers at a boundary.
+const MARGIN: f32 = 5.0;
+/// The rifle's length in the hands, and its pistol grip in the model (it's
+/// 1 m long, centered, muzzle at -x).
+const RIFLE_LENGTH: f32 = 0.85;
+const RIFLE_GRIP: Vec3 = Vec3::new(0.17, -0.1, 0.0);
 /// The first-person rifle's render layer (drawn over the world by its own
 /// camera, so it never sinks into a wall).
 pub const VIEWMODEL_LAYER: usize = 1;
@@ -56,6 +72,8 @@ pub struct Models {
     rocks: (Handle<Mesh>, Handle<StandardMaterial>),
     pub rifle: (Handle<Mesh>, Handle<StandardMaterial>),
     soldier: Handle<WorldAsset>,
+    /// The soldier's meshes by level of detail (all on the same skeleton).
+    soldier_meshes: [Handle<Mesh>; 3],
     soldier_material: Handle<StandardMaterial>,
     graph: Handle<AnimationGraph>,
     clips: Vec<AnimationNodeIndex>,
@@ -80,6 +98,7 @@ pub fn load(mut commands: Commands, assets: Res<AssetServer>, mut graphs: ResMut
         rocks: prop("rocks"),
         rifle: prop("rifle"),
         soldier: assets.load(GltfAssetLabel::Scene(0).from_asset(model("soldier"))),
+        soldier_meshes: ["soldier", "soldier_lod1", "soldier_lod2"].map(|f| assets.load(GltfAssetLabel::Primitive { mesh: 0, primitive: 0 }.from_asset(model(f)))),
         soldier_material: assets.load(format!("{}#Material0/std", model("soldier"))),
         graph: graphs.add(graph),
         clips: nodes,
@@ -167,13 +186,25 @@ pub fn spawn_rocks(commands: &mut Commands, models: &Models, world: &World) {
 }
 
 /// A player's soldier: the spawned scene under its body, and once it's
-/// ready, its animation player and the meshes to tint.
+/// ready, its animation player, its meshes (to tint and swap for lighter
+/// ones) and its rifle.
 #[derive(Component)]
 pub struct Soldier {
     player: Option<Entity>,
     meshes: Vec<Entity>,
+    rifle: Option<Entity>,
     clip: Option<Clip>,
     tint: Option<[u32; 3]>,
+    lod: usize,
+    shadows: bool,
+    animated: bool,
+    armed: bool,
+}
+
+impl Soldier {
+    fn new() -> Self {
+        Self { player: None, meshes: Vec::new(), rifle: None, clip: None, tint: None, lod: 0, shadows: true, animated: true, armed: true }
+    }
 }
 
 /// How a player moves, for its animation: its last drawn position and
@@ -185,6 +216,22 @@ pub struct Motion {
     backward: bool,
 }
 
+/// On a player's root: where it aims, for its rifle.
+#[derive(Component, Default)]
+pub struct Aim {
+    pub pitch: f32,
+}
+
+/// A rifle in a soldier's hands: it follows the right hand, pointed where
+/// the player aims (`hold_rifles`). The clips hold rifles of different
+/// sizes at different angles, so the hand gives the place and the aim the
+/// direction.
+#[derive(Component)]
+pub struct HeldBy {
+    hand: Entity,
+    root: Entity,
+}
+
 /// What a player is doing, as the scene draws it.
 pub struct Pose {
     pub feet: Vec3,
@@ -192,10 +239,20 @@ pub struct Pose {
     pub airborne: bool,
     pub dead: bool,
     pub tint: Color,
+    /// From the camera, meters.
+    pub distance: f32,
 }
 
+/// `want` with hysteresis: on inside `range`, off past `range + MARGIN`.
+fn near(on: bool, distance: f32, range: f32) -> bool {
+    distance < range + if on { MARGIN } else { 0.0 }
+}
+
+type SoldierMeshes<'w, 's, F> = Query<'w, 's, (&'static mut Mesh3d, &'static mut MeshMaterial3d<StandardMaterial>), F>;
+
 /// Adds or removes `root`'s soldier (as a child, turned to face the body's
-/// forward, -z), and keeps its animation and tint up to date.
+/// forward, -z), and keeps its tint, detail, animation and rifle up to
+/// date. True when the soldier is drawn (its capsule can hide).
 #[allow(clippy::too_many_arguments)]
 pub fn drive<F: bevy::ecs::query::QueryFilter>(
     commands: &mut Commands,
@@ -208,7 +265,7 @@ pub fn drive<F: bevy::ecs::query::QueryFilter>(
     motion: &mut Motion,
     soldier: Option<(Entity, &mut Soldier)>,
     players: &mut Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
-    material_q: &mut Query<&mut MeshMaterial3d<StandardMaterial>, F>,
+    mesh_q: &mut SoldierMeshes<F>,
 ) -> bool {
     // Speed from the drawn positions, smoothed over ~0.15 s.
     let speed = match motion.last {
@@ -230,11 +287,7 @@ pub fn drive<F: bevy::ecs::query::QueryFilter>(
     let Some((entity, soldier)) = soldier else {
         if want {
             let child = commands
-                .spawn((
-                    WorldAssetRoot(models.soldier.clone()),
-                    Transform::from_rotation(Quat::from_rotation_y(PI)),
-                    Soldier { player: None, meshes: Vec::new(), clip: None, tint: None },
-                ))
+                .spawn((WorldAssetRoot(models.soldier.clone()), Transform::from_rotation(Quat::from_rotation_y(PI)), Soldier::new()))
                 .observe(ready)
                 .id();
             commands.entity(root).add_child(child);
@@ -242,6 +295,9 @@ pub fn drive<F: bevy::ecs::query::QueryFilter>(
         return false;
     };
     if !want {
+        if let Some(r) = soldier.rifle {
+            commands.entity(r).despawn();
+        }
         commands.entity(entity).despawn();
         return false;
     }
@@ -261,11 +317,53 @@ pub fn drive<F: bevy::ecs::query::QueryFilter>(
             }
         };
         for &m in &soldier.meshes {
-            if let Ok(mut mm) = material_q.get_mut(m) {
+            if let Ok((_, mut mm)) = mesh_q.get_mut(m) {
                 mm.0 = handle.clone();
             }
         }
         soldier.tint = Some(key);
+    }
+
+    // Detail by distance: mesh, shadows, animation, rifle.
+    let d = pose.distance;
+    let raw = LOD_DISTANCES.iter().filter(|&&r| d >= r).count();
+    let lod = if raw < soldier.lod && d >= LOD_DISTANCES[soldier.lod - 1] - MARGIN { soldier.lod } else { raw };
+    if lod != soldier.lod {
+        for &m in &soldier.meshes {
+            if let Ok((mut mesh, _)) = mesh_q.get_mut(m) {
+                mesh.0 = models.soldier_meshes[lod].clone();
+            }
+        }
+        soldier.lod = lod;
+    }
+    let shadows = near(soldier.shadows, d, SHADOW_RANGE);
+    if shadows != soldier.shadows {
+        for &m in &soldier.meshes {
+            if shadows {
+                commands.entity(m).remove::<bevy::light::NotShadowCaster>();
+            } else {
+                commands.entity(m).insert(bevy::light::NotShadowCaster);
+            }
+        }
+        soldier.shadows = shadows;
+    }
+    // Past `ANIMATE_RANGE` the pose freezes (no graph, nothing evaluated).
+    let animated = near(soldier.animated, d, ANIMATE_RANGE);
+    if animated != soldier.animated {
+        if animated {
+            commands.entity(player_entity).insert(AnimationGraphHandle(models.graph.clone()));
+        } else {
+            commands.entity(player_entity).remove::<AnimationGraphHandle>();
+        }
+        soldier.animated = animated;
+    }
+    // The dead drop their rifles.
+    let armed = !pose.dead && near(soldier.armed, d, RIFLE_RANGE);
+    if armed != soldier.armed {
+        if let Some(r) = soldier.rifle {
+            commands.entity(r).insert(if armed { Visibility::Inherited } else { Visibility::Hidden });
+        }
+        soldier.armed = armed;
     }
 
     // Animation: by state and speed.
@@ -287,16 +385,7 @@ pub fn drive<F: bevy::ecs::query::QueryFilter>(
     if let Ok((mut player, mut transitions)) = players.get_mut(player_entity) {
         let node = models.clips[clip as usize];
         if soldier.clip != Some(clip) {
-            let fade = if clip == Clip::Death || soldier.clip == Some(Clip::Death) { 0.1 } else { 0.2 };
-            let active = transitions.play(&mut player, node, Duration::from_secs_f32(fade));
-            if clip == Clip::Death {
-                active.set_repeat(bevy::animation::RepeatAnimation::Never);
-            } else {
-                active.repeat();
-            }
-            if clip == Clip::Jump {
-                active.seek_to(0.35);
-            }
+            play(&mut player, &mut transitions, node, clip, soldier.clip);
             soldier.clip = Some(clip);
         }
         if let Some(active) = player.animation_mut(node) {
@@ -306,69 +395,135 @@ pub fn drive<F: bevy::ecs::query::QueryFilter>(
     true
 }
 
+fn play(player: &mut AnimationPlayer, transitions: &mut AnimationTransitions, node: AnimationNodeIndex, clip: Clip, from: Option<Clip>) {
+    let fade = if clip == Clip::Death || from == Some(Clip::Death) { 0.1 } else { 0.2 };
+    let active = transitions.play(player, node, Duration::from_secs_f32(fade));
+    if clip == Clip::Death {
+        active.set_repeat(bevy::animation::RepeatAnimation::Never);
+    } else {
+        active.repeat();
+    }
+    if clip == Clip::Jump {
+        active.seek_to(0.35);
+    }
+}
+
+/// `--viewer`: plays this clip (or none: the bind pose) on its own.
+#[derive(Component)]
+pub struct ViewerClip(Option<Clip>);
+
 /// When a soldier's scene has spawned: hook its animation player to the
-/// shared graph, note its meshes (to tint), and put the rifle in its right
-/// hand.
+/// shared graph, note its meshes, and give it a rifle (held by its root's
+/// right hand).
 #[allow(clippy::too_many_arguments)]
 fn ready(
     ev: On<WorldInstanceReady>,
     mut commands: Commands,
     models: Res<Models>,
     children: Query<&Children>,
+    parents: Query<&ChildOf>,
     names: Query<&Name>,
-    players: Query<(), With<AnimationPlayer>>,
+    mut players: Query<&mut AnimationPlayer>,
     meshes: Query<(), With<MeshMaterial3d<StandardMaterial>>>,
-    mut soldiers: Query<&mut Soldier>,
+    mut soldiers: Query<(&mut Soldier, Option<&ViewerClip>)>,
 ) {
-    let root = ev.entity;
-    let Ok(mut soldier) = soldiers.get_mut(root) else { return };
-    for e in children.iter_descendants(root) {
-        if players.contains(e) {
-            commands.entity(e).insert((AnimationGraphHandle(models.graph.clone()), AnimationTransitions::new()));
+    let entity = ev.entity;
+    let Ok((mut soldier, viewer)) = soldiers.get_mut(entity) else { return };
+    let root = parents.get(entity).map_or(entity, |c| c.parent());
+    for e in children.iter_descendants(entity) {
+        if let Ok(mut player) = players.get_mut(e) {
+            let mut transitions = AnimationTransitions::new();
+            if let Some(&ViewerClip(Some(clip))) = viewer {
+                play(&mut player, &mut transitions, models.clips[clip as usize], clip, None);
+            }
+            // The viewer's bind-pose soldier gets no graph: nothing moves it.
+            if !matches!(viewer, Some(ViewerClip(None))) {
+                commands.entity(e).insert(AnimationGraphHandle(models.graph.clone()));
+            }
+            commands.entity(e).insert(transitions);
             soldier.player = Some(e);
         }
         if meshes.contains(e) {
             soldier.meshes.push(e);
         }
         if names.get(e).is_ok_and(|n| n.as_str() == "RightHand") {
-            commands.entity(e).with_child((Mesh3d(models.rifle.0.clone()), MeshMaterial3d(models.rifle.1.clone()), rifle_in_hand()));
+            let rifle = commands
+                .spawn((Mesh3d(models.rifle.0.clone()), MeshMaterial3d(models.rifle.1.clone()), Transform::default(), HeldBy { hand: e, root }))
+                .id();
+            soldier.rifle = Some(rifle);
         }
     }
 }
 
-/// The rifle in the right hand bone's frame (the skeleton is in
-/// centimeters): 75 cm long, along the hand, muzzle forward.
-/// `LATTICE_RIFLE="x,y,z,rx,ry,rz"` (cm, degrees) overrides it, for tuning.
-fn rifle_in_hand() -> Transform {
-    let v: Vec<f32> = std::env::var("LATTICE_RIFLE")
-        .ok()
-        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
-        .filter(|v: &Vec<f32>| v.len() == 6)
-        .unwrap_or_else(|| vec![2.0, 10.0, 4.0, 0.0, 90.0, -90.0]);
-    let r = |d: f32| d.to_radians();
-    Transform::from_translation(Vec3::new(v[0], v[1], v[2]))
-        .with_rotation(Quat::from_euler(EulerRot::XYZ, r(v[3]), r(v[4]), r(v[5])))
-        .with_scale(Vec3::splat(75.0))
+/// Puts every held rifle at its soldier's right hand, pointed where the
+/// player aims (after the skeleton is posed, so it's this frame's hand). A
+/// rifle whose soldier is gone goes too.
+pub fn hold_rifles(
+    mut commands: Commands,
+    mut rifles: Query<(Entity, &HeldBy, &mut Transform, &mut GlobalTransform)>,
+    hands: Query<&GlobalTransform, Without<HeldBy>>,
+    roots: Query<(&GlobalTransform, &Aim), Without<HeldBy>>,
+) {
+    for (e, held, mut tf, mut gt) in &mut rifles {
+        let (Ok(hand), Ok((root, aim))) = (hands.get(held.hand), roots.get(held.root)) else {
+            commands.entity(e).despawn();
+            continue;
+        };
+        // The root faces -z; the rifle's muzzle is its -x.
+        let rot = root.rotation() * Quat::from_rotation_x(aim.pitch) * Quat::from_rotation_y(-FRAC_PI_2);
+        let at = hand.translation() - rot * (RIFLE_GRIP * RIFLE_LENGTH);
+        *tf = Transform::from_translation(at).with_rotation(rot).with_scale(Vec3::splat(RIFLE_LENGTH));
+        *gt = GlobalTransform::from(*tf);
+    }
+}
+
+/// `--viewer`: a ground, the sun, and a row of soldiers to look at: one in
+/// the bind pose, then one per clip, each beside its collision capsule.
+pub fn spawn_viewer(mut commands: Commands, models: Res<Models>, mut meshes: ResMut<Assets<Mesh>>, mut mats: ResMut<Assets<StandardMaterial>>) {
+    use lattice_game::movement::{HEIGHT, RADIUS};
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(80.0, 80.0))),
+        MeshMaterial3d(mats.add(StandardMaterial { base_color: Color::srgb(0.55, 0.52, 0.42), perceptual_roughness: 0.95, ..default() })),
+    ));
+    commands.spawn((
+        DirectionalLight { illuminance: 9000.0, shadow_maps_enabled: true, ..default() },
+        Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.6, -0.9, 0.0)),
+        RenderLayers::from_layers(&[0, VIEWMODEL_LAYER]),
+    ));
+    let capsule = meshes.add(Capsule3d::new(RADIUS, HEIGHT - 2.0 * RADIUS));
+    let glass = mats.add(StandardMaterial { base_color: Color::srgba(0.4, 0.8, 1.0, 0.25), alpha_mode: AlphaMode::Blend, ..default() });
+    let clips = [None, Some(Clip::Idle), Some(Clip::Aim), Some(Clip::Run), Some(Clip::Sprint), Some(Clip::Jump), Some(Clip::Death)];
+    for (i, clip) in clips.into_iter().enumerate() {
+        let x = (i as f32 - 3.0) * 2.0;
+        // A root like a player's (facing -z), turned to face the camera.
+        let root = commands.spawn((Transform::from_xyz(x, 0.0, 0.0).with_rotation(Quat::from_rotation_y(PI)), Visibility::default(), Aim::default())).id();
+        let soldier = commands
+            .spawn((WorldAssetRoot(models.soldier.clone()), Transform::from_rotation(Quat::from_rotation_y(PI)), Soldier::new(), ViewerClip(clip)))
+            .observe(ready)
+            .id();
+        commands.entity(root).add_child(soldier);
+        commands.spawn((Mesh3d(capsule.clone()), MeshMaterial3d(glass.clone()), Transform::from_xyz(x + 0.9, HEIGHT / 2.0, 0.0)));
+    }
 }
 
 /// The first-person rifle, in the view camera's frame: low and to the
-/// right, muzzle (its -x) forward.
+/// right, muzzle (its -x) forward. The sun lights it but it casts no
+/// shadow (it'd be a giant one in the world).
 pub fn viewmodel(models: &Models) -> impl Bundle {
     (
         Mesh3d(models.rifle.0.clone()),
         MeshMaterial3d(models.rifle.1.clone()),
         Transform::from_translation(Vec3::new(0.2, -0.2, -0.5)).with_rotation(Quat::from_rotation_y(-FRAC_PI_2)).with_scale(Vec3::splat(0.7)),
         RenderLayers::layer(VIEWMODEL_LAYER),
+        bevy::light::NotShadowCaster,
     )
 }
 
-/// Which of the drawn players (by distance from the camera) get soldiers:
-/// the nearest, within range; those that have one keep it a little longer.
-pub fn soldier_set(mut near: Vec<(f32, u16, bool)>) -> std::collections::HashSet<u16> {
-    near.sort_by(|a, b| a.0.total_cmp(&b.0));
-    near.iter()
-        .enumerate()
-        .filter(|&(i, &(d, _, has))| if has { d < SOLDIER_RANGE + 20.0 && i < MAX_SOLDIERS + 10 } else { d < SOLDIER_RANGE && i < MAX_SOLDIERS })
-        .map(|(_, &(_, e, _))| e)
-        .collect()
+/// Which of the drawn players get soldiers: the nearest `MAX_SOLDIERS`.
+pub fn soldier_set(mut near: Vec<(f32, u16)>) -> std::collections::HashSet<u16> {
+    if near.len() > MAX_SOLDIERS {
+        near.select_nth_unstable_by(MAX_SOLDIERS, |a, b| a.0.total_cmp(&b.0));
+        near.truncate(MAX_SOLDIERS);
+    }
+    near.into_iter().map(|(_, e)| e).collect()
 }
