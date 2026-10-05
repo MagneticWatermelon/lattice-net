@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lattice_game::delta;
+use lattice_game::events::{self, Event, SeenShot};
 use lattice_game::movement::{dead_input, step, Input, MoveState, TICK_HZ};
 use lattice_game::msg::{self, InputEntry, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
 use lattice_game::weapon::{shot_time, Shot, FIRE_STEPS};
@@ -142,6 +143,14 @@ pub struct ClientStats {
     pub delay_changes: u64,
     /// Shots sent (each rides its input).
     pub shots: u64,
+    /// Combat news received: our hits (and kills) confirmed, hits taken and
+    /// their damage, kills heard of, others' shots seen (for tracers).
+    pub hits_confirmed: u64,
+    pub kills_confirmed: u64,
+    pub hurts: u64,
+    pub damage_taken: u64,
+    pub kills_heard: u64,
+    pub shots_seen: u64,
     /// From the latest snapshot: the server's pace (per mille) and levels.
     pub pace: u16,
     pub level: u8,
@@ -212,6 +221,11 @@ pub struct ClientCore {
     near_delay: f64,
     near_bounds: (f64, f64),
     mid_delay: f64,
+    /// Combat news and others' shots, kept for the game to show when
+    /// `keep_news` (a bot only counts them).
+    keep_news: bool,
+    news: Vec<Event>,
+    seen_shots: Vec<SeenShot>,
     /// A shot waiting for the input whose step it was fired in: (seq, shot).
     pending_shot: Option<(u32, Shot)>,
     /// When the last shot fired (`weapon::shot_time`): the rifle's rate.
@@ -273,6 +287,9 @@ impl ClientCore {
             near_bounds: (steps(cfg.near_delay), steps(cfg.near_delay_max.max(cfg.near_delay))),
             mid_delay: steps(cfg.mid_delay),
             server_own: None,
+            keep_news: false,
+            news: Vec::new(),
+            seen_shots: Vec::new(),
             pending_shot: None,
             last_shot: None,
             own_offset: [0.0; 3],
@@ -427,7 +444,54 @@ impl ClientCore {
         out.append(&mut self.latency);
     }
 
+    /// Keep combat news and others' shots for `drain_news` (a game shows
+    /// them; a bot only counts them).
+    pub fn keep_news(&mut self, keep: bool) {
+        self.keep_news = keep;
+    }
+
+    /// Combat news and others' shots received since the last call.
+    pub fn drain_news(&mut self, events: &mut Vec<Event>, shots: &mut Vec<SeenShot>) {
+        events.append(&mut self.news);
+        shots.append(&mut self.seen_shots);
+    }
+
     pub fn on_message(&mut self, data: &[u8], now: Instant) {
+        match data.first() {
+            Some(&events::MSG_EVENTS) => {
+                let Ok(evs) = events::decode_events(data) else {
+                    self.stats.bad_messages += 1;
+                    return;
+                };
+                for ev in evs {
+                    let st = &mut self.stats;
+                    match ev {
+                        Event::Hit { killed, .. } => (st.hits_confirmed, st.kills_confirmed) = (st.hits_confirmed + 1, st.kills_confirmed + killed as u64),
+                        Event::Hurt { amount, .. } => (st.hurts, st.damage_taken) = (st.hurts + 1, st.damage_taken + amount as u64),
+                        Event::Kill { .. } => st.kills_heard += 1,
+                    }
+                    if self.keep_news {
+                        self.news.push(ev);
+                    }
+                }
+                return;
+            }
+            Some(&events::MSG_SHOTS) => {
+                if self.entities.is_none() {
+                    return; // a sink: tracers are for drawing
+                }
+                let Ok(shots) = events::decode_shots(data) else {
+                    self.stats.bad_messages += 1;
+                    return;
+                };
+                self.stats.shots_seen += shots.len() as u64;
+                if self.keep_news {
+                    self.seen_shots.extend(shots);
+                }
+                return;
+            }
+            _ => {}
+        }
         if data.first() == Some(&delta::MSG_NEAR) {
             // tag:1 | server_tick:4 | n:1 | bits: only tracking clients decode it.
             self.stats.tier_seen[Tier::Near as usize] += data.get(5).copied().unwrap_or(0) as u64;

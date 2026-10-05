@@ -127,6 +127,9 @@ pub struct Fire {
     pub shooter: u16,
     pub origin: [f32; 3],
     pub dir: [f32; 3],
+    /// The aim as sent (for others' tracers).
+    pub yaw: u16,
+    pub pitch: i16,
     /// When it fired, in steps.
     pub tau0: f64,
     /// How far the shooter's view was behind `tau0`, near and mid/far, in steps.
@@ -279,7 +282,7 @@ mod tests {
 
     #[test]
     fn rewinds_are_capped() {
-        let f = Fire { shooter: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], tau0: 100.0, behind: [4.0, 8.0], late: false };
+        let f = Fire { shooter: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false };
         let (p, capped) = Projectile::new(1, &f);
         assert_eq!((p.d, capped), ([4.0, 8.0], false));
         let (p, capped) = Projectile::new(2, &Fire { behind: [12.0, 16.0], ..f });

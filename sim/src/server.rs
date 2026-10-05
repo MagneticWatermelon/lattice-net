@@ -34,6 +34,7 @@ use crate::movement::{self, step, Input, MoveState, HEIGHT, RADIUS, TICK_HZ, WOR
 use crate::shots::{self, Fire, FlyStats, History, Outcome, Projectile, Sky};
 use lattice_game::weapon::{self, shot_time, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
 use lattice_game::msg::MID_LAG_UNITS;
+use lattice_game::events::{self, Event};
 use lattice_game::faction::{faction, FACTIONS, MAX_HEALTH, RESPAWN_STEPS};
 use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
 use crate::msg::{self, Blob, PacketFill, RenderTime, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
@@ -265,6 +266,9 @@ pub struct Counters {
     /// Projectile segments flown and player candidates tested.
     pub segments: u64,
     pub candidates: u64,
+    /// Combat events sent (reliable), and tracer bytes (unreliable).
+    pub events: u64,
+    pub tracer_bytes: u64,
     /// Real inputs that arrived for a seq a stand-in had already consumed.
     pub late_inputs: u64,
     /// Inputs dropped unapplied because the client queued too many.
@@ -322,6 +326,9 @@ struct Body {
     radius: f32,
     /// Test aid: hits land but deal no damage.
     invulnerable: bool,
+    /// Players it hit or was hit by recently: near-tier for each other until
+    /// the tick given ("interaction"). `NO_CONTACT` is empty.
+    contacts: [(u16, u32); CONTACTS],
 }
 
 impl Default for Body {
@@ -340,6 +347,7 @@ impl Default for Body {
             anchor: [0.0; 2],
             radius: 0.0,
             invulnerable: false,
+            contacts: [(NO_CONTACT, 0); CONTACTS],
         }
     }
 }
@@ -348,7 +356,21 @@ impl Body {
     fn dead(&self) -> bool {
         self.health == 0
     }
+
+    /// Keeps `other` near-tier for this player until `until` (replacing the
+    /// one that expires first, if all are taken).
+    fn contact(&mut self, other: u16, until: u32) {
+        let i = self.contacts.iter().position(|c| c.0 == other).unwrap_or_else(|| {
+            (0..CONTACTS).min_by_key(|&i| if self.contacts[i].0 == NO_CONTACT { 0 } else { self.contacts[i].1 }).unwrap()
+        });
+        self.contacts[i] = (other, until);
+    }
 }
+
+/// Recent combat contacts kept per player, and for how long (5 s).
+const CONTACTS: usize = 4;
+const CONTACT_TICKS: u32 = 150;
+const NO_CONTACT: u16 = u16::MAX;
 
 /// A connected client, kept in its transport shard's list with its interest state.
 struct ClientSlot {
@@ -401,6 +423,7 @@ struct Tally {
     /// Candidates the near and mid searches computed distances for.
     near_scanned: u64,
     mid_scanned: u64,
+    tracer_bytes: u64,
 }
 
 /// Per-entity input stream. Every tick consumes exactly one input seq, so each
@@ -532,6 +555,8 @@ impl InputQueue {
             shooter: e,
             origin: weapon::muzzle(&before, &after, shot.frac),
             dir: weapon::aim(shot.yaw, shot.pitch),
+            yaw: shot.yaw,
+            pitch: shot.pitch,
             tau0,
             behind: [near, near + mid_lag],
             late,
@@ -642,6 +667,15 @@ pub struct SimServer {
     next_projectile: u64,
     /// Hits since the last `take_hits`.
     hits: Vec<HitRecord>,
+    /// This tick's shots, sorted by shooter: (shooter, yaw, pitch, step fired),
+    /// for the tracers of whoever has the shooter near-tier.
+    tick_shots: Vec<(u16, u16, i16, f64)>,
+    /// Combat news to send this tick: (recipient entity, event).
+    outbox: Vec<(u16, Event)>,
+    /// Reliable messages per shard, sent before this tick's snapshots.
+    reliable_out: Vec<Vec<(ClientId, Vec<u8>)>>,
+    /// Each entity's client, while connected.
+    client_of: Vec<Option<ClientId>>,
     /// Free entity ids, per faction (`faction::faction(id)`).
     free: [Vec<u16>; FACTIONS as usize],
     /// Damage to apply after this tick's movement: (entity, amount).
@@ -723,6 +757,10 @@ impl SimServer {
             projectiles: Vec::new(),
             next_projectile: 0,
             hits: Vec::new(),
+            tick_shots: Vec::new(),
+            outbox: Vec::new(),
+            reliable_out: Vec::new(),
+            client_of: Vec::new(),
             free: Default::default(),
             pending_damage: Vec::new(),
             death_acc: 0.0,
@@ -1034,6 +1072,7 @@ impl SimServer {
 
         // 6b. shots: new projectiles, then every projectile flies to now
         self.spans[6] = self.shots_phase();
+        self.post_news();
         lap(6);
 
         // 7. serialize each entity once per tier. Far blobs are needed for this
@@ -1064,6 +1103,7 @@ impl SimServer {
         let packet_body = self.cfg.net.packet_body_size();
         let view = View {
             cfg: &self.interest,
+            shots: &self.tick_shots,
             tick,
             step: self.step,
             pace: (self.pace_now * 1000.0).round() as u16,
@@ -1131,6 +1171,7 @@ impl SimServer {
             c.near_deltas += t.near_deltas;
             c.near_full += t.near_full;
             c.near_scanned += t.near_scanned;
+            c.tracer_bytes += t.tracer_bytes;
             c.mid_scanned += t.mid_scanned;
         }
         lap(8);
@@ -1141,9 +1182,13 @@ impl SimServer {
             .shards_mut()
             .par_iter_mut()
             .zip(self.snapshots.par_iter_mut())
+            .zip(self.reliable_out.par_iter_mut())
             .zip(out.par_iter_mut())
-            .map(|((shard, snaps), out)| {
+            .map(|(((shard, snaps), news), out)| {
                 let t0 = Instant::now();
+                for (client, msg) in news.drain(..) {
+                    let _ = shard.send(client, Channel::Reliable, msg);
+                }
                 for (client, snap, tag) in snaps.drain(..) {
                     let _ = match tag {
                         Some(tag) => shard.send_tagged(client, snap, tag),
@@ -1174,6 +1219,9 @@ impl SimServer {
             }
             self.counters.shots_refused += std::mem::take(&mut q.refused) as u64;
         }
+        self.tick_shots.clear();
+        self.tick_shots.extend(fires.iter().map(|f| (f.shooter, f.yaw, f.pitch, f.tau0)));
+        self.tick_shots.sort_unstable_by_key(|s| s.0);
         for f in &fires {
             let (p, capped) = Projectile::new(self.next_projectile, f);
             self.next_projectile += 1;
@@ -1243,11 +1291,57 @@ impl SimServer {
                     c.hits_after_cover += after_cover as u64;
                     c.hits_too_late += (damage == 0) as u64;
                     self.hits.push(HitRecord { shooter, target, head, damage, killed, rewind, after_cover, at, tick: self.tick });
+                    if damage > 0 {
+                        self.news(shooter, target, damage, head, killed);
+                    }
                 }
             }
         }
         let _ = t0;
         task
+    }
+
+    /// Tells the shooter it hit, the target it was hit and from where, and
+    /// (on a kill) both and their squads; makes them near-tier for each other.
+    fn news(&mut self, shooter: u16, target: u16, damage: u8, head: bool, killed: bool) {
+        let until = self.tick + CONTACT_TICKS;
+        let (sp, tp) = (self.bodies[shooter as usize].state.pos, self.bodies[target as usize].state.pos);
+        self.bodies[shooter as usize].contact(target, until);
+        self.bodies[target as usize].contact(shooter, until);
+        self.outbox.push((shooter, Event::Hit { target, damage, head, killed }));
+        self.outbox.push((target, Event::Hurt { from: shooter, amount: damage, dir: events::direction(tp, sp) }));
+        if killed {
+            let kill = Event::Kill { killer: shooter, victim: target, head };
+            let mut to: Vec<u16> = vec![shooter, target];
+            for e in [shooter, target] {
+                if let Some(m) = self.squads.get(&self.bodies[e as usize].squad) {
+                    to.extend(m);
+                }
+            }
+            to.sort_unstable();
+            to.dedup();
+            self.outbox.extend(to.into_iter().map(|e| (e, kill)));
+        }
+    }
+
+    /// The outbox as one reliable message per client, bucketed by shard.
+    fn post_news(&mut self) {
+        self.reliable_out.resize_with(self.shard_count(), Vec::new);
+        if self.outbox.is_empty() {
+            return;
+        }
+        let mut outbox = std::mem::take(&mut self.outbox);
+        outbox.sort_by_key(|&(e, _)| e);
+        for run in outbox.chunk_by(|a, b| a.0 == b.0) {
+            let Some(Some(client)) = self.client_of.get(run[0].0 as usize).copied() else { continue };
+            for chunk in run.chunks(u8::MAX as usize) {
+                let events: Vec<Event> = chunk.iter().map(|&(_, ev)| ev).collect();
+                self.counters.events += events.len() as u64;
+                self.reliable_out[self.net.shard_of_client(client)].push((client, events::encode_events(&events)));
+            }
+        }
+        outbox.clear();
+        self.outbox = outbox;
     }
 
     /// Whether `shooter`'s eye sees `target`'s chest now (no terrain or cover
@@ -1410,6 +1504,10 @@ impl SimServer {
             self.squads.entry(squad).or_default().push(e);
         }
         self.by_client.insert(client, e);
+        if self.client_of.len() <= i {
+            self.client_of.resize(i + 1, None);
+        }
+        self.client_of[i] = Some(client);
         let slot = ClientSlot {
             client,
             entity: e,
@@ -1430,6 +1528,7 @@ impl SimServer {
             if let Some(i) = list.iter().position(|s| s.client == client) {
                 list.swap_remove(i);
             }
+            self.client_of[e as usize] = None;
             let body = &mut self.bodies[e as usize];
             body.alive = false;
             if let Some(members) = self.squads.get_mut(&body.squad) {
@@ -1487,6 +1586,8 @@ impl SimServer {
 /// Everything assembly reads, shared by all shard tasks.
 struct View<'a> {
     cfg: &'a InterestConfig,
+    /// This tick's shots, sorted by shooter (`SimServer::tick_shots`).
+    shots: &'a [(u16, u16, i16, f64)],
     tick: u32,
     step: u32,
     bodies: &'a [Body],
@@ -1585,6 +1686,14 @@ impl View<'_> {
                 }
             }
         }
+        // Combat contacts (who it hit, who hit it) too, for a few seconds.
+        for &(j, until) in &me.contacts {
+            if j != NO_CONTACT && until > tick && j != e && self.bodies[j as usize].alive && sc.stamp[j as usize] != epoch {
+                let d = self.dist2(me.state.pos, j).sqrt();
+                sc.near.push(NearCandidate { entity: j, base: near_base(d, true), seed_age: interest::seed_age(j, tick, d, cfg, fresh) });
+                sc.stamp[j as usize] = epoch;
+            }
+        }
         sc.picked.clear();
         slot.near.select(&sc.near, tick, cfg.near_per_tick, &mut sc.select, &mut sc.picked);
 
@@ -1648,6 +1757,18 @@ impl View<'_> {
             w.into_inner()
         });
         let near_bytes = near_msg.as_ref().map_or(0, |m| m.len());
+        // Tracers: this tick's shots by its near-tier players.
+        let shots_msg = (!self.shots.is_empty()).then(|| {
+            let mut seen: Vec<(u16, u16, i16, f64)> = Vec::new();
+            for c in &sc.near {
+                let at = self.shots.partition_point(|s| s.0 < c.entity);
+                seen.extend(self.shots[at..].iter().take_while(|s| s.0 == c.entity));
+            }
+            (!seen.is_empty()).then(|| events::encode_shots(self.step, seen.into_iter()))
+        });
+        let shots_msg = shots_msg.flatten();
+        let shots_bytes = shots_msg.as_ref().map_or(0, |m| m.len());
+        sc.tally.tracer_bytes += shots_bytes as u64;
         let (ring_tick, ring) = &mut slot.sent_ring[tick as usize % SENT_RING];
         *ring_tick = tick;
         ring.clear();
@@ -1661,10 +1782,13 @@ impl View<'_> {
         if near_bytes > 0 {
             fill.push(near_bytes);
         }
+        if shots_bytes > 0 {
+            fill.push(shots_bytes);
+        }
         let cost = |fill: PacketFill, tier: Tier, n: usize| {
             fill.entities(n, msg::blob_size(tier), msg::blobs_per_message(tier, self.max_message))
         };
-        let mut left = cfg.budget_bytes.saturating_sub(SNAPSHOT_LEN + near_bytes);
+        let mut left = cfg.budget_bytes.saturating_sub(SNAPSHOT_LEN + near_bytes + shots_bytes);
         let mut n_mid = sc.mid.len();
         while n_mid > 0 && cost(fill, Tier::Mid, n_mid).0 > left {
             n_mid -= 1;
@@ -1711,10 +1835,13 @@ impl View<'_> {
                 life: me.life,
             },
         );
-        let mut bytes = w.len() + near_bytes;
+        let mut bytes = w.len() + near_bytes + shots_bytes;
         snaps.push((slot.client, w.into_inner(), None));
         if let Some(m) = near_msg {
             snaps.push((slot.client, m, Some(tick))); // tagged: its ack sets baselines
+        }
+        if let Some(m) = shots_msg {
+            snaps.push((slot.client, m, None));
         }
         let mid_blobs = sc.mid[..n_mid].iter().map(|&(_, j)| &self.far_blobs[j as usize][..]);
         bytes += self.write_tier(Tier::Mid, mid_blobs, &mut fill, slot.client, snaps);

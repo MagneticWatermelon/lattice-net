@@ -1356,3 +1356,131 @@ fn five_body_hits_kill() {
     assert!(c.hits_too_late > 0 && c.hits_too_late as usize == hits.len() - hits.iter().filter(|h| h.damage > 0).count());
     let _ = target;
 }
+
+/// A shooter's spot and a target's `dist` m east of it with a clear line
+/// from the shooter's eye to the target's chest (terrain and cover).
+fn line_of_fire(world: &lattice_game::world::World, dist: f32) -> ([f32; 2], [f32; 2]) {
+    use lattice_game::hit;
+    for k in 0..2000 {
+        let (x, y) = (1200.0 + (k % 40) as f32 * 130.0, 1200.0 + (k / 40) as f32 * 97.0);
+        let (a, b) = ([x, y], [x + dist, y]);
+        let eye = [a[0], a[1], world.terrain(a[0], a[1]) + 1.6];
+        let chest = [b[0], b[1], world.terrain(b[0], b[1]) + 0.75];
+        if hit::terrain(world, eye, chest).is_some() {
+            continue;
+        }
+        let mut blocked = false;
+        world.boxes_near(x + dist / 2.0, y, dist / 2.0 + 2.0, |c| {
+            blocked |= hit::aabb(eye, chest, [c.min[0], c.min[1], c.bottom], [c.max[0], c.max[1], c.top]).is_some();
+            // Also keep cover off both spots.
+            blocked |= [a, b].iter().any(|p| p[0] > c.min[0] - 2.0 && p[0] < c.max[0] + 2.0 && p[1] > c.min[1] - 2.0 && p[1] < c.max[1] + 2.0);
+        });
+        if !blocked {
+            return (a, b);
+        }
+    }
+    panic!("no clear line of fire at {dist} m");
+}
+
+/// Three bots, no squads (three factions): bot 0 shoots bot 1 from `dist` m,
+/// bot 2 stands 5 m behind the shooter. All keep their combat news.
+fn firing_line(dist: f32, lethal: bool) -> (Swarm, [u16; 3]) {
+    use lattice_sim::bot::Moves;
+    let interest = InterestConfig { squad_size: 0, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, ..Default::default() };
+    let mut s = render_swarm(3, cfg, Duration::from_secs(3600));
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let (a, b) = line_of_fire(s.server.world(), dist);
+    let e = [0, 1, 2].map(|i| s.bots[i].2.welcome().unwrap().entity);
+    s.server.teleport(e[0], a);
+    s.server.teleport(e[1], b);
+    s.server.teleport(e[2], [a[0] - 5.0, a[1] + 3.0]);
+    s.server.set_invulnerable(e[1], !lethal);
+    for (_, _, bot) in &mut s.bots {
+        bot.set_moves(Moves::Hold);
+        bot.core_mut().keep_news(true);
+    }
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+    }
+    (s, e)
+}
+
+fn news(s: &mut Swarm, bot: usize) -> (Vec<lattice_game::events::Event>, Vec<lattice_game::events::SeenShot>) {
+    let (mut ev, mut sh) = (Vec::new(), Vec::new());
+    s.bots[bot].2.core_mut().drain_news(&mut ev, &mut sh);
+    (ev, sh)
+}
+
+#[test]
+fn combat_news_reaches_the_right_players() {
+    use lattice_game::events::{direction, Event};
+    let (mut s, [shooter, target, bystander]) = firing_line(50.0, true);
+    news(&mut s, 0);
+    news(&mut s, 1);
+    news(&mut s, 2);
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0 });
+    for _ in 0..10 * TICK_HZ {
+        s.step();
+    }
+    let g = s.gunner.take().unwrap();
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let hits: Vec<_> = s.server.take_hits().into_iter().filter(|h| h.damage > 0).collect();
+    let kills = hits.iter().filter(|h| h.killed).count();
+    assert!(hits.len() >= 10 && kills >= 1, "{} hits, {kills} kills", hits.len());
+    // The shooter: a hit marker for every hit that dealt damage, kills marked.
+    let (ev, _) = news(&mut s, 0);
+    let marks: Vec<_> = ev.iter().filter_map(|e| match *e {
+        Event::Hit { target: t, damage, killed, .. } => Some((t, damage, killed)),
+        _ => None,
+    }).collect();
+    assert_eq!(marks.len(), hits.len());
+    assert!(marks.iter().all(|&(t, d, _)| t == target && d == 20));
+    assert_eq!(marks.iter().filter(|m| m.2).count(), kills);
+    let kill_news = |ev: &[Event]| ev.iter().filter(|e| matches!(e, Event::Kill { killer, victim, .. } if *killer == shooter && *victim == target)).count();
+    assert_eq!(kill_news(&ev), kills);
+    // The target: hurt, from the shooter's direction (it stands due west).
+    let (ev, _) = news(&mut s, 1);
+    let hurts: Vec<_> = ev.iter().filter_map(|e| match *e {
+        Event::Hurt { from, amount, dir } => Some((from, amount, dir)),
+        _ => None,
+    }).collect();
+    assert_eq!(hurts.len(), hits.len());
+    let west = direction([1.0, 0.0], [0.0, 0.0]);
+    assert!(hurts.iter().all(|&(f, a, d)| f == shooter && a == 20 && (d as i32 - west as i32).abs() <= 2), "{hurts:?}");
+    assert_eq!(kill_news(&ev), kills);
+    // The bystander: no news of a fight it isn't in, but the shooter's
+    // tracers (it's near-tier to it), each at its aim and time.
+    let (ev, seen) = news(&mut s, 2);
+    assert!(ev.is_empty(), "{ev:?}");
+    assert!(seen.iter().all(|t| t.shooter == shooter));
+    assert!(seen.len() as u64 >= g.shots - 2 && seen.len() as u64 <= g.shots, "{} of {} shots seen", seen.len(), g.shots);
+    let _ = bystander;
+    let c = s.server.counters();
+    assert!(c.events > 0 && c.tracer_bytes > 0);
+}
+
+#[test]
+fn a_shooter_joins_its_targets_near_tier() {
+    // 200 m apart: mid tier to each other (near is 150 m). Hits make them
+    // near-tier for 5 s ("interaction"), then they drop back.
+    let (mut s, [shooter, target, _]) = firing_line(200.0, false);
+    let tier = |s: &Swarm| s.bots[1].2.entities().and_then(|e| e.get(shooter)).map(|k| k.tier);
+    assert_eq!(tier(&s), Some(Tier::Mid));
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0 });
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+    }
+    s.gunner = None;
+    let hits = s.server.take_hits().len();
+    assert!(hits > 5, "it hits at 200 m: {hits}");
+    assert_eq!(tier(&s), Some(Tier::Near), "the shooter is near-tier to its target");
+    for _ in 0..7 * TICK_HZ {
+        s.step();
+    }
+    assert_eq!(tier(&s), Some(Tier::Mid), "and drops back 5 s after the last hit");
+}
