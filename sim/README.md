@@ -421,6 +421,10 @@ One 100 ms timeline was too long for near players (it added 33 ms to every rewin
 | target behind a wall | 0 (all stop on the wall) |
 
 - **Kills land exactly at 100 HP.** Hits on a target that died since the shooter saw it deal nothing (`hits_too_late`).
+- **Hits are keyed to the life the shooter saw.** History keeps each entity's life counter. A hit deals damage only while the target is still on that life, so a shot at a corpse can't hurt its respawned body, even when the rewound position is right.
+- **Render-step claims are trimmed (the backtrack cheat).** A client could claim it drew a target earlier than it did, to shoot where the target used to be. The server bounds each shot's rewind by what an honest client could need: RTT + the input's wait on the server + the protocol's longest render delay (4 steps near, 6 mid/far) + 2 steps of slack. Anything beyond is trimmed and counted (`rewinds_trimmed`). There's no trim until the connection has an RTT.
+  - `backtrack_claims_are_trimmed`: a cheat claiming 10 steps further back has every shot trimmed and hits 10 of 100.
+  - Honest gunners are never trimmed (`what_you_see_is_what_you_hit` checks this).
 - **The input queue's rules are unit-tested:** shots fire once, at the rifle's rate, never from stand-ins; late ones still fire within 8 steps; shots from the dead are refused.
 
 **Firing load on WSL** (`lattice-bots --fire-share F`: bots hold the trigger, level along their heading; 8 server threads sharing the box):

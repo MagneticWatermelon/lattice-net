@@ -52,6 +52,12 @@ pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1 +
 pub const RENDER_UNITS: f64 = 64.0;
 /// `RenderTime::mid_lag` is in 1/`MID_LAG_UNITS` steps (up to ~1 s).
 pub const MID_LAG_UNITS: f64 = 8.0;
+/// The longest render delays a client may use, in steps: near 133 ms, mid
+/// and far 200 ms (the client core's defaults). The server trims a shot's
+/// claimed render time to what a client within these could have seen: an
+/// older claim is a "backtrack" cheat, not lag.
+pub const MAX_NEAR_DELAY: f64 = 4.0;
+pub const MAX_MID_DELAY: f64 = 6.0;
 const RENDER_FLAG: u8 = 0x80;
 pub const ENTITIES_HEADER: usize = 1 + 4 + 1 + 1;
 

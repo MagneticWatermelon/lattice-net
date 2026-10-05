@@ -322,13 +322,17 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
            - **The cap's guarantee:** ~167 ms RTT still hits like 33 ms at the 67 ms near delay. The cap guarantees 100 ms at the 133 ms crowd delay, and more when the delay is lower.
            - **Lethal, the same blob hits 23.8 / 21.1 / 18.7%:** what latency costs in a real fight. Shots go into the already dead (13k "too late" hits); that's not lag compensation.
            - **Corrections in the lethal WSL runs** (144 in the blob) all fall in two windows with server tick spikes (41 and 50 ms) on the shared box. The uniform 5k is overloaded on WSL (tick p50 39 ms). Both are for bare metal (M3e).
-    - **M3e** one bare-metal validation session.
+        5. **Anti-backtrack and life-keyed hits. Done** (2026-10-05, from a review):
+           - a shot's claimed rewind is trimmed to RTT + input wait + the longest render delay (4 near / 6 mid/far steps) + 2 steps of slack, and counted (`rewinds_trimmed`); honest shooters are never trimmed, and a 10-step backtrack hits 10% of the time;
+           - history keeps each entity's life, and a hit deals damage only to the life the shooter saw.
+           - **Not built yet, for scoping:** distant fights are invisible beyond the near tier (no tracers for mid/far shooters). Candidate: per-cell firing activity, aggregated and sent with the far tier.
+    - **M3e** one bare-metal validation session. It also runs a lethal 3k blob at mixed RTTs, and records `rewinds_trimmed`, which should be 0.
   - **Pass bars:**
     - prediction stays bit-exact (0 corrections on a clean link, outside separation pushes);
     - 10k at level 0 with heavy fire (~20% of players at 10 Hz), p99 < 25 ms on the 64-core box;
     - a 3k blob all fighting, p99 < 25 ms;
     - 20 ms and 100 ms RTT bots hit at the same rate (±10%) for the same aim error; 150 ms bots measurably less (they lead ~50 ms);
-    - no hit lands with a rewind beyond its cap (300 / 367 ms); post-cover hits are measured;
+    - no hit lands with a rewind beyond its cap (300 / 367 ms); post-cover hits are measured; honest bots are never trimmed (`rewinds_trimmed` 0);
     - corrections only from separation pushes and respawns, both flagged.
 - **M4:** vehicles.
 - **M5:** minimal playable client.

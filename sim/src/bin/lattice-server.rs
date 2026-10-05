@@ -799,6 +799,7 @@ fn summary_values(
         ("shots_late", c.shots_late),
         ("shots_refused", c.shots_refused),
         ("rewinds_capped", c.rewinds_capped),
+        ("rewinds_trimmed", c.rewinds_trimmed),
         ("hits_head", c.hits_head),
         ("hits_body", c.hits_body),
         ("hits_ground", c.hits_ground),

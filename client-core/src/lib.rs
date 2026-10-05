@@ -83,8 +83,9 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             near_delay: Duration::from_secs(2) / TICK_HZ,
-            near_delay_max: Duration::from_secs(4) / TICK_HZ,
-            mid_delay: Duration::from_millis(200),
+            // The protocol's maxima: the server trims claims beyond them.
+            near_delay_max: Duration::from_secs_f64(msg::MAX_NEAR_DELAY / TICK_HZ as f64),
+            mid_delay: Duration::from_secs_f64(msg::MAX_MID_DELAY / TICK_HZ as f64),
             track_entities: true,
         }
     }
@@ -682,6 +683,13 @@ impl ClientCore {
     /// the server tests it against. False while dead, before the render
     /// clock runs, or faster than the rifle fires (`FIRE_STEPS`).
     pub fn fire(&mut self, now: Instant, yaw: u16, pitch: i16) -> bool {
+        self.fire_claiming(now, yaw, pitch, 0.0)
+    }
+
+    /// `fire`, claiming a render time `back` steps older than the real one:
+    /// the "backtrack" cheat, for testing that the server trims it.
+    #[doc(hidden)]
+    pub fn fire_claiming(&mut self, now: Instant, yaw: u16, pitch: i16, back: f64) -> bool {
         if self.welcome.is_none() || self.is_dead() || self.pending_shot.is_some() {
             return false;
         }
@@ -695,7 +703,7 @@ impl ClientCore {
             return false;
         }
         let Some(render) = self.render_clock.render_at(now) else { return false };
-        self.pending_shot = Some((seq, Shot { frac, yaw, pitch, render: msg::render_units(render) }));
+        self.pending_shot = Some((seq, Shot { frac, yaw, pitch, render: msg::render_units(render - back) }));
         self.last_shot = Some(time);
         true
     }

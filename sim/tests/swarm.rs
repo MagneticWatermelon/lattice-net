@@ -79,14 +79,17 @@ struct Gunner {
     head: bool,
     extra_lead: f32,
     shots: u64,
+    /// A cheat: aim where it drew the target this many steps earlier, and
+    /// claim that render time ("backtrack").
+    back: f32,
 }
 
 /// Aims `brain` at `g.target` as drawn at `now`, and pulls the trigger.
 fn aim_and_fire(brain: &mut BotBrain, g: &mut Gunner, now: Instant) {
     let core = brain.core_mut();
     let Some(r) = core.render_step(now) else { return };
-    let Some((yaw, pitch)) = lattice_sim::bot::aim_at(core, g.target, r, g.head, g.extra_lead) else { return };
-    if core.fire(now, yaw, pitch) {
+    let Some((yaw, pitch)) = lattice_sim::bot::aim_at(core, g.target, r - g.back as f64, g.head, g.extra_lead) else { return };
+    if core.fire_claiming(now, yaw, pitch, g.back as f64) {
         g.shots += 1;
     }
 }
@@ -1209,7 +1212,7 @@ fn shoot_at(lag: u32, strafe: u32, head: bool, extra_lead: f32, secs: u32, letha
         s.step();
     }
     s.server.take_rewind();
-    s.gunner = Some(Gunner { bot: 0, target, head, extra_lead, shots: 0 });
+    s.gunner = Some(Gunner { bot: 0, target, head, extra_lead, shots: 0, back: 0.0 });
     for _ in 0..secs * TICK_HZ {
         s.step();
     }
@@ -1240,6 +1243,7 @@ fn what_you_see_is_what_you_hit() {
         assert!(rate >= 0.95, "lag {lag}: hit {:.1}%", 100.0 * rate);
         assert_eq!((c.shots, c.shots_refused), (g.shots, 0), "every shot fired once, none refused");
         assert!(hits.iter().all(|h| h.rewind <= lattice_sim::shots::NEAR_CAP));
+        assert_eq!(c.rewinds_trimmed, 0, "an honest shooter is never trimmed");
         assert_eq!(s.corrections(), 0, "shooting doesn't disturb prediction");
     }
 }
@@ -1306,7 +1310,7 @@ fn walls_stop_shots() {
     for _ in 0..2 * TICK_HZ {
         s.step();
     }
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, back: 0.0 });
     for _ in 0..5 * TICK_HZ {
         s.step();
     }
@@ -1404,7 +1408,7 @@ fn combat_news_reaches_the_right_players() {
     news(&mut s, 0);
     news(&mut s, 1);
     news(&mut s, 2);
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, back: 0.0 });
     for _ in 0..10 * TICK_HZ {
         s.step();
     }
@@ -1454,7 +1458,7 @@ fn a_shooter_joins_its_targets_near_tier() {
     let (mut s, [shooter, target, _]) = firing_line(200.0, false);
     let tier = |s: &Swarm| s.bots[1].2.entities().and_then(|e| e.get(shooter)).map(|k| k.tier);
     assert_eq!(tier(&s), Some(Tier::Mid));
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, back: 0.0 });
     for _ in 0..2 * TICK_HZ {
         s.step();
     }
@@ -1537,4 +1541,51 @@ fn latency_classes_hit_alike_within_the_cap() {
     assert!((rate[0] - rate[1]).abs() <= 0.1 * rate[0], "within the cap, alike: {rate:?}");
     assert!(rate[2] < 0.8 * rate[0], "past the cap, measurably less: {rate:?}");
     assert!(capped > 0);
+}
+
+#[test]
+fn backtrack_claims_are_trimmed() {
+    // A cheat claims it was looking 10 steps further in the past than it
+    // was, and aims where the target was then. The server trims the claim to
+    // what an honest client could have seen (RTT + wait + the longest render
+    // delays + slack), so against a runner it mostly misses.
+    let (mut s, target, _, _) = shoot(0, 30, false, 0.0, 1);
+    s.server.take_hits();
+    let shots0 = s.server.counters().shots;
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, back: 10.0 });
+    for _ in 0..10 * TICK_HZ {
+        s.step();
+    }
+    s.gunner = None;
+    for _ in 0..TICK_HZ / 3 {
+        s.step();
+    }
+    let c = s.server.counters().clone();
+    let shots = c.shots - shots0;
+    let hits = s.server.take_hits().len();
+    eprintln!("backtracking: {hits} of {shots} hit, {} trimmed", c.rewinds_trimmed);
+    assert!(c.rewinds_trimmed as f64 >= 0.95 * shots as f64, "{} of {shots} trimmed", c.rewinds_trimmed);
+    assert!((hits as f64) < 0.3 * shots as f64, "the cheat mostly misses: {hits} of {shots}");
+}
+
+#[test]
+fn hits_from_an_earlier_life_deal_nothing() {
+    // The target's life changes every 2 ticks (a teleport onto the same spot
+    // is a life change, like a respawn): every hit lands on a life the
+    // shooter saw that has since ended, so none deals damage.
+    let (mut s, [_, target, _]) = firing_line(100.0, true);
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, back: 0.0 });
+    for k in 0..4 * TICK_HZ {
+        if k % 2 == 0 {
+            let p = s.server.entity_state(target).unwrap().pos;
+            s.server.teleport(target, p);
+        }
+        s.step();
+    }
+    let hits = s.server.take_hits();
+    eprintln!("{} hits", hits.len());
+    assert!(hits.len() > 10, "it hits: {}", hits.len());
+    assert!(hits.iter().all(|h| h.damage == 0 && !h.killed));
+    assert_eq!(s.server.vitals(target), Some((100, false)));
+    assert_eq!(s.server.counters().hits_too_late as usize, hits.len());
 }

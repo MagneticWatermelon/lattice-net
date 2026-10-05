@@ -265,8 +265,12 @@ pub struct Counters {
     /// Hits on a target its shooter couldn't see any more (cover or terrain
     /// between them at the present): lag compensation's cost to the target.
     pub hits_after_cover: u64,
-    /// Hits on a target that had died since the shooter saw it: no damage.
+    /// Hits on a target that had died (or respawned) since the shooter saw
+    /// it: no damage.
     pub hits_too_late: u64,
+    /// Shots whose claimed render time was older than the shooter could
+    /// plausibly have seen (a "backtrack" cheat): trimmed to what it could.
+    pub rewinds_trimmed: u64,
     /// Projectile segments flown and player candidates tested.
     pub segments: u64,
     pub candidates: u64,
@@ -564,6 +568,8 @@ impl InputQueue {
             tau0,
             behind: [near, near + mid_lag],
             late,
+            // This input's server wait (just set by `advance`); none if late.
+            wait: if late { 0.0 } else { self.wait as f64 / 10.0 / 1000.0 * TICK_HZ as f64 },
         });
     }
 
@@ -1227,12 +1233,23 @@ impl SimServer {
         self.tick_shots.extend(fires.iter().map(|f| (f.shooter, f.yaw, f.pitch, f.tau0)));
         self.tick_shots.sort_unstable_by_key(|s| s.0);
         for f in &fires {
-            let (p, capped) = Projectile::new(self.next_projectile, f);
+            // What this shooter could plausibly have seen: from its RTT (once
+            // measured) and its input's wait. Older claims are trimmed.
+            let rtt = self
+                .client_of
+                .get(f.shooter as usize)
+                .copied()
+                .flatten()
+                .and_then(|c| self.net.client_stats(c))
+                .map(|s| s.rtt_ms as f64 / 1000.0 * TICK_HZ as f64)
+                .filter(|&r| r > 0.0);
+            let (p, cut) = Projectile::new(self.next_projectile, f, shots::plausible(rtt, f.wait));
             self.next_projectile += 1;
             self.projectiles.push(p);
             self.counters.shots += 1;
             self.counters.shots_late += f.late as u64;
-            self.counters.rewinds_capped += capped as u64;
+            self.counters.rewinds_capped += cut.capped as u64;
+            self.counters.rewinds_trimmed += cut.trimmed as u64;
         }
         if self.projectiles.is_empty() {
             return span(t0.elapsed());
@@ -1281,11 +1298,13 @@ impl SimServer {
                 Outcome::Ground => self.counters.hits_ground += 1,
                 Outcome::Cover => self.counters.hits_cover += 1,
                 Outcome::Expired => self.counters.expired += 1,
-                Outcome::Player { target, head, rewind } => {
+                Outcome::Player { target, head, rewind, life } => {
                     let full = if head { DAMAGE_HEAD } else { DAMAGE_BODY };
                     let after_cover = !self.in_sight(shooter, target);
-                    // The shooter saw it alive; if it has died since, no damage.
-                    let (damage, killed) = match self.hurt(target, full) {
+                    // The shooter saw it alive, in the life it hit; if it has
+                    // died (or respawned) since, no damage.
+                    let same_life = self.bodies[target as usize].life == life;
+                    let (damage, killed) = match same_life.then(|| self.hurt(target, full)).flatten() {
                         Some(killed) => (full, killed),
                         None => (0, false),
                     };
