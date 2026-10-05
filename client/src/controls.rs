@@ -126,11 +126,55 @@ pub fn toggles(
     }
 }
 
+/// Tracers draw as their own gizmo group: thick, constant pixel width.
+#[derive(Default, Reflect, GizmoConfigGroup)]
+pub struct TracerGizmos;
+
+/// Tracer lines' width, in pixels, and how much of the path behind a
+/// projectile shows (a fading trail), in meters.
+pub const TRACER_WIDTH: f32 = 4.0;
+const TRAIL: f32 = 20.0;
+/// Our tracers leave from a muzzle below and right of the eye, aimed to
+/// converge on the line of sight this far out (from the eye itself they'd
+/// be a dot under the crosshair).
+const CONVERGE: f32 = 120.0;
+
+pub fn setup_tracer_gizmos(mut store: ResMut<GizmoConfigStore>) {
+    let (cfg, _) = store.config_mut::<TracerGizmos>();
+    cfg.line.width = TRACER_WIDTH;
+}
+
+/// One tracer: its flight, where it started, seconds flown and not yet
+/// flown, and whether it's ours.
+pub struct Tracer {
+    flight: Flight,
+    start: [f32; 3],
+    age: f32,
+    owed: f32,
+    ours: bool,
+}
+
+impl Tracer {
+    pub fn new(origin: [f32; 3], dir: [f32; 3], ours: bool) -> Self {
+        Self { flight: Flight::new(origin, dir), start: origin, age: 0.0, owed: 0.0, ours }
+    }
+
+    /// Ours: from the muzzle, converging on what the eye at `eye` aims at.
+    pub fn ours(eye: [f32; 3], yaw: f32, aim_dir: [f32; 3]) -> Self {
+        let (s, c) = yaw.sin_cos();
+        let right = [s, -c, 0.0];
+        let muzzle = [0, 1, 2].map(|k| eye[k] + right[k] * 0.25 + aim_dir[k] * 0.6 - if k == 2 { 0.2 } else { 0.0 });
+        let target = [0, 1, 2].map(|k| eye[k] + aim_dir[k] * CONVERGE);
+        let d = [0, 1, 2].map(|k| target[k] - muzzle[k]);
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        Self::new(muzzle, d.map(|v| v / len), true)
+    }
+}
+
 /// Cosmetic tracers (ours and others'), flown with the server's kinematics.
 #[derive(Resource, Default)]
 pub struct Tracers {
-    /// (flight, seconds flown, seconds not yet flown, ours).
-    pub flying: Vec<(Flight, f32, f32, bool)>,
+    pub flying: Vec<Tracer>,
     /// Others' shots waiting for their shooter to be drawn firing:
     /// (shot, when it arrived).
     pub pending: Vec<(lattice_game::events::SeenShot, f32)>,
@@ -202,7 +246,7 @@ pub fn play(
         let (yaw, pitch) = (yaw_u16(view.yaw), pitch_i16(view.pitch));
         if net.0.core.fire(frame.now, yaw, pitch) {
             let f = view.feet;
-            tracers.flying.push((Flight::new([f[0], f[1], f[2] + EYE], aim(yaw, pitch)), 0.0, 0.0, true));
+            tracers.flying.push(Tracer::ours([f[0], f[1], f[2] + EYE], view.yaw, aim(yaw, pitch)));
         }
     }
     net.0.send_inputs(frame.now, input);
@@ -221,7 +265,7 @@ pub fn play(
 /// Flies and draws tracers: a streak along each one's last segments, until
 /// it hits the ground or cover, or runs out of range. Others' shots start
 /// when their shooter is drawn at the moment it fired, from its drawn eye.
-pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, mut gizmos: Gizmos) {
+pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, mut gizmos: Gizmos<TracerGizmos>) {
     let Some(w) = net.0.core.welcome() else { return };
     let world = lattice_game::world::World::shared(w.world_seed);
     let core = &net.0.core;
@@ -231,7 +275,7 @@ pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, m
             match ents.render_one(shot.shooter, r) {
                 Some(st) if st.at >= shot.step => {
                     let o = [st.pos[0], st.pos[1], st.pos[2] + EYE];
-                    tracers.flying.push((Flight::new(o, aim(shot.yaw, shot.pitch)), 0.0, 0.0, false));
+                    tracers.flying.push(Tracer::new(o, aim(shot.yaw, shot.pitch), false));
                     false
                 }
                 // Not drawn (yet): wait up to a second.
@@ -241,9 +285,9 @@ pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, m
     }
     let seg = 1.0 / (SUBSTEPS * 30) as f32;
     let range = RANGE_STEPS as f32 / 30.0;
-    tracers.flying.retain_mut(|(f, age, owed, ours)| {
+    tracers.flying.retain_mut(|t| {
+        let Tracer { flight: f, start, age, owed, ours } = t;
         *owed += frame.dt;
-        let tail = f.pos;
         while *owed >= seg {
             let next = f.advance();
             let mut hit = lattice_game::hit::terrain(&world, f.pos, next.pos).is_some();
@@ -258,8 +302,14 @@ pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, m
             }
             *f = next;
         }
-        let color = if *ours { Color::srgb(1.0, 0.85, 0.4) } else { Color::srgb(1.0, 0.5, 0.3) };
-        gizmos.line(to_bevy(tail[0], tail[1], tail[2]), to_bevy(f.pos[0], f.pos[1], f.pos[2]), color);
+        // A trail behind the head, no longer than the path flown, fading out.
+        let p = f.pos;
+        let flown = ((p[0] - start[0]).powi(2) + (p[1] - start[1]).powi(2) + (p[2] - start[2]).powi(2)).sqrt();
+        let speed = (f.vel[0] * f.vel[0] + f.vel[1] * f.vel[1] + f.vel[2] * f.vel[2]).sqrt().max(1.0);
+        let back = TRAIL.min(flown) / speed;
+        let tail = [p[0] - f.vel[0] * back, p[1] - f.vel[1] * back, p[2] - f.vel[2] * back];
+        let head = if *ours { Color::srgb(1.0, 0.95, 0.55) } else { Color::srgb(1.0, 0.55, 0.15) };
+        gizmos.line_gradient(to_bevy(tail[0], tail[1], tail[2]), to_bevy(p[0], p[1], p[2]), head.with_alpha(0.0), head);
         true
     });
 }

@@ -209,8 +209,9 @@ fn main() {
         .init_resource::<scene::Scene>()
         .init_resource::<hud::Rates>()
         .init_resource::<controls::Tracers>()
+        .init_gizmo_group::<controls::TracerGizmos>()
         .init_resource::<hud::Combat>()
-        .add_systems(Startup, (setup_camera, scene::setup_looks, hud::setup))
+        .add_systems(Startup, (setup_camera, scene::setup_looks, hud::setup, controls::setup_tracer_gizmos))
         .add_systems(First, begin_frame)
         .add_systems(PreUpdate, poll)
         .add_systems(
