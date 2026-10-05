@@ -130,6 +130,22 @@ pub fn aabb(p0: V, p1: V, min: V, max: V) -> Option<f32> {
     Some(t0)
 }
 
+/// Whether nothing (terrain or cover) stands between `p0` and `p1`: what a
+/// player at `p0` can see of `p1`. The server's "after cover" count and the
+/// bots' targeting use the same test.
+pub fn line_clear(world: &World, p0: V, p1: V) -> bool {
+    if terrain(world, p0, p1).is_some() {
+        return false;
+    }
+    let mid = [(p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0];
+    let half = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt() / 2.0;
+    let mut clear = true;
+    world.boxes_near(mid[0], mid[1], half + 1.0, |c| {
+        clear &= aabb(p0, p1, [c.min[0], c.min[1], c.bottom], [c.max[0], c.max[1], c.top]).is_none();
+    });
+    clear
+}
+
 /// The segment p0 -> p1 against the terrain: sampled at most every 2 m,
 /// then the crossing refined by bisection.
 pub fn terrain(world: &World, p0: V, p1: V) -> Option<f32> {

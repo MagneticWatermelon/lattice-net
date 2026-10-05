@@ -568,6 +568,11 @@ impl Entities {
         self.tracks.get(&entity).map(|t| t.render(r, t.lag(r, self.mid_lag)))
     }
 
+    /// Every entity it knows.
+    pub fn ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.tracks.keys().copied()
+    }
+
     /// The newest sample of `entity`: where the server last said it was,
     /// with no delay and no smoothing (the client's server ghost).
     pub fn newest(&self, entity: u16) -> Option<Sample> {

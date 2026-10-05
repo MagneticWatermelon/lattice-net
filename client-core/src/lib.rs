@@ -700,6 +700,11 @@ impl ClientCore {
         true
     }
 
+    /// The world, once welcomed.
+    pub fn world(&self) -> Option<&Arc<World>> {
+        self.world.as_ref()
+    }
+
     /// Own health from the newest snapshot.
     pub fn health(&self) -> u8 {
         self.health

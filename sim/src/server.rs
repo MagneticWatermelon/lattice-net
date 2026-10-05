@@ -1349,16 +1349,7 @@ impl SimServer {
     fn in_sight(&self, shooter: u16, target: u16) -> bool {
         let (Some(a), Some(b)) = (self.history.now(shooter), self.history.now(target)) else { return false };
         let (p0, p1) = ([a.pos[0], a.pos[1], a.pos[2] + weapon::EYE_HEIGHT], [b.pos[0], b.pos[1], b.pos[2] + 1.0]);
-        if lattice_game::hit::terrain(&self.world, p0, p1).is_some() {
-            return false;
-        }
-        let mid = [(p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0];
-        let half = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt() / 2.0;
-        let mut blocked = false;
-        self.world.boxes_near(mid[0], mid[1], half + 1.0, |c| {
-            blocked |= lattice_game::hit::aabb(p0, p1, [c.min[0], c.min[1], c.bottom], [c.max[0], c.max[1], c.top]).is_some();
-        });
-        !blocked
+        lattice_game::hit::line_clear(&self.world, p0, p1)
     }
 
     /// Takes `amount` of health from `e` now: whether that killed it (it

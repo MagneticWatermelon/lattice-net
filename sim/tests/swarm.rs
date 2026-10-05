@@ -83,26 +83,9 @@ struct Gunner {
 
 /// Aims `brain` at `g.target` as drawn at `now`, and pulls the trigger.
 fn aim_and_fire(brain: &mut BotBrain, g: &mut Gunner, now: Instant) {
-    use lattice_game::hit::{BODY_HIGH, BODY_LOW, HEAD_AT};
-    use lattice_game::weapon::{EYE_HEIGHT, GRAVITY, MUZZLE_SPEED};
     let core = brain.core_mut();
     let Some(r) = core.render_step(now) else { return };
-    let Some(ents) = core.entities() else { return };
-    let (Some(st), Some(was)) = (ents.render_one(g.target, r), ents.render_one(g.target, r - 0.5)) else { return };
-    if st.dead {
-        return;
-    }
-    let vel = [0, 1].map(|k| (st.pos[k] - was.pos[k]) * 2.0 * TICK_HZ as f32);
-    let me = core.predicted();
-    let eye = [me.pos[0], me.pos[1], me.z + EYE_HEIGHT];
-    let at = st.pos[2] + if g.head { HEAD_AT } else { (BODY_LOW + BODY_HIGH) / 2.0 };
-    let dist = ((st.pos[0] - eye[0]).powi(2) + (st.pos[1] - eye[1]).powi(2)).sqrt();
-    let flight = dist / MUZZLE_SPEED;
-    let lead = flight + g.extra_lead / TICK_HZ as f32;
-    let p = [st.pos[0] + vel[0] * lead, st.pos[1] + vel[1] * lead, at + 0.5 * GRAVITY * flight * flight];
-    let d = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
-    let yaw = (d[1].atan2(d[0]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16;
-    let pitch = (d[2].atan2(d[0].hypot(d[1])) / std::f32::consts::FRAC_PI_2 * 32767.0) as i16;
+    let Some((yaw, pitch)) = lattice_sim::bot::aim_at(core, g.target, r, g.head, g.extra_lead) else { return };
     if core.fire(now, yaw, pitch) {
         g.shots += 1;
     }
@@ -1483,4 +1466,75 @@ fn a_shooter_joins_its_targets_near_tier() {
         s.step();
     }
     assert_eq!(tier(&s), Some(Tier::Mid), "and drops back 5 s after the last hit");
+}
+
+/// 9 bots per latency class (one-way `lags` steps), 3 factions, all fighting
+/// with the same aim error in a 40 m disk; everyone invulnerable (hit rates
+/// then measure aim and lag compensation, not respawns). Returns per class
+/// (shots, hits, near rewind p50 ms) and the rewinds capped.
+fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64) {
+    use lattice_sim::bot::FightConfig;
+    let n = 9 * lags.len();
+    let interest = InterestConfig { squad_size: 0, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Disk(40.0), interest, ..Default::default() };
+    let mut s = Swarm::with_config(n, cfg);
+    s.render = true;
+    for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
+        b.set_fight(Some(FightConfig::default()));
+        s.lag[i] = lags[i % lags.len()];
+    }
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    let ents: Vec<u16> = s.bots.iter().map(|(_, _, b)| b.welcome().unwrap().entity).collect();
+    for &e in &ents {
+        s.server.set_invulnerable(e, true);
+    }
+    s.server.take_hits();
+    let capped0 = s.server.counters().rewinds_capped;
+    let shots0: Vec<u64> = s.bots.iter().map(|(_, _, b)| b.stats().shots).collect();
+    for _ in 0..secs * TICK_HZ {
+        s.step();
+    }
+    let hits = s.server.take_hits();
+    let mut per = vec![(0u64, 0u64, Vec::new()); lags.len()];
+    for (i, (_, _, b)) in s.bots.iter().enumerate() {
+        let c = i % lags.len();
+        per[c].0 += b.stats().shots - shots0[i];
+        per[c].1 += hits.iter().filter(|h| h.shooter == ents[i]).count() as u64;
+        per[c].2.extend(hits.iter().filter(|h| h.shooter == ents[i]).map(|h| h.rewind));
+    }
+    assert_eq!(s.corrections(), 0);
+    let out = per.into_iter().map(|(shots, hits, mut rw)| {
+        let p50 = pct(&mut rw.iter().map(|&r| r as f32).collect::<Vec<_>>(), 0.5) as f64 * 1000.0 / 30.0;
+        rw.clear();
+        (shots, hits, p50)
+    }).collect();
+    (out, s.server.counters().rewinds_capped - capped0)
+}
+
+#[test]
+#[ignore = "measurement: cargo test --release --test swarm fight_classes_sweep -- --ignored --nocapture"]
+fn fight_classes_sweep() {
+    let lags = [0, 1, 4, 6];
+    let (per, capped) = fight(&lags, 30);
+    for (lag, (shots, hits, rw)) in lags.iter().zip(&per) {
+        eprintln!("one-way {} ms: {hits} of {shots} shots hit ({:.1}%), hits' near rewind p50 {rw:.0} ms", lag * 33, 100.0 * *hits as f64 / *shots as f64);
+    }
+    eprintln!("rewinds capped: {capped}");
+}
+
+#[test]
+fn latency_classes_hit_alike_within_the_cap() {
+    // Same aim error, three latency classes: ~33 and ~100 ms RTT are fully
+    // compensated (rewinds under the 300 ms near cap) and must hit alike;
+    // ~300 ms RTT is ~100 ms past the cap: aiming at what it draws (not
+    // leading by the clipped time), it hits measurably less.
+    let (per, capped) = fight(&[0, 1, 4], 20);
+    let rate: Vec<f64> = per.iter().map(|&(shots, hits, _)| hits as f64 / shots as f64).collect();
+    eprintln!("hit rates by class: {rate:?}, rewinds capped {capped}");
+    assert!(per.iter().all(|p| p.0 > 600), "{per:?}");
+    assert!((rate[0] - rate[1]).abs() <= 0.1 * rate[0], "within the cap, alike: {rate:?}");
+    assert!(rate[2] < 0.8 * rate[0], "past the cap, measurably less: {rate:?}");
+    assert!(capped > 0);
 }
