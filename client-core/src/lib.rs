@@ -17,11 +17,13 @@
 //!   compensation rewinds each target by its own tier's delay.
 
 pub mod clock;
+pub mod distant;
 pub mod entities;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use lattice_game::activity;
 use lattice_game::delta;
 use lattice_game::events::{self, Event, SeenShot};
 use lattice_game::movement::{dead_input, step, Input, MoveState, TICK_HZ};
@@ -31,6 +33,7 @@ use lattice_game::tier::Tier;
 use lattice_game::world::World;
 
 pub use clock::{RenderClock, TickSteps};
+pub use distant::{AmbientShot, Distant};
 pub use entities::{Entities, How, Known, RenderState, Sample, SmoothStats};
 
 /// Predicted states kept for reconciliation (~4 s at 30 Hz).
@@ -152,6 +155,11 @@ pub struct ClientStats {
     pub damage_taken: u64,
     pub kills_heard: u64,
     pub shots_seen: u64,
+    /// Distant fights: cell entries received, the shots they count, and the
+    /// ambient shots made from them (after the ones drawn exactly).
+    pub activity_cells: u64,
+    pub activity_shots: u64,
+    pub ambient: u64,
     /// From the latest snapshot: the server's pace (per mille) and levels.
     pub pace: u16,
     pub level: u8,
@@ -227,6 +235,8 @@ pub struct ClientCore {
     keep_news: bool,
     news: Vec<Event>,
     seen_shots: Vec<SeenShot>,
+    /// Distant fights' ambient shots.
+    distant: Distant,
     /// A shot waiting for the input whose step it was fired in: (seq, shot).
     pending_shot: Option<(u32, Shot)>,
     /// When the last shot fired (`weapon::shot_time`): the rifle's rate.
@@ -291,6 +301,7 @@ impl ClientCore {
             keep_news: false,
             news: Vec::new(),
             seen_shots: Vec::new(),
+            distant: Distant::new(1),
             pending_shot: None,
             last_shot: None,
             own_offset: [0.0; 3],
@@ -457,6 +468,13 @@ impl ClientCore {
         shots.append(&mut self.seen_shots);
     }
 
+    /// Distant fights' ambient shots due by `now` (with `keep_news`), from
+    /// where their shooters are drawn now.
+    pub fn drain_ambient(&mut self, now: Instant, out: &mut Vec<AmbientShot>) {
+        let r = self.render_clock.last_render();
+        self.distant.drain(now, r, self.entities.as_ref(), self.world.as_deref(), out);
+    }
+
     pub fn on_message(&mut self, data: &[u8], now: Instant) {
         match data.first() {
             Some(&events::MSG_EVENTS) => {
@@ -477,6 +495,19 @@ impl ClientCore {
                 }
                 return;
             }
+            Some(&activity::MSG_ACTIVITY) => {
+                if self.entities.is_none() {
+                    return; // a sink
+                }
+                let Ok((step, len, cells)) = activity::decode(data) else {
+                    self.stats.bad_messages += 1;
+                    return;
+                };
+                self.stats.activity_cells += cells.len() as u64;
+                self.stats.activity_shots += cells.iter().map(|c| c.shots as u64).sum::<u64>();
+                self.stats.ambient += self.distant.on_window(step, len, &cells, self.entities.as_ref(), now, self.keep_news);
+                return;
+            }
             Some(&events::MSG_SHOTS) => {
                 if self.entities.is_none() {
                     return; // a sink: tracers are for drawing
@@ -486,6 +517,16 @@ impl ClientCore {
                     return;
                 };
                 self.stats.shots_seen += shots.len() as u64;
+                // Drawn exactly: not again as distant ambience. Counted by the
+                // server at the message's step.
+                let step = lattice_net::wire::Reader::new(&data[1..]).u32().unwrap_or(0);
+                if let Some(e) = &self.entities {
+                    for sh in &shots {
+                        if let Some(n) = e.newest(sh.shooter) {
+                            self.distant.exact([n.pos[0], n.pos[1]], sh.shooter, step);
+                        }
+                    }
+                }
                 if self.keep_news {
                     self.seen_shots.extend(shots);
                 }
@@ -521,6 +562,7 @@ impl ClientCore {
                 // The server starts us exactly here too.
                 self.state = MoveState::standing(&world, w.spawn);
                 self.world = Some(world);
+                self.distant = Distant::new(0x9E37_79B9_7F4A_7C15 ^ w.entity as u64);
                 self.welcome = Some(w);
                 // Start with the spare already queued: at depth 1 every input
                 // arrives just in time and any jitter makes it late.
@@ -705,6 +747,11 @@ impl ClientCore {
         let Some(render) = self.render_clock.render_at(now) else { return false };
         self.pending_shot = Some((seq, Shot { frac, yaw, pitch, render: msg::render_units(render - back) }));
         self.last_shot = Some(time);
+        // Our own tracer is drawn at once: not again as distant ambience. The
+        // server counts it about a round trip after the newest step we heard.
+        if let (Some(w), Some(newest)) = (&self.welcome, self.render_clock.newest_at(now)) {
+            self.distant.exact(self.state.pos, w.entity, newest as u32 + 3);
+        }
         true
     }
 

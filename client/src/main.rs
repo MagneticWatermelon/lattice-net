@@ -322,8 +322,8 @@ fn summary(s: &Session, times: &FrameTimes) {
         }
     }
     println!(
-        "  hits confirmed {} (kills {}) | hit {} times for {} damage | kills heard {} | others' shots seen {}",
-        st.hits_confirmed, st.kills_confirmed, st.hurts, st.damage_taken, st.kills_heard, st.shots_seen
+        "  hits confirmed {} (kills {}) | hit {} times for {} damage | kills heard {} | others' shots seen {} | distant fights: {} cells, {} shots, {} ambient",
+        st.hits_confirmed, st.kills_confirmed, st.hurts, st.damage_taken, st.kills_heard, st.shots_seen, st.activity_cells, st.activity_shots, st.ambient
     );
     let delay = st.render_delay_sum / st.render_frames.max(1) as f64 * 1000.0 / 30.0;
     let mid = s.core.entities().map_or(0.0, |e| e.mid_lag()) * 1000.0 / 30.0;

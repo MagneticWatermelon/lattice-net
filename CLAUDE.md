@@ -325,7 +325,11 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
         5. **Anti-backtrack and life-keyed hits. Done** (2026-10-05, from a review):
            - a shot's claimed rewind is trimmed to RTT + input wait + the longest render delay (4 near / 6 mid/far steps) + 2 steps of slack, and counted (`rewinds_trimmed`); honest shooters are never trimmed, and a 10-step backtrack hits 10% of the time;
            - history keeps each entity's life, and a hit deals damage only to the life the shooter saw.
-           - **Not built yet, for scoping:** distant fights are invisible beyond the near tier (no tracers for mid/far shooters). Candidate: per-cell firing activity, aggregated and sent with the far tier.
+        6. **Distant fights. Done** (2026-10-05, from the same review): before this, only near-tier shooters' tracers reached a client, so a big fight 400 m away was invisible.
+           - **Server** (`sim/src/activity.rs`, format in `game/src/activity.rs`): every shot is counted into its 128 m cell per faction over 15-tick windows, and encoded once as 5 B (`cell:2 | faction:2 shots:6 | yaw:1 | at:1`). Each client gets the finished window's cells within its far radius, once per window, on its own tick of it, after far and inside its byte budget (nearest first if cut).
+           - **Client** (`client-core/src/distant.rs`): it subtracts the shots it already drew exactly (near tracers, its own) and spreads the rest over the next window as ambient shots, capped at 600/s. Each leaves from a drawn, living player of that faction in that cell, along its drawn aim; with nobody drawn there, from near the cell's mean origin along its mean aim. The Bevy client flies them as tracers.
+           - **Swarm test** (`distant_fights_are_seen`): watchers at 400 m and 1 km count all 360 shots and draw 360 ambient shots, all from the shooters, aimed east. The 40 m watcher gets exact tracers and 0 ambient; the 2 km watcher gets nothing.
+           - **WSL cost:** 1k blob, 5.6 B per client per tick (tick unchanged, p50 8.6 ms); uniform 5k at 20% firing, 42 B (~10 kbps, ~120 cells per window). Worst case, every map cell active: 3.1 µs gather per client per window, and a 0.25 ms serial finish per window.
     - **M3e** one bare-metal validation session. It also runs a lethal 3k blob at mixed RTTs, and records `rewinds_trimmed`, which should be 0.
   - **Pass bars:**
     - prediction stays bit-exact (0 corrections on a clean link, outside separation pushes);

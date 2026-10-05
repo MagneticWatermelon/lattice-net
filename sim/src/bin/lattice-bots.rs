@@ -102,6 +102,12 @@ struct Totals {
     class_kills: [u64; 3],
     class_n: [u64; 3],
     class_rtt: [f64; 3],
+    /// Tracked bots: others' shots seen as tracers, and distant fights' cell
+    /// entries, the shots they counted and the ambient shots made.
+    shots_seen: u64,
+    activity_cells: u64,
+    activity_shots: u64,
+    ambient: u64,
 }
 
 impl Totals {
@@ -125,6 +131,10 @@ impl Totals {
         self.backlog_skips += o.backlog_skips;
         self.near_decode_errors += o.near_decode_errors;
         self.corrections += o.corrections;
+        self.shots_seen += o.shots_seen;
+        self.activity_cells += o.activity_cells;
+        self.activity_shots += o.activity_shots;
+        self.ambient += o.ambient;
         self.push_corrections += o.push_corrections;
         self.push_err_max = self.push_err_max.max(o.push_err_max);
         self.correction_err_sum += o.correction_err_sum;
@@ -386,6 +396,8 @@ impl Bot {
         t.backlog_skips += s.backlog_skips;
         t.near_decode_errors += s.near_decode_errors;
         t.corrections += s.corrections;
+        (t.shots_seen, t.activity_cells) = (t.shots_seen + s.shots_seen, t.activity_cells + s.activity_cells);
+        (t.activity_shots, t.ambient) = (t.activity_shots + s.activity_shots, t.ambient + s.ambient);
         t.correction_err_sum += s.correction_error_sum;
         t.correction_err_max = t.correction_err_max.max(s.correction_error_max);
         t.push_corrections += s.push_corrections;
@@ -783,6 +795,10 @@ fn summary_values(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) -
             kv.put(format!("class{c}_rtt_ms"), format!("{:.1}", t.class_rtt[c] / t.class_n[c] as f64));
         }
     }
+    kv.put("shots_seen", t.shots_seen);
+    kv.put("activity_cells", t.activity_cells);
+    kv.put("activity_shots", t.activity_shots);
+    kv.put("ambient", t.ambient);
     let frames: u64 = t.frames.iter().flatten().sum();
     kv.put("streak_frames_per_million", format!("{:.0}", t.streaks as f64 * 1e6 / frames.max(1) as f64));
     kv.put("clock_slewing_pct", format!("{:.2}", 100.0 * t.slewing as f64 / t.clock_frames.max(1) as f64));
@@ -937,6 +953,12 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
                 t.class_kills[c]
             );
         }
+    }
+    if t.activity_cells + t.shots_seen > 0 {
+        println!(
+            "  others' shots (tracked bots): {} as tracers | distant fights: {} cell entries counting {} shots, {} ambient shots made",
+            t.shots_seen, t.activity_cells, t.activity_shots, t.ambient
+        );
     }
     println!(
         "  input clock: {} extra inputs, {} skipped ticks, {} backlog skips | near decode errors (tracked bots) {}",

@@ -1589,3 +1589,90 @@ fn hits_from_an_earlier_life_deal_nothing() {
     assert_eq!(s.server.vitals(target), Some((100, false)));
     assert_eq!(s.server.counters().hits_too_late as usize, hits.len());
 }
+
+#[test]
+fn distant_fights_are_seen() {
+    use lattice_sim::bot::Moves;
+    // Six shooters in a 15 m line fire east; watchers stand 40 m (near),
+    // 400 m (mid), 1,000 m (far) and 2,000 m (past the far radius) south.
+    let interest = InterestConfig { squad_size: 0, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, ..Default::default() };
+    let mut s = render_swarm(10, cfg, Duration::from_secs(3600));
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let p = [3000.0, 4000.0];
+    let e: Vec<u16> = (0..10).map(|i| s.bots[i].2.welcome().unwrap().entity).collect();
+    for (k, &id) in e[..6].iter().enumerate() {
+        s.server.teleport(id, [p[0], p[1] + 3.0 * k as f32]);
+        s.server.set_invulnerable(id, true);
+    }
+    let watch = [40.0, 400.0, 1000.0, 2000.0];
+    for (i, d) in watch.iter().enumerate() {
+        s.server.teleport(e[6 + i], [p[0] - 20.0, p[1] - d]);
+    }
+    for (_, _, bot) in &mut s.bots {
+        bot.set_moves(Moves::Hold);
+        bot.set_heading(0.0);
+        bot.core_mut().keep_news(true);
+    }
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    let mut ambient = vec![Vec::new(); 4];
+    let drain = |s: &mut Swarm, ambient: &mut Vec<Vec<lattice_client_core::AmbientShot>>| {
+        for (w, out) in ambient.iter_mut().enumerate() {
+            let now = s.now;
+            s.bots[6 + w].2.core_mut().drain_ambient(now, out);
+        }
+    };
+    drain(&mut s, &mut ambient);
+    ambient.iter_mut().for_each(|a| a.clear());
+    let before: Vec<_> = (6..10).map(|i| s.bots[i].2.core().stats.clone()).collect();
+    for w in 6..10 {
+        news(&mut s, w);
+    }
+    let shots0 = s.server.counters().shots;
+    for k in 0..6 {
+        s.bots[k].2.set_trigger(true);
+    }
+    for _ in 0..6 * TICK_HZ {
+        s.step();
+        drain(&mut s, &mut ambient);
+    }
+    for k in 0..6 {
+        s.bots[k].2.set_trigger(false);
+    }
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+        drain(&mut s, &mut ambient);
+    }
+    let fired = s.server.counters().shots - shots0;
+    assert!(fired > 300, "{fired} shots");
+    for (w, d) in watch.iter().enumerate() {
+        let st = &s.bots[6 + w].2.core().stats;
+        let (counted, made) = (st.activity_shots - before[w].activity_shots, st.ambient - before[w].ambient);
+        let tracers = news(&mut s, 6 + w).1.len() as u64;
+        let a = &ambient[w];
+        let from_drawn = a.iter().filter(|x| x.shooter.is_some()).count();
+        let placed = a.iter().filter(|x| (x.origin[0] - p[0]).abs() < 12.0 && x.origin[1] > p[1] - 12.0 && x.origin[1] < p[1] + 27.0).count();
+        let east = a.iter().filter(|x| x.dir[0] > 0.95).count();
+        eprintln!("{d} m: {counted} of {fired} counted, {tracers} tracers, {made} ambient ({} drawn: {from_drawn} from players, {placed} placed, {east} east)", a.len());
+        if *d > 1600.0 {
+            assert_eq!(counted, 0, "past the far radius: nothing");
+            continue;
+        }
+        assert_eq!(counted, fired, "every shot is counted once");
+        if *d < 150.0 {
+            assert!(tracers + 6 >= fired, "near: exact tracers");
+            assert!((made as f64) < 0.05 * fired as f64, "and they aren't drawn again: {made}");
+        } else {
+            assert_eq!(tracers, 0);
+            assert!(made as f64 > 0.9 * fired as f64 && a.len() as u64 == made, "ambient for each shot: {made}");
+            assert!(from_drawn as f64 > 0.9 * made as f64, "from the drawn shooters");
+            assert!(placed == a.len() && east == a.len(), "where they are, aiming where they aim");
+        }
+    }
+    let c = s.server.counters();
+    assert!(c.activity_cells > 0 && c.activity_bytes > 0 && c.activity_cut == 0);
+}

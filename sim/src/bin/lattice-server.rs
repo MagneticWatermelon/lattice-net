@@ -773,6 +773,7 @@ fn summary_values(
         let snaps = e.snapshots.saturating_sub(w.snapshots).max(1) as f64;
         kv.put("snapshot_bytes_per_client_tick", format!("{:.0}", (e.snapshot_bytes - w.snapshot_bytes) as f64 / snaps));
         kv.put("near_bytes_per_client_tick", format!("{:.0}", (e.near_bytes - w.near_bytes) as f64 / snaps));
+        kv.put("activity_bytes_per_client_tick", format!("{:.1}", (e.activity_bytes - w.activity_bytes) as f64 / snaps));
         for (i, tier) in ["near", "mid", "far"].iter().enumerate() {
             kv.put(format!("{tier}_per_client_tick"), format!("{:.1}", (e.tier_sent[i] - w.tier_sent[i]) as f64 / snaps));
         }
@@ -810,6 +811,10 @@ fn summary_values(
         ("hits_too_late", c.hits_too_late),
         ("events", c.events),
         ("tracer_bytes", c.tracer_bytes),
+        ("activity_cells", c.activity_cells),
+        ("activity_sent", c.activity_sent),
+        ("activity_bytes", c.activity_bytes),
+        ("activity_cut", c.activity_cut),
         ("projectile_segments", c.segments),
         ("hit_candidates", c.candidates),
     ] {

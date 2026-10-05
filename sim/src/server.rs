@@ -26,6 +26,7 @@ use lattice_net::wire::Writer;
 use lattice_net::{Channel, ClientId, Config, Router, Server, ServerEvent, ServerIdentity};
 use rayon::prelude::*;
 
+use crate::activity::{self, Activity};
 use crate::grid::{Grid, Knn};
 use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
@@ -277,6 +278,12 @@ pub struct Counters {
     /// Combat events sent (reliable), and tracer bytes (unreliable).
     pub events: u64,
     pub tracer_bytes: u64,
+    /// Distant fights (`activity.rs`): cell entries made (per window), and
+    /// sent to clients, their bytes, and entries cut by the byte budget.
+    pub activity_cells: u64,
+    pub activity_sent: u64,
+    pub activity_bytes: u64,
+    pub activity_cut: u64,
     /// Real inputs that arrived for a seq a stand-in had already consumed.
     pub late_inputs: u64,
     /// Inputs dropped unapplied because the client queued too many.
@@ -412,6 +419,8 @@ struct Scratch {
     watched: Option<WatchedClient>,
     mid: Vec<(f32, u16)>,
     far: Vec<(f32, u16)>,
+    /// This client's distant-fight entries, with their squared distance.
+    activity: Vec<(f32, lattice_game::activity::Entry)>,
     tally: Tally,
 }
 
@@ -432,6 +441,9 @@ struct Tally {
     near_scanned: u64,
     mid_scanned: u64,
     tracer_bytes: u64,
+    activity_sent: u64,
+    activity_bytes: u64,
+    activity_cut: u64,
 }
 
 /// Per-entity input stream. Every tick consumes exactly one input seq, so each
@@ -674,6 +686,8 @@ pub struct SimServer {
     far_blobs: Vec<Blob>,
     history: History,
     projectiles: Vec<Projectile>,
+    /// Firing per cell, for distant fights.
+    activity: Activity,
     next_projectile: u64,
     /// Hits since the last `take_hits`.
     hits: Vec<HitRecord>,
@@ -765,6 +779,7 @@ impl SimServer {
             far_blobs: Vec::new(),
             history: History::default(),
             projectiles: Vec::new(),
+            activity: Activity::default(),
             next_projectile: 0,
             hits: Vec::new(),
             tick_shots: Vec::new(),
@@ -1083,6 +1098,9 @@ impl SimServer {
         // 6b. shots: new projectiles, then every projectile flies to now
         self.spans[6] = self.shots_phase();
         self.post_news();
+        if (tick + 1).is_multiple_of(activity::WINDOW) {
+            self.counters.activity_cells += self.activity.finish(self.step) as u64;
+        }
         lap(6);
 
         // 7. serialize each entity once per tier. Far blobs are needed for this
@@ -1114,6 +1132,7 @@ impl SimServer {
         let view = View {
             cfg: &self.interest,
             shots: &self.tick_shots,
+            activity: &self.activity,
             tick,
             step: self.step,
             pace: (self.pace_now * 1000.0).round() as u16,
@@ -1182,6 +1201,9 @@ impl SimServer {
             c.near_full += t.near_full;
             c.near_scanned += t.near_scanned;
             c.tracer_bytes += t.tracer_bytes;
+            c.activity_sent += t.activity_sent;
+            c.activity_bytes += t.activity_bytes;
+            c.activity_cut += t.activity_cut;
             c.mid_scanned += t.mid_scanned;
         }
         lap(8);
@@ -1233,6 +1255,7 @@ impl SimServer {
         self.tick_shots.extend(fires.iter().map(|f| (f.shooter, f.yaw, f.pitch, f.tau0)));
         self.tick_shots.sort_unstable_by_key(|s| s.0);
         for f in &fires {
+            self.activity.add(f.shooter, f.origin, f.yaw);
             // What this shooter could plausibly have seen: from its RTT (once
             // measured) and its input's wait. Older claims are trimmed.
             let rtt = self
@@ -1603,6 +1626,7 @@ struct View<'a> {
     cfg: &'a InterestConfig,
     /// This tick's shots, sorted by shooter (`SimServer::tick_shots`).
     shots: &'a [(u16, u16, i16, f64)],
+    activity: &'a Activity,
     tick: u32,
     step: u32,
     bodies: &'a [Body],
@@ -1815,6 +1839,24 @@ impl View<'_> {
         while n_far > 0 && cost(after_mid, Tier::Far, n_far).0 > left {
             n_far -= 1;
         }
+        let (far_cost, after_far) = cost(after_mid, Tier::Far, n_far);
+        left -= far_cost;
+        // Distant fights: once per window, on this client's tick of it, the
+        // nearest cells that fit what's left.
+        sc.activity.clear();
+        if tick % activity::WINDOW == e as u32 % activity::WINDOW {
+            self.activity.gather(me.state.pos, far_radius, &mut sc.activity);
+        }
+        let act_per = lattice_game::activity::per_message(self.max_message);
+        let act_size = lattice_game::activity::ENTRY;
+        let mut n_act = sc.activity.len();
+        while n_act > 0 && after_far.entities(n_act, act_size, act_per).0 > left {
+            n_act = n_act.saturating_sub(n_act.div_ceil(8).max(1));
+        }
+        if n_act < sc.activity.len() {
+            sc.tally.activity_cut += (sc.activity.len() - n_act) as u64;
+            sc.activity.select_nth_unstable_by(n_act, |a, b| a.0.total_cmp(&b.0));
+        }
         let mut starved = 0;
         for &(key, j) in &sc.far[n_far..] {
             if key < 0.0 {
@@ -1862,6 +1904,10 @@ impl View<'_> {
         bytes += self.write_tier(Tier::Mid, mid_blobs, &mut fill, slot.client, snaps);
         let far_blobs = sc.far[..n_far].iter().map(|&(_, j)| &self.far_blobs[j as usize][..]);
         bytes += self.write_tier(Tier::Far, far_blobs, &mut fill, slot.client, snaps);
+        let act_bytes = self.write_activity(&sc.activity[..n_act], &mut fill, slot.client, snaps);
+        bytes += act_bytes;
+        sc.tally.activity_sent += n_act as u64;
+        sc.tally.activity_bytes += act_bytes as u64;
 
         if self.watch == Some(e) {
             let sent: std::collections::HashSet<u16> = sc.picked.iter().map(|p| p.0).collect();
@@ -1902,6 +1948,26 @@ impl View<'_> {
         t.tier_sent[1] += n_mid as u64;
         t.tier_sent[2] += n_far as u64;
         t.bytes += bytes as u64;
+    }
+
+    /// Writes distant-fight entries as Activity messages, packed like
+    /// `write_tier`'s.
+    fn write_activity(&self, entries: &[(f32, lattice_game::activity::Entry)], fill: &mut PacketFill, client: ClientId, snaps: &mut Vec<Snap>) -> usize {
+        use lattice_game::activity::{per_message, write_header, ENTRY, HEADER};
+        let (per, mut rest, mut bytes) = (per_message(self.max_message), entries, 0);
+        while !rest.is_empty() {
+            let n = fill.next_chunk(rest.len(), ENTRY, per);
+            let mut w = Writer::with_capacity(HEADER + n * ENTRY);
+            write_header(&mut w, self.activity.end_step, self.activity.len, n as u8);
+            for (_, e) in &rest[..n] {
+                w.bytes(e);
+            }
+            bytes += w.len();
+            fill.push(w.len());
+            snaps.push((client, w.into_inner(), None));
+            rest = &rest[n..];
+        }
+        bytes
     }
 
     /// Writes `blobs` as Entities messages of at most one packet each, the

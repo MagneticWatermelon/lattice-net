@@ -5,6 +5,7 @@
 //! prediction. Both are sans-IO; the `lattice-server` and `lattice-bots` binaries
 //! own the sockets.
 
+pub mod activity;
 pub mod bot;
 pub mod debugmap;
 pub mod cli;

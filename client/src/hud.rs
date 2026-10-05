@@ -148,7 +148,7 @@ pub fn setup(mut commands: Commands) {
 type MarkText<'a> = (&'a mut Text, &'a mut TextColor, &'a mut TextFont);
 
 /// Takes the news: hit markers, damage arrows and the kill feed; others'
-/// shots go to the tracers.
+/// shots and distant fights' ambient shots go to the tracers.
 #[allow(clippy::too_many_arguments)]
 pub fn combat(
     mut net: ResMut<Net>,
@@ -165,6 +165,10 @@ pub fn combat(
     net.0.core.drain_news(&mut events, &mut shots);
     let now = frame.secs;
     tracers.pending.extend(shots.into_iter().map(|s| (s, now)));
+    // Distant fights: ambient shots from players drawn there (or the spot).
+    let mut ambient = Vec::new();
+    net.0.core.drain_ambient(frame.now, &mut ambient);
+    tracers.flying.extend(ambient.iter().map(|a| crate::controls::Tracer::new(a.origin, a.dir, false)));
     for ev in events {
         match ev {
             Event::Hit { head, killed, .. } => combat.mark = Some((now, head, killed)),
@@ -339,6 +343,7 @@ pub fn update(
             "corrections {} (largest {:.3} m)  push corrections {} (largest {:.2} m)  deaths/respawns {}",
             st.corrections, st.correction_error_max, st.push_corrections, st.push_error_max, st.life_events
         ),
+        format!("others' shots {}  distant fights: {} cells, {} shots, {} ambient", st.shots_seen, st.activity_cells, st.activity_shots, st.ambient),
     ];
     if settings.ghosts {
         lines.push("ghosts: blue = newest server sample, pink = our server state".into());

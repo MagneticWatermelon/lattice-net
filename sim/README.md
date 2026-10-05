@@ -450,6 +450,20 @@ One 100 ms timeline was too long for near players (it added 33 ms to every rewin
   - kills reach both and not a bystander, who does see the shooter's tracers;
   - a shooter 200 m away (mid tier) joins its target's near tier on hitting, and drops back 5 s after.
 
+**Distant fights** (`activity.rs`; format in `game/src/activity.rs`). Exact tracers only come from near-tier shooters, so without this, a fight beyond ~150 m (or beyond the 100 near candidates in a crowd) can't be seen.
+- **Server:** each shot is counted into its 128 m cell per faction over a 15-tick window, as one 5 B entry (shot count, mean aim, mean origin to 8 m), encoded once for every recipient. A client gets the finished window's cells within its far radius once per window, on its own tick, after the far tier and inside its byte budget (nearest kept if cut: `activity_cut`).
+- **Client:** it subtracts the shots it drew exactly (near tracers and its own) and spreads the rest as ambient shots over the next window, capped at 600/s. Each comes from a drawn player of that faction in that cell, or from near the cell's mean origin.
+- **Swarm test:** watchers at 400 m and 1 km draw all 360 shots, from the shooters, aimed right. The near watcher has exact tracers and nothing doubled, and 2 km is past the radius.
+
+| WSL run (30 s) | activity bytes per client-tick | entries sent per client | tracked bots: exact tracers vs ambient shots |
+|---|---|---|---|
+| 1k blob, 30% fighting | 5.6 | ~1,000 | 4.2 M vs 8.8 M (most at the 600/s cap) |
+| uniform 5k, 20% firing | 42 | ~7,400 | 0.2 M vs 13 M |
+
+Ticks were unchanged in the blob (p50 8.6 ms). Nothing was cut by the budget in either run.
+
+Worst case (every cell active): a 3.1 µs gather per client per window, and a 0.25 ms serial finish per window (`gather_cost`, ignored).
+
 **M3d.4: bots that fight, in latency classes** (`baselines/2026-10-05-wsl2-fight`).
 - **Fighting bots** (`BotBrain::set_fight`; `lattice-bots --fight-every N --aim-error MRAD`) take the nearest enemy they draw within 150 m and in sight (`hit::line_clear`, the same test as the server's after-cover count). They aim with lead (`bot::aim_at`) plus Gaussian error, firing in bursts.
 - **Latency classes:** `lattice-bots --classes K` binds class k's sockets from port 16384 × (k + 1), so one `tc` u32 match (mask 0xc000) catches a class. `scripts/baseline.sh fight` gives each class its own netem band: 10 / 50 / 75 ms one-way, i.e. 20 / 100 / 150 ms RTT. The server listens below the ranges (port 14500). With `BOTS_SSH`, the bot box is shaped: egress by source port, ingress through ifb by destination port.

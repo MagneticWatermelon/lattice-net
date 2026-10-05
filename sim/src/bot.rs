@@ -58,6 +58,12 @@ impl BotBrain {
         self.trigger = on;
     }
 
+    /// Where it walks (and, held or with the trigger, faces and fires), in
+    /// radians from east.
+    pub fn set_heading(&mut self, heading: f32) {
+        self.ai.heading = heading;
+    }
+
     pub fn set_moves(&mut self, m: Moves) {
         self.ai.moves = m;
     }
@@ -143,7 +149,8 @@ impl Wander {
         self.steps += 1;
         match self.moves {
             Moves::Wander => {}
-            Moves::Hold => return Input::default(),
+            // Stands, facing its heading.
+            Moves::Hold => return Input { yaw: (self.heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16, ..Input::default() },
             Moves::Strafe { period } => {
                 let dir = if (self.steps / period.max(1)).is_multiple_of(2) { 127 } else { -127 };
                 return Input { move_y: dir, ..Input::default() };

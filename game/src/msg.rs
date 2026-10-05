@@ -11,6 +11,7 @@
 //! S->C unreliable  Snapshot tag | server_tick:4 | step:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
 //!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 grounded:1 | pushes:1 | health:1 | life:1
 //! S->C unreliable  Near     see delta.rs: deltas against acked baselines, one per tick, tagged
+//! S->C unreliable  Activity distant fights' firing per 128 m cell, once per 0.5 s window (see activity.rs)
 //! S->C unreliable  Entities tag | server_tick:4 | tier:1 | n:1 | n × blob         (mid and far; one or more per tier per tick)
 //! far blob  (11 B) := entity:2 | cell:1 | 8 B bitpacked far-tier state (see bitpack.rs); used for mid and far
 //!   x:15 y:15 (~16 mm in the cell) | altitude:12 (16 cm) | yaw:9 | pitch:6 | flags:3 (airborne, dead) | health:4 (1/15ths)
