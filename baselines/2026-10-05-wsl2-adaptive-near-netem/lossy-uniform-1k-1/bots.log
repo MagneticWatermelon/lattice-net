@@ -1,0 +1,33 @@
+minting tokens with the public dev key (--token-key to change)
+1000 bots -> 127.0.0.1:40500 on 8 threads, ramp 0/s, 60s, 1000 full + 0 sink bots
+[    5s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 24.3 snaps/s/bot, entities/snap near 4.4 mid 4.2 far 6.4 | corrections 0.003/s/bot | down 49 up 13 kbps/bot | rtt 83.8 ms loss 0.42% | input->applied ~ p50 88 p99 132 ms, round trip p50 133 p99 200 ms | joins 1000 (p50 383 p99 697 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 6
+[   10s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 29.6 snaps/s/bot, entities/snap near 4.4 mid 4.2 far 6.3 | corrections 0.005/s/bot | down 58 up 16 kbps/bot | rtt 83.7 ms loss 4.89% | input->applied ~ p50 88 p99 134 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+[   15s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 27.7 snaps/s/bot, entities/snap near 4.4 mid 4.2 far 6.3 | corrections 0.004/s/bot | down 54 up 15 kbps/bot | rtt 83.9 ms loss 5.19% | input->applied ~ p50 88 p99 134 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+[   20s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 28.5 snaps/s/bot, entities/snap near 4.4 mid 4.2 far 6.3 | corrections 0.005/s/bot | down 56 up 15 kbps/bot | rtt 83.8 ms loss 4.97% | input->applied ~ p50 87 p99 135 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+[   25s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 29.3 snaps/s/bot, entities/snap near 4.3 mid 4.2 far 6.3 | corrections 0.004/s/bot | down 57 up 15 kbps/bot | rtt 83.9 ms loss 5.13% | input->applied ~ p50 88 p99 132 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+[   30s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 27.7 snaps/s/bot, entities/snap near 4.3 mid 4.2 far 6.3 | corrections 0.003/s/bot | down 54 up 15 kbps/bot | rtt 83.8 ms loss 4.95% | input->applied ~ p50 88 p99 134 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+[   35s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 28.9 snaps/s/bot, entities/snap near 4.4 mid 4.2 far 6.3 | corrections 0.003/s/bot | down 57 up 15 kbps/bot | rtt 83.9 ms loss 5.04% | input->applied ~ p50 88 p99 134 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+[   40s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 28.1 snaps/s/bot, entities/snap near 4.3 mid 4.2 far 6.3 | corrections 0.002/s/bot | down 55 up 15 kbps/bot | rtt 83.7 ms loss 4.83% | input->applied ~ p50 88 p99 134 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+[   45s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 28.6 snaps/s/bot, entities/snap near 4.3 mid 4.2 far 6.3 | corrections 0.005/s/bot | down 56 up 15 kbps/bot | rtt 83.8 ms loss 5.06% | input->applied ~ p50 88 p99 134 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+[   50s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 29.4 snaps/s/bot, entities/snap near 4.3 mid 4.2 far 6.3 | corrections 0.003/s/bot | down 58 up 16 kbps/bot | rtt 83.9 ms loss 5.05% | input->applied ~ p50 88 p99 133 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+[   55s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 27.7 snaps/s/bot, entities/snap near 4.3 mid 4.2 far 6.3 | corrections 0.004/s/bot | down 54 up 15 kbps/bot | rtt 83.9 ms loss 4.83% | input->applied ~ p50 88 p99 134 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+[   60s] bots 1000/1000 connected, 1000 welcomed, 0 failed | 28.7 snaps/s/bot, entities/snap near 4.3 mid 4.2 far 6.3 | corrections 0.003/s/bot | down 56 up 15 kbps/bot | rtt 83.6 ms loss 5.19% | input->applied ~ p50 88 p99 134 ms, round trip p50 133 p99 200 ms | joins 0 (p50 0 p99 0 ms) | server pace 1.00 level 0, 0 bots bandwidth-degraded | swarm busy 5%, overruns 0
+
+== bots summary ==
+  started 1000 welcomed 1000 failed 0
+  join latency ms: p50 383 p99 697 max 796 (n=1000)
+  corrections 218 (0.22/bot-minute), mean error 0.078 m, max 0.333 m
+  push corrections (the server pushed us apart from a crowd) 110 (0.11/bot-minute), max 0.162 m
+  snapshots 1698827 (entities per snapshot: near 4.4 mid 4.2 far 6.3), stale 53, unmatched acks 0, resyncs 0
+  input -> applied on server (est. RTT/2 + server wait): p50 88.0 p99 134.0 max 548.0 mean 91.4 ms (n=1690907)
+    of which server wait (arrival -> applied): p50 45.9 p99 91.6 max 506.2 mean 49.5 ms (n=1690907)
+  input -> seen acked (round trip): p50 133.0 p99 200.0 max 633.0 mean 147.4 ms (n=1696383)
+  near entity update interval (tracked bots): p50 33.0 p99 66.0 max 200.0 mean 34.8 ms (n=369239)
+  mid entity update interval (tracked bots): p50 100.0 p99 200.0 max 1000.0 mean 105.6 ms (n=354584)
+  far entity update interval (tracked bots): p50 500.0 p99 1000.0 max 2000.0 mean 524.3 ms (n=478261)
+  near drawn (tracked bots): 99.84% interpolated, 0.03% extrapolated, 0.00% held, 0.13% new | pops p50 0 p99 0 max 355 mm
+  mid drawn (tracked bots): 99.19% interpolated, 0.45% extrapolated, 0.03% held, 0.33% new | pops p50 0 p99 46 max 7100 mm
+  far drawn (tracked bots): 38.21% interpolated, 58.14% extrapolated, 3.16% held, 0.49% new | pops p50 496 p99 4584 max 16711 mm
+  render delay (near) 92.1 ms behind the newest step, clock snaps 0 (backwards 0)
+  input clock: 6254 extra inputs, 5303 skipped ticks, 8 backlog skips | near decode errors (tracked bots) 0
+  bytes down 418.0 MB up 112.4 MB | swarm busy 5% of its threads' time, tick overruns 6

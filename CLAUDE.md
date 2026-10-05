@@ -118,7 +118,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - projectiles simulated on the server from a rewound origin;
     - sub-tick shot timing;
     - **a render delay per tier** (decided 2026-10-05, replacing one render time for every entity):
-      - near is drawn 67 ms behind the newest server step (two 30 Hz updates);
+      - near is drawn 67 ms behind the newest server step (two 30 Hz updates), growing up to 133 ms to cover the 99th percentile of how late near updates actually come. In a crowd, the near tier's per-tick cap makes them come every 1–3 ticks; fixed at 67 ms, near was 83% interpolated in the jittery blob;
       - mid and far are drawn 200 ms behind (two 10 Hz updates, so a lost one is bridged; far is mostly extrapolated on it);
       - an entity changing tier glides between delays at 25% (133 ms over ~0.5 s);
       - lag compensation rewinds each target by its own tier's delay, so inputs carry the near render step plus the batch's mid lag;
@@ -135,7 +135,10 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
         - near is ≥98% interpolated on every link (exact to 1 cm);
         - far is ~20% interpolated (p50 error 0.3 m, p99 3–5 m);
         - there are 0 clock snaps, and render time never goes backwards.
-      - **Mid missed its ≥99% clean bar over UDP** with one 100 ms render time: 98.7% uniform, 95% blob (2% were entities leaving the capped mid set), ~82% under ±20 ms σ jitter. **Fixed by per-tier delays** (2026-10-05): mid at 200 ms reaches 99.7% in the swarm under 5% loss (was 96.4%). The WSL netem rerun is in sim/README.
+      - **Mid missed its ≥99% clean bar over UDP** with one 100 ms render time: 98.7% uniform, 95% blob (2% were entities leaving the capped mid set), ~82% under ±20 ms σ jitter. **Fixed by per-tier delays, with the near delay adaptive** (2026-10-05, `baselines/2026-10-05-wsl2-adaptive-near-netem`):
+        - near is ≥99.5% interpolated on every link, blob included;
+        - mid in uniform is ≥99.2% on every link (in the blob ~96%, of which ~3% is churn in and out of the capped mid set);
+        - pops are under 5 cm at p99.
         - Re-judge with human eyes in M3c before tuning.
       - **Finding for M3d: rewind = RTT + render delay + ~67 ms** (the spare input + the wait for the next tick). With one 100 ms render time that was RTT + 167 ms, and a 200 ms cap fully compensates only players under ~33 ms RTT. That led to per-tier delays: near targets RTT + 134 ms, mid/far RTT + 267 ms.
       - **The input clock has two entry points.** `step_inputs` is for 30 Hz callers (the bots); `tick_inputs` runs by elapsed time, for frame loops. Run by time, a 30 Hz caller's jitter raised p99 server wait from ~70 to 80–100 ms.

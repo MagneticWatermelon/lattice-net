@@ -369,6 +369,29 @@ One 100 ms timeline was too long for near players (it added 33 ms to every rewin
 - **At the ladder's bottom** (20 Hz, dilation 0.8), mid is 79% interpolated (was 40%), and near keeps 99.9%.
 - **On the Windows client** (1k blob, WSL server): near 99.7% interpolated, mid's extrapolated frames 1.26% → 0.92%, 0 corrections, render delay 68 ms. Mid's remaining misses are entities churning in and out of the capped mid set.
 
+**Near adapts to crowds.** WSL netem with near fixed at 67 ms (`baselines/2026-10-05-wsl2-tier-delays-netem`) fixed mid: uniform runs are ≥99.2% interpolated on every link, against 81–99% before. But near regressed in the 1k blob: jittery 98.2 → 83.0%, lossy 98.0 → 93.4%.
+- **The cause:** in a crowd, ~100 near candidates share the near tier's 64 sends per tick, so a near entity updates every 1–3 ticks, not every tick.
+- **The fix (`NearNeed`):** for each near update, the client records how far behind the newest step its predecessor was when it arrived. That's the delay that would have kept the entity interpolated.
+- **The delay follows the 99th percentile of that,** with a 3 s memory, between `--near-ms` 67 and `--near-max-ms` 133. It goes up at once and down with hysteresis.
+- **Mid stays at 200 ms** in all, and inputs already carry the absolute near render step, so the server's rewind follows.
+- **Swarm crowd test** (near capped at 20 per tick): fixed at 67 ms, near is 62.7% interpolated (pops p99 0.36 m); adaptive, 98.1% at 133 ms (pops p99 0.11 m). At the ladder's bottom it settles at 92 ms, and the near error p99 is 6 mm.
+
+**WSL netem with the adaptive near delay** (`baselines/2026-10-05-wsl2-adaptive-near-netem`). Interpolated %, uniform / blob:
+
+| link (one way) | near: one 100 ms timeline | near: fixed 67 ms | near: adaptive | its delay (tracked bots) | mid: 100 ms | mid: 200 ms |
+|---|---|---|---|---|---|---|
+| clean | 99.8 / 99.7 | 99.9 / 98.0 | **99.9 / 99.8** | 73 / 82 ms | 98.7 / 95.1 | **99.5 / 95.3** |
+| LAN: 15 ± 2 | 99.8 / 99.7 | 99.9 / 99.7 | **99.9 / 99.8** | 67 / 87 ms | 99.6 / 95.0 | **99.5 / 96.1** |
+| typical: 40 ± 5, 0.5% loss | 99.8 / 99.6 | 99.9 / 98.4 | **99.9 / 99.7** | 76 / 100 ms | 96.9 / 94.5 | **99.5 / 96.2** |
+| far: 75 ± 10, 1% loss | 99.8 / 99.4 | 99.7 / 93.5 | **99.9 / 99.7** | 95 / 127 ms | 96.7 / 91.6 | **99.4 / 96.2** |
+| lossy: 40 ± 5, 5% loss | 99.8 / 98.0 | 99.4 / 93.4 | **99.8 / 99.5** | 92 / 133 ms | 91.7 / 90.1 | **99.2 / 95.6** |
+| jittery: 40 ± 20 (σ) | 99.8 / 98.2 | 98.3 / 83.0 | **99.9 / 99.8** | 111 / 134 ms | 81.1 / 83.0 | **99.5 / 96.4** |
+
+- **Near and mid pops** are 0–46 mm at p99 on every link (mid was 0.3 m under loss and jitter before).
+- **Mid in the blob** sits at ~96%: ~3% are entities churning in and out of the capped mid set (held, or new), and ~1.3% is extrapolation.
+- **The server's rewind numbers** come from every bot, and only every 20th tracks entities and adapts. So `rewind_near_*` there mostly reflects 67 ms: clean p50 133 ms, RTT + 133 on the other links. A client at the 133 ms maximum adds 67 ms to that.
+- **Input → applied and corrections** are unchanged.
+
 **Separation across heights** has a unit test now (`separation_pushes_bodies_that_overlap_in_height_too`). Pairs a body height or more apart vertically aren't pushed; a player on a crate beside another overlaps it and is.
 
 ### Nearest-player search: `Grid::knn` (2026-10-04)
