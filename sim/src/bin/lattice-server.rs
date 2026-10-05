@@ -665,6 +665,11 @@ fn main() -> std::io::Result<()> {
         );
     }
     println!("  render times ahead of the server (bogus) {}", sim.counters().render_ahead);
+    let c = sim.counters();
+    println!(
+        "  shots {} (late {}, refused {}, rewinds capped {}) | hits head {} body {} (after cover {}, too late {}), kills {} | ground {} cover {} expired {} | segments {} candidates {}",
+        c.shots, c.shots_late, c.shots_refused, c.rewinds_capped, c.hits_head, c.hits_body, c.hits_after_cover, c.hits_too_late, c.kills, c.hits_ground, c.hits_cover, c.expired, c.segments, c.candidates
+    );
     Ok(())
 }
 

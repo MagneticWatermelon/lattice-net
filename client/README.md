@@ -1,6 +1,6 @@
 # lattice-client: the first playable client
 
-A Bevy window on `lattice-client-core`, the same client code the bots run: prediction, the render timeline, entity interpolation. It plays on a `lattice-server`, walking and jumping among the bots. There's no combat yet (M3d).
+A Bevy window on `lattice-client-core`, the same client code the bots run: prediction, the render timeline, entity interpolation. It plays on a `lattice-server`: walk, jump and shoot among the bots (3 factions; you respawn 5 s after dying).
 
 It's its own Cargo workspace, so the root's `cargo test` and `clippy` never build Bevy. Run Cargo inside `client/`.
 
@@ -30,6 +30,7 @@ In WSL itself, `cargo run` in `client/` opens a window under WSLg, but it render
 | key | |
 |---|---|
 | click / Esc | grab / release the mouse |
+| left mouse (held) | fire the rifle: 10 shots/s, with a tracer (the grabbing click doesn't fire) |
 | WASD, Shift, Space | move, sprint, jump |
 | V | view: first person → chase → spectator (free flight: WASD, Space/C, Shift) |
 | G | server ghosts: blue = each player's newest server sample (no delay, no smoothing); pink = our own last server state |
@@ -64,7 +65,7 @@ In WSL itself, `cargo run` in `client/` opens a window under WSLg, but it render
 | `--near-ms`, `--near-max-ms`, `--mid-ms` | the render delays: near players 67 ms, growing up to 133 ms when near updates come less often (crowds); mid and far 200 ms |
 | `--view first\|chase\|spectator`, `--spectate X,Y,Z,YAW,PITCH` | the starting camera |
 | `--no-vsync`, `--no-shadows`, `--ghosts` | rendering options |
-| `--autoplay` | wander instead of reading the keyboard |
+| `--autoplay`, `--autofire` | wander instead of reading the keyboard; hold the trigger |
 | `--screenshot PATH --after S` and `--exit-after S` | self-checks: save a frame, then quit with a summary (frame times, corrections, smoothness per tier) |
 
 ## Layout

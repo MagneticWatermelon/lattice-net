@@ -7,6 +7,7 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use lattice_game::movement::{Input, BUTTON_JUMP, BUTTON_SPRINT};
+use lattice_game::weapon::{aim, Flight, RANGE_STEPS, SUBSTEPS};
 
 use crate::coords::{look_rotation, pitch_i16, stick, to_bevy, yaw_u16};
 use crate::{Frame, Net, Settings};
@@ -42,6 +43,8 @@ pub struct View {
     /// The spectator camera has a place (else it starts above our player).
     spec_placed: bool,
     grabbed: bool,
+    /// The click that grabbed the mouse doesn't fire (until released).
+    swallow: bool,
     wander: Wander,
 }
 
@@ -58,6 +61,7 @@ impl View {
             spec_pitch: -0.4,
             spec_placed: false,
             grabbed: false,
+            swallow: false,
             wander: Wander { seed: 0x9E37_79B9, heading: 0.0, until: 0.0, sprint: false },
         }
     }
@@ -92,7 +96,7 @@ pub fn toggles(
         if buttons.just_pressed(MouseButton::Left) && !view.grabbed {
             c.grab_mode = CursorGrabMode::Confined;
             c.visible = false;
-            view.grabbed = true;
+            (view.grabbed, view.swallow) = (true, true);
         }
         if keys.just_pressed(KeyCode::Escape) && view.grabbed {
             c.grab_mode = CursorGrabMode::None;
@@ -122,10 +126,20 @@ pub fn toggles(
     }
 }
 
-/// Mouse look, then this frame's input to the input clock.
+/// Cosmetic tracers of our own shots, flown with the server's kinematics.
+#[derive(Resource, Default)]
+pub struct Tracers {
+    /// (flight, seconds flown, seconds not yet flown).
+    pub flying: Vec<(Flight, f32, f32)>,
+}
+
+/// Mouse look, then this frame's input (and shot) to the input clock.
+#[allow(clippy::too_many_arguments)]
 pub fn play(
     keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
+    mut tracers: ResMut<Tracers>,
     frame: Res<Frame>,
     settings: Res<Settings>,
     mut view: ResMut<View>,
@@ -175,6 +189,19 @@ pub fn play(
         }
         Input { move_x: mx, move_y: my, yaw: yaw_u16(view.yaw), pitch: pitch_i16(view.pitch), buttons }
     };
+    // Held left button (once the mouse is ours): a shot whenever the rifle is
+    // ready, from the eye along the view, riding this frame's input.
+    if !buttons.pressed(MouseButton::Left) {
+        view.swallow = false;
+    }
+    let trigger = view.grabbed && !view.swallow && view.mode != Mode::Spectator && buttons.pressed(MouseButton::Left);
+    if trigger || settings.autofire {
+        let (yaw, pitch) = (yaw_u16(view.yaw), pitch_i16(view.pitch));
+        if net.0.core.fire(frame.now, yaw, pitch) {
+            let f = view.feet;
+            tracers.flying.push((Flight::new([f[0], f[1], f[2] + EYE], aim(yaw, pitch)), 0.0, 0.0));
+        }
+    }
     net.0.send_inputs(frame.now, input);
 
     // Free flight: WASD along the view, Space/C up and down, Shift faster.
@@ -186,6 +213,35 @@ pub fn play(
         view.eye[1] += (s * fwd - c * right) * speed;
         view.eye[2] += up * speed;
     }
+}
+
+/// Flies and draws our tracers: a streak along each one's last segments,
+/// until it hits the ground or cover, or runs out of range.
+pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, mut gizmos: Gizmos) {
+    let Some(w) = net.0.core.welcome() else { return };
+    let world = lattice_game::world::World::shared(w.world_seed);
+    let seg = 1.0 / (SUBSTEPS * 30) as f32;
+    let range = RANGE_STEPS as f32 / 30.0;
+    tracers.flying.retain_mut(|(f, age, owed)| {
+        *owed += frame.dt;
+        let tail = f.pos;
+        while *owed >= seg {
+            let next = f.advance();
+            let mut hit = lattice_game::hit::terrain(&world, f.pos, next.pos).is_some();
+            let mid = [(f.pos[0] + next.pos[0]) / 2.0, (f.pos[1] + next.pos[1]) / 2.0];
+            world.boxes_near(mid[0], mid[1], 6.0, |b| {
+                hit |= lattice_game::hit::aabb(f.pos, next.pos, [b.min[0], b.min[1], b.bottom], [b.max[0], b.max[1], b.top]).is_some();
+            });
+            *owed -= seg;
+            *age += seg;
+            if hit || *age > range {
+                return false;
+            }
+            *f = next;
+        }
+        gizmos.line(to_bevy(tail[0], tail[1], tail[2]), to_bevy(f.pos[0], f.pos[1], f.pos[2]), Color::srgb(1.0, 0.85, 0.4));
+        true
+    });
 }
 
 /// Places the camera for the view, on our player's drawn position.

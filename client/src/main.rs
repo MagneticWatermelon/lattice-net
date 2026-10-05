@@ -37,6 +37,7 @@ lattice-client: play on a lattice-server
   --no-shadows
   --ghosts             start with the server ghosts on (G)
   --autoplay           wander instead of reading the keyboard
+  --autofire           hold the trigger (with --autoplay: a self-check)
   --screenshot PATH    save a frame to PATH after --after seconds [5], then
   --exit-after S       quit after S seconds, printing a summary";
 
@@ -61,6 +62,7 @@ pub struct Settings {
     pub net_graph: bool,
     pub shadows: bool,
     pub autoplay: bool,
+    pub autofire: bool,
     screenshot: Option<(String, f32)>,
     exit_after: Option<f32>,
 }
@@ -88,6 +90,7 @@ struct Args {
     shadows: bool,
     ghosts: bool,
     autoplay: bool,
+    autofire: bool,
     screenshot: Option<(String, f32)>,
     exit_after: Option<f32>,
 }
@@ -110,6 +113,7 @@ fn parse_args() -> Args {
         shadows: true,
         ghosts: false,
         autoplay: false,
+        autofire: false,
         screenshot: None,
         exit_after: None,
     };
@@ -146,6 +150,7 @@ fn parse_args() -> Args {
             "--no-shadows" => a.shadows = false,
             "--ghosts" => a.ghosts = true,
             "--autoplay" => a.autoplay = true,
+            "--autofire" => a.autofire = true,
             "--screenshot" => a.screenshot = Some((val(), 0.0)),
             "--after" => after = val().parse().unwrap_or_else(|e| die(&format!("--after: {e}"))),
             "--exit-after" => a.exit_after = Some(val().parse().unwrap_or_else(|e| die(&format!("--exit-after: {e}")))),
@@ -194,6 +199,7 @@ fn main() {
             net_graph: true,
             shadows: args.shadows,
             autoplay: args.autoplay,
+            autofire: args.autofire,
             screenshot: args.screenshot,
             exit_after: args.exit_after,
         })
@@ -201,6 +207,7 @@ fn main() {
         .init_resource::<FrameTimes>()
         .init_resource::<scene::Scene>()
         .init_resource::<hud::Rates>()
+        .init_resource::<controls::Tracers>()
         .add_systems(Startup, (setup_camera, scene::setup_looks, hud::setup))
         .add_systems(First, begin_frame)
         .add_systems(PreUpdate, poll)
@@ -214,6 +221,7 @@ fn main() {
                 scene::stream_terrain,
                 scene::sync_players,
                 scene::own_body,
+                controls::tracers,
                 hud::update,
                 hud::vitals,
                 shots,
@@ -292,8 +300,8 @@ fn summary(s: &Session, times: &FrameTimes) {
     println!("== client summary ==");
     println!("  frames {} | frame time p50 {:.1} p99 {:.1} max {:.1} ms", all.len(), at(0.5), at(0.99), at(1.0));
     println!(
-        "  snapshots {} | corrections {} (largest {:.3} m) | push corrections {} | resyncs {} | own correction offset largest {:.3} m",
-        st.snapshots, st.corrections, st.correction_error_max, st.push_corrections, st.resyncs, st.own_offset_max
+        "  snapshots {} | corrections {} (largest {:.3} m) | push corrections {} | resyncs {} | own correction offset largest {:.3} m | shots {} | deaths/respawns {}",
+        st.snapshots, st.corrections, st.correction_error_max, st.push_corrections, st.resyncs, st.own_offset_max, st.shots, st.life_events
     );
     if let Some(e) = s.core.entities() {
         for (t, name) in ["near", "mid", "far"].iter().enumerate() {

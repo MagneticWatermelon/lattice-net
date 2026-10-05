@@ -15,6 +15,8 @@ pub use lattice_client_core::CORRECTION_EPSILON;
 pub struct BotBrain {
     core: ClientCore,
     ai: Wander,
+    /// Holds the trigger, aiming level along its heading (firing load).
+    trigger: bool,
 }
 
 /// How a bot moves (tests use the scripted ones).
@@ -36,7 +38,12 @@ impl BotBrain {
     }
 
     pub fn with_config(seed: u64, cfg: ClientConfig) -> Self {
-        Self { core: ClientCore::new(cfg), ai: Wander::new(seed) }
+        Self { core: ClientCore::new(cfg), ai: Wander::new(seed), trigger: false }
+    }
+
+    /// Holds the trigger: a shot every 100 ms, level along its heading.
+    pub fn set_trigger(&mut self, on: bool) {
+        self.trigger = on;
     }
 
     pub fn set_moves(&mut self, m: Moves) {
@@ -93,6 +100,10 @@ impl BotBrain {
 
     /// One tick of the input clock, with the AI choosing each input.
     pub fn tick_inputs(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if self.trigger {
+            let yaw = (self.ai.heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16;
+            self.core.fire(now, yaw, 0);
+        }
         let ai = &mut self.ai;
         self.core.step_inputs(now, |s, w| ai.think(s, w))
     }

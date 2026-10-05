@@ -244,7 +244,15 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
            - corpses keep the aim they died with;
            - `--deaths-per-sec` stands in for weapons;
            - UDP, 100 tracked bots, 10 deaths/s: 0 corrections, streak frames 67,994 → 742 after the fixes.
-        2. **M3d.2: shots, 3D history, projectiles, damage** (scoped in full 2026-10-05).
+        2. **M3d.2: shots, 3D history, projectiles, damage. Built** (2026-10-05; see sim/README).
+           - **Swarm:** a target strafing at 6 m/s 50 m out takes 200/200 hits at 0 and 33 ms one-way; headshots 100/100; past the cap 3% until leading the clipped 2–3 steps (92%); walls stop everything; kills exactly at 100 HP.
+           - **WSL, `--fire-share`:**
+             - uniform 5k at 20% (~9k shots/s): shots phase p50 2.0 ms;
+             - 1k blob all firing: 1.6 ms;
+             - 0 corrections in both.
+           - **Each shot also carries its exact render step** (7 B, not 5). Deriving it from the input's assumed the input is made at its step's end, which 30 Hz callers don't do.
+           - **Hits on a target that died since the shooter saw it** deal no damage and are counted (`hits_too_late`).
+           - The scope as written:
            - **Shared rules, in `lattice-game`:**
              - `weapon.rs` holds the rifle: 600 m/s, gravity 9.81, 100 ms between shots, 2 s range, 20 body / 40 head damage. It also holds the projectile kinematics (semi-implicit, per half step), so the server and the client's cosmetic tracers fly the same arc;
              - `hit.rs` holds the geometry: segment against capsule, sphere, box (slab) and terrain (≤2 m march, then bisection);

@@ -93,7 +93,7 @@ pub fn setup(mut commands: Commands) {
     ));
     commands.spawn((
         Node { position_type: PositionType::Absolute, left: Val::Px(8.0), bottom: Val::Px(6.0), ..default() },
-        Text::new("click: grab mouse  Esc: release  WASD Shift Space: move  V: view  G: server ghosts  T: tier/faction colors  N: net graph"),
+        Text::new("click: grab mouse, then fire  Esc: release  WASD Shift Space: move  V: view  G: server ghosts  T: tier/faction colors  N: net graph"),
         TextFont { font_size: FontSize::Px(12.0), ..default() },
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
     ));

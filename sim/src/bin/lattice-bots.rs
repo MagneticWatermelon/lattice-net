@@ -32,6 +32,8 @@ lattice-bots: M1 bot swarm
   --near-ms MS         render delay of near entities behind the newest server step, at least [67]
   --near-max-ms MS     ...growing up to this to cover how late near updates come [133]
   --mid-ms MS          render delay of mid and far entities [200]
+  --fire-share F       this share of bots holds the trigger (10 shots/s, level along
+                       their heading): firing load before bots that aim [0]
   --full-every K       only every Kth bot measures (prediction, latency, tracking); the
                        rest are sink bots that play but only count what they're sent [1]
   --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
@@ -229,6 +231,8 @@ struct Bot {
     seed: u64,
     track: bool,
     sink: bool,
+    /// Holds the trigger (`--fire-share`).
+    trigger: bool,
     /// Near (least, most) and mid render delays.
     delays: (Duration, Duration, Duration),
     /// Bound up front, before the clock starts: creating thousands of sockets
@@ -262,6 +266,7 @@ impl Bot {
                 brain.enable_tracking();
             }
             brain.set_sink(self.sink);
+            brain.set_trigger(self.trigger);
             self.brain = Some(brain);
         }
         let (sock, client) = self.net.as_mut().unwrap();
@@ -493,6 +498,7 @@ fn main() -> std::io::Result<()> {
     let report = Duration::from_secs_f64(a.get("report", 5.0));
     let seed: u64 = a.get("seed", 1);
     let track_every: usize = a.get("track-every", 20);
+    let fire_share: f64 = a.get("fire-share", 0.0);
     let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
     let delays = (ms(a.get::<f64>("near-ms", 2000.0 / 30.0)), ms(a.get::<f64>("near-max-ms", 4000.0 / 30.0)), ms(a.get::<f64>("mid-ms", 200.0)));
     let full_every: usize = a.get::<usize>("full-every", 1).max(1);
@@ -532,6 +538,7 @@ fn main() -> std::io::Result<()> {
                 track: track_every > 0 && i % track_every == 0 && i % full_every == 0,
                 sink: i % full_every != 0,
                 delays,
+                trigger: ((i * 37) % 100) < (fire_share * 100.0).round() as usize,
                 sock: sockets[i].take(),
                 net: None,
                 brain: None,

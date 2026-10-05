@@ -394,6 +394,46 @@ One 100 ms timeline was too long for near players (it added 33 ms to every rewin
 
 **Separation across heights** has a unit test now (`separation_pushes_bodies_that_overlap_in_height_too`). Pairs a body height or more apart vertically aren't pushed; a player on a crate beside another overlaps it and is.
 
+### M3d: combat
+
+**M3d.1: factions, health, death and respawn.**
+- **Factions:** a player's faction is its entity id mod 3, from per-faction id lists, so it costs nothing on the wire.
+- **Health:** own health and a `life` counter are in the snapshot. Near states carry exact health and mid/far blobs a 1/15th bucket, with a dead flag in both.
+- **The dead:** their inputs move nothing (`movement::dead_input`), on the server and in prediction alike, and their bodies keep the aim they died with. They respawn after 5 s on their faction's side of the scenario's area.
+- **Clients:** a death or respawn rebases and replays (a life event, never a correction) and is a cut: never smoothed, never interpolated across.
+- **`--deaths-per-sec`** kills random players, standing in for weapons.
+
+**M3d.2: shots and lag compensation.**
+- **The rifle** (`game/src/weapon.rs`): 600 m/s with gravity, 10 rounds/s, 2 s range, 20 body / 40 head damage. Its kinematics are shared with the client's tracers.
+- **Hit geometry** (`game/src/hit.rs`): segment against capsule, sphere, box and terrain. Hitboxes are a body capsule (r 0.4, 0.4–1.1 m) and a head sphere (r 0.2 at 1.6 m).
+- **Shots ride their input** (`BUTTON_FIRE` + 7 B: when in the step it fired, the aim, the render step then), redundant ×3.
+- **The server fires a shot when its input is applied,** from the shooter's eye between its states for that step (late ones too, within 8 steps), never from stand-ins, at most every 3 steps.
+- **The shots phase** (`sim/src/shots.rs`) runs after history. A projectile lives in its shooter's timeline: each half-step segment is tested against terrain, cover and players placed at τ − D for their tier (capped at 300 / 367 ms), from a 3D, 16-tick history that never interpolates across a life change. Hits apply in projectile order.
+
+**The swarm tests** (`what_you_see_is_what_you_hit` and the rest). A gunner aims where its client draws the target, leading for flight time and drop at the drawn velocity:
+
+| case | hits |
+|---|---|
+| target strafing 6 m/s, 50 m out, 0 or 33 ms one-way | 200 / 200 |
+| headshots at a standing target | 100 / 100 head |
+| 133 ms one-way (past the 300 ms near cap), aiming at the drawn target | 3% |
+| ...leading the clipped 2–3 steps | 92% |
+| target behind a wall | 0 (all stop on the wall) |
+
+- **Kills land exactly at 100 HP.** Hits on a target that died since the shooter saw it deal nothing (`hits_too_late`).
+- **The input queue's rules are unit-tested:** shots fire once, at the rifle's rate, never from stand-ins; late ones still fire within 8 steps; shots from the dead are refused.
+
+**Firing load on WSL** (`lattice-bots --fire-share F`: bots hold the trigger, level along their heading; 8 server threads sharing the box):
+
+| run | shots | shots phase p50 / p99 | tick p50 | hits, kills | corrections |
+|---|---|---|---|---|---|
+| uniform 5k, 20% firing | ~9k/s | 2.0 / 2.8 ms | 21.6 ms | 942, 42 | 0 |
+| 1k blob, all firing | ~7k/s | 1.6 / 2.2 ms | 8.6 ms | 10,147, 1,844 | 0 |
+
+- **About 180 ns per segment** across 8 threads. Most is the terrain march: these bots fire level into hills, so 70–80% of shots end in the ground. A coarse max-height skip is the obvious saving, if bare metal asks.
+- **The blob's refused shots** (1,184) are bots that died on the server before they heard.
+- **The Windows client** fires on the left mouse button, with a cosmetic tracer. It was self-checked with `--autoplay --autofire`: 122 shots, 0 corrections.
+
 ### Nearest-player search: `Grid::knn` (2026-10-04)
 
 Following `reports/Nearest player search algorithms.md`, the near and mid tiers' k-nearest search is now `Grid::knn`, in `grid.rs`.
