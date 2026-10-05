@@ -2,7 +2,7 @@
 # One comparable baseline: the scenario matrix, run the same way on any Linux
 # box, with the machine's setup recorded next to the numbers.
 #
-#   scripts/baseline.sh [full|quick|limits|limits-quick] [name]
+#   scripts/baseline.sh [full|quick|limits|limits-quick|netem|netem-quick|fight|fight-quick] [name]
 #
 #   full    8 scenarios x REPEAT (2) runs of 60 s, interleaved: ~16 min
 #   quick   2 small scenarios x 1 run of 20 s: checks the harness, not the machine
@@ -23,6 +23,15 @@
 #           server: at 10k a netem queue on its interface throttled its sends.
 #           NETEM_BOTS=10000 runs it at full load instead of 1k.
 #   netem-quick   one short run on the typical profile: checks the harness
+#   fight   combat in latency classes (~4 min): bots in 3 classes, 10 / 50 / 75 ms
+#           one way (20 / 100 / 150 ms RTT), each class on its own port range
+#           (lattice-bots --classes) and shaped by its own netem band. Fighters
+#           aim at what they draw; the rest hold the trigger. A 1k blob immortal
+#           (lattice-server --immortal: hit rates measure aim and lag
+#           compensation: within the cap, alike), the same blob lethal (what
+#           latency costs in a real fight: shots into the already dead), and a
+#           lethal uniform 5k (load), 60 s each. summary.md gets a Fights table.
+#   fight-quick   one short immortal fight of 300 in a 60 m disk
 #
 # Writes baselines/<date>-<name>/ (name defaults to the host name):
 #   env.txt      the machine and the preflight checks (scripts/preflight.sh)
@@ -45,19 +54,23 @@ cd "$(dirname "$0")/.."
 
 mode=${1:-full}
 name=${2:-$(hostname -s)}
-port=${PORT:-40500}
+# Fights: below the classes' port ranges (16384 and up), so the server's own
+# port never matches a class filter.
+if [[ $mode == fight* ]]; then port=${PORT:-14500}; else port=${PORT:-40500}; fi
 case $mode in
   full) repeat=${REPEAT:-2}; secs=60 ;;
   quick) repeat=${REPEAT:-1}; secs=20 ;;
   limits | limits-quick) repeat=${REPEAT:-1}; secs=60 ;;
   netem) repeat=${REPEAT:-1}; secs=60 ;;
   netem-quick) repeat=${REPEAT:-1}; secs=20 ;;
-  *) echo "usage: $0 [full|quick|limits|limits-quick|netem|netem-quick] [name]" >&2; exit 2 ;;
+  fight) repeat=${REPEAT:-1}; secs=60 ;;
+  fight-quick) repeat=${REPEAT:-1}; secs=25 ;;
+  *) echo "usage: $0 [full|quick|limits|limits-quick|netem|netem-quick|fight|fight-quick] [name]" >&2; exit 2 ;;
 esac
 
 # Local netem: rerun inside a private network namespace, where we may shape
 # its loopback without root and nothing outside it is affected.
-if [[ $mode == netem* ]] && [ -z "${BOTS_SSH:-}" ] && [ -z "${LATTICE_NETNS:-}" ]; then
+if [[ $mode == netem* || $mode == fight* ]] && [ -z "${BOTS_SSH:-}" ] && [ -z "${LATTICE_NETNS:-}" ]; then
   exec unshare -rn env LATTICE_NETNS=1 "$0" "$@"
 fi
 [ -n "${LATTICE_NETNS:-}" ] && ip link set lo up
@@ -83,6 +96,18 @@ if [ "$mode" = netem ]; then
     runs+=("$pname-uniform-$tag|uniform|$nb||||$pargs" "$pname-blob-$tag|blob|$nb||||$pargs")
   done
   max_bots=$nb
+elif [ "$mode" = fight ]; then
+  # id | scenario | bots | server args | profile | ramp | link | bot args
+  classes="classes:10,50,75"
+  runs=(
+    "fight-blob-1k-immortal|blob|1000|--immortal|||$classes|--classes 3 --fight-every 2 --fire-share 0.3"
+    "fight-blob-1k|blob|1000||||$classes|--classes 3 --fight-every 2 --fire-share 0.3"
+    "fight-uniform-5k|uniform|5000||||$classes|--classes 3 --fight-every 10 --fire-share 0.2"
+  )
+  max_bots=5000
+elif [ "$mode" = fight-quick ]; then
+  runs=("fight-disk-300-immortal|disk:60|300|--immortal|||classes:10,50,75|--classes 3 --fight-every 2 --fire-share 0.3")
+  max_bots=300
 elif [ "$mode" = netem-quick ]; then
   runs=("typical-uniform-300|uniform|300||||delay 40ms 5ms distribution normal loss 0.5%")
   max_bots=300
@@ -145,8 +170,59 @@ cargo build --release -q -p lattice-sim
 if [ -n "$remote" ]; then
   bot_dev=$(ssh -o BatchMode=yes "$remote" "ip -o route get $server_ip" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}')
 fi
-netem() { # "" (clean) or netem arguments
+# Latency classes ("classes:10,50,75": one-way ms per class): a prio qdisc
+# with a netem band per class, matched by the bots' class port ranges (port
+# 16384 x (class + 1) and up: one u32 match, mask 0xc000). Traffic matching
+# no class goes to the last band, unshaped.
+class_qdisc() { # dev, "sport"/"dport"/"both", "10,50,75"
+  local dev=$1 match=$2 ms=$3 c=0 bands map
+  IFS=, read -r -a delays <<< "$ms"
+  bands=$(( ${#delays[@]} + 1 ))
+  map=$(for _ in $(seq 16); do printf '%d ' $(( bands - 1 )); done)
+  # shellcheck disable=SC2086 # the priomap is a list
+  tc qdisc add dev "$dev" root handle 1: prio bands "$bands" priomap $map
+  for d in "${delays[@]}"; do
+    tc qdisc add dev "$dev" parent "1:$((c + 1))" handle "$((c + 10)):" netem limit 1000000 delay "${d}ms" 1ms distribution normal
+    for m in sport dport; do
+      if [ "$match" = both ] || [ "$match" = "$m" ]; then
+        tc filter add dev "$dev" parent 1: protocol ip prio 1 u32 match ip "$m" "$(( 16384 * (c + 1) ))" 0xc000 flowid "1:$((c + 1))"
+      fi
+    done
+    c=$((c + 1))
+  done
+}
+
+netem() { # "" (clean), netem arguments, or "classes:<ms,ms,...>"
   local args="$1"
+  if [[ $args == classes:* ]]; then
+    local ms=${args#classes:}
+    if [ -n "$remote" ]; then
+      # Bot machine: egress (bots -> server) by source port, and ingress
+      # through ifb0 (server -> bots) by destination port.
+      {
+        echo "set -e"
+        declare -f class_qdisc
+        echo "tc qdisc del dev $bot_dev root 2> /dev/null || true"
+        echo "tc qdisc del dev $bot_dev ingress 2> /dev/null || true"
+        echo "tc qdisc del dev ifb0 root 2> /dev/null || true"
+        echo "modprobe ifb numifbs=1"
+        echo "ip link set ifb0 up"
+        echo "class_qdisc $bot_dev sport $ms"
+        echo "tc qdisc add dev $bot_dev handle ffff: ingress"
+        echo "tc filter add dev $bot_dev parent ffff: protocol all prio 1 u32 match u32 0 0 action mirred egress redirect dev ifb0"
+        echo "class_qdisc ifb0 dport $ms"
+      } | ssh -o BatchMode=yes "$remote" "sudo bash -s"
+    elif [ -n "${LATTICE_NETNS:-}" ]; then
+      # Loopback carries both directions: a class's port as source (bots ->
+      # server) or as destination (server -> bots).
+      tc qdisc del dev lo root 2> /dev/null || true
+      class_qdisc lo both "$ms"
+    else
+      echo "latency classes need a fight mode (local) or BOTS_SSH" >&2
+      exit 1
+    fi
+    return
+  fi
   if [ -n "$remote" ]; then
     # The bot machine only: egress for bots -> server, ingress via ifb0 for
     # server -> bots.
@@ -197,7 +273,7 @@ n=0
 # doesn't land on one scenario.
 for r in $(seq 1 "$repeat"); do
   for spec in "${runs[@]}"; do
-    IFS='|' read -r id scenario count extra prof ramp link <<< "$spec"
+    IFS='|' read -r id scenario count extra prof ramp link botargs <<< "$spec"
     n=$((n + 1))
     netem "$link"
     run_secs=$secs
@@ -216,7 +292,7 @@ for r in $(seq 1 "$repeat"); do
     # shellcheck disable=SC2086 # $extra is a list of server flags
     # shellcheck disable=SC2086 # $key_args is empty or a flag and its value
     if ! OUT=$out PROFILE=$profile PROFILE_DELAY=$profile_delay SERVER_THREADS=$server_threads BOT_THREADS=$bot_threads \
-      BOTS_SSH=$remote BOT_ARGS="--server $server_ip:$port $key_args $ramp_args ${BOT_ARGS:-}" \
+      BOTS_SSH=$remote BOT_ARGS="--server $server_ip:$port $key_args $ramp_args ${botargs:-} ${BOT_ARGS:-}" \
       scripts/m1.sh "$scenario" "$count" "$run_secs" --bind "$server_ip:$port" $key_args $extra ${SERVER_ARGS:-} > "$out/console.log" 2>&1; then
       echo "  failed: see $out/console.log"
     fi
@@ -341,6 +417,41 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
       echo "| $id #$r | $(tier near) | $(tier mid) | $(tier far) | $(kv "$b" near_pop_p99_mm) / $(kv "$b" mid_pop_p99_mm) / $(kv "$b" far_pop_p99_mm) | $(kv "$b" render_delay_ms) | $(kv "$b" render_snaps) | $(kv "$s" rewind_near_p50_ms) / $(kv "$s" rewind_near_p99_ms) | $(kv "$s" rewind_mid_p50_ms) / $(kv "$s" rewind_mid_p99_ms) |"
     done
   done
+
+  # Fights: hit rate per latency class (fight modes).
+  if [[ $mode == fight* ]]; then
+    echo
+    echo "## Fights"
+    echo
+    echo "Fighters aim at what they draw (lattice-bots --fight-every, the same aim error for all); classes are one-way delays on their own port ranges. Within the rewind cap (300 ms near, 367 ms mid) hit rates must match; past it they drop."
+    echo
+    echo "| run | class | link (one way) | fighters | RTT | shots | hits | hit % | kills |"
+    echo "|---|---|---|---|---|---|---|---|---|"
+    for r in $(seq 1 "$repeat"); do
+      for spec in "${runs[@]}"; do
+        IFS='|' read -r id _ _ _ _ _ link _ <<< "$spec"
+        b=$dir/$id-$r/bots.summary
+        [ -f "$b" ] || continue
+        IFS=, read -r -a delays <<< "${link#classes:}"
+        for c in 0 1 2; do
+          [ "$(kv "$b" "class${c}_fighters")" = - ] && continue
+          echo "| $id #$r | $c | ${delays[$c]:-?} ms | $(kv "$b" "class${c}_fighters") | $(kv "$b" "class${c}_rtt_ms") | $(kv "$b" "class${c}_shots") | $(kv "$b" "class${c}_hits") | $(kv "$b" "class${c}_hit_pct") | $(kv "$b" "class${c}_kills") |"
+        done
+      done
+    done
+    echo
+    echo "| run | shots | hits head / body | after cover | too late | rewinds capped | kills | shots phase p50 / p99 | tick p50 / p99 | corrections |"
+    echo "|---|---|---|---|---|---|---|---|---|---|"
+    for r in $(seq 1 "$repeat"); do
+      for spec in "${runs[@]}"; do
+        IFS='|' read -r id _ <<< "$spec"
+        s=$dir/$id-$r/server.summary
+        b=$dir/$id-$r/bots.summary
+        [ -f "$s" ] || continue
+        echo "| $id #$r | $(kv "$s" shots) | $(kv "$s" hits_head) / $(kv "$s" hits_body) | $(kv "$s" hits_after_cover) | $(kv "$s" hits_too_late) | $(kv "$s" rewinds_capped) | $(kv "$s" kills) | $(kv "$s" shots_p50_ms) / $(kv "$s" shots_p99_ms) | $(kv "$s" tick_p50_ms) / $(kv "$s" tick_p99_ms) | $(kv "$b" corrections) |"
+      done
+    done
+  fi
 
   # Network: how play holds up on each link (netem modes).
   if [[ $mode == netem* ]]; then

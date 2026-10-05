@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use lattice_net::token::USER_DATA_BYTES;
 use lattice_net::{Channel, Client, ClientState, Config, ConnectToken};
-use lattice_sim::bot::{BotBrain, ClientConfig, InputTiming};
+use lattice_sim::bot::{BotBrain, ClientConfig, FightConfig, InputTiming};
 use lattice_sim::cli::{Args, HexKey};
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::stats::{summarize, Histogram, KeyValues};
@@ -34,6 +34,12 @@ lattice-bots: M1 bot swarm
   --mid-ms MS          render delay of mid and far entities [200]
   --fire-share F       this share of bots holds the trigger (10 shots/s, level along
                        their heading): firing load before bots that aim [0]
+  --fight-every N      every Nth bot fights: aims at the nearest enemy it draws (it
+                       tracks entities), with --aim-error, in bursts (0 = none) [0]
+  --aim-error MRAD     fighters' aim error, one standard deviation [6]
+  --classes K          latency classes (1-3): bot i is in class i % K and binds its
+                       socket in that class's port range (16384 x (class + 1) + i / K),
+                       so tc can shape each class (scripts/baseline.sh fight) [none]
   --full-every K       only every Kth bot measures (prediction, latency, tracking); the
                        rest are sink bots that play but only count what they're sent [1]
   --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
@@ -89,6 +95,13 @@ struct Totals {
     slewing: u64,
     clock_frames: u64,
     delay_changes: u64,
+    /// Fighters by latency class (or all in class 0): shots, hits confirmed,
+    /// kills confirmed, connected fighters and their RTT sum.
+    class_shots: [u64; 3],
+    class_hits: [u64; 3],
+    class_kills: [u64; 3],
+    class_n: [u64; 3],
+    class_rtt: [f64; 3],
 }
 
 impl Totals {
@@ -133,6 +146,13 @@ impl Totals {
         self.render_snaps += o.render_snaps;
         self.render_backwards += o.render_backwards;
         self.streaks += o.streaks;
+        for c in 0..3 {
+            self.class_shots[c] += o.class_shots[c];
+            self.class_hits[c] += o.class_hits[c];
+            self.class_kills[c] += o.class_kills[c];
+            self.class_n[c] += o.class_n[c];
+            self.class_rtt[c] += o.class_rtt[c];
+        }
         self.slewing += o.slewing;
         self.clock_frames += o.clock_frames;
         self.delay_changes += o.delay_changes;
@@ -233,6 +253,10 @@ struct Bot {
     sink: bool,
     /// Holds the trigger (`--fire-share`).
     trigger: bool,
+    /// Fights (`--fight-every`), and its latency class and port (`--classes`).
+    fight: Option<FightConfig>,
+    class: Option<usize>,
+    port: Option<u16>,
     /// Near (least, most) and mid render delays.
     delays: (Duration, Duration, Duration),
     /// Bound up front, before the clock starts: creating thousands of sockets
@@ -255,7 +279,7 @@ impl Bot {
         if self.net.is_none() {
             let sock = match self.sock.take() {
                 Some(s) => s,
-                None => bot_socket(server)?,
+                None => bot_socket(server, self.port)?,
             };
             let token = login.token(self.seed, clocks.system);
             self.net = Some((sock, Client::new(Config::default(), server, token, now)));
@@ -267,6 +291,7 @@ impl Bot {
             }
             brain.set_sink(self.sink);
             brain.set_trigger(self.trigger);
+            brain.set_fight(self.fight);
             self.brain = Some(brain);
         }
         let (sock, client) = self.net.as_mut().unwrap();
@@ -299,7 +324,7 @@ impl Bot {
                 while let Some((_, data)) = client.recv() {
                     brain.on_message(&data, now);
                 }
-                if self.track {
+                if self.track || self.fight.is_some() {
                     brain.core_mut().render(now, |_, _| {});
                 }
                 if self.joined_ms.is_none() && brain.welcome().is_some() {
@@ -330,6 +355,15 @@ impl Bot {
         t.failed += self.failed as u64;
         if let Some((_, client)) = &self.net {
             if let (ClientState::Connected, Some(s)) = (client.state(), client.stats()) {
+                if self.fight.is_some() {
+                    let c = self.class.unwrap_or(0);
+                    let st = brain.stats();
+                    t.class_shots[c] += st.shots;
+                    t.class_hits[c] += st.hits_confirmed;
+                    t.class_kills[c] += st.kills_confirmed;
+                    t.class_n[c] += 1;
+                    t.class_rtt[c] += s.rtt_ms as f64;
+                }
                 t.connected += 1;
                 t.pace_sum += brain.stats().pace as f64;
                 t.level_max = t.level_max.max(brain.stats().level);
@@ -377,8 +411,19 @@ impl Bot {
 /// Input latencies above this land in the histogram's last bucket.
 const LATENCY_CAP_MS: u32 = 2000;
 
-fn bot_socket(server: SocketAddr) -> std::io::Result<UdpSocket> {
-    let sock = UdpSocket::bind(if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
+/// The port range of latency class `c`: 16384 ports from 16384 x (c + 1),
+/// one `tc` u32 match (mask 0xc000) per class.
+pub fn class_port(class: usize, k: usize) -> u16 {
+    (16384 * (class + 1) + k) as u16
+}
+
+fn bot_socket(server: SocketAddr, port: Option<u16>) -> std::io::Result<UdpSocket> {
+    let port = port.unwrap_or(0);
+    let sock = if server.is_ipv4() {
+        UdpSocket::bind(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?
+    } else {
+        UdpSocket::bind(std::net::SocketAddr::from(([0u16; 8], port)))?
+    };
     sock.connect(server)?;
     sock.set_nonblocking(true)?;
     #[cfg(target_os = "linux")]
@@ -499,6 +544,9 @@ fn main() -> std::io::Result<()> {
     let seed: u64 = a.get("seed", 1);
     let track_every: usize = a.get("track-every", 20);
     let fire_share: f64 = a.get("fire-share", 0.0);
+    let fight_every: usize = a.get("fight-every", 0);
+    let aim_error: f32 = a.get::<f32>("aim-error", 6.0) / 1000.0;
+    let classes: usize = a.get::<usize>("classes", 0).min(3);
     let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
     let delays = (ms(a.get::<f64>("near-ms", 2000.0 / 30.0)), ms(a.get::<f64>("near-max-ms", 4000.0 / 30.0)), ms(a.get::<f64>("mid-ms", 200.0)));
     let full_every: usize = a.get::<usize>("full-every", 1).max(1);
@@ -517,7 +565,9 @@ fn main() -> std::io::Result<()> {
     );
     // One socket per bot, plus a few for the process itself.
     raise_open_file_limit(count as u64 + 64)?;
-    let sockets = (0..count).map(|_| bot_socket(server)).collect::<std::io::Result<Vec<_>>>()?;
+    let class_of = |i: usize| (classes > 0).then(|| i % classes);
+    let port_of = |i: usize| class_of(i).map(|c| class_port(c, i / classes));
+    let sockets = (0..count).map(|i| bot_socket(server, port_of(i))).collect::<std::io::Result<Vec<_>>>()?;
     let mut sockets = sockets.into_iter().map(Some).collect::<Vec<_>>();
     let start = Instant::now();
     let end = start + duration;
@@ -539,6 +589,9 @@ fn main() -> std::io::Result<()> {
                 sink: i % full_every != 0,
                 delays,
                 trigger: ((i * 37) % 100) < (fire_share * 100.0).round() as usize,
+                fight: (fight_every > 0 && i % fight_every == 0).then_some(FightConfig { aim_error, ..FightConfig::default() }),
+                class: class_of(i),
+                port: port_of(i),
                 sock: sockets[i].take(),
                 net: None,
                 brain: None,
@@ -713,6 +766,16 @@ fn summary_values(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) -
     }
     kv.put("render_delay_ms", format!("{:.1}", render_delay_ms(t)));
     kv.put("render_snaps", t.render_snaps);
+    for c in 0..3 {
+        if t.class_n[c] > 0 {
+            kv.put(format!("class{c}_fighters"), t.class_n[c]);
+            kv.put(format!("class{c}_shots"), t.class_shots[c]);
+            kv.put(format!("class{c}_hits"), t.class_hits[c]);
+            kv.put(format!("class{c}_kills"), t.class_kills[c]);
+            kv.put(format!("class{c}_hit_pct"), format!("{:.1}", 100.0 * t.class_hits[c] as f64 / t.class_shots[c].max(1) as f64));
+            kv.put(format!("class{c}_rtt_ms"), format!("{:.1}", t.class_rtt[c] / t.class_n[c] as f64));
+        }
+    }
     let frames: u64 = t.frames.iter().flatten().sum();
     kv.put("streak_frames_per_million", format!("{:.0}", t.streaks as f64 * 1e6 / frames.max(1) as f64));
     kv.put("clock_slewing_pct", format!("{:.2}", 100.0 * t.slewing as f64 / t.clock_frames.max(1) as f64));
@@ -855,6 +918,19 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
         t.delay_changes,
         t.streaks
     );
+    for c in 0..3 {
+        if t.class_n[c] > 0 {
+            println!(
+                "  fighters, class {c}: {} at rtt {:.1} ms | {} shots, {} hits ({:.1}%), {} kills",
+                t.class_n[c],
+                t.class_rtt[c] / t.class_n[c] as f64,
+                t.class_shots[c],
+                t.class_hits[c],
+                100.0 * t.class_hits[c] as f64 / t.class_shots[c].max(1) as f64,
+                t.class_kills[c]
+            );
+        }
+    }
     println!(
         "  input clock: {} extra inputs, {} skipped ticks, {} backlog skips | near decode errors (tracked bots) {}",
         t.clock_extra, t.clock_skipped, t.backlog_skips, t.near_decode_errors

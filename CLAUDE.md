@@ -315,7 +315,13 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
            - **contacts:** a hit makes shooter and target near-tier for each other for 5 s;
            - **swarm:** one marker and one Hurt per damaging hit, kills to both and not a bystander, tracers to the bystander, and a 200 m shooter joins its target's near tier;
            - **Windows self-check, 200 bots:** 26 hits confirmed, 5 kills, 4,618 tracers, 0 corrections.
-        4. M3d.4: fighting bots, latency classes, measurements.
+        4. **M3d.4: fighting bots, latency classes, measurements. Done** (2026-10-05):
+           - **Fighting bots** (`BotBrain::set_fight`, `lattice-bots --fight-every --aim-error`) aim at the nearest enemy they draw, in sight, with lead and Gaussian error, in bursts.
+           - **Latency classes over UDP:** `lattice-bots --classes` binds class ports (16384 × (class + 1) and up), and `scripts/baseline.sh fight` shapes each class with its own netem band. `--immortal` makes hits deal no damage, so hit rates measure aim and lag compensation.
+           - **Pass bar met** (WSL, 1k blob immortal, `baselines/2026-10-05-wsl2-fight`): 20 / 100 / 150 ms RTT classes hit 92.8 / 93.3 / 84.5%. The swarm test agrees (33 / 100 / 300 ms: 90.9 / 92.4 / 54.8%).
+           - **The cap's guarantee:** ~167 ms RTT still hits like 33 ms at the 67 ms near delay. The cap guarantees 100 ms at the 133 ms crowd delay, and more when the delay is lower.
+           - **Lethal, the same blob hits 23.8 / 21.1 / 18.7%:** what latency costs in a real fight. Shots go into the already dead (13k "too late" hits); that's not lag compensation.
+           - **Corrections in the lethal WSL runs** (144 in the blob) all fall in two windows with server tick spikes (41 and 50 ms) on the shared box. The uniform 5k is overloaded on WSL (tick p50 39 ms). Both are for bare metal (M3e).
     - **M3e** one bare-metal validation session.
   - **Pass bars:**
     - prediction stays bit-exact (0 corrections on a clean link, outside separation pushes);

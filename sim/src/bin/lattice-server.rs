@@ -66,7 +66,9 @@ lattice-server: M1 movement-only authoritative server
   --world-seed N       the world's terrain and cover (clients build it from the Welcome) [1]
   --no-separation      don't push overlapping players apart (for comparisons)
   --deaths-per-sec R   kill R random players a second, to exercise death and respawn
-                       until there are weapons (they respawn after 5 s) [0]";
+                       until there are weapons (they respawn after 5 s) [0]
+  --immortal           hits land (and are confirmed) but deal no damage: hit rates then
+                       measure aim and lag compensation, not who died first";
 
 /// Columns of per-tick timing samples: the sim phases, then egress and total.
 const COLS: usize = PHASES.len() + 2;
@@ -359,6 +361,7 @@ fn main() -> std::io::Result<()> {
         world_seed: a.get("world-seed", 1),
         separation: !a.flag("no-separation"),
         deaths_per_sec: a.get("deaths-per-sec", 0.0),
+        immortal: a.flag("immortal"),
         identity: lattice_net::ServerIdentity {
             token_key: a.get("token-key", HexKey::default()).0,
             server_id: a.get("server-id", 1),
@@ -803,6 +806,9 @@ fn summary_values(
         ("projectiles_expired", c.expired),
         ("kills", c.kills),
         ("hits_after_cover", c.hits_after_cover),
+        ("hits_too_late", c.hits_too_late),
+        ("events", c.events),
+        ("tracer_bytes", c.tracer_bytes),
         ("projectile_segments", c.segments),
         ("hit_candidates", c.candidates),
     ] {

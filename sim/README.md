@@ -446,6 +446,21 @@ One 100 ms timeline was too long for near players (it added 33 ms to every rewin
   - kills reach both and not a bystander, who does see the shooter's tracers;
   - a shooter 200 m away (mid tier) joins its target's near tier on hitting, and drops back 5 s after.
 
+**M3d.4: bots that fight, in latency classes** (`baselines/2026-10-05-wsl2-fight`).
+- **Fighting bots** (`BotBrain::set_fight`; `lattice-bots --fight-every N --aim-error MRAD`) take the nearest enemy they draw within 150 m and in sight (`hit::line_clear`, the same test as the server's after-cover count). They aim with lead (`bot::aim_at`) plus Gaussian error, firing in bursts.
+- **Latency classes:** `lattice-bots --classes K` binds class k's sockets from port 16384 × (k + 1), so one `tc` u32 match (mask 0xc000) catches a class. `scripts/baseline.sh fight` gives each class its own netem band: 10 / 50 / 75 ms one-way, i.e. 20 / 100 / 150 ms RTT. The server listens below the ranges (port 14500). With `BOTS_SSH`, the bot box is shaped: egress by source port, ingress through ifb by destination port.
+- **`lattice-server --immortal`:** hits land and are confirmed but deal no damage, so hit rates measure aim and lag compensation rather than who died first.
+
+| run | 20 ms RTT | 100 ms | 150 ms |
+|---|---|---|---|
+| 1k blob, immortal | 92.8% | 93.3% | 84.5% |
+| 1k blob, lethal | 23.8% | 21.1% | 18.7% |
+| uniform 5k, lethal (WSL overloaded: tick p50 39 ms) | 26.3% | 25.6% | 24.1% |
+
+- **Within the rewind cap, players hit alike; past it, less.** In a crowd the near delay sits at 133 ms, which puts 150 ms RTT past the 300 ms near cap. The swarm test (`latency_classes_hit_alike_within_the_cap`, deterministic) agrees: 33 / 100 / 300 ms RTT hit 90.9 / 92.4 / 54.8%.
+- **Lethal fights cost latency more,** because shots go into the already dead (13k "too late" hits in the blob). That's information arriving later, not lag compensation.
+- **The lethal WSL runs had corrections** (144 in the blob). They all fall in two report windows with server tick spikes (41 and 50 ms) on the shared box; the immortal blob and a lethal run without netem had none.
+
 ### Nearest-player search: `Grid::knn` (2026-10-04)
 
 Following `reports/Nearest player search algorithms.md`, the near and mid tiers' k-nearest search is now `Grid::knn`, in `grid.rs`.

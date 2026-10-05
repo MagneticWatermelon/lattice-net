@@ -202,6 +202,9 @@ pub struct SimConfig {
     /// Test aid until there are weapons: kill this many random living
     /// players a second (they respawn after `RESPAWN_STEPS`).
     pub deaths_per_sec: f32,
+    /// Measurement aid: hits land (and are confirmed) but deal no damage, so
+    /// hit rates measure aim and lag compensation, not who died first.
+    pub immortal: bool,
     /// Server id and token key, shared with whatever mints the clients'
     /// tokens (the bots, standing in for a login service).
     pub identity: ServerIdentity,
@@ -223,6 +226,7 @@ impl Default for SimConfig {
             world_seed: 1,
             separation: true,
             deaths_per_sec: 0.0,
+            immortal: false,
             identity: ServerIdentity { server_id: 1, token_key: lattice_net::token::DEV_TOKEN_KEY },
         }
     }
@@ -1488,6 +1492,7 @@ impl SimServer {
             spawned: self.tick,
             anchor,
             radius,
+            invulnerable: self.cfg.immortal,
             ..Body::default()
         };
         self.inputs[i] = InputQueue::default();
