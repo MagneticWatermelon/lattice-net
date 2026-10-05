@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-pub use lattice_client_core::{ClientCore, ClientStats, InputTiming, Tracker};
+pub use lattice_client_core::{ClientConfig, ClientCore, ClientStats, Entities, InputTiming};
 
 use crate::movement::{Input, MoveState, BUTTON_JUMP, BUTTON_SPRINT};
 use crate::msg::Welcome;
@@ -18,8 +18,13 @@ pub struct BotBrain {
 }
 
 impl BotBrain {
+    /// A bot that only counts entities until `enable_tracking`.
     pub fn new(seed: u64) -> Self {
-        Self { core: ClientCore::new(), ai: Wander::new(seed) }
+        Self::with_config(seed, ClientConfig { track_entities: false, ..Default::default() })
+    }
+
+    pub fn with_config(seed: u64, cfg: ClientConfig) -> Self {
+        Self { core: ClientCore::new(cfg), ai: Wander::new(seed) }
     }
 
     pub fn core(&self) -> &ClientCore {
@@ -54,8 +59,8 @@ impl BotBrain {
         self.core.enable_tracking();
     }
 
-    pub fn tracker(&self) -> Option<&Tracker> {
-        self.core.tracker()
+    pub fn entities(&self) -> Option<&Entities> {
+        self.core.entities()
     }
 
     pub fn drain_intervals(&mut self, out: &mut [Vec<u16>; 3]) {
@@ -73,7 +78,7 @@ impl BotBrain {
     /// One tick of the input clock, with the AI choosing each input.
     pub fn tick_inputs(&mut self, now: Instant) -> Option<Vec<u8>> {
         let ai = &mut self.ai;
-        self.core.tick_inputs(now, |s, w| ai.think(s, w))
+        self.core.step_inputs(now, |s, w| ai.think(s, w))
     }
 }
 

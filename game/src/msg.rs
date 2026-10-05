@@ -1,14 +1,21 @@
 //! Game messages carried in lattice-net channels. Each starts with a tag byte.
 //!
 //! ```text
-//! C->S unreliable  Input    tag | newest_seq:4 | n:1 | n × (move_x:1 move_y:1 yaw:2 pitch:2 buttons:1)   newest first
+//! C->S unreliable  Input    tag | newest_seq:4 | n:1 | n × (move_x:1 move_y:1 yaw:2 pitch:2 buttons:1 [render:2])   newest first
+//!                           n's top bit: every input carries `render`, the client's render step
+//!                           when it was made (1/64 steps, wrapping; see RENDER_UNITS)
 //! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32 | world_seed:8
-//! S->C unreliable  Snapshot tag | server_tick:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
+//! S->C unreliable  Snapshot tag | server_tick:4 | step:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
 //!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 grounded:1 | pushes:1
 //! S->C unreliable  Near     see delta.rs: deltas against acked baselines, one per tick, tagged
 //! S->C unreliable  Entities tag | server_tick:4 | tier:1 | n:1 | n × blob         (mid and far; one or more per tier per tick)
 //! far blob  (11 B) := entity:2 | cell:1 | 8 B bitpacked far-tier state (see bitpack.rs); used for mid and far
+//!   x:15 y:15 (~16 mm in the cell) | altitude:12 (16 cm) | yaw:9 | pitch:6 | flags:3 (airborne) | health:4
 //! cell := cx | cy<<4, the entity's own 512 m cell, so a blob is the same for every recipient
+//!
+//! Time: `server_tick` counts ticks; `step` counts 1/30 s movement steps (game
+//! time). They advance together at 30 Hz, but a 20 Hz tick is 1 or 2 steps,
+//! so clients render on steps. Every state a tick sends is at its `step`.
 //! ```
 //!
 //! Inputs are sent 3× redundantly, so one lost packet never starves the server.
@@ -34,7 +41,11 @@ pub const MSG_ENTITIES: u8 = 4;
 pub const INPUT_REDUNDANCY: usize = 3;
 /// Mid- and far-tier blob.
 pub const FAR_BLOB: usize = 11;
-pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1;
+pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1;
+/// Render times in inputs are in 1/`RENDER_UNITS` steps, as a wrapping u16:
+/// unambiguous within ±512 steps (±17 s) of the server's step.
+pub const RENDER_UNITS: f64 = 64.0;
+const RENDER_FLAG: u8 = 0x80;
 pub const ENTITIES_HEADER: usize = 1 + 4 + 1 + 1;
 
 /// `SnapshotHeader::wait` when `ack_seq` was consumed by a stand-in, not a real input.
@@ -98,36 +109,56 @@ impl PacketFill {
     }
 }
 
-pub fn encode_inputs(newest_seq: u32, newest_first: &[Input]) -> Vec<u8> {
-    let mut w = Writer::with_capacity(6 + newest_first.len() * 7);
+/// The wire form of a render step (see `RENDER_UNITS`).
+pub fn render_units(step: f64) -> u16 {
+    (step * RENDER_UNITS).round().rem_euclid(65536.0) as u16
+}
+
+/// How far a render time (from `render_units`) lies behind `step`, in steps;
+/// negative if it's ahead (a client can't render the future, so it's bogus).
+pub fn render_age(step: u32, render: u16) -> f64 {
+    let now = (step as u64 * RENDER_UNITS as u64) as u16;
+    now.wrapping_sub(render) as i16 as f64 / RENDER_UNITS
+}
+
+/// Each input with its render time (`render_units`). Render times are sent
+/// only when every input in the batch has one.
+pub fn encode_inputs(newest_seq: u32, newest_first: &[(Input, Option<u16>)]) -> Vec<u8> {
+    let timed = newest_first.iter().all(|(_, r)| r.is_some());
+    let mut w = Writer::with_capacity(6 + newest_first.len() * 9);
     w.u8(MSG_INPUT);
     w.u32(newest_seq);
-    w.u8(newest_first.len() as u8);
-    for i in newest_first {
+    w.u8(newest_first.len() as u8 | if timed { RENDER_FLAG } else { 0 });
+    for (i, render) in newest_first {
         w.u8(i.move_x as u8);
         w.u8(i.move_y as u8);
         w.u16(i.yaw);
         w.u16(i.pitch as u16);
         w.u8(i.buttons);
+        if timed {
+            w.u16(render.unwrap());
+        }
     }
     w.into_inner()
 }
 
-/// Calls `f(seq, input)` for each input in the batch, newest first.
-pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input)) -> Result<(), DecodeError> {
+/// Calls `f(seq, input, render)` for each input in the batch, newest first.
+pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input, Option<u16>)) -> Result<(), DecodeError> {
     let mut r = Reader::new(data);
     if r.u8()? != MSG_INPUT {
         return Err(DecodeError::Invalid);
     }
     let newest = r.u32()?;
-    let n = r.u8()? as u32;
+    let n = r.u8()?;
+    let (timed, n) = (n & RENDER_FLAG != 0, (n & !RENDER_FLAG) as u32);
     if n > newest {
         return Err(DecodeError::Invalid); // seq 0 is never a real input
     }
     for k in 0..n {
         let input =
             Input { move_x: r.u8()? as i8, move_y: r.u8()? as i8, yaw: r.u16()?, pitch: r.u16()? as i16, buttons: r.u8()? };
-        f(newest - k, input);
+        let render = if timed { Some(r.u16()?) } else { None };
+        f(newest - k, input, render);
     }
     r.finish()
 }
@@ -157,6 +188,8 @@ pub fn encode_welcome(m: &Welcome) -> Vec<u8> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SnapshotHeader {
     pub server_tick: u32,
+    /// Game time of this tick's states, in 1/30 s movement steps.
+    pub step: u32,
     /// Newest input seq the server has consumed (real or stand-in), 0 if none yet.
     pub ack_seq: u32,
     /// Real inputs the server had queued for this client when the tick began.
@@ -183,6 +216,7 @@ pub struct SnapshotHeader {
 pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
     w.u8(MSG_SNAPSHOT);
     w.u32(h.server_tick);
+    w.u32(h.step);
     w.u32(h.ack_seq);
     w.u8(h.buffered);
     w.u16(h.wait);
@@ -226,6 +260,7 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
         }
         MSG_SNAPSHOT => {
             let server_tick = r.u32()?;
+            let step = r.u32()?;
             let ack_seq = r.u32()?;
             let buffered = r.u8()?;
             let wait = r.u16()?;
@@ -241,7 +276,7 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             let own = MoveState { pos, vel, z, vz, grounded };
             let pushes = r.u8()?;
             r.finish()?;
-            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, ack_seq, buffered, wait, pace, level, client_level, own, pushes }))
+            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, step, ack_seq, buffered, wait, pace, level, client_level, own, pushes }))
         }
         MSG_ENTITIES => {
             let server_tick = r.u32()?;
@@ -259,17 +294,36 @@ fn read_f32(r: &mut Reader<'_>) -> Result<f32, DecodeError> {
     r.u32().map(f32::from_bits)
 }
 
+/// Heights in blobs: 12 bits over 0-655 m (16 cm), like the near tier's range.
+const BLOB_Z_MAX: f32 = 655.35;
+/// Blob flag: in the air (jumping or falling).
+const BLOB_AIRBORNE: u32 = 1;
+
+/// A mid/far entity as a blob carries it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlobState {
+    pub entity: u16,
+    pub pos: [f32; 2],
+    /// Height of the feet.
+    pub z: f32,
+    /// Radians.
+    pub yaw: f32,
+    pub pitch: f32,
+    pub airborne: bool,
+}
+
 /// Far-tier encoding: position relative to the entity's own 512 m cell, so the
 /// blob is identical for every recipient and is serialized once per tick.
-pub fn encode_blob(entity: u16, pos: [f32; 2], yaw: u16) -> Blob {
+pub fn encode_blob(entity: u16, s: &MoveState, yaw: u16, pitch: i16) -> Blob {
+    let pos = s.pos;
     let (cx, cy) = blob_cell(pos);
     let mut bw = BitWriter::new();
     bw.write(quantize(pos[0] - cx as f32 * BLOB_CELL, 0.0, BLOB_CELL, 15), 15);
     bw.write(quantize(pos[1] - cy as f32 * BLOB_CELL, 0.0, BLOB_CELL, 15), 15);
-    bw.write(0, 12); // altitude: flat world for now
+    bw.write(quantize(s.z, 0.0, BLOB_Z_MAX, 12), 12);
     bw.write(yaw as u32 >> 7, 9);
-    bw.write(32, 6); // pitch: level
-    bw.write(0, 3); // stance / seat flags
+    bw.write((pitch as i32 + 32768) as u32 >> 10, 6);
+    bw.write(if s.grounded { 0 } else { BLOB_AIRBORNE }, 3); // stance / seat flags
     bw.write(15, 4); // health bucket: full
     let bits = bw.finish();
 
@@ -285,8 +339,7 @@ fn blob_cell(pos: [f32; 2]) -> (u32, u32) {
     (cell(pos[0]), cell(pos[1]))
 }
 
-/// Returns (entity, pos, yaw radians).
-pub fn decode_blob(b: &[u8]) -> Result<(u16, [f32; 2], f32), DecodeError> {
+pub fn decode_blob(b: &[u8]) -> Result<BlobState, DecodeError> {
     if b.len() != FAR_BLOB {
         return Err(DecodeError::Invalid);
     }
@@ -295,9 +348,12 @@ pub fn decode_blob(b: &[u8]) -> Result<(u16, [f32; 2], f32), DecodeError> {
     let mut r = BitReader::new(&b[3..]);
     let x = cx * BLOB_CELL + dequantize(r.read(15)?, 0.0, BLOB_CELL, 15);
     let y = cy * BLOB_CELL + dequantize(r.read(15)?, 0.0, BLOB_CELL, 15);
-    let _z = r.read(12)?;
+    let z = dequantize(r.read(12)?, 0.0, BLOB_Z_MAX, 12);
     let yaw = dequantize_angle(r.read(9)?, 9);
-    Ok((entity, [x, y], yaw))
+    // Pitch is the top 6 bits of the input's i16 (-pi/2..pi/2 maps to its range).
+    let pitch = ((r.read(6)? << 10) as f32 + 512.0 - 32768.0) / 32768.0 * std::f32::consts::FRAC_PI_2;
+    let airborne = r.read(3)? & BLOB_AIRBORNE != 0;
+    Ok(BlobState { entity, pos: [x, y], z, yaw, pitch, airborne })
 }
 
 #[cfg(test)]
@@ -307,15 +363,32 @@ mod tests {
     #[test]
     fn inputs_roundtrip() {
         let ins = [
-            Input { move_x: -127, move_y: 5, yaw: 40000, pitch: -32767, buttons: 3 },
-            Input { move_x: 3, move_y: 127, yaw: 1, pitch: 1200, buttons: 0 },
+            (Input { move_x: -127, move_y: 5, yaw: 40000, pitch: -32767, buttons: 3 }, Some(65535)),
+            (Input { move_x: 3, move_y: 127, yaw: 1, pitch: 1200, buttons: 0 }, Some(7)),
         ];
         let bytes = encode_inputs(10, &ins);
+        assert_eq!(bytes.len(), 6 + 2 * 9);
         let mut got = Vec::new();
-        decode_inputs(&bytes, |s, i| got.push((s, i))).unwrap();
-        assert_eq!(got, vec![(10, ins[0]), (9, ins[1])]);
+        decode_inputs(&bytes, |s, i, r| got.push((s, i, r))).unwrap();
+        assert_eq!(got, vec![(10, ins[0].0, ins[0].1), (9, ins[1].0, ins[1].1)]);
+        // Without a render time on every input, none is sent.
+        let untimed = [ins[0], (ins[1].0, None)];
+        let bytes = encode_inputs(10, &untimed);
+        assert_eq!(bytes.len(), 6 + 2 * 7);
+        got.clear();
+        decode_inputs(&bytes, |s, i, r| got.push((s, i, r))).unwrap();
+        assert_eq!(got, vec![(10, ins[0].0, None), (9, ins[1].0, None)]);
         // a batch reaching back past seq 1 is malformed
-        assert!(decode_inputs(&encode_inputs(1, &ins), |_, _| {}).is_err());
+        assert!(decode_inputs(&encode_inputs(1, &ins), |_, _, _| {}).is_err());
+    }
+
+    #[test]
+    fn render_times_wrap_and_measure_age() {
+        assert_eq!(render_age(1000, render_units(997.5)), 2.5);
+        // Across the u16 wrap (1024 steps of 1/64).
+        assert_eq!(render_age(1030, render_units(1020.25)), 9.75);
+        assert_eq!(render_age(5, render_units(5.0)), 0.0);
+        assert!(render_age(100, render_units(101.0)) < 0.0, "ahead of the server");
     }
 
     #[test]
@@ -325,6 +398,7 @@ mod tests {
 
         let h = SnapshotHeader {
             server_tick: 99,
+            step: 120,
             ack_seq: 42,
             buffered: 2,
             wait: 333,
@@ -341,8 +415,9 @@ mod tests {
 
         let mut wr = Writer::default();
         write_entities_header(&mut wr, 99, Tier::Mid, 2);
-        wr.bytes(&encode_blob(1, [10.0, 20.0], 0));
-        wr.bytes(&encode_blob(2, [30.0, 40.0], 0));
+        let at = |x, y| MoveState { pos: [x, y], ..Default::default() };
+        wr.bytes(&encode_blob(1, &at(10.0, 20.0), 0, 0));
+        wr.bytes(&encode_blob(2, &at(30.0, 40.0), 0, 0));
         assert_eq!(wr.len(), ENTITIES_HEADER + 2 * FAR_BLOB);
         let Ok(ServerMsg::Entities { server_tick: 99, tier: Tier::Mid, blobs }) = decode_server_msg(wr.as_slice()) else {
             panic!()
@@ -359,11 +434,19 @@ mod tests {
     fn blob_precision_across_cells() {
         for &(x, y) in &[(0.0, 0.0), (511.99, 512.0), (4096.3, 7000.7), (WORLD_SIZE, WORLD_SIZE)] {
             let yaw = 12345u16;
-            let (id, p, a) = decode_blob(&encode_blob(9, [x, y], yaw)).unwrap();
-            assert_eq!(id, 9);
-            assert!((p[0] - x).abs() < 0.02 && (p[1] - y).abs() < 0.02, "{x},{y} -> {p:?}");
-            let want = yaw as f32 / 65536.0 * std::f32::consts::TAU;
-            assert!((a - want).abs() < 0.013, "{a} vs {want}");
+            for (z, grounded, pitch) in [(0.0, true, 0i16), (163.27, false, -16384), (655.0, true, 32767)] {
+                let s = MoveState { pos: [x, y], z, grounded, ..Default::default() };
+                let b = decode_blob(&encode_blob(9, &s, yaw, pitch)).unwrap();
+                assert_eq!(b.entity, 9);
+                let p = b.pos;
+                assert!((p[0] - x).abs() < 0.02 && (p[1] - y).abs() < 0.02, "{x},{y} -> {p:?}");
+                let want = yaw as f32 / 65536.0 * std::f32::consts::TAU;
+                assert!((b.yaw - want).abs() < 0.013, "{} vs {want}", b.yaw);
+                assert!((b.z - z).abs() <= 0.08, "height to 16 cm: {z} -> {}", b.z);
+                let want = pitch as f32 / 32768.0 * std::f32::consts::FRAC_PI_2;
+                assert!((b.pitch - want).abs() < 0.03, "pitch {want} -> {}", b.pitch);
+                assert_eq!(b.airborne, !grounded);
+            }
         }
     }
 }

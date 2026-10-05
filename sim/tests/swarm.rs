@@ -1,6 +1,7 @@
 //! Real `lattice_net::Client`s + `BotBrain`s against `SimServer`, in simulated
 //! time, with no sockets. Lockstep: every bot ticks, then the server ticks.
 
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,30 @@ struct Swarm {
     hold_bot0: Option<Vec<(SocketAddr, Vec<u8>)>>,
     /// The server's datagrams from its latest tick, in send order.
     last_out: Vec<(SocketAddr, usize)>,
+    /// Server->bot datagrams are held back 0..=`down_jitter` bot steps, uniformly.
+    down_jitter: u32,
+    to_bots: Vec<(Instant, SocketAddr, Vec<u8>)>,
+    /// Tracking bots draw a frame every step, checked against `truth`.
+    render: bool,
+    /// What tracking bots drew vs the server's states at the render step, in
+    /// meters, by tier (from `render_from` on).
+    render_err: [Vec<f32>; 3],
+    render_from: Option<Instant>,
+    /// Render steps went backwards (across all bots).
+    render_backwards: u64,
+    last_render: HashMap<usize, f64>,
+    /// The server's states by game step (the last 3 s), for checking renders.
+    truth: VecDeque<(u32, HashMap<u16, [f32; 3]>)>,
+}
+
+/// Where `entity` really was at (fractional) game step `r`: the server's
+/// states either side, interpolated.
+fn truth_at(truth: &VecDeque<(u32, HashMap<u16, [f32; 3]>)>, entity: u16, r: f64) -> Option<[f32; 3]> {
+    let i = truth.partition_point(|(s, _)| (*s as f64) <= r);
+    let (a, b) = (truth.get(i.checked_sub(1)?)?, truth.get(i)?);
+    let (pa, pb) = (a.1.get(&entity)?, b.1.get(&entity)?);
+    let t = ((r - a.0 as f64) / (b.0 - a.0) as f64) as f32;
+    Some([0, 1, 2].map(|k| pa[k] + (pb[k] - pa[k]) * t))
 }
 
 impl Swarm {
@@ -78,6 +103,14 @@ impl Swarm {
             stall_bot0: false,
             hold_bot0: None,
             last_out: Vec::new(),
+            down_jitter: 0,
+            to_bots: Vec::new(),
+            render: false,
+            render_err: Default::default(),
+            render_from: None,
+            render_backwards: 0,
+            last_render: HashMap::new(),
+            truth: VecDeque::new(),
         }
     }
 
@@ -86,6 +119,19 @@ impl Swarm {
         let now = self.now;
         self.to_server.extend(self.delayed.drain(..).map(|(a, p)| (a, now, p)));
         let server_addr: SocketAddr = SERVER.parse().unwrap();
+        // Held-back server datagrams that are due.
+        let mut k = 0;
+        while k < self.to_bots.len() {
+            if self.to_bots[k].0 <= now {
+                let (_, to, pkt) = self.to_bots.swap_remove(k);
+                if let Some((_, client, _)) = self.bots.iter_mut().find(|(a, _, _)| *a == to) {
+                    client.receive(server_addr, &pkt, now);
+                }
+            } else {
+                k += 1;
+            }
+        }
+        let measuring = self.render_from.is_some_and(|t| now >= t);
         for (i, (addr, client, brain)) in self.bots.iter_mut().enumerate() {
             if i == 0 && self.stall_bot0 {
                 continue;
@@ -94,6 +140,20 @@ impl Swarm {
             if client.state() == ClientState::Connected {
                 while let Some((_, data)) = client.recv() {
                     brain.on_message(&data, self.now);
+                }
+                if self.render && brain.entities().is_some() {
+                    let core = brain.core_mut();
+                    if let Some(r) = core.render_step(now) {
+                        let last = self.last_render.insert(i, r);
+                        self.render_backwards += last.is_some_and(|l| r < l) as u64;
+                        let (truth, err) = (&self.truth, &mut self.render_err);
+                        core.render(now, |e, st| {
+                            if let (true, Some(t)) = (measuring, truth_at(truth, e, r)) {
+                                let d = [0, 1, 2].map(|k| st.pos[k] - t[k]);
+                                err[st.tier as usize].push((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt());
+                            }
+                        });
+                    }
                 }
                 if let Some(batch) = brain.tick_inputs(self.now) {
                     client.send(Channel::Unreliable, batch).unwrap();
@@ -132,8 +192,23 @@ impl Swarm {
             if self.rng.chance(self.loss) {
                 continue;
             }
-            if let Some((_, client, _)) = self.bots.iter_mut().find(|(a, _, _)| *a == to) {
+            if self.down_jitter > 0 {
+                let extra = (self.rng.next_u64() % (self.down_jitter as u64 + 1)) as u32;
+                self.to_bots.push((self.now + Duration::from_secs(1) / TICK_HZ * extra, to, pkt));
+            } else if let Some((_, client, _)) = self.bots.iter_mut().find(|(a, _, _)| *a == to) {
                 client.receive(server_addr, &pkt, self.now);
+            }
+        }
+        if self.render {
+            let states = self
+                .bots
+                .iter()
+                .filter_map(|(_, _, b)| b.welcome().map(|w| w.entity))
+                .filter_map(|e| self.server.entity_state(e).map(|s| (e, [s.pos[0], s.pos[1], s.z])))
+                .collect();
+            self.truth.push_back((self.server.step_number(), states));
+            if self.truth.len() > 3 * TICK_HZ as usize {
+                self.truth.pop_front();
             }
         }
         self.now += Duration::from_secs(1) / TICK_HZ;
@@ -390,7 +465,7 @@ fn tiers_follow_distance_and_update_at_their_rates() {
     for _ in 0..3 * TICK_HZ {
         s.step();
     }
-    let t = s.bots[0].2.tracker().unwrap();
+    let t = s.bots[0].2.entities().unwrap();
     let (_, k0) = line_index(&s, 0, 26.0);
     for i in 1..s.bots.len() {
         let (entity, k) = line_index(&s, i, 26.0);
@@ -427,7 +502,7 @@ fn squadmates_are_near_tier_at_any_distance() {
         s.step();
     }
     // Squads are by spawn order: line index k is in squad k / 2.
-    let t = s.bots[0].2.tracker().unwrap();
+    let t = s.bots[0].2.entities().unwrap();
     let (_, k0) = line_index(&s, 0, 300.0);
     for i in 1..3 {
         let (entity, k) = line_index(&s, i, 300.0);
@@ -567,7 +642,7 @@ fn assert_near_states_exact(s: &Swarm) -> usize {
     let mut checked = 0;
     for (_, _, b) in &s.bots {
         assert_eq!(b.stats().near_decode_errors, 0, "a delta referred to a baseline the client lacks");
-        let t = b.tracker().unwrap();
+        let t = b.entities().unwrap();
         for (_, _, other) in &s.bots {
             let entity = other.welcome().unwrap().entity;
             let Some(k) = t.get(entity).filter(|k| k.tier == Tier::Near) else { continue };
@@ -718,4 +793,169 @@ fn crowds_are_pushed_apart_and_clients_tell_pushes_from_mispredictions() {
     assert!(pushes > 0, "pushes reach the clients");
     assert!(max_push < 0.25, "a push correction is a couple of ticks of push at most: {max_push} m");
     assert_eq!(s.corrections(), 0, "and nothing else mispredicts");
+}
+
+/// Every bot tracks and draws a frame each step; measured from `warm` on.
+fn render_swarm(n: usize, cfg: SimConfig, warm: Duration) -> Swarm {
+    let mut s = Swarm::with_config(n, cfg);
+    for (_, _, b) in &mut s.bots {
+        b.enable_tracking();
+    }
+    s.render = true;
+    s.render_from = Some(s.now + warm);
+    s
+}
+
+/// Entity-frames by tier and how they were drawn, over all bots.
+fn frames(s: &Swarm) -> [[u64; 4]; 3] {
+    let mut f = [[0u64; 4]; 3];
+    for (_, _, b) in &s.bots {
+        for (t, row) in b.entities().unwrap().smooth.frames.iter().enumerate() {
+            for (h, n) in row.iter().enumerate() {
+                f[t][h] += n;
+            }
+        }
+    }
+    f
+}
+
+fn pct(v: &mut [f32], p: f64) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f32::total_cmp);
+    v[((v.len() as f64 * p).ceil() as usize).clamp(1, v.len()) - 1]
+}
+
+struct RenderReport {
+    /// Share of entity-frames interpolated, by tier.
+    interpolated: [f64; 3],
+    /// Render error vs the server's states, p50 and p99 by tier, in meters.
+    err: [(f32, f32); 3],
+    /// Pops (mm) p50 and p99 by tier.
+    pops: [(f32, f32); 3],
+    /// Mean actual render delay, in steps.
+    delay: f64,
+}
+
+/// Runs `secs` of measurement after the warm-up, and reports.
+fn measure_render(s: &mut Swarm, warm_steps: u32, secs: u32) -> RenderReport {
+    for _ in 0..warm_steps {
+        s.step();
+    }
+    let f0 = frames(s);
+    let mut pops: [Vec<u16>; 3] = Default::default();
+    let d0: (u64, f64) = s.bots.iter().fold((0, 0.0), |a, (_, _, b)| (a.0 + b.stats().render_frames, a.1 + b.stats().render_delay_sum));
+    for (_, _, b) in &mut s.bots {
+        b.core_mut().drain_pops(&mut Default::default());
+    }
+    for _ in 0..secs * TICK_HZ {
+        s.step();
+    }
+    for (_, _, b) in &mut s.bots {
+        b.core_mut().drain_pops(&mut pops);
+    }
+    let d1: (u64, f64) = s.bots.iter().fold((0, 0.0), |a, (_, _, b)| (a.0 + b.stats().render_frames, a.1 + b.stats().render_delay_sum));
+    let f1 = frames(s);
+    let mut r = RenderReport { interpolated: [0.0; 3], err: [(0.0, 0.0); 3], pops: [(0.0, 0.0); 3], delay: (d1.1 - d0.1) / (d1.0 - d0.0).max(1) as f64 };
+    for t in 0..3 {
+        let n: u64 = (0..4).map(|h| f1[t][h] - f0[t][h]).sum();
+        r.interpolated[t] = (f1[t][0] - f0[t][0]) as f64 / n.max(1) as f64;
+        let e = &mut s.render_err[t];
+        r.err[t] = (pct(e, 0.5), pct(e, 0.99));
+        let mut p: Vec<f32> = pops[t].iter().map(|&x| x as f32).collect();
+        r.pops[t] = (pct(&mut p, 0.5), pct(&mut p, 0.99));
+        eprintln!(
+            "{:?}: {:.2}% interpolated of {n} frames, error p50 {:.3} p99 {:.3} m ({} samples), pops p50 {} p99 {} mm",
+            [Tier::Near, Tier::Mid, Tier::Far][t],
+            r.interpolated[t] * 100.0,
+            r.err[t].0,
+            r.err[t].1,
+            e.len(),
+            r.pops[t].0,
+            r.pops[t].1
+        );
+    }
+    eprintln!("render delay {:.2} steps", r.delay);
+    r
+}
+
+#[test]
+fn render_timeline_on_a_clean_link() {
+    // 60 bots roaming a 500 m disk: every tier in play.
+    let cfg = SimConfig { spawn: SpawnMode::Disk(500.0), ..Default::default() };
+    let mut s = render_swarm(60, cfg, Duration::from_secs(3));
+    let r = measure_render(&mut s, 3 * TICK_HZ, 8);
+    assert_eq!(s.render_backwards, 0, "render time never goes backwards");
+    assert_eq!(s.corrections(), 0);
+    assert!((r.delay - 3.0).abs() < 0.05, "100 ms behind the newest step: {}", r.delay);
+    // Near and mid are drawn between samples, to their quantization (near
+    // ~8 mm; mid 16 mm across and 16 cm in height).
+    assert!(r.interpolated[0] >= 0.999 && r.interpolated[1] >= 0.99, "{:?}", r.interpolated);
+    assert!(r.err[0].1 < 0.02 && r.err[1].1 < 0.2, "{:?}", r.err);
+    assert_eq!((r.pops[0].1, r.pops[1].1), (0.0, 0.0), "nothing near or mid pops");
+    // Far (2 Hz) is mostly extrapolated: errors of a few meters at 500+ m.
+    assert!(r.err[2].0 < 1.0 && r.err[2].1 < 8.0, "{:?}", r.err[2]);
+    // Lag compensation's rewind on a zero-latency link: the render delay
+    // (100 ms) + the spare input (33 ms) + waiting for the next tick (33 ms).
+    let rewind = s.server.take_rewind().summary();
+    eprintln!("rewind p50 {} p99 {} max {} ms", rewind.p50, rewind.p99, rewind.max);
+    assert_eq!((rewind.p50, rewind.max), (167, 167));
+    assert_eq!(s.server.counters().render_ahead, 0);
+}
+
+#[test]
+fn render_timeline_rides_out_loss_and_jitter() {
+    let cfg = SimConfig { spawn: SpawnMode::Disk(500.0), ..Default::default() };
+    let mut s = render_swarm(60, cfg, Duration::from_secs(3));
+    s.loss = 0.05;
+    s.down_jitter = 1;
+    let r = measure_render(&mut s, 3 * TICK_HZ, 8);
+    assert_eq!(s.render_backwards, 0);
+    let snaps: u64 = s.bots.iter().map(|(_, _, b)| b.core().render_clock().snaps).sum();
+    assert_eq!(snaps, 0, "jitter and loss are slewed through, never jumped");
+    // 5% loss with a step of jitter: near still interpolates (a lost update
+    // is bridged by the next), mid extrapolates over its lost updates.
+    assert!(r.interpolated[0] >= 0.99 && r.interpolated[1] >= 0.9, "{:?}", r.interpolated);
+    assert!(r.err[0].1 < 0.05 && r.err[1].1 < 0.5, "{:?}", r.err);
+    let rewind = s.server.take_rewind().summary();
+    eprintln!("rewind p50 {} p99 {} max {} ms", rewind.p50, rewind.p99, rewind.max);
+    assert!(rewind.p50 == 167 && rewind.p99 <= 233, "{rewind:?}");
+}
+
+#[test]
+#[ignore = "measurement: cargo test --release --test swarm render_delay_sweep -- --ignored --nocapture"]
+fn render_delay_sweep() {
+    for ms in [67, 100, 133] {
+        for (loss, jitter) in [(0.0, 0), (0.05, 1)] {
+            let cfg = SimConfig { spawn: SpawnMode::Disk(500.0), ..Default::default() };
+            let mut s = render_swarm(60, cfg, Duration::from_secs(3));
+            let client = lattice_sim::bot::ClientConfig { interp_delay: Duration::from_millis(ms), track_entities: true };
+            for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
+                *b = BotBrain::with_config(i as u64, client.clone());
+            }
+            (s.loss, s.down_jitter) = (loss, jitter);
+            eprintln!("== delay {ms} ms, loss {loss}, jitter {jitter} step");
+            measure_render(&mut s, 3 * TICK_HZ, 8);
+            let rewind = s.server.take_rewind().summary();
+            eprintln!("rewind p50 {} p99 {} ms", rewind.p50, rewind.p99);
+        }
+    }
+}
+
+#[test]
+fn render_timeline_at_20_hz_and_dilation() {
+    // The ladder's bottom: 20 Hz ticks of 1 or 2 steps, at pace 0.8.
+    let cfg = SimConfig { spawn: SpawnMode::Disk(300.0), ..Default::default() };
+    let mut s = render_swarm(30, cfg, Duration::from_secs(32));
+    s.fake_load = Some(0.95);
+    let r = measure_render(&mut s, 32 * TICK_HZ, 6);
+    assert_eq!(s.server.level(), lattice_sim::ladder::MAX_LEVEL);
+    assert_eq!(s.render_backwards, 0);
+    assert!((r.delay - 3.0).abs() < 0.05, "{}", r.delay);
+    // Rendering on steps, not ticks: near moves as smoothly as at 30 Hz.
+    // (On ticks, 1-or-2-step ticks would be off by ~10 cm at a run.) Mid and
+    // far update every 5 and 30 ticks down here: mostly extrapolated.
+    assert!(r.interpolated[0] >= 0.99 && r.err[0].1 < 0.02, "{:?} {:?}", r.interpolated, r.err);
+    assert!(r.err[1].1 < 3.0, "{:?}", r.err);
 }

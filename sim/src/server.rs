@@ -118,6 +118,8 @@ pub struct DebugFrame {
 }
 /// Input waits above 1 s land in the histogram's last bucket (0.1 ms units).
 const INPUT_WAIT_CAP: u32 = 10_000;
+/// Rewinds above 1 s land in the histogram's last bucket (ms).
+const REWIND_CAP_MS: u32 = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SpawnMode {
@@ -210,6 +212,8 @@ pub struct Counters {
     /// with a stand-in: the last input for `GRACE_TICKS`, then a frozen one.
     pub repeated: u64,
     pub frozen: u64,
+    /// Inputs whose render time was ahead of the server's step (bogus).
+    pub render_ahead: u64,
     /// Real inputs that arrived for a seq a stand-in had already consumed.
     pub late_inputs: u64,
     /// Inputs dropped unapplied because the client queued too many.
@@ -333,8 +337,12 @@ struct InputQueue {
     /// Wait of the newest consumed seq, arrival to applied, in 0.1 ms, or
     /// `WAIT_STAND_IN`. Set by `advance`; reported in the snapshot.
     wait: u16,
-    /// Sorted by seq, all > last_seq, each with its first arrival time.
-    pending: VecDeque<(u32, Input, Instant)>,
+    /// How far behind its step the newest applied input's render time was,
+    /// in steps: what lag compensation would rewind for it. Set by `advance`
+    /// when the input carried a render time.
+    rewind: Option<f64>,
+    /// Sorted by seq, all > last_seq, each with its render time and first arrival.
+    pending: VecDeque<(u32, Input, Option<u16>, Instant)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,7 +366,7 @@ enum Step {
 }
 
 impl InputQueue {
-    fn push(&mut self, seq: u32, input: Input, arrived: Instant) -> Push {
+    fn push(&mut self, seq: u32, input: Input, render: Option<u16>, arrived: Instant) -> Push {
         if seq <= self.last_seq {
             let age = self.last_seq - seq;
             if age < 32 && self.stand_ins & (1 << age) != 0 {
@@ -367,13 +375,13 @@ impl InputQueue {
             }
             return Push::Duplicate;
         }
-        let at = self.pending.partition_point(|&(s, _, _)| s < seq);
-        if self.pending.get(at).is_some_and(|&(s, _, _)| s == seq) {
+        let at = self.pending.partition_point(|&(s, ..)| s < seq);
+        if self.pending.get(at).is_some_and(|&(s, ..)| s == seq) {
             return Push::Duplicate; // keep the first arrival
         }
-        self.pending.insert(at, (seq, input, arrived));
+        self.pending.insert(at, (seq, input, render, arrived));
         if self.pending.len() > MAX_QUEUED_INPUTS {
-            let (s, _, _) = self.pending.pop_front().unwrap();
+            let (s, ..) = self.pending.pop_front().unwrap();
             self.consume(s, false);
             return Push::Discarded;
         }
@@ -386,12 +394,15 @@ impl InputQueue {
         self.last_seq = seq;
     }
 
-    /// Advance one tick, consuming seq `last_seq + 1`. `now` is the tick's time.
-    fn advance(&mut self, body: &mut Body, now: Instant, world: &World) -> Step {
+    /// Advance one movement step, consuming seq `last_seq + 1`. `now` is the
+    /// tick's time, `step` the game step the result is at.
+    fn advance(&mut self, body: &mut Body, now: Instant, step_no: u32, world: &World) -> Step {
         self.depth = self.pending.len().min(u8::MAX as usize) as u8;
+        self.rewind = None;
         let next = self.last_seq + 1;
-        let (input, kind) = if self.pending.front().is_some_and(|&(s, _, _)| s == next) {
-            let (_, input, arrived) = self.pending.pop_front().unwrap();
+        let (input, kind) = if self.pending.front().is_some_and(|&(s, ..)| s == next) {
+            let (_, input, render, arrived) = self.pending.pop_front().unwrap();
+            self.rewind = render.map(|r| msg::render_age(step_no, r));
             let waited = now.saturating_duration_since(arrived).as_micros() / 100;
             self.wait = waited.min(WAIT_STAND_IN as u128 - 1) as u16;
             self.last = input;
@@ -424,6 +435,8 @@ pub struct SimServer {
     cfg: SimConfig,
     net: Server,
     tick: u32,
+    /// Game time in 1/30 s movement steps, as of the last tick's states.
+    step: u32,
     bodies: Vec<Body>,
     inputs: Vec<InputQueue>,
     /// Serialized once per tick: every entity's quantized near state, kept
@@ -449,6 +462,8 @@ pub struct SimServer {
     shard_events: Vec<Vec<(Instant, ServerEvent)>>,
     /// Input waits (arrival -> applied) since the last `take_input_wait`, in 0.1 ms.
     input_wait: Histogram,
+    /// Rewinds (see `InputQueue::rewind`) since the last `take_rewind`, in ms of game time.
+    rewind: Histogram,
     /// The shared spatial index (all entities).
     grid: Grid,
     /// Networking's views of it: entities due this tick for mid and for far.
@@ -494,9 +509,11 @@ impl SimServer {
             snapshots: vec![Vec::new(); cfg.shards],
             shard_events: (0..cfg.shards).map(|_| Vec::new()).collect(),
             input_wait: Histogram::new(INPUT_WAIT_CAP),
+            rewind: Histogram::new(REWIND_CAP_MS),
             rng: Rng::new(cfg.seed),
             cfg,
             tick: 0,
+            step: 0,
             bodies: Vec::new(),
             inputs: Vec::new(),
             near_hist: vec![Vec::new(); NEAR_HISTORY],
@@ -606,6 +623,17 @@ impl SimServer {
         std::mem::replace(&mut self.input_wait, Histogram::new(INPUT_WAIT_CAP))
     }
 
+    /// How far back each applied input's render time was (what lag
+    /// compensation rewinds), in ms of game time, since the last call.
+    pub fn take_rewind(&mut self) -> Histogram {
+        std::mem::replace(&mut self.rewind, Histogram::new(REWIND_CAP_MS))
+    }
+
+    /// Game time of the last tick's states, in movement steps.
+    pub fn step_number(&self) -> u32 {
+        self.step
+    }
+
     /// The quantized near state `entity` had at `tick`, if still in history.
     pub fn near_state_at(&self, entity: u16, tick: u32) -> Option<NearQ> {
         let slot = tick as usize % NEAR_HISTORY;
@@ -689,6 +717,7 @@ impl SimServer {
 
         // 2. movement
         let world = &*self.world;
+        let base_step = self.step;
         let [applied, repeated, frozen] = self
             .bodies
             .par_iter_mut()
@@ -699,8 +728,8 @@ impl SimServer {
                 // A tick consumes `steps` 1/30 s movement steps (1 or 2 at 20 Hz).
                 let queued = q.pending.len();
                 let mut n = [0u64; 3];
-                for _ in 0..steps {
-                    match q.advance(b, now, world) {
+                for k in 0..steps {
+                    match q.advance(b, now, base_step + k + 1, world) {
                         Step::Applied => n[0] += 1,
                         Step::Repeated => n[1] += 1,
                         Step::Frozen => n[2] += 1,
@@ -712,12 +741,19 @@ impl SimServer {
                 n
             })
             .reduce(|| [0u64; 3], |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]]);
+        self.step = base_step + steps;
         self.counters.inputs_applied += applied;
         self.counters.repeated += repeated;
         self.counters.frozen += frozen;
         for (b, q) in self.bodies.iter().zip(&self.inputs) {
             if b.alive && q.last_seq > 0 && q.wait != WAIT_STAND_IN {
                 self.input_wait.record(q.wait as u32);
+            }
+            if let (true, Some(r)) = (b.alive, q.rewind) {
+                // A render time ahead of the server is bogus (a client can't
+                // see the future): counted, and treated as no rewind.
+                self.counters.render_ahead += (r < 0.0) as u64;
+                self.rewind.record((r.max(0.0) * 1000.0 / TICK_HZ as f64).round() as u32);
             }
         }
         lap(2);
@@ -811,7 +847,7 @@ impl SimServer {
                 *near = NearQ::new(&b.state, b.yaw, b.pitch);
                 let prev = tick.wrapping_sub(1);
                 if due(e, tick, mid_period) || due(e, tick, far_period) || due(e, prev, far_period) {
-                    *far = msg::encode_blob(e, b.state.pos, b.yaw);
+                    *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch);
                 }
             });
         lap(6);
@@ -823,6 +859,7 @@ impl SimServer {
         let view = View {
             cfg: &self.interest,
             tick,
+            step: self.step,
             pace: (self.pace_now * 1000.0).round() as u16,
             level: self.ladder.level(),
             watch: self.watch.filter(|_| tick % 6 == 0),
@@ -981,7 +1018,7 @@ impl SimServer {
     fn on_input(&mut self, client: ClientId, data: &[u8], arrived: Instant) {
         let Some(&e) = self.by_client.get(&client) else { return };
         let (q, c) = (&mut self.inputs[e as usize], &mut self.counters);
-        let ok = msg::decode_inputs(data, |seq, input| match q.push(seq, input, arrived) {
+        let ok = msg::decode_inputs(data, |seq, input, render| match q.push(seq, input, render, arrived) {
             Push::Late => c.late_inputs += 1,
             Push::Discarded => c.discarded_inputs += 1,
             Push::Queued | Push::Duplicate => {}
@@ -1020,6 +1057,7 @@ impl SimServer {
 struct View<'a> {
     cfg: &'a InterestConfig,
     tick: u32,
+    step: u32,
     bodies: &'a [Body],
     inputs: &'a [InputQueue],
     near_hist: &'a [Vec<NearQ>],
@@ -1229,6 +1267,7 @@ impl View<'_> {
             &mut w,
             &SnapshotHeader {
                 server_tick: tick,
+                step: self.step,
                 ack_seq: inp.last_seq,
                 buffered: inp.depth,
                 wait: inp.wait,
@@ -1362,14 +1401,14 @@ mod tests {
         let ms = |n| t + Duration::from_millis(n);
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
-        q.push(1, fwd(), ms(0));
-        q.push(1, fwd(), ms(20)); // a redundant copy doesn't reset the clock
-        q.push(2, fwd(), ms(20));
-        assert_eq!(q.advance(&mut b, ms(33), &tw()), Step::Applied);
+        q.push(1, fwd(), None, ms(0));
+        q.push(1, fwd(), None, ms(20)); // a redundant copy doesn't reset the clock
+        q.push(2, fwd(), None, ms(20));
+        assert_eq!(q.advance(&mut b, ms(33), 1, &tw()), Step::Applied);
         assert_eq!(q.wait, 330, "33 ms in 0.1 ms units");
-        assert_eq!(q.advance(&mut b, ms(66), &tw()), Step::Applied);
+        assert_eq!(q.advance(&mut b, ms(66), 1, &tw()), Step::Applied);
         assert_eq!(q.wait, 460);
-        assert_eq!(q.advance(&mut b, ms(99), &tw()), Step::Repeated);
+        assert_eq!(q.advance(&mut b, ms(99), 1, &tw()), Step::Repeated);
         assert_eq!(q.wait, WAIT_STAND_IN);
     }
 
@@ -1379,24 +1418,24 @@ mod tests {
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
 
-        assert_eq!(q.advance(&mut b, t, &tw()), Step::Waiting, "no input yet consumes nothing");
+        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Waiting, "no input yet consumes nothing");
         assert_eq!(q.last_seq, 0);
-        assert_eq!(q.push(2, fwd(), t), Push::Queued);
-        assert_eq!(q.push(1, fwd(), t), Push::Queued);
-        assert_eq!(q.push(2, fwd(), t), Push::Duplicate);
-        assert_eq!(q.advance(&mut b, t, &tw()), Step::Applied);
+        assert_eq!(q.push(2, fwd(), None, t), Push::Queued);
+        assert_eq!(q.push(1, fwd(), None, t), Push::Queued);
+        assert_eq!(q.push(2, fwd(), None, t), Push::Duplicate);
+        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Applied);
         assert_eq!((q.last_seq, q.depth), (1, 2));
-        assert_eq!(q.push(1, fwd(), t), Push::Duplicate, "already applied");
-        assert_eq!(q.advance(&mut b, t, &tw()), Step::Applied);
+        assert_eq!(q.push(1, fwd(), None, t), Push::Duplicate, "already applied");
+        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Applied);
         assert_eq!(q.last_seq, 2);
 
         // A backlog drains one per tick; overflow discards the oldest unapplied.
         for s in 3..=3 + MAX_QUEUED_INPUTS as u32 {
-            q.push(s, fwd(), t);
+            q.push(s, fwd(), None, t);
         }
         assert_eq!(q.pending.len(), MAX_QUEUED_INPUTS);
         assert_eq!(q.last_seq, 3, "seq 3 was discarded");
-        assert_eq!(q.advance(&mut b, t, &tw()), Step::Applied);
+        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Applied);
         assert_eq!(q.last_seq, 4);
     }
 
@@ -1405,11 +1444,11 @@ mod tests {
         let t = Instant::now();
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
-        q.push(1, fwd(), t);
-        assert_eq!(q.advance(&mut b, t, &tw()), Step::Applied);
+        q.push(1, fwd(), None, t);
+        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Applied);
 
         // Lag switch: nothing arrives for 10 ticks.
-        let kinds: Vec<Step> = (0..10).map(|_| q.advance(&mut b, t, &tw())).collect();
+        let kinds: Vec<Step> = (0..10).map(|_| q.advance(&mut b, t, 1, &tw())).collect();
         assert_eq!(&kinds[..2], &[Step::Repeated; 2]);
         assert!(kinds[2..].iter().all(|&k| k == Step::Frozen));
         assert_eq!(q.last_seq, 11, "every stand-in consumes a seq");
@@ -1418,18 +1457,18 @@ mod tests {
 
         // The held-back burst arrives: all of it is too late to move anyone.
         for s in 2..=11 {
-            assert_eq!(q.push(s, fwd(), t), Push::Late);
-            assert_eq!(q.push(s, fwd(), t), Push::Duplicate, "a late seq counts once");
+            assert_eq!(q.push(s, fwd(), None, t), Push::Late);
+            assert_eq!(q.push(s, fwd(), None, t), Push::Duplicate, "a late seq counts once");
         }
         assert!(q.pending.is_empty());
         for _ in 0..30 {
-            q.advance(&mut b, t, &tw());
+            q.advance(&mut b, t, 1, &tw());
         }
         assert!(b.state.vel == [0.0, 0.0] && b.state.pos[0] - frozen_at[0] < 0.5, "{:?}", b.state);
 
         // Fresh input for the next seq resumes movement and resets the grace.
-        assert_eq!(q.push(q.last_seq + 1, fwd(), t), Push::Queued);
-        assert_eq!(q.advance(&mut b, t, &tw()), Step::Applied);
+        assert_eq!(q.push(q.last_seq + 1, fwd(), None, t), Push::Queued);
+        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Applied);
         assert_eq!(q.starved_run, 0);
         assert!(b.state.vel[0] > 0.0);
     }

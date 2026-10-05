@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use lattice_net::token::USER_DATA_BYTES;
 use lattice_net::{Channel, Client, ClientState, Config, ConnectToken};
-use lattice_sim::bot::{BotBrain, InputTiming};
+use lattice_sim::bot::{BotBrain, ClientConfig, InputTiming};
 use lattice_sim::cli::{Args, HexKey};
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::stats::{summarize, Histogram, KeyValues};
@@ -27,7 +27,9 @@ lattice-bots: M1 bot swarm
   --ramp R             bots joining per second (0 = all at once) [0]
   --duration S         seconds from start until every bot disconnects [60]
   --report S           report interval, seconds [5]
-  --track-every N      every Nth bot tracks entities to measure update intervals per tier [20]
+  --track-every N      every Nth bot tracks entities and draws a frame every tick, to measure
+                       update intervals and smoothness per tier [20]
+  --interp-ms MS       render delay behind the newest server step [100]
   --full-every K       only every Kth bot measures (prediction, latency, tracking); the
                        rest are sink bots that play but only count what they're sent [1]
   --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
@@ -71,6 +73,14 @@ struct Totals {
     /// Bot threads' time spent working vs. elapsed, summed over threads.
     busy_us: u64,
     wall_us: u64,
+    /// Tracked bots' entity-frames by tier and how they were drawn
+    /// (interpolated, extrapolated, held, new).
+    frames: [[u64; 4]; 3],
+    render_frames: u64,
+    /// Summed actual render delay behind the newest step, in steps.
+    render_delay_sum: f64,
+    render_snaps: u64,
+    render_backwards: u64,
 }
 
 impl Totals {
@@ -105,6 +115,15 @@ impl Totals {
         self.tick_overruns += o.tick_overruns;
         self.busy_us += o.busy_us;
         self.wall_us += o.wall_us;
+        for (a, b) in self.frames.iter_mut().zip(&o.frames) {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x += y;
+            }
+        }
+        self.render_frames += o.render_frames;
+        self.render_delay_sum += o.render_delay_sum;
+        self.render_snaps += o.render_snaps;
+        self.render_backwards += o.render_backwards;
     }
 }
 
@@ -126,6 +145,9 @@ struct Latency {
     applied: Histogram,
     /// Update interval per entity, in ms, per tier (tracked bots only).
     intervals: [Histogram; 3],
+    /// Pops per tier: what each arriving sample moved on screen before
+    /// smoothing, in mm (tracked bots only).
+    pops: [Histogram; 3],
 }
 
 impl Latency {
@@ -135,6 +157,7 @@ impl Latency {
             wait: Histogram::new(LATENCY_CAP_MS * 10),
             applied: Histogram::new(LATENCY_CAP_MS),
             intervals: std::array::from_fn(|_| Histogram::new(10_000)),
+            pops: std::array::from_fn(|_| Histogram::new(20_000)),
         }
     }
 
@@ -151,6 +174,9 @@ impl Latency {
         self.wait.merge(&o.wait);
         self.applied.merge(&o.applied);
         for (a, b) in self.intervals.iter_mut().zip(&o.intervals) {
+            a.merge(b);
+        }
+        for (a, b) in self.pops.iter_mut().zip(&o.pops) {
             a.merge(b);
         }
     }
@@ -193,6 +219,7 @@ struct Bot {
     seed: u64,
     track: bool,
     sink: bool,
+    interp: Duration,
     /// Bound up front, before the clock starts: creating thousands of sockets
     /// inside the first tick overran the swarm and delivered its inputs late.
     sock: Option<UdpSocket>,
@@ -217,7 +244,8 @@ impl Bot {
             };
             let token = login.token(self.seed, clocks.system);
             self.net = Some((sock, Client::new(Config::default(), server, token, now)));
-            let mut brain = BotBrain::new(self.seed);
+            let client = ClientConfig { interp_delay: self.interp, track_entities: false };
+            let mut brain = BotBrain::with_config(self.seed, client);
             if self.track {
                 brain.enable_tracking();
             }
@@ -253,6 +281,9 @@ impl Bot {
             ClientState::Connected => {
                 while let Some((_, data)) = client.recv() {
                     brain.on_message(&data, now);
+                }
+                if self.track {
+                    brain.core_mut().render(now, |_, _| {});
                 }
                 if self.joined_ms.is_none() && brain.welcome().is_some() {
                     let ms = (now - self.start_at).as_millis() as u32;
@@ -308,6 +339,17 @@ impl Bot {
         t.correction_err_max = t.correction_err_max.max(s.correction_error_max);
         t.push_corrections += s.push_corrections;
         t.push_err_max = t.push_err_max.max(s.push_error_max);
+        t.render_frames += s.render_frames;
+        t.render_delay_sum += s.render_delay_sum;
+        let clock = brain.core().render_clock();
+        (t.render_snaps, t.render_backwards) = (t.render_snaps + clock.snaps, t.render_backwards + clock.backwards);
+        if let Some(e) = brain.core().entities() {
+            for (a, b) in t.frames.iter_mut().zip(&e.smooth.frames) {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x += y;
+                }
+            }
+        }
         t.bytes_down += self.bytes.0;
         t.bytes_up += self.bytes.1;
     }
@@ -437,6 +479,7 @@ fn main() -> std::io::Result<()> {
     let report = Duration::from_secs_f64(a.get("report", 5.0));
     let seed: u64 = a.get("seed", 1);
     let track_every: usize = a.get("track-every", 20);
+    let interp = Duration::from_secs_f64(a.get::<f64>("interp-ms", 100.0) / 1000.0);
     let full_every: usize = a.get::<usize>("full-every", 1).max(1);
     let key: HexKey = a.get("token-key", HexKey::default());
     let summary_path: Option<String> = a.opt("summary");
@@ -473,6 +516,7 @@ fn main() -> std::io::Result<()> {
                 seed: seed.wrapping_mul(1_000_003).wrapping_add(i as u64),
                 track: track_every > 0 && i % track_every == 0 && i % full_every == 0,
                 sink: i % full_every != 0,
+                interp,
                 sock: sockets[i].take(),
                 net: None,
                 brain: None,
@@ -492,6 +536,7 @@ fn main() -> std::io::Result<()> {
             let mut latency = Latency::new();
             let mut samples = Vec::new();
             let mut intervals: [Vec<u16>; 3] = Default::default();
+            let mut pops: [Vec<u16>; 3] = Default::default();
             let mut last_publish = start;
             loop {
                 let now = Instant::now();
@@ -518,6 +563,10 @@ fn main() -> std::io::Result<()> {
                         let hz = lattice_sim::ladder::RUNGS[(brain.stats().level as usize).min(lattice_sim::ladder::MAX_LEVEL as usize)].tick_hz;
                         for (h, v) in latency.intervals.iter_mut().zip(&mut intervals) {
                             v.drain(..).for_each(|g| h.record(g as u32 * 1000 / hz));
+                        }
+                        brain.core_mut().drain_pops(&mut pops);
+                        for (h, v) in latency.pops.iter_mut().zip(&mut pops) {
+                            v.drain(..).for_each(|mm| h.record(mm as u32));
                         }
                     }
                 }
@@ -629,6 +678,20 @@ fn summary_values(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) -
     for (name, h) in ["near", "mid", "far"].iter().zip(&latency.intervals) {
         hist(&format!("{name}_interval"), h, 1.0);
     }
+    for (i, tier) in ["near", "mid", "far"].iter().enumerate() {
+        let f = &t.frames[i];
+        let n = f.iter().sum::<u64>().max(1) as f64;
+        kv.put(format!("{tier}_interpolated_pct"), format!("{:.2}", 100.0 * f[0] as f64 / n));
+        kv.put(format!("{tier}_extrapolated_pct"), format!("{:.2}", 100.0 * f[1] as f64 / n));
+        kv.put(format!("{tier}_held_pct"), format!("{:.2}", 100.0 * f[2] as f64 / n));
+        kv.put(format!("{tier}_new_pct"), format!("{:.2}", 100.0 * f[3] as f64 / n));
+        let p = latency.pops[i].summary();
+        kv.put(format!("{tier}_pop_p50_mm"), p.p50);
+        kv.put(format!("{tier}_pop_p99_mm"), p.p99);
+    }
+    kv.put("render_delay_ms", format!("{:.1}", render_delay_ms(t)));
+    kv.put("render_snaps", t.render_snaps);
+    kv.put("render_backwards", t.render_backwards);
     kv.put("clock_extra", t.clock_extra);
     kv.put("clock_skipped", t.clock_skipped);
     kv.put("backlog_skips", t.backlog_skips);
@@ -638,6 +701,11 @@ fn summary_values(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) -
     kv.put("swarm_busy_pct", format!("{:.0}", 100.0 * t.busy_us as f64 / t.wall_us.max(1) as f64));
     kv.put("swarm_overruns", t.tick_overruns);
     kv
+}
+
+/// Mean actual render delay of tracked bots, in ms of game time.
+fn render_delay_ms(t: &Totals) -> f64 {
+    t.render_delay_sum / t.render_frames.max(1) as f64 * 1000.0 / TICK_HZ as f64
 }
 
 fn snapshot(shared: &Mutex<Shared>) -> (Totals, Vec<u32>, Latency) {
@@ -737,6 +805,27 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
     for (name, h) in ["near", "mid", "far"].iter().zip(&latency.intervals) {
         line(&format!("{name} entity update interval (tracked bots)"), h, 1.0);
     }
+    for (i, name) in ["near", "mid", "far"].iter().enumerate() {
+        let f = &t.frames[i];
+        let n = f.iter().sum::<u64>().max(1) as f64;
+        let p = latency.pops[i].summary();
+        println!(
+            "  {name} drawn (tracked bots): {:.2}% interpolated, {:.2}% extrapolated, {:.2}% held, {:.2}% new | pops p50 {} p99 {} max {} mm",
+            100.0 * f[0] as f64 / n,
+            100.0 * f[1] as f64 / n,
+            100.0 * f[2] as f64 / n,
+            100.0 * f[3] as f64 / n,
+            p.p50,
+            p.p99,
+            p.max
+        );
+    }
+    println!(
+        "  render delay {:.1} ms behind the newest step, clock snaps {} (backwards {})",
+        render_delay_ms(t),
+        t.render_snaps,
+        t.render_backwards
+    );
     println!(
         "  input clock: {} extra inputs, {} skipped ticks, {} backlog skips | near decode errors (tracked bots) {}",
         t.clock_extra, t.clock_skipped, t.backlog_skips, t.near_decode_errors

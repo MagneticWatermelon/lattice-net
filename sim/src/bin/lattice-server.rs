@@ -477,6 +477,8 @@ fn main() -> std::io::Result<()> {
     let mut inbound: Vec<Vec<InDatagram>> = vec![Vec::new(); shards];
     // Server-side input waits after warmup, 0.1 ms units.
     let mut kept_wait = Histogram::new(10_000);
+    // What lag compensation would rewind for each applied input, in ms.
+    let mut kept_rewind = Histogram::new(1000);
     let mut kept_overruns = 0u64;
     let mut out: Vec<Vec<Datagram>> = vec![Vec::new(); shards];
     let mut window = Window::new(start, &sim, &net);
@@ -589,8 +591,10 @@ fn main() -> std::io::Result<()> {
 
         if done - window.start >= report {
             let wait = sim.take_input_wait();
+            let rewind = sim.take_rewind();
             if steady(&warm, &cool) {
                 kept_wait.merge(&wait);
+                kept_rewind.merge(&rewind);
             }
             window.report(done - start, &sim, &wait, &net, csv.as_mut())?;
             window = Window::new(done, &sim, &net);
@@ -612,8 +616,10 @@ fn main() -> std::io::Result<()> {
 
     if window.rows.len() > 1 {
         let wait = sim.take_input_wait();
+        let rewind = sim.take_rewind();
         if warm.is_some() && cool.is_none() {
             kept_wait.merge(&wait);
+            kept_rewind.merge(&rewind);
         }
         window.report(Instant::now() - start, &sim, &wait, &net, csv.as_mut())?;
     }
@@ -625,6 +631,10 @@ fn main() -> std::io::Result<()> {
         steady_state.net_end.get_or_insert_with(|| net_snapshot(&net));
         let run = RunInfo { egress, peak_clients, overruns: kept_overruns };
         let mut kv = summary_values(&kept, &run, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net, &steady_state);
+        let r = kept_rewind.summary();
+        kv.put("rewind_p50_ms", r.p50);
+        kv.put("rewind_p99_ms", r.p99);
+        kv.put("rewind_mean_ms", format!("{:.1}", kept_rewind.mean()));
         // Where a split phase's time goes: wall = longest task + dispatch and
         // waiting; longest - work / threads = imbalance.
         for (i, name) in ["ingress", "assembly", "transport", "egress"].iter().enumerate() {
@@ -636,6 +646,16 @@ fn main() -> std::io::Result<()> {
         kv.write(&path)?;
     }
     print_summary(&mut kept, kept_overruns, peak_clients, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net);
+    let r = kept_rewind.summary();
+    println!(
+        "  rewind (applied step - the input's render step, what lag compensation would rewind): p50 {} p99 {} max {} mean {:.1} ms (n={}), render times ahead of the server {}",
+        r.p50,
+        r.p99,
+        r.max,
+        kept_rewind.mean(),
+        kept_rewind.len(),
+        sim.counters().render_ahead
+    );
     Ok(())
 }
 

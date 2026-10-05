@@ -323,6 +323,25 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
       echo "| $id #$r | $joined | $join_p99 | $(kv "$b" input_applied_p50_ms) / $(kv "$b" input_applied_p99_ms) | $(kv "$b" server_wait_p50_ms) | $(kv "$s" repeated) / $(kv "$s" frozen) | $(kv "$s" late_inputs) / $(kv "$s" discarded_inputs) | $(kv "$b" corrections) | $(kv "$b" push_corrections) | $(kv "$b" near_decode_errors) | $(kv "$b" swarm_busy_pct)% |"
     done
   done
+  # Smoothness: how tracked bots drew everyone else, and the server's rewind.
+  echo
+  echo "## Smoothness"
+  echo
+  echo "Tracked bots draw a frame every tick, 100 ms behind the newest server step (lattice-bots --interp-ms). Shares of entity-frames interpolated / extrapolated / held (updates stopped); pops are what an arriving update moved on screen before smoothing. Rewind is applied step - the input's render step: what lag compensation would rewind."
+  echo
+  echo "| run | near % | mid % | far % | pops p99 near / mid / far (mm) | render delay | clock snaps | rewind p50 / p99 (ms) |"
+  echo "|---|---|---|---|---|---|---|---|"
+  for r in $(seq 1 "$repeat"); do
+    for spec in "${runs[@]}"; do
+      IFS='|' read -r id _ _ _ _ <<< "$spec"
+      b=$dir/$id-$r/bots.summary
+      s=$dir/$id-$r/server.summary
+      [ -f "$b" ] || continue
+      tier() { echo "$(kv "$b" "${1}_interpolated_pct") / $(kv "$b" "${1}_extrapolated_pct") / $(kv "$b" "${1}_held_pct")"; }
+      echo "| $id #$r | $(tier near) | $(tier mid) | $(tier far) | $(kv "$b" near_pop_p99_mm) / $(kv "$b" mid_pop_p99_mm) / $(kv "$b" far_pop_p99_mm) | $(kv "$b" render_delay_ms) | $(kv "$b" render_snaps) | $(kv "$s" rewind_p50_ms) / $(kv "$s" rewind_p99_ms) |"
+    done
+  done
+
   # Network: how play holds up on each link (netem modes).
   if [[ $mode == netem* ]]; then
     echo
