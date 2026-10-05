@@ -67,6 +67,13 @@ impl MoveState {
     }
 }
 
+/// What a dead player's inputs move: nothing. It can still look around (yaw
+/// and pitch are kept), and its body settles under gravity like any other.
+/// The server and the client's prediction both apply this while dead.
+pub fn dead_input(i: Input) -> Input {
+    Input { yaw: i.yaw, pitch: i.pitch, ..Input::default() }
+}
+
 pub fn step(world: &World, s: MoveState, input: Input) -> MoveState {
     let mut wish = [input.move_x as f32 / 127.0, input.move_y as f32 / 127.0];
     let len = (wish[0] * wish[0] + wish[1] * wish[1]).sqrt();

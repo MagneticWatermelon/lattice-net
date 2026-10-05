@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 use lattice_client_core::{How, RenderState};
+use lattice_game::faction::faction;
 use lattice_game::movement::{HEIGHT, RADIUS};
 use lattice_game::world::World;
 
@@ -35,6 +36,8 @@ pub struct Looks {
     capsule: Handle<Mesh>,
     nose: Handle<Mesh>,
     tiers: [Handle<StandardMaterial>; 3],
+    factions: [Handle<StandardMaterial>; 3],
+    dead: Handle<StandardMaterial>,
     held: Handle<StandardMaterial>,
     new: Handle<StandardMaterial>,
     plain: Handle<StandardMaterial>,
@@ -42,6 +45,9 @@ pub struct Looks {
     own_ghost: Handle<StandardMaterial>,
     nose_mat: Handle<StandardMaterial>,
 }
+
+/// Faction colors (red, blue, purple), by `faction(entity)`.
+pub const FACTION_COLORS: [Color; 3] = [Color::srgb(0.85, 0.25, 0.2), Color::srgb(0.25, 0.45, 0.9), Color::srgb(0.6, 0.3, 0.85)];
 
 /// A drawn player; its nose (a child) shows where it looks.
 #[derive(Component)]
@@ -52,6 +58,8 @@ pub struct Nose;
 pub fn setup_looks(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut mats: ResMut<Assets<StandardMaterial>>) {
     let mut mat = |c: Color| mats.add(StandardMaterial { base_color: c, perceptual_roughness: 0.8, ..default() });
     let tiers = [mat(Color::srgb(0.25, 0.85, 0.35)), mat(Color::srgb(0.95, 0.75, 0.2)), mat(Color::srgb(0.9, 0.3, 0.25))];
+    let factions = FACTION_COLORS.map(&mut mat);
+    let dead = mat(Color::srgb(0.25, 0.25, 0.27));
     let (held, new, plain, nose_mat) = (mat(Color::srgb(0.5, 0.5, 0.5)), mat(Color::srgb(0.95, 0.95, 0.95)), mat(Color::srgb(0.35, 0.5, 0.85)), mat(Color::srgb(0.1, 0.1, 0.12)));
     let mut ghost = |c: Color| {
         mats.add(StandardMaterial { base_color: c, alpha_mode: AlphaMode::Blend, unlit: true, ..default() })
@@ -60,6 +68,8 @@ pub fn setup_looks(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut
         capsule: meshes.add(Capsule3d::new(RADIUS, HEIGHT - 2.0 * RADIUS)),
         nose: meshes.add(Cuboid::new(0.12, 0.12, 0.3)),
         tiers,
+        factions,
+        dead,
         held,
         new,
         plain,
@@ -143,9 +153,14 @@ pub fn stream_terrain(view: Res<View>, mut scene: ResMut<Scene>, mut meshes: Res
     }
 }
 
-fn tier_material<'a>(looks: &'a Looks, s: &RenderState, colors: bool) -> &'a Handle<StandardMaterial> {
-    if !colors {
-        return &looks.plain;
+/// Faction colors, or with `tier_colors` how it's drawn (tier, held, new).
+/// The dead are grey either way.
+fn material<'a>(looks: &'a Looks, entity: u16, s: &RenderState, tier_colors: bool) -> &'a Handle<StandardMaterial> {
+    if s.dead {
+        return &looks.dead;
+    }
+    if !tier_colors {
+        return &looks.factions[faction(entity) as usize];
     }
     match s.how {
         How::Held => &looks.held,
@@ -154,8 +169,13 @@ fn tier_material<'a>(looks: &'a Looks, s: &RenderState, colors: bool) -> &'a Han
     }
 }
 
-/// Centered capsule transform for feet at game (x, y, z), facing `yaw`.
-fn body(pos: [f32; 3], yaw: f32) -> Transform {
+/// Centered capsule transform for feet at game (x, y, z), facing `yaw`;
+/// the dead lie on the ground, along where they faced.
+fn body(pos: [f32; 3], yaw: f32, dead: bool) -> Transform {
+    if dead {
+        let rot = yaw_rotation(yaw) * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        return Transform::from_translation(to_bevy(pos[0], pos[1], pos[2] + RADIUS)).with_rotation(rot);
+    }
     Transform::from_translation(to_bevy(pos[0], pos[1], pos[2] + HEIGHT / 2.0)).with_rotation(yaw_rotation(yaw))
 }
 
@@ -189,8 +209,8 @@ pub fn sync_players(
     for (e, s) in &drawn {
         seen.insert(*e);
         scene.drawn[s.tier as usize] += 1;
-        let t = body(s.pos, s.yaw);
-        let mat = tier_material(&looks, s, settings.tier_colors).clone();
+        let t = body(s.pos, s.yaw, s.dead);
+        let mat = material(&looks, *e, s, settings.tier_colors).clone();
         match scene.players.get(e).copied() {
             Some(id) => {
                 if let Ok((mut tf, mut m, children)) = bodies.get_mut(id) {
@@ -224,16 +244,16 @@ pub fn sync_players(
 
     // Server ghosts: where the newest samples say everyone is, and where the
     // server has us.
-    let wanted: Vec<(u16, [f32; 3], f32)> = if settings.ghosts {
+    let wanted: Vec<(u16, [f32; 3], f32, bool)> = if settings.ghosts {
         let ents = net.0.core.entities();
-        drawn.iter().filter_map(|(e, _)| ents.and_then(|x| x.newest(*e)).map(|n| (*e, n.pos, n.yaw))).collect()
+        drawn.iter().filter_map(|(e, _)| ents.and_then(|x| x.newest(*e)).map(|n| (*e, n.pos, n.yaw, n.dead))).collect()
     } else {
         Vec::new()
     };
     let mut keep = std::collections::HashSet::with_capacity(wanted.len());
-    for (e, pos, yaw) in wanted {
+    for (e, pos, yaw, dead) in wanted {
         keep.insert(e);
-        let t = body(pos, yaw);
+        let t = body(pos, yaw, dead);
         match scene.ghosts.get(&e) {
             Some(&id) => {
                 commands.entity(id).insert(t);
@@ -254,10 +274,10 @@ pub fn sync_players(
     let own_server = net.0.core.server_own().filter(|_| settings.ghosts);
     match (own_server, scene.own_ghost) {
         (Some((s, _)), Some(id)) => {
-            commands.entity(id).insert(body([s.pos[0], s.pos[1], s.z], 0.0));
+            commands.entity(id).insert(body([s.pos[0], s.pos[1], s.z], 0.0, false));
         }
         (Some((s, _)), None) => {
-            let t = body([s.pos[0], s.pos[1], s.z], 0.0);
+            let t = body([s.pos[0], s.pos[1], s.z], 0.0, false);
             scene.own_ghost = Some(commands.spawn((Mesh3d(looks.capsule.clone()), MeshMaterial3d(looks.own_ghost.clone()), t)).id());
         }
         (None, Some(id)) => {
@@ -282,16 +302,28 @@ pub fn own_body(
     mut commands: Commands,
     view: Res<View>,
     looks: Res<Looks>,
-    mut q: Query<(Entity, &mut Transform), With<OwnBody>>,
+    net: Res<Net>,
+    mut q: Query<(Entity, &mut Transform, &mut MeshMaterial3d<StandardMaterial>), With<OwnBody>>,
 ) {
     let show = view.mode != crate::controls::Mode::FirstPerson && view.has_body;
-    let t = body(view.feet, view.yaw);
+    let dead = net.0.core.is_dead();
+    let t = body(view.feet, view.yaw, dead);
+    let mat = match net.0.core.welcome() {
+        _ if dead => looks.dead.clone(),
+        Some(w) => looks.factions[faction(w.entity) as usize].clone(),
+        None => looks.plain.clone(),
+    };
     match (q.single_mut(), show) {
-        (Ok((_, mut tf)), true) => *tf = t,
-        (Ok((e, _)), false) => commands.entity(e).despawn(),
+        (Ok((_, mut tf, mut m)), true) => {
+            *tf = t;
+            if m.0 != mat {
+                m.0 = mat;
+            }
+        }
+        (Ok((e, _, _)), false) => commands.entity(e).despawn(),
         (Err(_), true) => {
             commands
-                .spawn((OwnBody, Mesh3d(looks.capsule.clone()), MeshMaterial3d(looks.plain.clone()), t))
+                .spawn((OwnBody, Mesh3d(looks.capsule.clone()), MeshMaterial3d(mat), t))
                 .with_child((Nose, Mesh3d(looks.nose.clone()), MeshMaterial3d(looks.nose_mat.clone()), nose(view.pitch)));
         }
         (Err(_), false) => {}

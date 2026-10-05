@@ -190,7 +190,7 @@ fn main() {
         .insert_resource(Frame { now, start: now, secs: 0.0, dt: 0.0 })
         .insert_resource(Settings {
             ghosts: args.ghosts,
-            tier_colors: true,
+            tier_colors: false,
             net_graph: true,
             shadows: args.shadows,
             autoplay: args.autoplay,
@@ -215,6 +215,7 @@ fn main() {
                 scene::sync_players,
                 scene::own_body,
                 hud::update,
+                hud::vitals,
                 shots,
             )
                 .chain(),

@@ -80,7 +80,7 @@ impl Wander {
 }
 
 /// Click grabs the mouse, Esc releases it; V cycles views; G, T and N
-/// toggle the ghosts, tier colors and net graph.
+/// toggle the ghosts, tier colors (vs faction colors) and net graph.
 pub fn toggles(
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,

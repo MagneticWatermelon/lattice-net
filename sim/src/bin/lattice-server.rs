@@ -64,7 +64,9 @@ lattice-server: M1 movement-only authoritative server
   --server-id N        the server id tokens are minted for [1]
   --seed N             spawn RNG seed [1]
   --world-seed N       the world's terrain and cover (clients build it from the Welcome) [1]
-  --no-separation      don't push overlapping players apart (for comparisons)";
+  --no-separation      don't push overlapping players apart (for comparisons)
+  --deaths-per-sec R   kill R random players a second, to exercise death and respawn
+                       until there are weapons (they respawn after 5 s) [0]";
 
 /// Columns of per-tick timing samples: the sim phases, then egress and total.
 const COLS: usize = PHASES.len() + 2;
@@ -356,6 +358,7 @@ fn main() -> std::io::Result<()> {
         seed: a.get("seed", 1),
         world_seed: a.get("world-seed", 1),
         separation: !a.flag("no-separation"),
+        deaths_per_sec: a.get("deaths-per-sec", 0.0),
         identity: lattice_net::ServerIdentity {
             token_key: a.get("token-key", HexKey::default()).0,
             server_id: a.get("server-id", 1),
@@ -780,6 +783,8 @@ fn summary_values(
     // Whole run.
     kv.put("spawns", c.spawns);
     kv.put("despawns", c.despawns);
+    kv.put("deaths", c.deaths);
+    kv.put("respawns", c.respawns);
     kv.put("joins_deferred", sim.net().deferred_accepts());
     kv.put("bad_messages", c.bad_messages);
     kv.put("recv_errors", net.recv_errors.load(Relaxed));
@@ -982,10 +987,12 @@ fn print_summary(
         println!("  {:<10} {:>8} {:>8} {:>8}", col_name(i), ms(s.p50), ms(s.p99), ms(s.max));
     }
     println!(
-        "  overruns {over} | spawns {} despawns {} ({} joins deferred) | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
+        "  overruns {over} | spawns {} despawns {} ({} joins deferred) | deaths {} respawns {} | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
         c.spawns,
         c.despawns,
         sim.net().deferred_accepts(),
+        c.deaths,
+        c.respawns,
         c.repeated,
         c.frozen,
         c.late_inputs,

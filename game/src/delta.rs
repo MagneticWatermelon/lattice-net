@@ -49,6 +49,8 @@ const Z: [u32; 4] = [0, 6, 10, 17];
 const Z_MAX: f32 = 655.35;
 /// `NearQ::flags` bit: in the air (jumping or falling).
 pub const FLAG_AIRBORNE: u8 = 1;
+/// `NearQ::flags` bit: dead (health 0), waiting to respawn.
+pub const FLAG_DEAD: u8 = 2;
 
 /// An entity's near-tier state, quantized: the unit deltas are taken in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,7 +69,7 @@ pub struct NearQ {
 }
 
 impl NearQ {
-    pub fn new(s: &MoveState, yaw: u16, pitch: i16) -> Self {
+    pub fn new(s: &MoveState, yaw: u16, pitch: i16, health: u8) -> Self {
         let axis = |v: f32| {
             let c = ((v / CELL) as u32).min(CELLS - 1);
             c << 16 | quantize(v - c as f32 * CELL, 0.0, CELL, 16)
@@ -80,8 +82,8 @@ impl NearQ {
             vy: quantize(s.vel[1], -MAX_SPEED, MAX_SPEED, 10) as u16,
             yaw: yaw >> 4,
             pitch: ((pitch as i32 + 32768) >> 8) as u8,
-            flags: if s.grounded { 0 } else { FLAG_AIRBORNE },
-            health: 100,
+            flags: if s.grounded { 0 } else { FLAG_AIRBORNE } | if health == 0 { FLAG_DEAD } else { 0 },
+            health: health.min(127),
         }
     }
 
@@ -287,7 +289,7 @@ mod tests {
 
     fn q(x: f32, y: f32, vx: f32, vy: f32, yaw: u16) -> NearQ {
         let z = (x * 0.013) % 150.0; // terrain-like heights, varying with x
-        NearQ::new(&MoveState { pos: [x, y], vel: [vx, vy], z, vz: 0.0, grounded: true }, yaw, 0)
+        NearQ::new(&MoveState { pos: [x, y], vel: [vx, vy], z, vz: 0.0, grounded: true }, yaw, 0, 100)
     }
 
     #[test]

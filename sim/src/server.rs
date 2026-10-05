@@ -31,6 +31,7 @@ use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{self, step, Input, MoveState, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
+use lattice_game::faction::{faction, FACTIONS, MAX_HEALTH, RESPAWN_STEPS};
 use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
 use crate::msg::{self, Blob, PacketFill, RenderTime, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
 use crate::rng::Rng;
@@ -176,6 +177,9 @@ pub struct SimConfig {
     pub world_seed: u64,
     /// Push overlapping players apart (soft separation). Off only for comparisons.
     pub separation: bool,
+    /// Test aid until there are weapons: kill this many random living
+    /// players a second (they respawn after `RESPAWN_STEPS`).
+    pub deaths_per_sec: f32,
     /// Server id and token key, shared with whatever mints the clients'
     /// tokens (the bots, standing in for a login service).
     pub identity: ServerIdentity,
@@ -196,6 +200,7 @@ impl Default for SimConfig {
             seed: 1,
             world_seed: 1,
             separation: true,
+            deaths_per_sec: 0.0,
             identity: ServerIdentity { server_id: 1, token_key: lattice_net::token::DEV_TOKEN_KEY },
         }
     }
@@ -207,6 +212,8 @@ pub struct Counters {
     pub ticks: u64,
     pub spawns: u64,
     pub despawns: u64,
+    pub deaths: u64,
+    pub respawns: u64,
     pub inputs_applied: u64,
     /// Entity-ticks where the next input hadn't arrived. Each consumes that seq
     /// with a stand-in: the last input for `GRACE_TICKS`, then a frozen one.
@@ -250,6 +257,7 @@ pub struct Counters {
 
 #[derive(Clone, Copy)]
 struct Body {
+    /// The slot holds a connected player (dead or not).
     alive: bool,
     state: MoveState,
     yaw: u16,
@@ -259,11 +267,39 @@ struct Body {
     squad: u32,
     /// Tick this entity (slot) spawned: an older baseline belongs to a previous occupant.
     spawned: u32,
+    /// 0 is dead: inputs move nothing until the respawn.
+    health: u8,
+    /// While dead, the step it respawns at.
+    respawn_at: Option<u32>,
+    /// Deaths and respawns (wrapping), for the snapshot.
+    life: u8,
+    /// Where it was sent to play (respawns come back there).
+    anchor: [f32; 2],
+    radius: f32,
 }
 
 impl Default for Body {
     fn default() -> Self {
-        Self { alive: false, state: MoveState::default(), yaw: 0, pitch: 0, pushes: 0, squad: NO_SQUAD, spawned: 0 }
+        Self {
+            alive: false,
+            state: MoveState::default(),
+            yaw: 0,
+            pitch: 0,
+            pushes: 0,
+            squad: NO_SQUAD,
+            spawned: 0,
+            health: MAX_HEALTH,
+            respawn_at: None,
+            life: 0,
+            anchor: [0.0; 2],
+            radius: 0.0,
+        }
+    }
+}
+
+impl Body {
+    fn dead(&self) -> bool {
+        self.health == 0
     }
 }
 
@@ -409,7 +445,7 @@ impl InputQueue {
             self.starved_run = 0;
             (input, Step::Applied)
         } else if self.last_seq == 0 {
-            body.state = step(world, body.state, Input::default());
+            body.state = step(world, body.state, Input::default()); // (dead or not, it stands)
             return Step::Waiting;
         } else {
             // The input for `next` is late or lost: a stand-in takes its seq, and
@@ -423,7 +459,7 @@ impl InputQueue {
                 (Input { yaw: self.last.yaw, ..Default::default() }, Step::Frozen)
             }
         };
-        body.state = step(world, body.state, input);
+        body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input });
         body.yaw = input.yaw;
         body.pitch = input.pitch;
         self.consume(next, kind != Step::Applied);
@@ -472,7 +508,12 @@ pub struct SimServer {
     near_hist_tick: [u32; NEAR_HISTORY],
     far_blobs: Vec<Blob>,
     history: Vec<Vec<[f32; 2]>>,
-    free: Vec<u16>,
+    /// Free entity ids, per faction (`faction::faction(id)`).
+    free: [Vec<u16>; FACTIONS as usize],
+    /// Damage to apply after this tick's movement: (entity, amount).
+    pending_damage: Vec<(u16, u8)>,
+    /// Fractional random deaths carried between ticks (`deaths_per_sec`).
+    death_acc: f64,
     by_client: HashMap<ClientId, u16>,
     /// Clients grouped by transport shard, with their interest state.
     shard_clients: Vec<Vec<ClientSlot>>,
@@ -545,7 +586,9 @@ impl SimServer {
             near_hist_tick: [u32::MAX; NEAR_HISTORY],
             far_blobs: Vec::new(),
             history: vec![Vec::new(); HISTORY_TICKS],
-            free: Vec::new(),
+            free: Default::default(),
+            pending_damage: Vec::new(),
+            death_acc: 0.0,
             by_client: HashMap::new(),
             grid: Grid::new(GRID_CELL),
             mid_grid: Grid::new(MID_GRID_CELL),
@@ -741,7 +784,9 @@ impl SimServer {
         }
         lap(1);
 
-        // 2. movement
+        // 2. respawns due this tick (before its movement: the inputs it
+        // applies are the new life's), then movement
+        self.respawn_due(self.step + steps);
         let world = &*self.world;
         let base_step = self.step;
         let [applied, repeated, frozen] = self
@@ -809,12 +854,13 @@ impl SimServer {
             .map(|(i, push)| {
                 *push = [0.0; 2];
                 let b = &bodies[i];
-                if !b.alive || !on {
+                if !b.alive || !on || b.dead() {
                     return 0;
                 }
                 let p = b.state.pos;
                 grid.for_each_within(p, SEP_DIST, |j, x, y| {
-                    if j as usize == i {
+                    // The dead don't block (they're lying on the ground).
+                    if j as usize == i || bodies[j as usize].dead() {
                         return;
                     }
                     let d = separation(i as u32, p, b.state.z, j, [x, y], bodies[j as usize].state.z);
@@ -838,6 +884,9 @@ impl SimServer {
                 }
             });
         }
+        // 5c. damage and deaths: after movement, so a death shows in this
+        // tick's snapshots and the next tick's inputs move nothing.
+        self.apply_damage(self.step);
         lap(4);
 
         // 6. lag-comp history
@@ -860,10 +909,10 @@ impl SimServer {
             .filter(|(_, (_, b))| b.alive)
             .for_each(|(i, ((near, far), b))| {
                 let e = i as u16;
-                *near = NearQ::new(&b.state, b.yaw, b.pitch);
+                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health);
                 let prev = tick.wrapping_sub(1);
                 if due(e, tick, mid_period) || due(e, tick, far_period) || due(e, prev, far_period) {
-                    *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch);
+                    *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch, b.health);
                 }
             });
         lap(6);
@@ -972,25 +1021,97 @@ impl SimServer {
         times
     }
 
+    /// Damages `entity` after the next tick's movement (0 = no effect, a
+    /// dead player takes none). Weapons come in M3d.2; tests and
+    /// `deaths_per_sec` use this.
+    pub fn damage(&mut self, entity: u16, amount: u8) {
+        self.pending_damage.push((entity, amount));
+    }
+
+    /// (health, dead) of a connected player.
+    pub fn vitals(&self, entity: u16) -> Option<(u8, bool)> {
+        self.bodies.get(entity as usize).filter(|b| b.alive).map(|b| (b.health, b.dead()))
+    }
+
+    /// Applies queued damage (and `deaths_per_sec`'s): a player brought to 0
+    /// dies, to respawn `RESPAWN_STEPS` after `step`.
+    fn apply_damage(&mut self, step_no: u32) {
+        self.death_acc += self.cfg.deaths_per_sec as f64 * self.ladder.rung().steps_per_tick() / TICK_HZ as f64;
+        while self.death_acc >= 1.0 && !self.by_client.is_empty() {
+            self.death_acc -= 1.0;
+            // A living player, at random (a few tries past free slots).
+            let n = self.bodies.len() as u64;
+            for _ in 0..16 {
+                let e = (self.rng.next_u64() % n) as u16;
+                if self.bodies[e as usize].alive && !self.bodies[e as usize].dead() {
+                    self.pending_damage.push((e, MAX_HEALTH));
+                    break;
+                }
+            }
+        }
+        for (e, amount) in std::mem::take(&mut self.pending_damage) {
+            let Some(b) = self.bodies.get_mut(e as usize).filter(|b| b.alive && !b.dead()) else { continue };
+            b.health = b.health.saturating_sub(amount);
+            if b.health == 0 {
+                b.respawn_at = Some(step_no + RESPAWN_STEPS);
+                b.life = b.life.wrapping_add(1);
+                self.counters.deaths += 1;
+            }
+        }
+    }
+
+    /// Respawns the dead whose time has come by `step`: back where they were
+    /// sent to play, on their faction's side of it (120 degrees apart),
+    /// standing, at full health.
+    fn respawn_due(&mut self, step_no: u32) {
+        for (e, b) in self.bodies.iter_mut().enumerate() {
+            if !b.alive || b.respawn_at.is_none_or(|at| at > step_no) {
+                continue;
+            }
+            let side = faction(e as u16) as f32 * std::f32::consts::TAU / FACTIONS as f32;
+            let (s, c) = side.sin_cos();
+            let center = [b.anchor[0] + c * b.radius * 0.5, b.anchor[1] + s * b.radius * 0.5];
+            let p = self.rng.in_disk(center, b.radius * 0.3);
+            let p = [p[0].clamp(1.0, WORLD_SIZE - 1.0), p[1].clamp(1.0, WORLD_SIZE - 1.0)];
+            b.state = MoveState::standing(&self.world, p);
+            (b.health, b.respawn_at, b.life) = (MAX_HEALTH, None, b.life.wrapping_add(1));
+            self.counters.respawns += 1;
+        }
+    }
+
     fn spawn(&mut self, client: ClientId) {
         let squad = match self.cfg.interest.squad_size {
             0 => NO_SQUAD,
             n => (self.counters.spawns / n as u64) as u32,
         };
         let (spawn, anchor, radius) = self.pick_spawn(squad);
-        let e = match self.free.pop() {
+        // Factions take turns: by squad, or by player without squads.
+        let side = if squad == NO_SQUAD { self.counters.spawns } else { squad as u64 } % FACTIONS as u64;
+        let e = match self.free[side as usize].pop() {
             Some(e) => e,
-            None => {
+            None => loop {
+                // New ids go to their faction's free list until one is ours.
+                let id = self.bodies.len() as u16;
                 self.bodies.push(Body::default());
                 self.pushes.push([0.0; 2]);
                 self.inputs.push(InputQueue::default());
                 self.far_blobs.push([0; FAR_BLOB]);
-                (self.bodies.len() - 1) as u16
-            }
+                if faction(id) as u64 == side {
+                    break id;
+                }
+                self.free[faction(id) as usize].insert(0, id);
+            },
         };
         let i = e as usize;
-        self.bodies[i] =
-            Body { alive: true, state: MoveState::standing(&self.world, spawn), yaw: 0, pitch: 0, pushes: 0, squad, spawned: self.tick };
+        self.bodies[i] = Body {
+            alive: true,
+            state: MoveState::standing(&self.world, spawn),
+            squad,
+            spawned: self.tick,
+            anchor,
+            radius,
+            ..Body::default()
+        };
         self.inputs[i] = InputQueue::default();
         if squad != NO_SQUAD {
             self.squads.entry(squad).or_default().push(e);
@@ -1026,7 +1147,7 @@ impl SimServer {
                 }
             }
             body.squad = NO_SQUAD;
-            self.free.push(e);
+            self.free[faction(e) as usize].push(e);
             self.counters.despawns += 1;
         }
     }
@@ -1292,6 +1413,8 @@ impl View<'_> {
                 client_level: slot.ladder.level(),
                 own: me.state,
                 pushes: me.pushes,
+                health: me.health,
+                life: me.life,
             },
         );
         let mut bytes = w.len() + near_bytes;

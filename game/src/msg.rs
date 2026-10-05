@@ -7,11 +7,11 @@
 //!                           RENDER_UNITS); mid and far entities were drawn `mid_lag` (1/8 steps) earlier
 //! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32 | world_seed:8
 //! S->C unreliable  Snapshot tag | server_tick:4 | step:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
-//!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 grounded:1 | pushes:1
+//!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 grounded:1 | pushes:1 | health:1 | life:1
 //! S->C unreliable  Near     see delta.rs: deltas against acked baselines, one per tick, tagged
 //! S->C unreliable  Entities tag | server_tick:4 | tier:1 | n:1 | n × blob         (mid and far; one or more per tier per tick)
 //! far blob  (11 B) := entity:2 | cell:1 | 8 B bitpacked far-tier state (see bitpack.rs); used for mid and far
-//!   x:15 y:15 (~16 mm in the cell) | altitude:12 (16 cm) | yaw:9 | pitch:6 | flags:3 (airborne) | health:4
+//!   x:15 y:15 (~16 mm in the cell) | altitude:12 (16 cm) | yaw:9 | pitch:6 | flags:3 (airborne, dead) | health:4 (1/15ths)
 //! cell := cx | cy<<4, the entity's own 512 m cell, so a blob is the same for every recipient
 //!
 //! Time: `server_tick` counts ticks; `step` counts 1/30 s movement steps (game
@@ -32,6 +32,7 @@ use lattice_net::wire::{DecodeError, Reader, Writer};
 use lattice_net::Config;
 
 use crate::tier::Tier;
+use crate::faction::MAX_HEALTH;
 use crate::movement::{Input, MoveState, WORLD_SIZE};
 
 pub const MSG_INPUT: u8 = 1;
@@ -42,7 +43,7 @@ pub const MSG_ENTITIES: u8 = 4;
 pub const INPUT_REDUNDANCY: usize = 3;
 /// Mid- and far-tier blob.
 pub const FAR_BLOB: usize = 11;
-pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1;
+pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1 + 1 + 1;
 /// Render times in inputs are in 1/`RENDER_UNITS` steps, as a wrapping u16:
 /// unambiguous within ±512 steps (±17 s) of the server's step.
 pub const RENDER_UNITS: f64 = 64.0;
@@ -235,6 +236,12 @@ pub struct SnapshotHeader {
     /// Counts (wrapping) the ticks the server pushed this player apart from
     /// a crowd. A prediction miss when it changed is a push, not a bug.
     pub pushes: u8,
+    /// Own health; 0 is dead, and a dead player's inputs move nothing
+    /// (`movement::dead_input`).
+    pub health: u8,
+    /// Counts (wrapping) deaths and respawns. When it changes, the client
+    /// rebases and replays under the new rule; a respawn also teleports.
+    pub life: u8,
 }
 
 pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
@@ -252,6 +259,8 @@ pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
     }
     w.u8(h.own.grounded as u8);
     w.u8(h.pushes);
+    w.u8(h.health);
+    w.u8(h.life);
 }
 
 /// Starts an Entities message; append exactly `count` blobs of `tier` after it.
@@ -298,9 +307,22 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
                 _ => return Err(DecodeError::Invalid),
             };
             let own = MoveState { pos, vel, z, vz, grounded };
-            let pushes = r.u8()?;
+            let (pushes, health, life) = (r.u8()?, r.u8()?, r.u8()?);
             r.finish()?;
-            Ok(ServerMsg::Snapshot(SnapshotHeader { server_tick, step, ack_seq, buffered, wait, pace, level, client_level, own, pushes }))
+            Ok(ServerMsg::Snapshot(SnapshotHeader {
+                server_tick,
+                step,
+                ack_seq,
+                buffered,
+                wait,
+                pace,
+                level,
+                client_level,
+                own,
+                pushes,
+                health,
+                life,
+            }))
         }
         MSG_ENTITIES => {
             let server_tick = r.u32()?;
@@ -320,8 +342,9 @@ fn read_f32(r: &mut Reader<'_>) -> Result<f32, DecodeError> {
 
 /// Heights in blobs: 12 bits over 0-655 m (16 cm), like the near tier's range.
 const BLOB_Z_MAX: f32 = 655.35;
-/// Blob flag: in the air (jumping or falling).
+/// Blob flags: in the air (jumping or falling); dead.
 const BLOB_AIRBORNE: u32 = 1;
+const BLOB_DEAD: u32 = 2;
 
 /// A mid/far entity as a blob carries it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -334,11 +357,14 @@ pub struct BlobState {
     pub yaw: f32,
     pub pitch: f32,
     pub airborne: bool,
+    /// Health to 1/15th (rounded up: a living player never reads 0).
+    pub health: u8,
+    pub dead: bool,
 }
 
 /// Far-tier encoding: position relative to the entity's own 512 m cell, so the
 /// blob is identical for every recipient and is serialized once per tick.
-pub fn encode_blob(entity: u16, s: &MoveState, yaw: u16, pitch: i16) -> Blob {
+pub fn encode_blob(entity: u16, s: &MoveState, yaw: u16, pitch: i16, health: u8) -> Blob {
     let pos = s.pos;
     let (cx, cy) = blob_cell(pos);
     let mut bw = BitWriter::new();
@@ -347,8 +373,9 @@ pub fn encode_blob(entity: u16, s: &MoveState, yaw: u16, pitch: i16) -> Blob {
     bw.write(quantize(s.z, 0.0, BLOB_Z_MAX, 12), 12);
     bw.write(yaw as u32 >> 7, 9);
     bw.write((pitch as i32 + 32768) as u32 >> 10, 6);
-    bw.write(if s.grounded { 0 } else { BLOB_AIRBORNE }, 3); // stance / seat flags
-    bw.write(15, 4); // health bucket: full
+    let dead = if health == 0 { BLOB_DEAD } else { 0 };
+    bw.write(if s.grounded { 0 } else { BLOB_AIRBORNE } | dead, 3); // stance / seat flags
+    bw.write(health_bucket(health), 4);
     let bits = bw.finish();
 
     let mut b = [0u8; FAR_BLOB];
@@ -356,6 +383,11 @@ pub fn encode_blob(entity: u16, s: &MoveState, yaw: u16, pitch: i16) -> Blob {
     b[2] = (cx | cy << 4) as u8;
     b[3..].copy_from_slice(&bits);
     b
+}
+
+/// Health in 15ths of `MAX_HEALTH`, rounded up so only 0 reads 0.
+fn health_bucket(health: u8) -> u32 {
+    (health.min(MAX_HEALTH) as u32 * 15).div_ceil(MAX_HEALTH as u32)
 }
 
 fn blob_cell(pos: [f32; 2]) -> (u32, u32) {
@@ -376,8 +408,9 @@ pub fn decode_blob(b: &[u8]) -> Result<BlobState, DecodeError> {
     let yaw = dequantize_angle(r.read(9)?, 9);
     // Pitch is the top 6 bits of the input's i16 (-pi/2..pi/2 maps to its range).
     let pitch = ((r.read(6)? << 10) as f32 + 512.0 - 32768.0) / 32768.0 * std::f32::consts::FRAC_PI_2;
-    let airborne = r.read(3)? & BLOB_AIRBORNE != 0;
-    Ok(BlobState { entity, pos: [x, y], z, yaw, pitch, airborne })
+    let flags = r.read(3)?;
+    let health = (r.read(4)? * MAX_HEALTH as u32 / 15) as u8;
+    Ok(BlobState { entity, pos: [x, y], z, yaw, pitch, airborne: flags & BLOB_AIRBORNE != 0, health, dead: flags & BLOB_DEAD != 0 })
 }
 
 #[cfg(test)]
@@ -433,6 +466,8 @@ mod tests {
             client_level: 1,
             own: MoveState { pos: [1.0, 2.0], vel: [-3.0, 0.125], z: 87.25, vz: -1.5, grounded: false },
             pushes: 9,
+            health: 37,
+            life: 255,
         };
         let mut wr = Writer::default();
         write_snapshot(&mut wr, &h);
@@ -442,8 +477,8 @@ mod tests {
         let mut wr = Writer::default();
         write_entities_header(&mut wr, 99, Tier::Mid, 2);
         let at = |x, y| MoveState { pos: [x, y], ..Default::default() };
-        wr.bytes(&encode_blob(1, &at(10.0, 20.0), 0, 0));
-        wr.bytes(&encode_blob(2, &at(30.0, 40.0), 0, 0));
+        wr.bytes(&encode_blob(1, &at(10.0, 20.0), 0, 0, 100));
+        wr.bytes(&encode_blob(2, &at(30.0, 40.0), 0, 0, 100));
         assert_eq!(wr.len(), ENTITIES_HEADER + 2 * FAR_BLOB);
         let Ok(ServerMsg::Entities { server_tick: 99, tier: Tier::Mid, blobs }) = decode_server_msg(wr.as_slice()) else {
             panic!()
@@ -462,7 +497,7 @@ mod tests {
             let yaw = 12345u16;
             for (z, grounded, pitch) in [(0.0, true, 0i16), (163.27, false, -16384), (655.0, true, 32767)] {
                 let s = MoveState { pos: [x, y], z, grounded, ..Default::default() };
-                let b = decode_blob(&encode_blob(9, &s, yaw, pitch)).unwrap();
+                let b = decode_blob(&encode_blob(9, &s, yaw, pitch, 100)).unwrap();
                 assert_eq!(b.entity, 9);
                 let p = b.pos;
                 assert!((p[0] - x).abs() < 0.02 && (p[1] - y).abs() < 0.02, "{x},{y} -> {p:?}");
@@ -472,7 +507,18 @@ mod tests {
                 let want = pitch as f32 / 32768.0 * std::f32::consts::FRAC_PI_2;
                 assert!((b.pitch - want).abs() < 0.03, "pitch {want} -> {}", b.pitch);
                 assert_eq!(b.airborne, !grounded);
+                assert_eq!((b.health, b.dead), (100, false));
             }
         }
+    }
+
+    #[test]
+    fn blobs_carry_health_and_death() {
+        let s = MoveState::default();
+        let at = |h| decode_blob(&encode_blob(4, &s, 0, 0, h)).unwrap();
+        assert_eq!((at(0).health, at(0).dead), (0, true));
+        assert_eq!((at(1).health, at(1).dead), (6, false), "alive never reads 0");
+        assert_eq!(at(50).health, 53);
+        assert_eq!((at(100).health, at(100).dead), (100, false));
     }
 }

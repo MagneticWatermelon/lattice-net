@@ -51,6 +51,10 @@ pub struct RenderClock {
     pub snaps: u64,
     /// Times it jumped backwards.
     pub backwards: u64,
+    /// Frames where it ran more than 1% fast or slow to catch up: the whole
+    /// scene's tempo wobbling.
+    pub slewing: u64,
+    pub frames: u64,
 }
 
 impl RenderClock {
@@ -62,6 +66,8 @@ impl RenderClock {
             render: None,
             snaps: 0,
             backwards: 0,
+            slewing: 0,
+            frames: 0,
         }
     }
 
@@ -122,7 +128,10 @@ impl RenderClock {
                     self.backwards += (target < r) as u64;
                     target
                 } else {
-                    free + err.clamp(-run * SLEW, run * SLEW)
+                    let adj = err.clamp(-run * SLEW, run * SLEW);
+                    self.frames += 1;
+                    self.slewing += (adj.abs() > run * 0.01) as u64;
+                    free + adj
                 }
             }
         };

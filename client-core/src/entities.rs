@@ -77,6 +77,9 @@ pub struct Sample {
     pub yaw: f32,
     pub pitch: f32,
     pub airborne: bool,
+    /// Exact for near samples, to 1/15th for mid and far.
+    pub health: u8,
+    pub dead: bool,
 }
 
 impl Sample {
@@ -90,6 +93,8 @@ impl Sample {
             yaw: q.yaw(),
             pitch: (q.pitch as f32 * 256.0 + 128.0 - 32768.0) / 32768.0 * std::f32::consts::FRAC_PI_2,
             airborne: q.flags & delta::FLAG_AIRBORNE != 0,
+            health: q.health,
+            dead: q.flags & delta::FLAG_DEAD != 0,
         }
     }
 
@@ -102,6 +107,8 @@ impl Sample {
             yaw: b.yaw,
             pitch: b.pitch,
             airborne: b.airborne,
+            health: b.health,
+            dead: b.dead,
         }
     }
 }
@@ -124,6 +131,9 @@ pub struct RenderState {
     pub yaw: f32,
     pub pitch: f32,
     pub airborne: bool,
+    pub health: u8,
+    /// Dead, waiting to respawn (draw it lying down).
+    pub dead: bool,
     /// The tier of its newest sample.
     pub tier: Tier,
     pub how: How,
@@ -153,6 +163,8 @@ struct Track {
     /// step `lag_at` (it slews toward its tier's lag).
     lag: f64,
     lag_at: f64,
+    /// Where it was drawn last frame, the render step then, and dead then.
+    drawn: Option<([f32; 3], f64, bool)>,
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -167,7 +179,7 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
 
 impl Track {
     fn new(known: Known, s: Sample, lag: f64, at: f64) -> Self {
-        Self { known, samples: [s; SAMPLES], len: 1, visual: [0.0; 3], visual_at: at, lag, lag_at: at }
+        Self { known, samples: [s; SAMPLES], len: 1, visual: [0.0; 3], visual_at: at, lag, lag_at: at, drawn: None }
     }
 
     /// The lag its tier asks for: near none, mid and far `mid_lag`.
@@ -233,6 +245,8 @@ impl Track {
             yaw: x.yaw,
             pitch: x.pitch,
             airborne: x.airborne,
+            health: x.health,
+            dead: x.dead,
             tier: self.newest().tier,
             how,
             at: r,
@@ -244,12 +258,20 @@ impl Track {
         if i < n {
             // s[i - 1].step <= r < s[i].step
             let (a, b) = (&s[i - 1], &s[i]);
+            if a.dead && !b.dead {
+                // It respawned in between: the corpse stays until the new
+                // life's first sample, then it's there. Never a streak
+                // across the map.
+                return state(a, a.pos, How::Interpolated);
+            }
             let t = ((r - a.step) / (b.step - a.step)) as f32;
             return RenderState {
                 pos: [lerp(a.pos[0], b.pos[0], t), lerp(a.pos[1], b.pos[1], t), lerp(a.pos[2], b.pos[2], t)],
                 yaw: lerp_angle(a.yaw, b.yaw, t),
                 pitch: lerp(a.pitch, b.pitch, t),
                 airborne: if t < 0.5 { a.airborne } else { b.airborne },
+                health: if t < 0.5 { a.health } else { b.health },
+                dead: if t < 0.5 { a.dead } else { b.dead },
                 tier: self.newest().tier,
                 how: How::Interpolated,
                 at: r,
@@ -263,13 +285,15 @@ impl Track {
         // Velocity in m per step: the tier's own, or from the two newest
         // samples; extrapolated for as long as updates have been apart.
         let interval = if n >= 2 { last.step - s[n - 2].step } else { f64::INFINITY };
-        let derived = (interval <= MAX_INTERVAL).then(|| {
+        // Never across a death or respawn (a corpse to a new spawn point).
+        let derived = (interval <= MAX_INTERVAL && s[n - 2].dead == last.dead).then(|| {
             let (p, dt) = (&s[n - 2], interval as f32);
             [(last.pos[0] - p.pos[0]) / dt, (last.pos[1] - p.pos[1]) / dt, (last.pos[2] - p.pos[2]) / dt]
         });
         let limit = if interval <= MAX_INTERVAL { interval.max(MAX_EXTRAPOLATION) } else { MAX_EXTRAPOLATION };
         let per_step = 1.0 / TICK_HZ as f32;
         let v = match (last.vel, derived) {
+            _ if last.dead => [0.0; 3], // the dead lie still
             (Some(v), d) => [v[0] * per_step, v[1] * per_step, d.map_or(0.0, |d| d[2])],
             (None, Some(d)) => d,
             (None, None) => [0.0; 3],
@@ -397,7 +421,13 @@ pub struct SmoothStats {
     /// Pops: what each sample arriving changed on screen before smoothing,
     /// in mm (capped at 65 m), until drained.
     pub pops: [Vec<u16>; 3],
+    /// Entity-frames drawn moving faster than `STREAK_SPEED` (no player
+    /// runs that fast: a jump or smear on screen), by tier.
+    pub streaks: [u64; 3],
 }
+
+/// Drawn speeds above this are streaks: sprint is 9 m/s, a fall ~15.
+pub const STREAK_SPEED: f32 = 20.0;
 
 /// Every entity this client has heard about.
 #[derive(Debug)]
@@ -511,14 +541,23 @@ impl Entities {
     /// lag): calls `f(entity, state)`, counts how each was drawn, and forgets
     /// entities that stopped coming.
     pub fn render(&mut self, r: f64, mut f: impl FnMut(u16, &RenderState)) {
-        let (frames, mid_lag) = (&mut self.smooth.frames, self.mid_lag);
+        let (smooth, mid_lag) = (&mut self.smooth, self.mid_lag);
         self.tracks.retain(|&e, t| {
             let lag = t.settle_lag(r, mid_lag);
             if t.gone(r - lag) {
                 return false;
             }
             let s = t.render(r, lag);
-            frames[s.tier as usize][s.how as usize] += 1;
+            smooth.frames[s.tier as usize][s.how as usize] += 1;
+            if let Some((p, at, was_dead)) = t.drawn {
+                let dt = (r - at) as f32 / TICK_HZ as f32;
+                let d = ((s.pos[0] - p[0]).powi(2) + (s.pos[1] - p[1]).powi(2) + (s.pos[2] - p[2]).powi(2)).sqrt();
+                // A respawn is a cut (dead last frame, alive now), not a streak.
+                if dt > 0.0 && d > 0.3 && d / dt > STREAK_SPEED && !(was_dead && !s.dead) {
+                    smooth.streaks[s.tier as usize] += 1;
+                }
+            }
+            t.drawn = Some((s.pos, r, s.dead));
             f(e, &s);
             true
         });
@@ -570,7 +609,7 @@ mod tests {
     }
 
     fn s(step: f64, x: f32, vel: Option<[f32; 2]>) -> Sample {
-        Sample { step, tier: if vel.is_some() { Tier::Near } else { Tier::Far }, pos: [x, 0.0, 10.0], vel, yaw: 0.0, pitch: 0.0, airborne: false }
+        Sample { step, tier: if vel.is_some() { Tier::Near } else { Tier::Far }, pos: [x, 0.0, 10.0], vel, yaw: 0.0, pitch: 0.0, airborne: false, health: 100, dead: false }
     }
 
     #[test]
@@ -670,7 +709,7 @@ mod tests {
         // An entity running east at 6 m/s (0.2 m a step), one sample a step.
         let mut e = Entities::new(MID_LAG);
         let k = |tier| Known { tick: 0, tier, pos: [0.0; 2] };
-        let at = |step: f64, tier| Sample { step, tier, pos: [step as f32 * 0.2, 0.0, 0.0], vel: Some([6.0, 0.0]), yaw: 0.0, pitch: 0.0, airborne: false };
+        let at = |step: f64, tier| Sample { step, tier, pos: [step as f32 * 0.2, 0.0, 0.0], vel: Some([6.0, 0.0]), yaw: 0.0, pitch: 0.0, airborne: false, health: 100, dead: false };
         let draw = |e: &mut Entities, r: f64| {
             let mut got = None;
             e.render(r, |_, s| got = Some(*s));
@@ -735,5 +774,23 @@ mod tests {
             n.record(1.25);
         }
         assert_eq!(n.quantile(0.99), Some(1.25));
+    }
+
+    #[test]
+    fn a_respawn_is_a_cut_not_a_streak() {
+        let k = Known { tick: 0, tier: Tier::Near, pos: [0.0; 2] };
+        let at = |step: f64, x: f32, dead: bool| Sample { step, tier: Tier::Near, pos: [x, 0.0, 0.0], vel: Some([0.0; 2]), yaw: 0.0, pitch: 0.0, airborne: false, health: if dead { 0 } else { 100 }, dead };
+        let mut t = Track::new_test(k, at(10.0, 5.0, true));
+        t.add_test(at(11.0, 5.0, true), None);
+        // Respawned 40 m away.
+        t.add_test(at(12.0, 45.0, false), Some(11.2));
+        for (r, x) in [(11.2, 5.0), (11.5, 5.0), (11.99, 5.0), (12.0, 45.0)] {
+            assert_eq!(t.render(r, 0.0).pos[0], x, "at {r}: the corpse, then the new life");
+        }
+        assert_eq!(t.visual, [0.0; 3], "nothing to smooth");
+        // And no velocity from the corpse to the spawn point.
+        t.add_test(at(13.0, 45.2, false), None);
+        let ahead = t.raw(14.0).pos[0];
+        assert!((ahead - 45.2).abs() < 0.3, "{ahead}");
     }
 }

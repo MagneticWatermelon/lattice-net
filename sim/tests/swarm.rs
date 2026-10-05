@@ -993,3 +993,112 @@ fn the_near_delay_grows_when_near_updates_come_less_often() {
     // Mid stays at 200 ms whatever near does: its lag shrank instead.
     assert!((260..=270).contains(&mid_rw.p50), "{mid_rw:?}");
 }
+
+#[test]
+fn factions_follow_squads_and_stay_balanced() {
+    let interest = InterestConfig { squad_size: 4, ..Default::default() };
+    let s = {
+        // Uniform: each squad has its own anchor, so bots can tell squads apart.
+        let mut s = Swarm::with_config(36, SimConfig { spawn: SpawnMode::Uniform, interest, ..Default::default() });
+        for _ in 0..TICK_HZ {
+            s.step();
+        }
+        s
+    };
+    let mut per = [0; 3];
+    let mut squads: HashMap<[u32; 2], (u8, usize)> = HashMap::new();
+    for (_, _, b) in &s.bots {
+        let w = b.welcome().unwrap();
+        let f = lattice_game::faction::faction(w.entity);
+        per[f as usize] += 1;
+        let sq = squads.entry(w.anchor.map(f32::to_bits)).or_insert((f, 0));
+        assert_eq!(f, sq.0, "a squad is one faction");
+        sq.1 += 1;
+    }
+    assert!(squads.values().all(|&(_, n)| n == 4), "{squads:?}");
+    assert_eq!(per, [12, 12, 12], "squads take turns");
+}
+
+#[test]
+fn death_and_respawn_keep_prediction_exact() {
+    let mut s = Swarm::new(12, SpawnMode::Blob);
+    for (_, _, b) in &mut s.bots {
+        b.enable_tracking();
+    }
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+    }
+    let me = s.bots[0].2.welcome().unwrap().entity;
+    s.server.damage(me, 30);
+    s.step();
+    assert_eq!(s.server.vitals(me), Some((70, false)));
+    s.server.damage(me, 200);
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    assert_eq!(s.server.vitals(me), Some((0, true)));
+    let b0 = &s.bots[0].2;
+    assert!(b0.core().is_dead(), "the client knows");
+    // Its inputs move nothing now, on the server as in its prediction.
+    let at = s.server.entity_state(me).unwrap().pos;
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let later = s.server.entity_state(me).unwrap();
+    assert!(((later.pos[0] - at[0]).powi(2) + (later.pos[1] - at[1]).powi(2)).sqrt() < 0.05, "the dead don't walk");
+    // Everyone tracking it sees it dead.
+    let seen_dead = s.bots[1..].iter().filter(|(_, _, b)| b.entities().and_then(|e| e.newest(me)).is_some_and(|x| x.dead)).count();
+    assert!(seen_dead > 0, "others see the body");
+    // 5 s after death it's back, at full health, somewhere else.
+    for _ in 0..4 * TICK_HZ {
+        s.step();
+    }
+    assert_eq!(s.server.vitals(me), Some((100, false)));
+    assert!(!s.bots[0].2.core().is_dead());
+    let c = s.server.counters();
+    assert_eq!((c.deaths, c.respawns), (1, 1));
+    // Dying and respawning are life events, never mispredictions.
+    for (i, (_, _, b)) in s.bots.iter().enumerate() {
+        assert_eq!((b.stats().corrections, b.stats().resyncs), (0, 0), "bot {i}");
+    }
+    assert_eq!(s.bots[0].2.stats().life_events, 2);
+    assert_eq!(stand_ins(&s), 0);
+}
+
+#[test]
+fn random_deaths_keep_everyone_in_step() {
+    // 3 deaths a second among 40 players for 15 s (~15 dead at a time).
+    let cfg = SimConfig { spawn: SpawnMode::Disk(60.0), deaths_per_sec: 3.0, ..Default::default() };
+    let mut s = Swarm::with_config(40, cfg);
+    for _ in 0..15 * TICK_HZ {
+        s.step();
+    }
+    let c = s.server.counters().clone();
+    assert!((35..=46).contains(&c.deaths), "{} deaths", c.deaths);
+    assert!(c.respawns + 16 >= c.deaths && c.respawns <= c.deaths, "respawned 5 s later: {} of {}", c.respawns, c.deaths);
+    let life: u64 = s.bots.iter().map(|(_, _, b)| b.stats().life_events).sum();
+    assert!(life >= c.deaths + c.respawns - 40, "clients saw them: {life}");
+    assert_eq!(s.corrections(), 0, "no misprediction from any death or respawn");
+    assert_eq!(stand_ins(&s), 0);
+}
+
+#[test]
+#[ignore = "diagnostic: cargo test --release --test swarm jitter_diagnostic -- --ignored --nocapture"]
+fn jitter_diagnostic() {
+    // Like the Windows check: a dense 80 m disk with random deaths.
+    for deaths in [0.0, 6.0] {
+        let cfg = SimConfig { spawn: SpawnMode::Disk(60.0), deaths_per_sec: deaths, ..Default::default() };
+        let mut s = render_swarm(60, cfg, Duration::from_secs(4));
+        let r = measure_render(&mut s, 4 * TICK_HZ, 10);
+        let big = s.render_err[0].iter().filter(|&&e| e > 1.0).count();
+        let changes: u64 = s.bots.iter().map(|(_, _, b)| b.stats().delay_changes).sum();
+        let own = s.bots.iter().map(|(_, _, b)| b.stats().own_offset_max).fold(0.0f32, f32::max);
+        eprintln!(
+            "deaths {deaths}/s: near frames drawn >1 m from truth {big} of {} | delay changes {:.1} per bot | delay {:.2} steps | own offset max {own:.2} m | corrections {}",
+            s.render_err[0].len(),
+            changes as f64 / 60.0,
+            r.delay,
+            s.corrections()
+        );
+    }
+}

@@ -83,6 +83,10 @@ struct Totals {
     render_delay_sum: f64,
     render_snaps: u64,
     render_backwards: u64,
+    streaks: u64,
+    slewing: u64,
+    clock_frames: u64,
+    delay_changes: u64,
 }
 
 impl Totals {
@@ -126,6 +130,10 @@ impl Totals {
         self.render_delay_sum += o.render_delay_sum;
         self.render_snaps += o.render_snaps;
         self.render_backwards += o.render_backwards;
+        self.streaks += o.streaks;
+        self.slewing += o.slewing;
+        self.clock_frames += o.clock_frames;
+        self.delay_changes += o.delay_changes;
     }
 }
 
@@ -347,7 +355,9 @@ impl Bot {
         t.render_delay_sum += s.render_delay_sum;
         let clock = brain.core().render_clock();
         (t.render_snaps, t.render_backwards) = (t.render_snaps + clock.snaps, t.render_backwards + clock.backwards);
+        (t.slewing, t.clock_frames, t.delay_changes) = (t.slewing + clock.slewing, t.clock_frames + clock.frames, t.delay_changes + s.delay_changes);
         if let Some(e) = brain.core().entities() {
+            t.streaks += e.smooth.streaks.iter().sum::<u64>();
             for (a, b) in t.frames.iter_mut().zip(&e.smooth.frames) {
                 for (x, y) in a.iter_mut().zip(b) {
                     *x += y;
@@ -696,6 +706,10 @@ fn summary_values(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) -
     }
     kv.put("render_delay_ms", format!("{:.1}", render_delay_ms(t)));
     kv.put("render_snaps", t.render_snaps);
+    let frames: u64 = t.frames.iter().flatten().sum();
+    kv.put("streak_frames_per_million", format!("{:.0}", t.streaks as f64 * 1e6 / frames.max(1) as f64));
+    kv.put("clock_slewing_pct", format!("{:.2}", 100.0 * t.slewing as f64 / t.clock_frames.max(1) as f64));
+    kv.put("delay_changes", t.delay_changes);
     kv.put("render_backwards", t.render_backwards);
     kv.put("clock_extra", t.clock_extra);
     kv.put("clock_skipped", t.clock_skipped);
@@ -826,10 +840,13 @@ fn print_summary(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) {
         );
     }
     println!(
-        "  render delay (near) {:.1} ms behind the newest step, clock snaps {} (backwards {})",
+        "  render delay (near) {:.1} ms behind the newest step, clock snaps {} (backwards {}), slewing {:.2}% of frames, near delay changes {} | streak entity-frames (drawn > 20 m/s) {}",
         render_delay_ms(t),
         t.render_snaps,
-        t.render_backwards
+        t.render_backwards,
+        100.0 * t.slewing as f64 / t.clock_frames.max(1) as f64,
+        t.delay_changes,
+        t.streaks
     );
     println!(
         "  input clock: {} extra inputs, {} skipped ticks, {} backlog skips | near decode errors (tracked bots) {}",

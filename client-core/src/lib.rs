@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lattice_game::delta;
-use lattice_game::movement::{step, Input, MoveState, TICK_HZ};
+use lattice_game::movement::{dead_input, step, Input, MoveState, TICK_HZ};
 use lattice_game::msg::{self, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
 use lattice_game::tier::Tier;
 use lattice_game::world::World;
@@ -133,6 +133,12 @@ pub struct ClientStats {
     pub render_delay_sum: f64,
     /// Own-player corrections, smoothed: the largest offset, in meters.
     pub own_offset_max: f32,
+    /// Deaths and respawns seen in snapshots: each rebases and replays
+    /// (under the dead player's rule, or after the respawn's teleport), and
+    /// none counts as a correction.
+    pub life_events: u64,
+    /// Times the near render delay changed (it adapts).
+    pub delay_changes: u64,
     /// From the latest snapshot: the server's pace (per mille) and levels.
     pub pace: u16,
     pub level: u8,
@@ -167,6 +173,11 @@ pub struct ClientCore {
     /// The push counter in the last snapshot (see `SnapshotHeader::pushes`);
     /// the server starts it at 0 when we spawn.
     last_pushes: u8,
+    /// The life counter in the last snapshot (deaths and respawns).
+    last_life: u8,
+    /// Own health from the newest snapshot; 0 is dead, and then our inputs
+    /// move nothing (`movement::dead_input`), here as on the server.
+    health: u8,
     /// Built from the Welcome's seed (shared by every bot in the process).
     world: Option<Arc<World>>,
     seq: u32,
@@ -227,6 +238,8 @@ impl ClientCore {
         Self {
             welcome: None,
             last_pushes: 0,
+            last_life: 0,
+            health: lattice_game::faction::MAX_HEALTH,
             world: None,
             seq: 0,
             state: MoveState::default(),
@@ -351,8 +364,12 @@ impl ClientCore {
             e.need.decay_to(r);
             if let Some(need) = e.need.quantile(0.99) {
                 let want = need.clamp(self.near_bounds.0, self.near_bounds.1);
-                if want > self.near_delay || want < self.near_delay - 0.5 {
+                // Down only by a full step: each change runs the scene up to
+                // 10% slow while the clock catches up (UDP disk of 100: ~4
+                // changes per client per 30 s at half a step).
+                if want > self.near_delay || want < self.near_delay - 1.0 {
                     self.near_delay = want;
+                    self.stats.delay_changes += 1;
                     self.render_clock.set_delay(want);
                     self.mid_lag = (self.mid_delay - want).max(0.0);
                     e.set_mid_lag(self.mid_lag);
@@ -463,6 +480,8 @@ impl ClientCore {
         self.pace = (h.pace as f32 / 1000.0).clamp(0.1, 1.0);
         self.tick_steps.put(h.server_tick, h.step);
         self.server_own = Some((h.own, h.step));
+        let life_changed = h.life != self.last_life;
+        (self.last_life, self.health) = (h.life, h.health);
         self.render_clock.on_snapshot(h.step, self.pace, now);
 
         if h.ack_seq == 0 {
@@ -527,6 +546,13 @@ impl ClientCore {
         // a miss now is that push, which we couldn't have predicted.
         let pushed = self.last_pushes != h.pushes;
         self.last_pushes = h.pushes;
+        if life_changed {
+            // We died or respawned: whatever we predicted since is under the
+            // wrong rule (or the wrong place). Replay from the server's state.
+            self.stats.life_events += 1;
+            self.rebase(h.ack_seq, h.own, now, true);
+            return;
+        }
         let (s, o) = (&slot.state, &h.own);
         let err = ((s.pos[0] - o.pos[0]).powi(2) + (s.pos[1] - o.pos[1]).powi(2) + (s.z - o.z).powi(2)).sqrt();
         let vel_err = (s.vel[0] - o.vel[0]).abs() + (s.vel[1] - o.vel[1]).abs() + (s.vz - o.vz).abs();
@@ -546,23 +572,43 @@ impl ClientCore {
             self.stats.correction_error_max = self.stats.correction_error_max.max(err);
         }
 
-        // Rebase on the server's state and replay everything it hasn't seen
-        // yet. What that moves on screen is smoothed away, not snapped.
-        let mut s = h.own;
+        self.rebase(h.ack_seq, h.own, now, false);
+    }
+
+    /// Rebases on the server's state `own` for input `ack` and replays
+    /// everything it hasn't seen yet. What that moves on screen is smoothed
+    /// away, unless it's a `cut` (a death or respawn) or a teleport.
+    fn rebase(&mut self, ack: u32, own: MoveState, now: Instant, cut: bool) {
+        let mut s = own;
         let world = self.world.as_ref().expect("welcomed");
-        self.history[h.ack_seq as usize % HISTORY].state = s;
-        for seq in h.ack_seq + 1..=self.seq {
+        let dead = self.is_dead();
+        self.history[ack as usize % HISTORY].state = s;
+        for seq in ack + 1..=self.seq {
             let p = &mut self.history[seq as usize % HISTORY];
-            s = step(world, s, p.input);
+            s = step(world, s, if dead { dead_input(p.input) } else { p.input });
             p.state = s;
         }
         let (old, cur) = (self.state, self.own_offset(now));
         let o = [cur[0] + old.pos[0] - s.pos[0], cur[1] + old.pos[1] - s.pos[1], cur[2] + old.z - s.z];
         let len = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
-        self.own_offset = if len > entities::TELEPORT { [0.0; 3] } else { o };
+        if cut || len > entities::TELEPORT {
+            self.own_offset = [0.0; 3];
+        } else {
+            self.own_offset = o;
+            self.stats.own_offset_max = self.stats.own_offset_max.max(len);
+        }
         self.own_offset_at = Some(now);
-        self.stats.own_offset_max = self.stats.own_offset_max.max(len);
         self.state = s;
+    }
+
+    /// Own health from the newest snapshot.
+    pub fn health(&self) -> u8 {
+        self.health
+    }
+
+    /// Dead: waiting to respawn, inputs move nothing.
+    pub fn is_dead(&self) -> bool {
+        self.health == 0
     }
 
     /// Run the input clock up to `now`, by elapsed time: for a frame loop
@@ -611,7 +657,8 @@ impl ClientCore {
             self.clock -= 1.0;
             let input = source(&self.state, &w);
             self.seq += 1;
-            self.state = step(self.world.as_ref().expect("welcomed"), self.state, input);
+            let applied = if self.is_dead() { dead_input(input) } else { input };
+            self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied);
             self.history[self.seq as usize % HISTORY] =
                 Predicted { seq: self.seq, input, state: self.state, sent_at: Some(now), render };
             made += 1;

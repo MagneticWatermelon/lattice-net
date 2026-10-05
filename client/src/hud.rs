@@ -23,6 +23,10 @@ pub struct GraphPanel;
 #[derive(Component)]
 pub struct FrameBar(usize);
 #[derive(Component)]
+pub struct HealthFill;
+#[derive(Component)]
+pub struct DeathText;
+#[derive(Component)]
 pub struct GapBar(usize);
 
 /// Last second's counters, for rates.
@@ -68,6 +72,20 @@ pub fn setup(mut commands: Commands) {
                 });
             }
         });
+    // Health, bottom center; the death notice in the middle.
+    commands
+        .spawn((
+            Node { position_type: PositionType::Absolute, left: Val::Percent(50.0), bottom: Val::Px(28.0), margin: UiRect::left(Val::Px(-100.0)), width: Val::Px(200.0), height: Val::Px(10.0), ..default() },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.5)),
+        ))
+        .with_child((HealthFill, Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(Color::srgb(0.3, 0.85, 0.4))));
+    commands.spawn((
+        DeathText,
+        Node { position_type: PositionType::Absolute, left: Val::Percent(50.0), top: Val::Percent(40.0), margin: UiRect::left(Val::Px(-160.0)), width: Val::Px(320.0), justify_content: JustifyContent::Center, ..default() },
+        Text::new(""),
+        TextFont { font_size: FontSize::Px(24.0), ..default() },
+        TextColor(Color::srgb(1.0, 0.85, 0.8)),
+    ));
     // Crosshair and help.
     commands.spawn((
         Node { position_type: PositionType::Absolute, left: Val::Percent(50.0), top: Val::Percent(50.0), margin: UiRect { left: Val::Px(-2.0), top: Val::Px(-2.0), ..default() }, width: Val::Px(4.0), height: Val::Px(4.0), ..default() },
@@ -75,10 +93,38 @@ pub fn setup(mut commands: Commands) {
     ));
     commands.spawn((
         Node { position_type: PositionType::Absolute, left: Val::Px(8.0), bottom: Val::Px(6.0), ..default() },
-        Text::new("click: grab mouse  Esc: release  WASD Shift Space: move  V: view  G: server ghosts  T: tier colors  N: net graph"),
+        Text::new("click: grab mouse  Esc: release  WASD Shift Space: move  V: view  G: server ghosts  T: tier/faction colors  N: net graph"),
         TextFont { font_size: FontSize::Px(12.0), ..default() },
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
     ));
+}
+
+/// The health bar, and while dead, the time to respawn (from when we heard).
+pub fn vitals(
+    net: Res<Net>,
+    mut died_at: Local<Option<Instant>>,
+    mut fill: Query<(&mut Node, &mut BackgroundColor), With<HealthFill>>,
+    mut text: Query<&mut Text, With<DeathText>>,
+) {
+    let core = &net.0.core;
+    let hp = core.health() as f32 / lattice_game::faction::MAX_HEALTH as f32;
+    if let Ok((mut n, mut c)) = fill.single_mut() {
+        n.width = Val::Percent(hp * 100.0);
+        c.0 = if hp > 0.5 { Color::srgb(0.3, 0.85, 0.4) } else if hp > 0.25 { Color::srgb(0.95, 0.75, 0.2) } else { Color::srgb(0.9, 0.3, 0.25) };
+    }
+    let msg = if core.is_dead() {
+        let at = *died_at.get_or_insert_with(Instant::now);
+        let left = lattice_game::faction::RESPAWN_STEPS as f32 / 30.0 - at.elapsed().as_secs_f32();
+        format!("You died. Respawning in {:.0} s", left.max(0.0).ceil())
+    } else {
+        *died_at = None;
+        String::new()
+    };
+    if let Ok(mut t) = text.single_mut() {
+        if t.0 != msg {
+            t.0 = msg;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -168,7 +214,10 @@ pub fn update(
             rates.interpolated[1] * 100.0,
             rates.interpolated[2] * 100.0
         ),
-        format!("corrections {} (largest {:.3} m)  push corrections {} (largest {:.2} m)", st.corrections, st.correction_error_max, st.push_corrections, st.push_error_max),
+        format!(
+            "corrections {} (largest {:.3} m)  push corrections {} (largest {:.2} m)  deaths/respawns {}",
+            st.corrections, st.correction_error_max, st.push_corrections, st.push_error_max, st.life_events
+        ),
     ];
     if settings.ghosts {
         lines.push("ghosts: blue = newest server sample, pink = our server state".into());

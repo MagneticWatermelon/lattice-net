@@ -7,6 +7,7 @@
 //! is exactly one copy of anything that must agree on both sides.
 
 pub mod delta;
+pub mod faction;
 pub mod movement;
 pub mod msg;
 pub mod tier;
