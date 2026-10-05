@@ -244,7 +244,63 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
            - corpses keep the aim they died with;
            - `--deaths-per-sec` stands in for weapons;
            - UDP, 100 tracked bots, 10 deaths/s: 0 corrections, streak frames 67,994 → 742 after the fixes.
-        2. M3d.2: shots, 3D history, projectiles, damage (server and swarm tests).
+        2. **M3d.2: shots, 3D history, projectiles, damage** (scoped in full 2026-10-05).
+           - **Shared rules, in `lattice-game`:**
+             - `weapon.rs` holds the rifle: 600 m/s, gravity 9.81, 100 ms between shots, 2 s range, 20 body / 40 head damage. It also holds the projectile kinematics (semi-implicit, per half step), so the server and the client's cosmetic tracers fly the same arc;
+             - `hit.rs` holds the geometry: segment against capsule, sphere, box (slab) and terrain (≤2 m march, then bisection);
+             - hitboxes: a body capsule (r 0.4, z+0.4 to z+1.1) and a head sphere (r 0.2 at z+1.6). The movement collider is unchanged;
+             - `EYE_HEIGHT` 1.6 moves into the game crate.
+           - **Shots ride their input.**
+             - `BUTTON_FIRE` marks an input carrying a shot: `frac:1 yaw:2 pitch:2` (+5 B), redundant ×3 like the input;
+             - it's at most one shot per step: the rifle fires every 3 steps, so the input's seq is the shot's id;
+             - `frac` is when in that step it fired, from the input clock's phase, so it's sub-tick;
+             - the shot's render step is the input's minus (1 − frac) steps (no extra bytes, ≤ 3 ms off), and the batch's mid lag gives the mid/far one;
+             - the client rate-limits itself the same way the server does.
+           - **Server, receiving:**
+             - a shot fires when its input is applied, its origin the shooter's eye between its own states for seq−1 and seq at `frac` (bit-exact with the client's prediction);
+             - **stand-ins never fire** (a repeated input drops its shot);
+             - a shot whose seq a stand-in already consumed still fires late, within 8 steps, from a ring of the shooter's last 16 states, and is counted;
+             - duplicates are dropped (seq ≤ the last fired), and so are shots faster than 3 steps apart, and shots from the dead.
+           - **Projectiles live in the shooter's timeline.**
+             - a shot fired at step τ0 (seq − 1 + frac) when the client drew tier T at render step R_T keeps D_T = τ0 − R_T, capped at 9 steps for near targets (300 ms) and 11 for mid/far (367 ms);
+             - at projectile time τ, it's tested against targets at τ − D_T: what the shooter saw, advanced by the flight time;
+             - the first tick catches up from τ0 to now; after that it runs with the server's steps.
+           - **History:** each tick's step plus, per entity, its 3D position, a life counter and alive-and-not-dead (16 B). The last 16 ticks are kept (≥ 0.53 s, ~2.6 MB at 10k). Positions are interpolated between ticks, never across a life change.
+           - **Shots phase** (new, after history, before serialize; parallel over projectiles). Each half-step segment is tested against:
+             1. the terrain;
+             2. cover in the cover cells it crosses;
+             3. players from the shared grid within segment/2 + 0.4 + 9 m/s × (D + 1 step).
+           - **Player candidates:**
+             - skipped: the shooter, its faction, and the dead (at the rewound time);
+             - each one's tier comes from the shooter's current near set (a per-entity index into the shard client lists);
+             - the nearest hit along the segment wins; on a player, the head counts when it's first along the ray.
+             - Results are sorted by projectile id and applied serially: damage, then deaths, with kill credit to the shot that took health to 0.
+           - **Measured:**
+             - shots fired, rejected, late; projectiles alive; segments; terrain, cover and candidate tests;
+             - hits by body or head, kills;
+             - rewinds clipped by a cap;
+             - post-cover hits (target occluded from the shooter's eye at the present): count and rewind;
+             - the shots phase's wall / longest / work, plus a `take_hits()` log for tests.
+           - **Load tests before fighting bots:**
+             - `lattice-bots --fire-share F`: that share of bots holds the trigger, aiming along its heading;
+             - `--fire-share` runs on WSL: uniform 5k at 20%, and a 1k blob all firing.
+           - **Client:**
+             - left mouse fires (held: every 100 ms) with the frame's phase and view;
+             - a cosmetic local tracer flies the shared arc;
+             - hit feedback (markers, damage direction, kill feed, others' tracers) is M3d.3, but deaths and health already show.
+           - **Swarm tests:**
+             - per-bot one-way delay in the harness, in steps, both directions;
+             - **what you see is what you hit:** a gunner aims at the rendered body, leading by the flight time at the rendered velocity, at a wandering target 30–80 m away. It hits ≥95% at 33 and 100 ms RTT; at ~250 ms RTT (past the near cap) it misses until it leads by the clipped time;
+             - headshot aim hits the head ≥90%;
+             - a wall or hill between shooter and target (placed with a test `teleport` API) blocks 100%, and post-cover hits only land within the cap;
+             - damage is exact: 5 body or 40+40+20 head/body; no friendly fire, self-damage, or damage to the dead;
+             - redundant copies never fire twice, stand-ins never fire, the fire rate holds;
+             - 20 Hz with dilation stays correct (all in steps);
+             - prediction stays bit-exact while shooting.
+           - **Deferred:**
+             - a "target hint" per shot (+3 B: the entity under the crosshair and its exact drawn step), if transition-time misses show up in the measurements;
+             - projectile-vs-projectile;
+             - ammo and reload.
         3. M3d.3: events, tracers, client combat.
         4. M3d.4: fighting bots, latency classes, measurements.
     - **M3e** one bare-metal validation session.
