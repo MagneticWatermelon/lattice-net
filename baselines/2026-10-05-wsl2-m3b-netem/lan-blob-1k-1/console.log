@@ -1,0 +1,38 @@
+== blob, 1000 bots, 60s -> baselines/2026-10-05-wsl2-m3b-netem/lan-blob-1k-1
+== summary: 1709 steady-state ticks (after warmup, before clients drain), peak 1000 clients ==
+  phase        p50 ms   p99 ms   max ms
+  ingress        0.39     0.55     2.59
+  events         0.11     0.17     0.26
+  movement       0.27     0.36     0.39
+  grid           0.17     0.27     0.34
+  separate       0.30     0.39     0.44
+  history        0.00     0.00     0.02
+  serialize      0.04     0.07     0.09
+  assembly       2.23     2.64     2.96
+  transport      0.93     1.28     1.43
+  egress         3.73     4.35     5.20
+  tick           8.21     9.11    11.19
+  overruns 0 | spawns 1000 despawns 1000 (632 joins deferred) | stand-ins: repeated 0 frozen 0 | late inputs 0 discarded 0 | bad messages 0 | recv errors 0 send errors 0
+  egress (whole run): 3593246 datagrams in 3593246 sends (1.00 per send), 115258 syscalls
+  ticks per ladder level (whole run): L0: 1810
+  input wait on the server (datagram arrival -> applied): p50 50.3 p99 68.2 max 101.8 mean 50.0 ms
+  steady state: stand-ins repeated 0 frozen 0 | late inputs 0 discarded 0
+  rewind (applied step - the input's render step, what lag compensation would rewind): p50 200 p99 210 max 267 mean 199.0 ms (n=1787395), render times ahead of the server 0
+== bots summary ==
+  started 1000 welcomed 1000 failed 0
+  join latency ms: p50 279 p99 529 max 662 (n=1000)
+  corrections 0 (0.00/bot-minute), mean error 0.000 m, max 0.000 m
+  push corrections (the server pushed us apart from a crowd) 26008 (26.01/bot-minute), max 0.357 m
+  snapshots 1791069 (entities per snapshot: near 64.1 mid 86.1 far 0.0), stale 0, unmatched acks 0, resyncs 0
+  input -> applied on server (est. RTT/2 + server wait): p50 69.0 p99 87.0 max 120.0 mean 68.4 ms (n=1789965)
+    of which server wait (arrival -> applied): p50 50.3 p99 68.2 max 101.8 mean 50.0 ms (n=1789965)
+  input -> seen acked (round trip): p50 100.0 p99 133.0 max 167.0 mean 101.9 ms (n=1789965)
+  near entity update interval (tracked bots): p50 66.0 p99 66.0 max 133.0 mean 53.2 ms (n=5726996)
+  mid entity update interval (tracked bots): p50 100.0 p99 100.0 max 2100.0 mean 100.4 ms (n=7656639)
+  far entity update interval (tracked bots): p50 0.0 p99 0.0 max 0.0 mean 0.0 ms (n=0)
+  near drawn (tracked bots): 99.73% interpolated, 0.05% extrapolated, 0.00% held, 0.22% new | pops p50 0 p99 0 max 334 mm
+  mid drawn (tracked bots): 94.95% interpolated, 2.66% extrapolated, 1.78% held, 0.60% new | pops p50 0 p99 145 max 17123 mm
+  far drawn (tracked bots): 0.00% interpolated, 0.00% extrapolated, 0.00% held, 0.00% new | pops p50 0 p99 0 max 0 mm
+  render delay 100.3 ms behind the newest step, clock snaps 0 (backwards 0)
+  input clock: 2763 extra inputs, 1795 skipped ticks, 0 backlog skips | near decode errors (tracked bots) 0
+  bytes down 2661.5 MB up 111.0 MB | swarm busy 11% of its threads' time, tick overruns 2

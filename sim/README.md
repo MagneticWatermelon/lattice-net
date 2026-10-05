@@ -286,6 +286,66 @@ The game rules both sides run now live in the `lattice-game` crate (`game/`): mo
 
 Prediction stays bit-exact (the swarm test `clean_link_predicts_bit_exactly` runs on terrain, with cover and jumps). Over UDP, the only corrections outside pushes come from stand-ins when the box is overloaded.
 
+### M3b: the client core and one render timeline (2026-10-05)
+
+The client every player runs, bots and humans alike, is now `lattice-client-core` (`client-core/`): the input clock, prediction and reconciliation, and the entity store. A bot (`sim/src/bot.rs`) is that core plus a wander AI as its input source.
+
+**The timeline is game steps, not ticks.** Snapshots carry `step` (1/30 s of game time). Every other message's tick maps to a step through the snapshots (`TickSteps`). At 30 Hz a tick is a step; at 20 Hz it's 1 or 2, so rendering on ticks would play movement at alternating 0.67× and 1.33× speed.
+
+**Render clock** (`client-core/src/clock.rs`):
+- other entities are drawn at the newest step minus 100 ms (`--interp-ms` on the bots);
+- the newest step tracks the earliest snapshot arrivals: it moves up at once, and down by 2% per late snapshot, so jitter doesn't move it;
+- the render step slews at most ±10% to follow and never runs backwards; it snaps only past 0.5 s of error;
+- under dilation it runs at pace × 30 steps/s.
+
+**Entities** (`client-core/src/entities.rs`) keep one timeline of samples each, whatever tier the samples came from.
+- **Drawing:** interpolated when bracketed; otherwise extrapolated (near: its velocity; mid/far: derived from the last two samples) for one update interval, then held.
+- **Smoothing:** a sample that changes what's on screen becomes a visual offset that decays over 100 ms. Its size before smoothing is the *pop*, which tracked bots report per tier.
+- **Forgetting:** an entity that stops coming (it left interest; leaving isn't sent) is dropped at twice its update interval overdue, at least 0.5 s and at most 2 s.
+- **Blobs:** mid/far blobs now fill their altitude (16 cm), pitch and airborne bits.
+
+**Render times in inputs.** Each input carries the render step it was made at (u16 in 1/64 steps, +2 B per input). The server records **rewind** = applied step − render step: what lag compensation would rewind for that input (server summary `rewind_*`).
+
+**The input clock has two entry points:**
+- `step_inputs`: exactly one step per call, for callers at 30 Hz (the bots);
+- `tick_inputs`: by elapsed time, for a frame loop (the human client).
+
+A 30 Hz caller running by elapsed time doubled the extra/skipped inputs and raised p99 server wait from 67–74 to 80–102 ms (WSL blob, 3 runs each). `own_render` draws the client's own player between its last two predicted steps.
+
+**Swarm tests** (`render_timeline_*`, 60 bots roaming a 500 m disk, renders checked against the server's states at the render step):
+
+| link | near interpolated, error p99 | mid interpolated, error p99 | far error p50 / p99, pops p50 / p99 | rewind p50 / p99 |
+|---|---|---|---|---|
+| clean | 100%, 7 mm | 99.9%, 10 cm | 0.31 / 3.5 m, 0.64 / 5.0 m | 167 / 167 ms |
+| 5% loss, 0–33 ms jitter | 100%, 1.2 cm | 96.4%, 25 cm | 0.35 / 4.5 m, 0.77 / 5.9 m | 167 / 200 ms |
+| 20 Hz at dilation 0.8 (ladder bottom) | 99.9%, 6 mm | 40% (mid every 5 ticks), 1.4 m | 2.1 / 13 m | |
+
+- **Near and mid are exact to their quantization.** Mid's error is mostly its 16 cm height steps.
+- **Far (2 Hz) is extrapolated ~75% of the time by design.** A metre-scale error at 500–1,500 m is a pixel or a few. These bots turn at random every ~1.5 s, a harsh case. This is the number that decides whether mid/far need velocity bytes; not yet.
+- **Rewind on a zero-latency link is 167 ms:** the 100 ms render delay, the spare input (33 ms), and the wait for the next tick (33 ms). **So rewind = RTT + ~167 ms**, which M3d's 200 ms cap must reckon with: only players under ~33 ms RTT would be fully compensated.
+- **The delay sweep** (`render_delay_sweep`, ignored by default) shows the trade:
+  - 67 ms: rewind 134 ms; mid pops p99 0.2 m clean, 0.4 m lossy;
+  - 100 ms: near and mid without pops;
+  - 133 ms: rewind 199 ms.
+
+**Over UDP on WSL**, blob 1k: 0 corrections, render delay 100.1 ms, 0 clock snaps; near 99.5% interpolated, mid 94.4% (2.9% held: entities churning out of the capped mid set); rewind p50 167 / p99 200 ms at 7.6 ms RTT.
+
+**Netem on WSL** (`baselines/2026-10-05-wsl2-m3b-netem`, 1k bots, every 20th tracked). Shares of frames interpolated; pops p99 in mm; uniform / blob.
+
+| link (one way) | near | mid | mid pops p99 | far interpolated / extrapolated, pops p99 | rewind p50 / p99 |
+|---|---|---|---|---|---|
+| clean | 99.8 / 99.7% | 98.7 / 95.1% | 118 / 117 | 20 / 79%, 4.9 m | 167 / 200 ms |
+| LAN: 15 ± 2 | 99.8 / 99.7% | 99.6 / 95.0% | 46 / 145 | 20 / 79%, 4.9 m | 200 / 210 ms |
+| typical: 40 ± 5, 0.5% loss | 99.8 / 99.6% | 96.9 / 94.5% | 133 / 168 | 21 / 78%, 5.0 m | 233–249 / 267 ms |
+| far: 75 ± 10, 1% loss | 99.8 / 99.4% | 96.7 / 91.6% | 193 / 201 | 20 / 78%, 5.3 m | 302–304 / 330 ms |
+| lossy: 40 ± 5, 5% loss | 99.8 / 98.0% | 91.7 / 90.1% | 324 / 320 | 20 / 76%, 5.6 m | 234 / 270–299 ms |
+| jittery: 40 ± 20 (σ) | 99.8 / 98.2% | 81.1 / 83.0% | 332 / 333 | 17 / 83%, 5.3 m | 217–233 / 261–267 ms |
+
+- **Near holds on every link** (≥98%, pops ≤ 8 cm at p99), and the render delay stays 100–102 ms with no snaps.
+- **Mid misses its ≥99% clean bar over UDP:** 98.7% uniform, 95% blob. In the blob, ~2% are held: entities that left the capped mid set and linger until forgotten. The rest is extrapolation of 1–3 steps where a 10 Hz update lands right at the render step. Under ±20 ms jitter (σ, so tails of 60 ms), mid falls to ~82% interpolated, with pops of 0.33 m at p99, smoothed over 100 ms.
+- **Rewind = RTT + ~150–170 ms on every link.** On the far link (150 ms RTT) it's ~300 ms.
+- **Unchanged from 2026-10-04:** input → applied, stand-ins, and corrections (≤0.18 per bot-minute).
+
 ### Nearest-player search: `Grid::knn` (2026-10-04)
 
 Following `reports/Nearest player search algorithms.md`, the near and mid tiers' k-nearest search is now `Grid::knn`, in `grid.rs`.

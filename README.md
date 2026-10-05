@@ -8,7 +8,7 @@ cargo run --release --example server                   # real UDP, 30 Hz tick, e
 cargo run --release --example client 127.0.0.1:40000 5
 ```
 
-The game rules both sides run (movement, the world, message formats) are in [`game/`](game/) (`lattice-game`). The M1 headless scale test (the server, a bot swarm and per-phase tick metrics) lives in [`sim/`](sim/README.md): `scripts/m1.sh blob 3000 60` runs one scenario, and `scripts/baseline.sh full <name>` runs the whole matrix into a comparable baseline in `baselines/`.
+The game rules both sides run (movement, the world, message formats) are in [`game/`](game/) (`lattice-game`). The client every player runs, bots and humans alike (input clock, prediction, the render timeline and entity interpolation), is [`client-core/`](client-core/) (`lattice-client-core`). The M1 headless scale test (the server, a bot swarm and per-phase tick metrics) lives in [`sim/`](sim/README.md): `scripts/m1.sh blob 3000 60` runs one scenario, and `scripts/baseline.sh full <name>` runs the whole matrix into a comparable baseline in `baselines/`.
 
 ## Wire format
 

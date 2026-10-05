@@ -125,7 +125,16 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
       - Movement is 2.5D: pitch, jump, gravity, 45° max slope, 0.45 m steps, sliding along cover, ledge catch when falling.
       - Soft separation is a server phase (`separate`). Snapshots carry a push counter, so bots count push corrections apart from real ones.
       - Prediction stays bit-exact; on WSL there are 0 real corrections in the pile and blob, and the cost is +0.3–1 ms of tick. See sim/README.
-    - **M3b `lattice-client-core`** (`client-core/`, scoped 2026-10-05). Bots and humans run the same client code.
+    - **M3b `lattice-client-core`: built** (`client-core/`, 2026-10-05; see sim/README). Bots and humans run the same client code.
+      - **Results** (WSL netem, `baselines/2026-10-05-wsl2-m3b-netem`):
+        - near is ≥98% interpolated on every link (exact to 1 cm);
+        - far is ~20% interpolated (p50 error 0.3 m, p99 3–5 m);
+        - there are 0 clock snaps, and render time never goes backwards.
+      - **Mid misses its ≥99% clean bar over UDP:** 98.7% uniform, 95% blob (2% are entities leaving the capped mid set). Under ±20 ms σ jitter it's ~82%.
+        - Options: a slightly longer render delay (+1 step), or an adaptive delay sized to measured jitter.
+        - Re-judge with human eyes in M3c before tuning.
+      - **Finding for M3d: rewind = RTT + ~167 ms** (100 ms render delay + the spare input + the wait for the next tick). A 200 ms cap fully compensates only players under ~33 ms RTT. Decide the cap and the render delay together: at 67 ms, rewind is RTT + 134 ms, at the cost of mid pops up to 0.4 m on a lossy link.
+      - **The input clock has two entry points.** `step_inputs` is for 30 Hz callers (the bots); `tick_inputs` runs by elapsed time, for frame loops. Run by time, a 30 Hz caller's jitter raised p99 server wait from ~70 to 80–100 ms.
       - **Extraction.** Prediction, the input clock and the entity store move out of `BotBrain`. The bot AI (`think`) stays in sim, as the input source passed to `tick_inputs`.
       - **The timeline is game steps (1/30 s), not server ticks.** Snapshots carry `step`. Ticks map to steps 1:1 at 30 Hz but 1-or-2 at 20 Hz, so interpolating in ticks would play 20 Hz movement at alternating 0.67×/1.33× speed. Under dilation the clock runs at pace × 30 steps/s.
       - **Render clock.** It tracks the envelope of snapshot arrivals: up at once when a step arrives earlier than expected, slow drift down when it arrives later. Render = newest − delay (100 ms default), slewed at most ±10% and never backwards; it snaps past 0.5 s of error.
