@@ -325,6 +325,70 @@ impl Track {
     }
 }
 
+/// Quarter-step bins of `NearNeed`, up to 16 steps.
+const NEED_BINS: usize = 64;
+/// `NearNeed` forgets with this time constant, in steps (3 s).
+const NEED_MEMORY: f64 = 90.0;
+
+/// What near delay would have kept near entities interpolated. When a near
+/// update arrives, the entity's previous update was the newest it had until
+/// then: a render delay at least as long as that update was behind the
+/// newest step (when its successor arrived) never ran past it. A decaying
+/// histogram of those, in quarter steps.
+///
+/// It reflects every way near updates come late: loss, jitter, and the near
+/// tier's per-tick cap (in a crowd, ~100 candidates share 64 sends a tick,
+/// so a near entity updates every 1-3 ticks, not every tick).
+#[derive(Debug, Clone)]
+pub struct NearNeed {
+    hist: [f32; NEED_BINS],
+    at: Option<f64>,
+}
+
+impl Default for NearNeed {
+    fn default() -> Self {
+        Self { hist: [0.0; NEED_BINS], at: None }
+    }
+}
+
+impl NearNeed {
+    /// An update arrived when its predecessor was `behind` steps behind the newest.
+    pub fn record(&mut self, behind: f64) {
+        let b = ((behind * 4.0).ceil().max(0.0) as usize).min(NEED_BINS - 1);
+        self.hist[b] += 1.0;
+    }
+
+    /// Ages the histogram to render step `r`.
+    pub fn decay_to(&mut self, r: f64) {
+        match self.at {
+            Some(at) if r > at => {
+                let k = (-(r - at) / NEED_MEMORY).exp() as f32;
+                self.hist.iter_mut().for_each(|h| *h *= k);
+                self.at = Some(r);
+            }
+            None => self.at = Some(r),
+            _ => {}
+        }
+    }
+
+    /// The delay that would have covered a `q` share of recent near updates,
+    /// in steps; `None` with too few to tell.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        let total: f32 = self.hist.iter().sum();
+        if total < 30.0 {
+            return None;
+        }
+        let mut seen = 0.0;
+        for (b, &h) in self.hist.iter().enumerate() {
+            seen += h;
+            if seen as f64 >= q * total as f64 {
+                return Some(b as f64 / 4.0);
+            }
+        }
+        Some((NEED_BINS - 1) as f64 / 4.0)
+    }
+}
+
 /// Smoothness, per tier (near, mid, far).
 #[derive(Debug, Clone, Default)]
 pub struct SmoothStats {
@@ -347,6 +411,8 @@ pub struct Entities {
     pub intervals: [Vec<u16>; 3],
     pub bad_blobs: u64,
     pub smooth: SmoothStats,
+    /// What near delay recent near updates needed (see `NearNeed`).
+    pub need: NearNeed,
 }
 
 impl Default for Entities {
@@ -365,6 +431,7 @@ impl Entities {
             intervals: Default::default(),
             bad_blobs: 0,
             smooth: SmoothStats::default(),
+            need: NearNeed::default(),
         }
     }
 
@@ -372,20 +439,35 @@ impl Entities {
         self.mid_lag
     }
 
+    /// Mid and far entities glide to the new lag (`LAG_SLEW`).
+    pub fn set_mid_lag(&mut self, lag: f64) {
+        self.mid_lag = lag.max(0.0);
+    }
+
     /// A near message: `step` maps its server tick to a game step (`None` if
-    /// unknown yet), `render` is the render step it arrived at.
+    /// unknown yet), `render` is the render step it arrived at and `newest`
+    /// the newest step the server had sent by then.
     pub(crate) fn on_near(
         &mut self,
         data: &[u8],
         step: impl Fn(u32) -> Option<f64>,
         render: Option<f64>,
+        newest: Option<f64>,
     ) -> Result<(), lattice_net::wire::DecodeError> {
         let mut got = Vec::new();
         let tick = delta::decode_near(data, &mut self.near, |e, q| got.push((e, q)))?;
         let at = step(tick);
         for (e, q) in got {
             let known = Known { tick, tier: Tier::Near, pos: q.pos() };
-            self.record(e, known, at.map(|s| Sample::from_near(s, &q)), render);
+            let sample = at.map(|s| Sample::from_near(s, &q));
+            // What delay its previous near update needed (see NearNeed).
+            if let (Some(s), Some(newest), Some(t)) = (sample, newest, self.tracks.get(&e)) {
+                let prev = t.newest();
+                if prev.tier == Tier::Near && s.step > prev.step && s.step - prev.step <= 8.0 {
+                    self.need.record(newest - prev.step);
+                }
+            }
+            self.record(e, known, sample, render);
         }
         Ok(())
     }
@@ -629,5 +711,29 @@ mod tests {
             }
         }
         assert!((last.at - (r - MID_LAG)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn near_need_tracks_how_late_near_updates_come() {
+        let mut n = NearNeed::default();
+        assert_eq!(n.quantile(0.99), None, "too few to tell");
+        // Updates every step, each arriving as the newest: 1 step behind.
+        for _ in 0..100 {
+            n.record(1.0);
+        }
+        assert_eq!(n.quantile(0.99), Some(1.0));
+        // In a crowd, every 1-3 steps: the 99th percentile is 3.
+        for i in 0..300 {
+            n.record([1.0, 2.0, 3.0][i % 3]);
+        }
+        assert_eq!(n.quantile(0.99), Some(3.0));
+        assert_eq!((n.quantile(0.5), n.quantile(0.6)), (Some(1.0), Some(2.0)), "400 updates: 200 at 1, 100 at 2, 100 at 3");
+        // It forgets (3 s time constant): 20 s later, new data dominates.
+        n.decay_to(0.0);
+        n.decay_to(600.0);
+        for _ in 0..100 {
+            n.record(1.25);
+        }
+        assert_eq!(n.quantile(0.99), Some(1.25));
     }
 }

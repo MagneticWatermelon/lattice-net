@@ -70,6 +70,12 @@ impl RenderClock {
         self.delay
     }
 
+    /// A new render delay, in steps. The render step slews to it (`SLEW`),
+    /// never jumping unless it's more than `SNAP` away.
+    pub fn set_delay(&mut self, steps: f64) {
+        self.delay = steps;
+    }
+
     /// The last render step handed out by `render_at`.
     pub fn last_render(&self) -> Option<f64> {
         self.render.map(|(_, r)| r)

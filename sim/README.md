@@ -346,6 +346,31 @@ A 30 Hz caller running by elapsed time doubled the extra/skipped inputs and rais
 - **Rewind = RTT + ~150–170 ms on every link.** On the far link (150 ms RTT) it's ~300 ms.
 - **Unchanged from 2026-10-04:** input → applied, stand-ins, and corrections (≤0.18 per bot-minute).
 
+### Per-tier render delays (2026-10-05)
+
+One 100 ms timeline was too long for near players (it added 33 ms to every rewind for nothing) and too short for mid ones (at 10 Hz, one late or lost update made them extrapolate). Now each tier has its own delay:
+- **Near: 67 ms,** two 30 Hz updates. The render clock runs at this delay.
+- **Mid and far: 200 ms,** two 10 Hz updates, so a lost one is bridged. 200 ms in the past is invisible at 150 m and beyond. Far (2 Hz) is still mostly extrapolated, but less.
+- **A tier change glides:** an entity's lag behind the render clock slews at 25% (133 ms over ~0.5 s). It plays a little fast or slow, never skips.
+- **Lag compensation rewinds each target by its own tier's delay.** Inputs carry the near render step, and each batch carries the mid lag (1 B). The server reports `rewind_near_*` and `rewind_mid_*`.
+- **16 samples per entity** (was 8): a mid entity is drawn ~6 steps behind its newest sample.
+
+**The delay sweep** (`render_delay_sweep`: 60 bots in a 500 m disk, renders checked against the server's states at each entity's own step; lossy is 5% loss with 0–33 ms of jitter):
+
+| near / mid delay | near interpolated, clean / lossy | mid interpolated, clean / lossy | mid pops p99, lossy | far interpolated, error p50 | rewind near / mid, clean |
+|---|---|---|---|---|---|
+| 100 / 100 ms (before) | 100 / 100% | 99.9 / 96.4% | 320 mm | 27%, 0.31 m | 167 / 167 ms |
+| 33 / 133 ms | 99.9 / **95.0%** | 99.9 / 96.4% | 215 mm | 27%, 0.26 m | 99 / 199 ms |
+| 67 / 133 ms | 100 / 100% | 99.8 / 96.4% | 215 mm | 27%, 0.25 m | 134 / 201 ms |
+| **67 / 200 ms** | **100 / 99.99%** | **99.9 / 99.7%** | **0** | **47%, 0.17 m** | **134 / 267 ms** |
+| 100 / 267 ms | 100 / 99.99% | 99.97 / 99.9% | 0 | 60%, 0.12 m | 167 / 333 ms |
+
+- **67 / 200 is the knee.** Near at 33 ms loses interpolation under loss. Mid needs 200 ms to bridge a lost update; at 133 ms it gains nothing over 100. Going to 267 ms buys 0.2% for 67 ms more rewind.
+- **At the ladder's bottom** (20 Hz, dilation 0.8), mid is 79% interpolated (was 40%), and near keeps 99.9%.
+- **On the Windows client** (1k blob, WSL server): near 99.7% interpolated, mid's extrapolated frames 1.26% → 0.92%, 0 corrections, render delay 68 ms. Mid's remaining misses are entities churning in and out of the capped mid set.
+
+**Separation across heights** has a unit test now (`separation_pushes_bodies_that_overlap_in_height_too`). Pairs a body height or more apart vertically aren't pushed; a player on a crate beside another overlaps it and is.
+
 ### Nearest-player search: `Grid::knn` (2026-10-04)
 
 Following `reports/Nearest player search algorithms.md`, the near and mid tiers' k-nearest search is now `Grid::knn`, in `grid.rs`.

@@ -61,7 +61,7 @@ In WSL itself, `cargo run` in `client/` opens a window under WSLg, but it render
 | `--server` | the server's address |
 | `--user` | the user id |
 | `--token-key`, `--server-id` | for the dev connect token, which the client mints itself like the bots do |
-| `--near-ms`, `--mid-ms` | the render delays: near players 67 ms, mid and far 200 ms |
+| `--near-ms`, `--near-max-ms`, `--mid-ms` | the render delays: near players 67 ms, growing up to 133 ms when near updates come less often (crowds); mid and far 200 ms |
 | `--view first\|chase\|spectator`, `--spectate X,Y,Z,YAW,PITCH` | the starting camera |
 | `--no-vsync`, `--no-shadows`, `--ghosts` | rendering options |
 | `--autoplay` | wander instead of reading the keyboard |

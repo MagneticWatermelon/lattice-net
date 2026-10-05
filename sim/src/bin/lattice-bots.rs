@@ -29,7 +29,8 @@ lattice-bots: M1 bot swarm
   --report S           report interval, seconds [5]
   --track-every N      every Nth bot tracks entities and draws a frame every tick, to measure
                        update intervals and smoothness per tier [20]
-  --near-ms MS         render delay of near entities behind the newest server step [67]
+  --near-ms MS         render delay of near entities behind the newest server step, at least [67]
+  --near-max-ms MS     ...growing up to this to cover how late near updates come [133]
   --mid-ms MS          render delay of mid and far entities [200]
   --full-every K       only every Kth bot measures (prediction, latency, tracking); the
                        rest are sink bots that play but only count what they're sent [1]
@@ -220,7 +221,8 @@ struct Bot {
     seed: u64,
     track: bool,
     sink: bool,
-    delays: (Duration, Duration),
+    /// Near (least, most) and mid render delays.
+    delays: (Duration, Duration, Duration),
     /// Bound up front, before the clock starts: creating thousands of sockets
     /// inside the first tick overran the swarm and delivered its inputs late.
     sock: Option<UdpSocket>,
@@ -245,7 +247,8 @@ impl Bot {
             };
             let token = login.token(self.seed, clocks.system);
             self.net = Some((sock, Client::new(Config::default(), server, token, now)));
-            let client = ClientConfig { near_delay: self.delays.0, mid_delay: self.delays.1, track_entities: false };
+            let (near_delay, near_delay_max, mid_delay) = self.delays;
+            let client = ClientConfig { near_delay, near_delay_max, mid_delay, track_entities: false };
             let mut brain = BotBrain::with_config(self.seed, client);
             if self.track {
                 brain.enable_tracking();
@@ -481,7 +484,7 @@ fn main() -> std::io::Result<()> {
     let seed: u64 = a.get("seed", 1);
     let track_every: usize = a.get("track-every", 20);
     let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
-    let delays = (ms(a.get::<f64>("near-ms", 2000.0 / 30.0)), ms(a.get::<f64>("mid-ms", 200.0)));
+    let delays = (ms(a.get::<f64>("near-ms", 2000.0 / 30.0)), ms(a.get::<f64>("near-max-ms", 4000.0 / 30.0)), ms(a.get::<f64>("mid-ms", 200.0)));
     let full_every: usize = a.get::<usize>("full-every", 1).max(1);
     let key: HexKey = a.get("token-key", HexKey::default());
     let summary_path: Option<String> = a.opt("summary");

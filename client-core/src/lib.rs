@@ -62,9 +62,13 @@ const OWN_SMOOTH: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// How far behind the newest server state near entities are drawn: two
-    /// of their 30 Hz updates, so one late or lost update is ridden out.
+    /// How far behind the newest server state near entities are drawn, at
+    /// least: two of their 30 Hz updates, so one late or lost update is ridden
+    /// out. It grows (up to `near_delay_max`) to cover the 99th percentile of
+    /// how late near updates actually come (`NearNeed`): in a crowd the near
+    /// tier's per-tick cap makes them come every 1-3 ticks.
     pub near_delay: Duration,
+    pub near_delay_max: Duration,
     /// The same for mid and far entities: two 10 Hz updates. (Far updates at
     /// 2 Hz are mostly extrapolated on this timeline.)
     pub mid_delay: Duration,
@@ -75,7 +79,12 @@ pub struct ClientConfig {
 
 impl Default for ClientConfig {
     fn default() -> Self {
-        Self { near_delay: Duration::from_secs(2) / TICK_HZ, mid_delay: Duration::from_millis(200), track_entities: true }
+        Self {
+            near_delay: Duration::from_secs(2) / TICK_HZ,
+            near_delay_max: Duration::from_secs(4) / TICK_HZ,
+            mid_delay: Duration::from_millis(200),
+            track_entities: true,
+        }
     }
 }
 
@@ -183,6 +192,10 @@ pub struct ClientCore {
     entities: Option<Entities>,
     /// Mid and far entities are drawn this many steps behind near ones.
     mid_lag: f64,
+    /// The near render delay now, and its bounds; the mid one, all in steps.
+    near_delay: f64,
+    near_bounds: (f64, f64),
+    mid_delay: f64,
     /// The newest snapshot's own state and its step: the server's view of us.
     server_own: Option<(MoveState, u32)>,
     /// Own-player correction being smoothed away, as of `own_offset_at`.
@@ -196,7 +209,11 @@ pub struct ClientCore {
 
 /// Steps mid and far entities are drawn behind near ones.
 fn mid_lag(cfg: &ClientConfig) -> f64 {
-    (cfg.mid_delay.saturating_sub(cfg.near_delay)).as_secs_f64() * TICK_HZ as f64
+    steps(cfg.mid_delay.saturating_sub(cfg.near_delay))
+}
+
+fn steps(d: Duration) -> f64 {
+    d.as_secs_f64() * TICK_HZ as f64
 }
 
 impl Default for ClientCore {
@@ -230,6 +247,9 @@ impl ClientCore {
             tick_steps: TickSteps::default(),
             entities: cfg.track_entities.then(|| Entities::new(mid_lag(&cfg))),
             mid_lag: mid_lag(&cfg),
+            near_delay: steps(cfg.near_delay),
+            near_bounds: (steps(cfg.near_delay), steps(cfg.near_delay_max.max(cfg.near_delay))),
+            mid_delay: steps(cfg.mid_delay),
             server_own: None,
             own_offset: [0.0; 3],
             own_offset_at: None,
@@ -325,8 +345,26 @@ impl ClientCore {
         }
         if let Some(e) = &mut self.entities {
             e.render(r, f);
+            // The near delay follows what near updates need: up at once, down
+            // only when clearly less is needed. Mid stays at its delay, so its
+            // lag behind near changes the other way.
+            e.need.decay_to(r);
+            if let Some(need) = e.need.quantile(0.99) {
+                let want = need.clamp(self.near_bounds.0, self.near_bounds.1);
+                if want > self.near_delay || want < self.near_delay - 0.5 {
+                    self.near_delay = want;
+                    self.render_clock.set_delay(want);
+                    self.mid_lag = (self.mid_delay - want).max(0.0);
+                    e.set_mid_lag(self.mid_lag);
+                }
+            }
         }
         Some(r)
+    }
+
+    /// The near render delay now, in steps (it adapts; see `ClientConfig`).
+    pub fn near_delay(&self) -> f64 {
+        self.near_delay
     }
 
     /// Where to draw our own player at `now`: between the last two predicted
@@ -367,8 +405,9 @@ impl ClientCore {
             self.stats.tier_seen[Tier::Near as usize] += data.get(5).copied().unwrap_or(0) as u64;
             if let Some(t) = &mut self.entities {
                 let render = self.render_clock.render_at(now);
+                let newest = self.render_clock.newest_at(now);
                 let steps = &self.tick_steps;
-                if t.on_near(data, |tick| steps.get(tick), render).is_err() {
+                if t.on_near(data, |tick| steps.get(tick), render, newest).is_err() {
                     self.stats.near_decode_errors += 1;
                 }
             }

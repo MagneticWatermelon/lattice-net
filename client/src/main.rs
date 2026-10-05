@@ -27,7 +27,9 @@ lattice-client: play on a lattice-server
   --user N             user id for the dev connect token [random]
   --token-key HEX      the server's --token-key [the public dev key]
   --server-id N        [1]
-  --near-ms MS         render delay of near players behind the newest server step [67]
+  --near-ms MS         render delay of near players behind the newest server step, at
+                       least [67]; it grows to cover how late near updates come, up to
+  --near-max-ms MS     [133]
   --mid-ms MS          render delay of mid and far players [200]
   --view first|chase|spectator   starting view [first]
   --spectate X,Y,Z,YAW,PITCH     start in free flight there (meters, degrees)
@@ -78,7 +80,8 @@ struct Args {
     user: u64,
     key: [u8; 32],
     server_id: u64,
-    delays: (Duration, Duration),
+    /// Near (least, most) and mid render delays.
+    delays: (Duration, Duration, Duration),
     mode: Mode,
     spectate: Option<([f32; 3], f32, f32)>,
     vsync: bool,
@@ -100,7 +103,7 @@ fn parse_args() -> Args {
         user: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |d| d.as_nanos() as u64) | 1 << 40,
         key: lattice_net::token::DEV_TOKEN_KEY,
         server_id: 1,
-        delays: (Duration::from_secs(2) / 30, Duration::from_millis(200)),
+        delays: (Duration::from_secs(2) / 30, Duration::from_secs(4) / 30, Duration::from_millis(200)),
         mode: Mode::FirstPerson,
         spectate: None,
         vsync: true,
@@ -128,7 +131,8 @@ fn parse_args() -> Args {
                 }
             }
             "--near-ms" => a.delays.0 = Duration::from_secs_f64(val().parse::<f64>().unwrap_or_else(|e| die(&format!("--near-ms: {e}"))) / 1000.0),
-            "--mid-ms" => a.delays.1 = Duration::from_secs_f64(val().parse::<f64>().unwrap_or_else(|e| die(&format!("--mid-ms: {e}"))) / 1000.0),
+            "--near-max-ms" => a.delays.1 = Duration::from_secs_f64(val().parse::<f64>().unwrap_or_else(|e| die(&format!("--near-max-ms: {e}"))) / 1000.0),
+            "--mid-ms" => a.delays.2 = Duration::from_secs_f64(val().parse::<f64>().unwrap_or_else(|e| die(&format!("--mid-ms: {e}"))) / 1000.0),
             "--view" => {
                 a.mode = match val().as_str() {
                     "first" => Mode::FirstPerson,
@@ -162,7 +166,7 @@ fn main() {
     let args = parse_args();
     let now = Instant::now();
     let token = net::dev_token(&args.key, args.server_id, args.user);
-    let cfg = ClientConfig { near_delay: args.delays.0, mid_delay: args.delays.1, track_entities: true };
+    let cfg = ClientConfig { near_delay: args.delays.0, near_delay_max: args.delays.1, mid_delay: args.delays.2, track_entities: true };
     let session = Session::connect(args.server, token, cfg, now).unwrap_or_else(|e| die(&format!("socket: {e}")));
     println!("connecting to {} as user {}", args.server, args.user);
     let mut view = View::new(args.mode);

@@ -924,7 +924,9 @@ fn render_timeline_rides_out_loss_and_jitter() {
     assert!(r.err[0].1 < 0.05 && r.err[1].1 < 0.3, "{:?}", r.err);
     let [near_rw, mid_rw] = s.server.take_rewind().map(|h| h.summary());
     eprintln!("rewind near p50 {} p99 {} max {}, mid p50 {} p99 {} max {} ms", near_rw.p50, near_rw.p99, near_rw.max, mid_rw.p50, mid_rw.p99, mid_rw.max);
-    assert!(near_rw.p50 == 133 && near_rw.p99 <= 167 && mid_rw.p50 == 267 && mid_rw.p99 <= 300, "{near_rw:?} {mid_rw:?}");
+    // The near delay grows a little to cover lost updates (~2.1 steps).
+    assert!(r.delay < 2.5, "{}", r.delay);
+    assert!(near_rw.p50 == 133 && near_rw.p99 <= 200 && mid_rw.p50 == 267 && mid_rw.p99 <= 300, "{near_rw:?} {mid_rw:?}");
 }
 
 #[test]
@@ -935,7 +937,8 @@ fn render_delay_sweep() {
             let cfg = SimConfig { spawn: SpawnMode::Disk(500.0), ..Default::default() };
             let mut s = render_swarm(60, cfg, Duration::from_secs(3));
             let ms = Duration::from_millis;
-            let client = lattice_sim::bot::ClientConfig { near_delay: ms(near), mid_delay: ms(mid), track_entities: true };
+            // Fixed delays, for the sweep.
+            let client = lattice_sim::bot::ClientConfig { near_delay: ms(near), near_delay_max: ms(near), mid_delay: ms(mid), track_entities: true };
             for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
                 *b = BotBrain::with_config(i as u64, client.clone());
             }
@@ -957,10 +960,36 @@ fn render_timeline_at_20_hz_and_dilation() {
     let r = measure_render(&mut s, 32 * TICK_HZ, 6);
     assert_eq!(s.server.level(), lattice_sim::ladder::MAX_LEVEL);
     assert_eq!(s.render_backwards, 0);
-    assert!((r.delay - 2.0).abs() < 0.05, "{}", r.delay);
-    // Rendering on steps, not ticks: near keeps interpolating. (Two steps of
-    // delay against ticks of up to 2 steps: a few cm of extrapolation at
-    // p99.) Mid and far update every 5 and 30 ticks down here.
-    assert!(r.interpolated[0] >= 0.99 && r.err[0].1 < 0.06, "{:?} {:?}", r.interpolated, r.err);
+    // Rendering on steps, not ticks: near keeps interpolating, the near delay
+    // growing to cover 20 Hz ticks of 1 or 2 steps. Mid and far update every
+    // 5 and 30 ticks down here.
+    assert!(r.delay > 2.0 && r.delay <= 4.0 + 1e-6, "{}", r.delay);
+    assert!(r.interpolated[0] >= 0.99 && r.err[0].1 < 0.02, "{:?} {:?}", r.interpolated, r.err);
     assert!(r.err[1].1 < 3.0, "{:?}", r.err);
+}
+
+#[test]
+fn the_near_delay_grows_when_near_updates_come_less_often() {
+    // 60 bots in a 30 m disk, with room for only 20 near updates per client
+    // per tick: each near entity updates every ~3 ticks, irregularly, like
+    // the near tier's cap in a big crowd. 67 ms would run past them.
+    let interest = InterestConfig { near_per_tick: 20, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Disk(30.0), interest, ..Default::default() };
+    // First with the near delay fixed at 67 ms, for comparison.
+    let mut fixed = render_swarm(60, cfg.clone(), Duration::from_secs(4));
+    let client = lattice_sim::bot::ClientConfig { near_delay_max: Duration::from_secs(2) / TICK_HZ, ..Default::default() };
+    for (i, (_, _, b)) in fixed.bots.iter_mut().enumerate() {
+        *b = BotBrain::with_config(i as u64, client.clone());
+    }
+    let f = measure_render(&mut fixed, 4 * TICK_HZ, 6);
+    let mut s = render_swarm(60, cfg, Duration::from_secs(4));
+    let r = measure_render(&mut s, 4 * TICK_HZ, 6);
+    assert!(f.interpolated[0] < 0.9, "fixed at 67 ms, near extrapolates: {:?}", f.interpolated);
+    assert_eq!(s.render_backwards, 0);
+    assert!(r.delay > 2.5 && r.delay <= 4.0 + 1e-6, "near delay grew from 2 steps: {}", r.delay);
+    assert!(r.interpolated[0] >= 0.98, "{:?}", r.interpolated);
+    let [near_rw, mid_rw] = s.server.take_rewind().map(|h| h.summary());
+    eprintln!("rewind near p50 {} p99 {}, mid p50 {} p99 {} ms", near_rw.p50, near_rw.p99, mid_rw.p50, mid_rw.p99);
+    // Mid stays at 200 ms whatever near does: its lag shrank instead.
+    assert!((260..=270).contains(&mid_rw.p50), "{mid_rw:?}");
 }

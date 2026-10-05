@@ -6,7 +6,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 
 - **One authoritative server process per continent**, with every player on the continent in that one process. Initial hard ceiling: **10k players**. Don't split one battle across servers: cross-server hit resolution means two clocks and two rewind histories.
 - **Server is authoritative for movement and hits.**
-  - Lag-compensated rewind is capped at ~150–200 ms.
+  - Lag-compensated rewind is capped at ~150–200 ms. (To revisit in M3d: the rewind's fixed part, render delay + spare + tick wait, is already ~134 ms for near targets, so that cap compensates only very low RTTs. See the M3 decisions.)
   - Projectiles are simulated on the server from a rewound origin.
   - Hit detection is not client-side (PS2's model).
 - **Per-client downstream is O(k), not O(N).** Interest management uses tiers:
@@ -117,7 +117,12 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - 3 factions;
     - projectiles simulated on the server from a rewound origin;
     - sub-tick shot timing;
-    - one render time for every entity on the client (~100–133 ms behind; mid/far smoothed or extrapolated to it);
+    - **a render delay per tier** (decided 2026-10-05, replacing one render time for every entity):
+      - near is drawn 67 ms behind the newest server step (two 30 Hz updates);
+      - mid and far are drawn 200 ms behind (two 10 Hz updates, so a lost one is bridged; far is mostly extrapolated on it);
+      - an entity changing tier glides between delays at 25% (133 ms over ~0.5 s);
+      - lag compensation rewinds each target by its own tier's delay, so inputs carry the near render step plus the batch's mid lag;
+    - **the rewind cap is "the highest RTT we fully compensate" + the fixed part:** a near target is rewound by RTT + 67 ms render + ~33 ms spare + ~33 ms tick wait, about 134 ms of fixed part (~115 with a spare sized to measured jitter). For 120–150 ms of RTT that's a cap of ~250–285 ms; players beyond it lead their shots. A deliberate fairness tradeoff (shots behind cover), decided in M3d;
     - mid/far velocity derived on the client first, with velocity bytes in the blobs only if the bots' smoothness numbers ask.
   - **Order:**
     - **M3a world and movement: done** (2026-10-04).
@@ -130,10 +135,9 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
         - near is ≥98% interpolated on every link (exact to 1 cm);
         - far is ~20% interpolated (p50 error 0.3 m, p99 3–5 m);
         - there are 0 clock snaps, and render time never goes backwards.
-      - **Mid misses its ≥99% clean bar over UDP:** 98.7% uniform, 95% blob (2% are entities leaving the capped mid set). Under ±20 ms σ jitter it's ~82%.
-        - Options: a slightly longer render delay (+1 step), or an adaptive delay sized to measured jitter.
+      - **Mid missed its ≥99% clean bar over UDP** with one 100 ms render time: 98.7% uniform, 95% blob (2% were entities leaving the capped mid set), ~82% under ±20 ms σ jitter. **Fixed by per-tier delays** (2026-10-05): mid at 200 ms reaches 99.7% in the swarm under 5% loss (was 96.4%). The WSL netem rerun is in sim/README.
         - Re-judge with human eyes in M3c before tuning.
-      - **Finding for M3d: rewind = RTT + ~167 ms** (100 ms render delay + the spare input + the wait for the next tick). A 200 ms cap fully compensates only players under ~33 ms RTT. Decide the cap and the render delay together: at 67 ms, rewind is RTT + 134 ms, at the cost of mid pops up to 0.4 m on a lossy link.
+      - **Finding for M3d: rewind = RTT + render delay + ~67 ms** (the spare input + the wait for the next tick). With one 100 ms render time that was RTT + 167 ms, and a 200 ms cap fully compensates only players under ~33 ms RTT. That led to per-tier delays: near targets RTT + 134 ms, mid/far RTT + 267 ms.
       - **The input clock has two entry points.** `step_inputs` is for 30 Hz callers (the bots); `tick_inputs` runs by elapsed time, for frame loops. Run by time, a 30 Hz caller's jitter raised p99 server wait from ~70 to 80–100 ms.
       - **Extraction.** Prediction, the input clock and the entity store move out of `BotBrain`. The bot AI (`think`) stays in sim, as the input source passed to `tick_inputs`.
       - **The timeline is game steps (1/30 s), not server ticks.** Snapshots carry `step`. Ticks map to steps 1:1 at 30 Hz but 1-or-2 at 20 Hz, so interpolating in ticks would play 20 Hz movement at alternating 0.67×/1.33× speed. Under dilation the clock runs at pace × 30 steps/s.
@@ -144,7 +148,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
         - A sample that changes what's on screen becomes a visual offset that decays (~100 ms), never a pop.
         - Entities unheard for 2 s are dropped (explicit despawns come with M3d's events).
       - **Mid/far blobs** fill their unused altitude (12 bits, 16 cm), pitch and airborne bits.
-      - **Inputs carry the render step** (u16, 1/64 step, wrapping; +2 B per input). The server records rewind = applied step − render step, the number M3d's 200 ms cap applies to.
+      - **Inputs carry the render step** (near: u16 in 1/64 steps, wrapping; +2 B per input; plus the batch's mid lag, 1 B). The server records rewind = applied step − render step, per tier.
       - **The client's own player** is drawn between its last two predicted steps by the input clock's phase. A reconciliation becomes a decaying offset. The input clock runs on elapsed time, so a 144 Hz client works.
       - **Measurement.** Tracked bots record, per tier:
         - the share of frames interpolated, extrapolated or held;
