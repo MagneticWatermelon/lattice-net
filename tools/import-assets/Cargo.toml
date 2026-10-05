@@ -1,0 +1,19 @@
+[package]
+name = "import-assets"
+version = "0.1.0"
+edition = "2021"
+description = "Meshy's output -> client/assets/models: textures shrunk, props normalized, the soldier's lighter meshes, clips cut down; and `decimate` for models too detailed to rig."
+license = "MIT"
+publish = false
+
+# Its own workspace: a dev tool, kept out of the server's and the client's builds.
+[workspace]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde_json = "1"
+# meshoptimizer (C++) for `decimate`.
+meshopt = "0.6"
+
+[profile.release]
+debug = 0

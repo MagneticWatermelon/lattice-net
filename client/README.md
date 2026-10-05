@@ -27,13 +27,13 @@ In WSL itself, `cargo run` in `client/` opens a window under WSLg, but it render
 
 ## Models
 
-Everything visible beyond the terrain is a model in `assets/models/` (7.9 MB), made with Meshy and imported by `import-assets`.
+Everything visible beyond the terrain is a model in `assets/models/` (~25 MB), made with Meshy and imported by `tools/import-assets`. The soldier and the rifle are the user's own Meshy models (image-to-3d from concept art); the rest came from text prompts.
 
 | model | drawn as | triangles |
 |---|---|---|
-| `soldier` | every drawn player (the nearest 1,200), tinted by faction or tier, rigged; `soldier_lod1`/`lod2` beyond 35 / 110 m, on the same skeleton | 15.5k / 4.2k / 1.2k |
+| `soldier` | every drawn player (the nearest 1,200), tinted by faction or tier, rigged; `soldier_lod1`–`lod3` beyond 15 / 50 / 130 m, on the same skeleton | 60k / 15k / 4k / 1.3k |
 | `anim_*` | its clips: idle, aim-walk ("Run and Shoot"), run ("Rifle Charge"), sprint, jump, death | — |
-| `rifle` | in each soldier's hands (within 150 m), and the first-person view model | 3.9k |
+| `rifle`, `rifle_view` | in each soldier's hands (within 150 m); the first-person one | 10k; 40k |
 | `wall` | concrete blocks tiled along every wall (the scattered walls and base perimeters) | 0.9k |
 | `crate`, `container`, `sandbags` | low cover and base cover | 0.9–1.8k |
 | `post`, `command`, `bunker` | base buildings: guard posts at the gates, the command building, bunkers | 2.8–5.0k |
@@ -41,27 +41,30 @@ Everything visible beyond the terrain is a model in `assets/models/` (7.9 MB), m
 
 - **What you see is what blocks you.** Each prop is normalized to fill a unit box (x along its long side, y up, front at +z), so one transform puts it exactly in its collision box from `World::boxes()`. Antennas and the radar dish stick out above. Beyond 700 m (1.8 km for buildings) the plain boxes take over.
 - **Soldiers:** a soldier's white armor takes the player's color, dead or alive. Its clip follows its drawn speed (idle < 0.4 m/s, aim-walk < 4.5, run < 7.5, sprint), played backward when it backs up. Death plays once and holds.
-- **Distance:** lighter meshes past 35 and 110 m; no shadows past 90 m; past 250 m the pose freezes (its animation graph is removed, so nothing is evaluated). With all 291 players of a 300-bot fight drawn as soldiers, frames take p50 6.6 / p99 7.8 ms on the Windows desktop.
+- **Distance:** lighter meshes past 15, 50 and 130 m; no shadows past 90 m; past 250 m the pose freezes (its animation graph is removed, so nothing is evaluated). With all ~280 players of a 300-bot fight drawn as soldiers, frames take p50 6.6 / p99 7.5 ms in first person on the Windows desktop (chase view 8.6 / 9.4).
 - **Rifles:** the clips hold rifles of different sizes at different angles, so a rifle follows the right hand's position but points where the player aims (`hold_rifles`, after the skeleton is posed). The dead drop theirs.
 - **`--viewer`:** no game. It shows a row of soldiers (bind pose, then each clip) beside their collision capsules, for looking at the models.
 - **First person:** the rifle is drawn by a second camera on render layer 1 after the world, with depth cleared, so it never sinks into a wall.
 
-**Re-importing:** `cargo run --release --bin import-assets` turns Meshy's output (`assets/meshy_output/*/<name>.glb`, kept out of git, 152 MB) into `assets/models/`:
+**Re-importing:** `tools/import-assets` (its own Cargo workspace; it uses meshoptimizer, which the client doesn't need). `cargo run --release` there turns Meshy's output (`assets/meshy_output/*/<name>.glb`, kept out of git) into `assets/models/`:
 - it shrinks textures to 1024 px and makes materials single-sided;
 - it normalizes the props;
 - it cuts the clips down to skeleton and keyframes;
 - it makes "Run and Shoot" and "Rifle Charge" run in place (they move the hips forward 1.1 and 2.5 m a cycle);
 - it takes the jump's own rise out;
-- it builds the soldier's lighter meshes (vertices clustered on 4 and 8 cm grids: same vertices and skin, fewer triangles).
+- it simplifies the rifle (~800k triangles) to 10k (held) and 40k (first person) with meshoptimizer, which keeps each vertex's UVs so the textures still fit;
+- it builds the soldier's lighter meshes the same way, on its index buffer only: same vertices and skin, a quarter, a fifteenth and a fiftieth of the triangles.
 
-**Meshy tasks** (2026-10-05/06, 235 credits). Each prop is a smart-topology text-to-3d preview, refined with 2k PBR textures. The soldier is a `latest` preview remeshed to 15k triangles, refined, rigged at 1.8 m, plus 5 animations. Follow-ups (retexture, remesh, LODs, more clips) start from these, without regenerating.
+**Models too detailed to rig:** Meshy rigs up to 300k faces. `cargo run --release -- decimate IN.glb OUT.glb TRIANGLES` simplifies a model first; the user's soldier (881k triangles, 8k textures) went to 60k (2.1% error) and was rigged from that file.
 
-**The first soldier was replaced** (50 credits). It had a carbine slung across its chest, and Meshy's auto-rig of it was broken: the collarbones owned 31% of the vertices (the chest and back), the spine bones 2%, and the spine ran along the front of the belly. The torso was squeezed whenever the arms moved. The second soldier (no weapon) rigged cleanly, with joints centered in the limbs and the collarbones at 9%. Check a new rig the same way before buying clips.
+**Meshy tasks** (2026-10-05/06, 255 credits of ours; the user's soldier and rifle generations are theirs). Each prop is a smart-topology text-to-3d preview, refined with 2k PBR textures. The soldier is a `latest` preview remeshed to 15k triangles, refined, rigged at 1.8 m, plus 5 animations. Follow-ups (retexture, remesh, LODs, more clips) start from these, without regenerating.
+
+**The first two soldiers were replaced.** The first (50 credits to replace) It had a carbine slung across its chest, and Meshy's auto-rig of it was broken: the collarbones owned 31% of the vertices (the chest and back), the spine bones 2%, and the spine ran along the front of the belly. The torso was squeezed whenever the arms moved. The second (no weapon) rigged cleanly, with joints centered in the limbs and the collarbones at 9%. The user's T-pose soldier replaced it (rig 5 + clips 15 credits), rigged as cleanly: collarbones 10%, torso 13%, left and right matching. Check a new rig the same way before buying clips.
 
 | model | preview | refine |
 |---|---|---|
-| soldier | `01a10dff-404c-7432-be92-371370feb17c` | `01a10e00-d49c-7282-8827-e46f01ea31b0`, rig `01a10e02-7299-7100-9396-104bc659b90b` |
-| rifle | `01a10dc6-6023-751a-bc97-a4790d5493f4` | `01a10dc8-ca95-7552-b442-697ee4819a38` |
+| soldier (the user's) | image-to-3d `c44b834b-2c00-40f8-a9e7-ade09de1b73d` | decimated locally, rig `01a10e0e-1eea-7052-8dec-93a6361fcf1e` |
+| rifle (the user's) | multi-image-to-3d `8a8338b0-c99b-44f9-ba63-b1f7229c4d0b` | — |
 | wall | `01a10dc6-730c-7437-b186-a0104fca3891` | `01a10dc8-d675-756e-bd59-2662e86b623d` |
 | crate | `01a10dc5-c29f-729c-8154-d0a8d6a81872` | `01a10dc8-b18b-7193-b81c-b42d64defe2b` |
 | container | `01a10dc6-86c6-72de-8a0f-cbc1ac991966` | `01a10dc8-e227-77fc-b6f0-cad6287916f4` |
@@ -71,7 +74,7 @@ Everything visible beyond the terrain is a model in `assets/models/` (7.9 MB), m
 | bunker | `01a10dc6-cef7-7118-9a3a-3546b4bc827e` | `01a10dc9-17e8-704b-ba3d-22fe9e27c4dd` |
 | rocks | `01a10dc6-ddb9-75b9-8503-449a7c5867fe` | `01a10dc9-2539-7160-bae0-b08de3b0d553` |
 
-Animations (on the rig): idle `01a10e03-adf1-712f-a746-b769b0128c09`, Run and Shoot `01a10e03-b3c9-7440-89f7-40de00681aee`, Rifle Charge `01a10e03-b9b9-706c-ae33-f828c2630f05`, Regular Jump `01a10e03-bf80-7618-bce0-cf3495bda46f`, Shot and Fall Backward `01a10e03-c55d-710e-8003-12cac2a8b556`. Walking and running came with the rig.
+Animations (on the rig): idle `01a10e0e-cc96-708b-8090-79afbad6b7b0`, Run and Shoot `01a10e0e-d22e-7127-a427-d17a1867058a`, Rifle Charge `01a10e0e-d7c1-758d-88dd-04993e92a9d0`, Regular Jump `01a10e0e-dd47-7182-b634-0600eb9ad798`, Shot and Fall Backward `01a10e0e-e299-7122-81d3-dfe20e1d100d`. Walking and running came with the rig.
 
 ## Controls
 
@@ -131,7 +134,7 @@ Animations (on the rig): idle `01a10e03-adf1-712f-a746-b769b0128c09`, Run and Sh
 | `terrain.rs` | 64 × 64 chunks of 128 m: every 4 m sample within ~1 km of the camera, every 32 m beyond, skirts on every edge. Vertex colors by height and slope, ±8% noise per sample. |
 | `scene.rs` | The world on Welcome (terrain, cover, rocks, sun), terrain streaming, players (a root at the feet: capsule, or soldier when near) and ghosts. |
 | `models.rs` | The models: loading, cover fitted to its boxes, rocks, soldiers (spawn, tint, animation, rifle in hand), the first-person rifle. |
-| `bin/import-assets.rs` | Meshy's output → `assets/models` (see Models). |
+| `../tools/import-assets` | Meshy's output → `assets/models` (see Models). |
 | `controls.rs` | Mouse look, the frame's input to `tick_inputs`, cameras, toggles, autoplay. |
 | `hud.rs` | The net graph, the crosshair and the help line. |
 

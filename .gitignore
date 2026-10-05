@@ -4,3 +4,4 @@ results/
 /client/target
 # Meshy's raw output (152 MB): client/assets/models is made from it (import-assets).
 /client/assets/meshy_output/
+/tools/*/target

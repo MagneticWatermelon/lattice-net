@@ -2835,12 +2835,10 @@ name = "lattice-client"
 version = "0.1.0"
 dependencies = [
  "bevy",
- "image",
  "lattice-client-core",
  "lattice-game",
  "lattice-net",
  "lattice-sim",
- "serde_json",
 ]
 
 [[package]]

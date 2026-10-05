@@ -34,18 +34,19 @@ const WALL_ASPECT: f32 = 1.28;
 /// The nearest this many drawn players are soldiers; the rest (rare, or
 /// while a soldier loads) capsules.
 const MAX_SOLDIERS: usize = 1200;
-/// Soldier detail by distance (meters): the full mesh, then the 4 cm and
-/// 8 cm meshes; shadows; animation and the rifle.
-const LOD_DISTANCES: [f32; 2] = [35.0, 110.0];
+/// Soldier detail by distance (meters): the full mesh (60k triangles),
+/// then a quarter, a fifteenth and a fiftieth of it; shadows; animation and
+/// the rifle.
+const LOD_DISTANCES: [f32; 3] = [15.0, 50.0, 130.0];
 const SHADOW_RANGE: f32 = 90.0;
 const ANIMATE_RANGE: f32 = 250.0;
 const RIFLE_RANGE: f32 = 150.0;
 /// Hysteresis on all of those, so nothing flickers at a boundary.
 const MARGIN: f32 = 5.0;
 /// The rifle's length in the hands, and its pistol grip in the model (it's
-/// 1 m long, centered, muzzle at -x).
+/// 1 m long, centered, muzzle at -x; a bullpup, so the grip is well back).
 const RIFLE_LENGTH: f32 = 0.85;
-const RIFLE_GRIP: Vec3 = Vec3::new(0.17, -0.1, 0.0);
+const RIFLE_GRIP: Vec3 = Vec3::new(0.33, -0.12, 0.0);
 /// The first-person rifle's render layer (drawn over the world by its own
 /// camera, so it never sinks into a wall).
 pub const VIEWMODEL_LAYER: usize = 1;
@@ -71,9 +72,11 @@ pub struct Models {
     props: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
     rocks: (Handle<Mesh>, Handle<StandardMaterial>),
     pub rifle: (Handle<Mesh>, Handle<StandardMaterial>),
+    /// The first-person rifle: the same, with more detail.
+    rifle_view: (Handle<Mesh>, Handle<StandardMaterial>),
     soldier: Handle<WorldAsset>,
     /// The soldier's meshes by level of detail (all on the same skeleton).
-    soldier_meshes: [Handle<Mesh>; 3],
+    soldier_meshes: [Handle<Mesh>; 4],
     soldier_material: Handle<StandardMaterial>,
     graph: Handle<AnimationGraph>,
     clips: Vec<AnimationNodeIndex>,
@@ -97,8 +100,10 @@ pub fn load(mut commands: Commands, assets: Res<AssetServer>, mut graphs: ResMut
         props,
         rocks: prop("rocks"),
         rifle: prop("rifle"),
+        rifle_view: prop("rifle_view"),
         soldier: assets.load(GltfAssetLabel::Scene(0).from_asset(model("soldier"))),
-        soldier_meshes: ["soldier", "soldier_lod1", "soldier_lod2"].map(|f| assets.load(GltfAssetLabel::Primitive { mesh: 0, primitive: 0 }.from_asset(model(f)))),
+        soldier_meshes: ["soldier", "soldier_lod1", "soldier_lod2", "soldier_lod3"]
+            .map(|f| assets.load(GltfAssetLabel::Primitive { mesh: 0, primitive: 0 }.from_asset(model(f)))),
         soldier_material: assets.load(format!("{}#Material0/std", model("soldier"))),
         graph: graphs.add(graph),
         clips: nodes,
@@ -511,9 +516,9 @@ pub fn spawn_viewer(mut commands: Commands, models: Res<Models>, mut meshes: Res
 /// shadow (it'd be a giant one in the world).
 pub fn viewmodel(models: &Models) -> impl Bundle {
     (
-        Mesh3d(models.rifle.0.clone()),
-        MeshMaterial3d(models.rifle.1.clone()),
-        Transform::from_translation(Vec3::new(0.2, -0.2, -0.5)).with_rotation(Quat::from_rotation_y(-FRAC_PI_2)).with_scale(Vec3::splat(0.7)),
+        Mesh3d(models.rifle_view.0.clone()),
+        MeshMaterial3d(models.rifle_view.1.clone()),
+        Transform::from_translation(Vec3::new(0.22, -0.24, -0.58)).with_rotation(Quat::from_rotation_y(-FRAC_PI_2)).with_scale(Vec3::splat(0.55)),
         RenderLayers::layer(VIEWMODEL_LAYER),
         bevy::light::NotShadowCaster,
     )

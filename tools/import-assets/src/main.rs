@@ -6,14 +6,22 @@
 //! - props normalized: x along the long side, y up, z out of the front, the
 //!   body filling [-0.5, 0.5] x [0, 1] x [-0.5, 0.5], so the client scales a
 //!   prop straight to its cover box (antennas and such may stick out above);
-//! - the rifle centered and 1 m long, its muzzle at -x;
-//! - the soldier as rigged, plus two lighter meshes for the distance
-//!   (vertices clustered on 4 and 8 cm grids: same vertices and skin, fewer
-//!   triangles); each animation clip cut down to its skeleton
+//! - the rifle centered and 1 m long, its muzzle at -x, simplified to ~8k
+//!   triangles (held) and ~40k (`rifle_view`, the first-person one);
+//! - the soldier as rigged (textures at 2048 px: it's seen up close), plus
+//!   three lighter meshes for the distance (meshoptimizer's simplifier on its
+//!   index buffer: same vertices and skin, a quarter, a fifteenth and a
+//!   fiftieth of the triangles); each animation clip cut down to its skeleton
 //!   and keyframes, the two clips that run forward made to run in place, and
 //!   the jump's own rise taken out (the game moves the body up).
 //!
-//! Run from `client/`: `cargo run --release --bin import-assets`.
+//! Run from `tools/import-assets/`: `cargo run --release`.
+//!
+//! `cargo run --release -- decimate IN.glb OUT.glb TRIANGLES` makes a model
+//! that's too detailed to rig (Meshy rigs up to 300k faces) or to draw
+//! hundreds of times light enough: meshoptimizer's simplifier, which keeps
+//! each vertex's UVs, so the model's own textures (shrunk to 2048 px) still
+//! fit it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -23,6 +31,8 @@ use serde_json::{json, Value};
 
 /// Longest texture side kept.
 const TEXTURE_MAX: u32 = 1024;
+/// The rifle's source: long along x, muzzle at -x.
+const RIFLE: &str = "rifle_user.glb";
 const JPEG_QUALITY: u8 = 85;
 
 /// A prop: its Meshy name, its game name, and the top of its body in
@@ -184,8 +194,8 @@ impl Glb {
         self.bin = bin;
     }
 
-    /// Every texture down to `TEXTURE_MAX`, every material single-sided.
-    fn shrink_textures(&mut self) {
+    /// Every texture down to `max` px, every material single-sided.
+    fn shrink_textures(&mut self, max: u32) {
         let mut replace = HashMap::new();
         for img in self.arr("images") {
             let bv = img["bufferView"].as_u64().unwrap() as usize;
@@ -193,10 +203,10 @@ impl Glb {
             let off = v["byteOffset"].as_u64().unwrap_or(0) as usize;
             let bytes = &self.bin[off..off + v["byteLength"].as_u64().unwrap() as usize];
             let pic = image::load_from_memory(bytes).expect("texture");
-            if pic.width().max(pic.height()) <= TEXTURE_MAX {
+            if pic.width().max(pic.height()) <= max {
                 continue;
             }
-            let small = pic.resize(TEXTURE_MAX, TEXTURE_MAX, image::imageops::FilterType::Lanczos3).into_rgb8();
+            let small = pic.resize(max, max, image::imageops::FilterType::Lanczos3).into_rgb8();
             let mut out = Vec::new();
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY).encode_image(&small).unwrap();
             replace.insert(bv, out);
@@ -209,6 +219,20 @@ impl Glb {
         }
         let all: Vec<usize> = (0..self.arr("bufferViews").len()).collect();
         self.rebuild(&all, &replace);
+    }
+
+    /// The first primitive's triangle indices.
+    fn indices(&self) -> Vec<u32> {
+        let ia = self.json["meshes"][0]["primitives"][0]["indices"].as_u64().unwrap() as usize;
+        let acc = &self.json["accessors"][ia];
+        let bv = &self.json["bufferViews"][acc["bufferView"].as_u64().unwrap() as usize];
+        let start = bv["byteOffset"].as_u64().unwrap_or(0) as usize + acc["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let n = acc["count"].as_u64().unwrap() as usize;
+        match acc["componentType"].as_u64() {
+            Some(5125) => (0..n).map(|k| u32::from_le_bytes(self.bin[start + 4 * k..][..4].try_into().unwrap())).collect(),
+            Some(5123) => (0..n).map(|k| u16::from_le_bytes(self.bin[start + 2 * k..][..2].try_into().unwrap()) as u32).collect(),
+            t => panic!("index type {t:?}"),
+        }
     }
 
     /// The first primitive's attribute accessor, if it has one.
@@ -255,48 +279,39 @@ impl Glb {
         (lo, hi)
     }
 
-    /// A lighter level of detail: vertices merged on a grid of `cell`
-    /// meters (each cell's first vertex stands for it), triangles that
-    /// collapse dropped. The vertices (and their skin weights) stay as they
-    /// are, so the same skeleton drives it. Only the mesh is kept.
-    fn lod(&self, cell: f32) -> Glb {
+    /// A lighter level of detail with about `tris` triangles: the
+    /// simplifier picks a subset of the triangles' corners (normals and UVs
+    /// weigh in); the vertices (and their skin weights) stay as they are, so
+    /// the same skeleton drives it. Only the mesh is kept.
+    fn lod(&self, tris: usize) -> Glb {
         let mut g = Glb { json: self.json.clone(), bin: self.bin.clone() };
         let pos = g.read(g.attribute("POSITION").unwrap());
+        let extras: Vec<Vec<Vec<f32>>> = ["NORMAL", "TEXCOORD_0"].iter().filter_map(|n| g.attribute(n)).map(|a| g.read(a)).collect();
+        let indices = g.indices();
+        let bytes: Vec<u8> = pos.iter().flat_map(|v| v.iter().flat_map(|x| x.to_le_bytes())).collect();
+        let adapter = meshopt::VertexDataAdapter::new(&bytes, 12, 0).unwrap();
+        let mut attrs = Vec::new();
+        for i in 0..pos.len() {
+            for e in &extras {
+                attrs.extend_from_slice(&e[i]);
+            }
+        }
+        let weights: Vec<f32> = extras.iter().flat_map(|e| std::iter::repeat_n(0.5, e[0].len())).collect();
+        let locks = vec![false; pos.len()];
+        let mut error = 0.0;
+        let mut out = meshopt::simplify_with_attributes_and_locks(
+            &indices, &adapter, &attrs, &weights, weights.len(), &locks, tris * 3, 0.2, meshopt::SimplifyOptions::Permissive, Some(&mut error),
+        );
+        if out.len() > tris * 3 * 13 / 10 {
+            // Still too many (seams): the sloppy simplifier ignores topology.
+            out = meshopt::simplify_sloppy(&indices, &adapter, tris * 3, 0.2, Some(&mut error));
+        }
         let ia = g.json["meshes"][0]["primitives"][0]["indices"].as_u64().unwrap() as usize;
-        let acc = g.json["accessors"][ia].clone();
-        let bv = acc["bufferView"].as_u64().unwrap() as usize;
-        let start = g.json["bufferViews"][bv]["byteOffset"].as_u64().unwrap_or(0) as usize + acc["byteOffset"].as_u64().unwrap_or(0) as usize;
-        let wide = acc["componentType"] == 5125;
-        let index = |k: usize| -> u32 {
-            if wide {
-                u32::from_le_bytes(g.bin[start + 4 * k..][..4].try_into().unwrap())
-            } else {
-                u16::from_le_bytes(g.bin[start + 2 * k..][..2].try_into().unwrap()) as u32
-            }
-        };
-        let mut rep: HashMap<[i32; 3], u32> = HashMap::new();
-        let merged: Vec<u32> = pos
-            .iter()
-            .enumerate()
-            .map(|(i, p)| *rep.entry([0, 1, 2].map(|k| (p[k] / cell).floor() as i32)).or_insert(i as u32))
-            .collect();
-        let mut out = Vec::new();
-        for t in 0..acc["count"].as_u64().unwrap() as usize / 3 {
-            let [a, b, c] = [0, 1, 2].map(|k| merged[index(3 * t + k) as usize]);
-            if a != b && b != c && a != c {
-                out.extend([a, b, c]);
-            }
-        }
-        let mut bytes = Vec::with_capacity(out.len() * 4);
-        for &i in &out {
-            if wide {
-                bytes.extend_from_slice(&i.to_le_bytes());
-            } else {
-                bytes.extend_from_slice(&(i as u16).to_le_bytes());
-            }
-        }
+        let bv = g.json["accessors"][ia]["bufferView"].as_u64().unwrap() as usize;
+        let bytes: Vec<u8> = out.iter().flat_map(|i| i.to_le_bytes()).collect();
         g.json["accessors"][ia]["count"] = json!(out.len());
         g.json["accessors"][ia]["byteOffset"] = json!(0);
+        g.json["accessors"][ia]["componentType"] = json!(5125);
         // Just the mesh: no material, textures or animation.
         for key in ["materials", "textures", "images", "samplers", "animations"] {
             if let Some(o) = g.json.as_object_mut() {
@@ -310,7 +325,7 @@ impl Glb {
         views.sort_unstable();
         views.dedup();
         g.rebuild(&views, &HashMap::from([(bv, bytes)]));
-        println!("  lod {:.0} cm: {} triangles", cell * 100.0, out.len() / 3);
+        println!("  lod: {} triangles (error {:.4} of its size)", out.len() / 3, error);
         g
     }
 
@@ -402,7 +417,15 @@ fn find(raw: &Path, file: &str) -> PathBuf {
 }
 
 fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("decimate") {
+        let [_, input, output, tris] = &args[..] else {
+            panic!("usage: import-assets decimate IN.glb OUT.glb TRIANGLES");
+        };
+        decimate(Path::new(input), Path::new(output), tris.parse().expect("TRIANGLES"));
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/assets");
     let (raw, out) = (root.join("meshy_output"), root.join("models"));
     fs::create_dir_all(&out).unwrap();
     let save = |name: &str, g: &Glb| {
@@ -413,7 +436,7 @@ fn main() {
 
     for (meshy, name, top) in PROPS {
         let mut g = read_glb(&find(&raw, &format!("{meshy}.glb")));
-        g.shrink_textures();
+        g.shrink_textures(TEXTURE_MAX);
         let (lo, hi) = g.bounds();
         let top = top.unwrap_or(hi[1]);
         let center = [(lo[0] + hi[0]) / 2.0, lo[1], (lo[2] + hi[2]) / 2.0];
@@ -422,18 +445,26 @@ fn main() {
     }
 
     // The rifle: centered, 1 m long (the client sizes it).
-    let mut g = read_glb(&find(&raw, "rifle.glb"));
-    g.shrink_textures();
-    let (lo, hi) = g.bounds();
-    let len = hi[0] - lo[0];
-    g.transform([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0], [len; 3]);
-    save("rifle", &g);
+    // The rifle (made from concept views in Meshy, ~800k triangles): ~8k
+    // in soldiers' hands, ~40k for the first-person view.
+    let full = read_glb(&find(&raw, RIFLE));
+    for (name, tris, error, texture) in [("rifle", 8_000, 0.15, TEXTURE_MAX), ("rifle_view", 40_000, 0.05, 2048)] {
+        let mut g = full.simplified(tris, error);
+        g.shrink_textures(texture);
+        let (lo, hi) = g.bounds();
+        let len = hi[0] - lo[0];
+        g.transform([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0], [len; 3]);
+        save(name, &g);
+    }
 
     let mut g = read_glb(&find(&raw, "soldier_rigged.glb"));
-    g.shrink_textures();
+    g.shrink_textures(2048);
+    let tris = g.indices().len() / 3;
+    println!("soldier: {tris} triangles");
     save("soldier", &g);
-    save("soldier_lod1", &g.lod(0.04));
-    save("soldier_lod2", &g.lod(0.08));
+    save("soldier_lod1", &g.lod(tris / 4));
+    save("soldier_lod2", &g.lod(tris / 15));
+    save("soldier_lod3", &g.lod(tris / 50));
 
     for (meshy, name, fix) in CLIPS {
         let mut g = read_glb(&find(&raw, &format!("{meshy}.glb")));
@@ -442,5 +473,112 @@ fn main() {
         }
         g.strip_to_animation();
         save(name, &g);
+    }
+}
+
+/// `decimate`: simplifies IN's mesh to about `tris` triangles with
+/// meshoptimizer (normals and UVs weigh in, so seams and shading hold up and
+/// the textures still fit), drops the vertices nothing uses, and shrinks the
+/// textures to 2048 px. One mesh, one primitive, unrigged.
+fn decimate(input: &Path, output: &Path, tris: usize) {
+    let mut g = read_glb(input).simplified(tris, 0.05);
+    g.shrink_textures(2048);
+    write_glb(output, &g);
+    println!("  {} ({} KB)", output.display(), fs::metadata(output).unwrap().len() / 1024);
+}
+
+impl Glb {
+    /// This (single, unrigged) mesh simplified to about `tris` triangles
+    /// with meshoptimizer, stopping early rather than deviating more than
+    /// `max_error` of its size: normals and UVs weigh in, so seams and
+    /// shading hold up and the textures still fit; unused vertices are
+    /// dropped.
+    fn simplified(&self, tris: usize, max_error: f32) -> Glb {
+        let mut g = Glb { json: self.json.clone(), bin: self.bin.clone() };
+        let attrs: Vec<(&str, usize)> = ["POSITION", "NORMAL", "TEXCOORD_0"].iter().filter_map(|&n| g.attribute(n).map(|a| (n, a))).collect();
+        let data: Vec<Vec<Vec<f32>>> = attrs.iter().map(|&(_, a)| g.read(a)).collect();
+        let pos = &data[0];
+        let indices = g.indices();
+        println!("  simplifying {} triangles, {} vertices", indices.len() / 3, pos.len());
+        let bytes: Vec<u8> = pos.iter().flat_map(|v| v.iter().flat_map(|x| x.to_le_bytes())).collect();
+        let adapter = meshopt::VertexDataAdapter::new(&bytes, 12, 0).unwrap();
+        // Normal and UV per vertex, weighted against position error.
+        let (mut extra, mut weights) = (Vec::new(), Vec::new());
+        for (k, &(name, _)) in attrs.iter().enumerate().skip(1) {
+            let w = if name == "NORMAL" { 0.5 } else { 1.0 };
+            weights.extend(std::iter::repeat_n(w, data[k][0].len()));
+        }
+        for i in 0..pos.len() {
+            for d in &data[1..] {
+                extra.extend_from_slice(&d[i]);
+            }
+        }
+        let locks = vec![false; pos.len()];
+        let mut error = 0.0;
+        let mut out = meshopt::simplify_with_attributes_and_locks(
+            &indices,
+            &adapter,
+            &extra,
+            &weights,
+            weights.len(),
+            &locks,
+            tris * 3,
+            max_error,
+            meshopt::SimplifyOptions::None,
+            Some(&mut error),
+        );
+        // Seams can stop it short of the target: then allow collapses across them.
+        if out.len() > tris * 3 * 13 / 10 {
+            println!("  {} triangles at the seams' limit; collapsing across them", out.len() / 3);
+            out = meshopt::simplify_with_attributes_and_locks(
+                &indices,
+                &adapter,
+                &extra,
+                &weights,
+                weights.len(),
+                &locks,
+                tris * 3,
+                max_error,
+                meshopt::SimplifyOptions::Permissive,
+                Some(&mut error),
+            );
+        }
+        // Keep only the vertices used, in first-use order.
+        let mut remap = vec![u32::MAX; pos.len()];
+        let mut order: Vec<usize> = Vec::new();
+        let new_indices: Vec<u32> = out
+            .iter()
+            .map(|&i| {
+                let r = &mut remap[i as usize];
+                if *r == u32::MAX {
+                    *r = order.len() as u32;
+                    order.push(i as usize);
+                }
+                *r
+            })
+            .collect();
+        println!("  -> {} triangles, {} vertices (error {:.4} of its size)", new_indices.len() / 3, order.len(), error);
+        let mut replace = HashMap::new();
+        for (k, &(_, a)) in attrs.iter().enumerate() {
+            let bv = g.json["accessors"][a]["bufferView"].as_u64().unwrap() as usize;
+            assert!(g.json["bufferViews"][bv].get("byteStride").is_none(), "interleaved attributes");
+            let v: Vec<u8> = order.iter().flat_map(|&i| data[k][i].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()).collect();
+            replace.insert(bv, v);
+            g.json["accessors"][a]["count"] = json!(order.len());
+            g.json["accessors"][a]["byteOffset"] = json!(0);
+        }
+        let ia = g.json["meshes"][0]["primitives"][0]["indices"].as_u64().unwrap() as usize;
+        let ibv = g.json["accessors"][ia]["bufferView"].as_u64().unwrap() as usize;
+        replace.insert(ibv, new_indices.iter().flat_map(|i| i.to_le_bytes()).collect());
+        g.json["accessors"][ia]["count"] = json!(new_indices.len());
+        g.json["accessors"][ia]["byteOffset"] = json!(0);
+        g.json["accessors"][ia]["componentType"] = json!(5125);
+        let views: Vec<usize> = (0..g.arr("bufferViews").len()).collect();
+        g.rebuild(&views, &replace);
+        // POSITION's bounds.
+        let p = g.attribute("POSITION").unwrap();
+        let pos = g.read(p);
+        g.write(p, &pos);
+        g
     }
 }
