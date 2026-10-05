@@ -567,7 +567,14 @@ fn main() -> std::io::Result<()> {
     raise_open_file_limit(count as u64 + 64)?;
     let class_of = |i: usize| (classes > 0).then(|| i % classes);
     let port_of = |i: usize| class_of(i).map(|c| class_port(c, i / classes));
-    let sockets = (0..count).map(|i| bot_socket(server, port_of(i))).collect::<std::io::Result<Vec<_>>>()?;
+    // A class port can be taken (the classes overlap the ephemeral range):
+    // then the next one 4096 up, still in the class's range.
+    let sockets = (0..count)
+        .map(|i| match port_of(i) {
+            Some(p) => (0..4).map(|j| bot_socket(server, Some(p + 4096 * j))).find(|s| s.is_ok()).unwrap_or_else(|| bot_socket(server, Some(p))),
+            None => bot_socket(server, None),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
     let mut sockets = sockets.into_iter().map(Some).collect::<Vec<_>>();
     let start = Instant::now();
     let end = start + duration;

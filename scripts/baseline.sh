@@ -32,6 +32,10 @@
 #           latency costs in a real fight: shots into the already dead), and a
 #           lethal uniform 5k (load), 60 s each. summary.md gets a Fights table.
 #   fight-quick   one short immortal fight of 300 in a 60 m disk
+#   m3e     M3's pass bars at scale (~9 min, for bare metal): uniform 10k with 20%
+#           firing (and 200 aiming fighters), a 3k blob all firing (300 aiming),
+#           and uniform 10k with --sockets 1 / 4 / 8 / 16 (no fire, comparable
+#           with the 2026-10-04 baselines)
 #
 # Writes baselines/<date>-<name>/ (name defaults to the host name):
 #   env.txt      the machine and the preflight checks (scripts/preflight.sh)
@@ -65,7 +69,8 @@ case $mode in
   netem-quick) repeat=${REPEAT:-1}; secs=20 ;;
   fight) repeat=${REPEAT:-1}; secs=60 ;;
   fight-quick) repeat=${REPEAT:-1}; secs=25 ;;
-  *) echo "usage: $0 [full|quick|limits|limits-quick|netem|netem-quick|fight|fight-quick] [name]" >&2; exit 2 ;;
+  m3e) repeat=${REPEAT:-1}; secs=60 ;;
+  *) echo "usage: $0 [full|quick|limits|limits-quick|netem|netem-quick|fight|fight-quick|m3e] [name]" >&2; exit 2 ;;
 esac
 
 # Local netem: rerun inside a private network namespace, where we may shape
@@ -105,6 +110,16 @@ elif [ "$mode" = fight ]; then
     "fight-uniform-5k|uniform|5000||||$classes|--classes 3 --fight-every 10 --fire-share 0.2"
   )
   max_bots=5000
+elif [ "$mode" = m3e ]; then
+  runs=(
+    "m3e-uniform-10k-fire20|uniform|10000||profile|||--fire-share 0.2 --fight-every 50"
+    "m3e-blob-3k-fight|blob|3000||profile|||--fire-share 1.0 --fight-every 10"
+    "m3e-uniform-10k-sockets-1|uniform|10000|--sockets 1|"
+    "m3e-uniform-10k-sockets-4|uniform|10000|--sockets 4|"
+    "m3e-uniform-10k-sockets-8|uniform|10000|--sockets 8|"
+    "m3e-uniform-10k-sockets-16|uniform|10000|--sockets 16|"
+  )
+  max_bots=10000
 elif [ "$mode" = fight-quick ]; then
   runs=("fight-disk-300-immortal|disk:60|300|--immortal|||classes:10,50,75|--classes 3 --fight-every 2 --fire-share 0.3")
   max_bots=300
@@ -418,8 +433,8 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
     done
   done
 
-  # Fights: hit rate per latency class (fight modes).
-  if [[ $mode == fight* ]]; then
+  # Fights: hit rate per latency class (fight and m3e modes).
+  if [[ $mode == fight* || $mode == m3e ]]; then
     echo
     echo "## Fights"
     echo
