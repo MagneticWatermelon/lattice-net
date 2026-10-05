@@ -53,6 +53,8 @@ const BUMP_COOLDOWN: f32 = 10.0;
 /// A reported depth this far above target (say, after the server slowed down
 /// before we heard) drops an input at once instead of draining at 5%.
 const BACKLOG: f32 = 3.0;
+/// Most inputs one `tick_inputs` call makes (300 ms): a slow frame catches up.
+const MAX_CATCH_UP: usize = 3 * INPUT_REDUNDANCY;
 /// Own-player corrections are smoothed with this time constant.
 const OWN_SMOOTH: Duration = Duration::from_millis(100);
 
@@ -174,6 +176,8 @@ pub struct ClientCore {
     render_clock: RenderClock,
     tick_steps: TickSteps,
     entities: Option<Entities>,
+    /// The newest snapshot's own state and its step: the server's view of us.
+    server_own: Option<(MoveState, u32)>,
     /// Own-player correction being smoothed away, as of `own_offset_at`.
     own_offset: [f32; 3],
     own_offset_at: Option<Instant>,
@@ -213,6 +217,7 @@ impl ClientCore {
             render_clock: RenderClock::new(cfg.interp_delay),
             tick_steps: TickSteps::default(),
             entities: cfg.track_entities.then(Entities::default),
+            server_own: None,
             own_offset: [0.0; 3],
             own_offset_at: None,
             sink: false,
@@ -252,6 +257,17 @@ impl ClientCore {
 
     pub fn entities(&self) -> Option<&Entities> {
         self.entities.as_ref()
+    }
+
+    /// Our own state in the newest snapshot, and its game step: where the
+    /// server has us, a round trip behind our prediction (the server ghost).
+    pub fn server_own(&self) -> Option<(MoveState, u32)> {
+        self.server_own
+    }
+
+    /// The newest predicted state and its input seq.
+    pub fn predicted_seq(&self) -> u32 {
+        self.seq
     }
 
     pub fn render_clock(&self) -> &RenderClock {
@@ -392,6 +408,7 @@ impl ClientCore {
         // under time dilation, or when it falls behind): send at that rate.
         self.pace = (h.pace as f32 / 1000.0).clamp(0.1, 1.0);
         self.tick_steps.put(h.server_tick, h.step);
+        self.server_own = Some((h.own, h.step));
         self.render_clock.on_snapshot(h.step, self.pace, now);
 
         if h.ack_seq == 0 {
@@ -499,40 +516,44 @@ impl ClientCore {
     /// input and inputs come out every few frames. Each input comes from
     /// `source`, given the predicted state it will be applied to, and carries
     /// the render step of `now`. Returns the batch to send (unreliable), or
-    /// `None` when there's nothing new or before the server has welcomed us.
+    /// nothing when there's nothing new or before the server has welcomed
+    /// us. A frame slower than 100 ms makes more inputs than one batch
+    /// carries: each batch goes out, oldest first.
     ///
     /// A caller running at the input rate itself (30 Hz) should use
     /// `step_inputs`: by elapsed time, a millisecond of jitter near the
     /// clock's phase boundary turns one input per call into two then none,
     /// and the early one waits a tick longer on the server (WSL blob: p99
     /// server wait 67-74 ms per call vs 80-102 ms by time).
-    pub fn tick_inputs(&mut self, now: Instant, source: impl FnMut(&MoveState, &Welcome) -> Input) -> Option<Vec<u8>> {
-        // In 1/30 s; a hitch counts for at most a batch's worth of inputs (a
-        // long stall is the server's to fill with stand-ins, then a resync).
+    pub fn tick_inputs(&mut self, now: Instant, source: impl FnMut(&MoveState, &Welcome) -> Input) -> Vec<Vec<u8>> {
+        // In 1/30 s. A slow frame makes all its inputs, as several batches,
+        // up to `MAX_CATCH_UP`; a longer stall is the server's to fill with
+        // stand-ins, then a resync.
         let elapsed = match self.clock_at {
             None => 1.0,
-            Some(t) => (now.saturating_duration_since(t).as_secs_f32() * TICK_HZ as f32).min(INPUT_REDUNDANCY as f32),
+            Some(t) => (now.saturating_duration_since(t).as_secs_f32() * TICK_HZ as f32).min(MAX_CATCH_UP as f32),
         };
-        self.run_inputs(now, elapsed, source)
+        self.run_inputs(now, elapsed, MAX_CATCH_UP, source)
     }
 
     /// Run the input clock for exactly one 1/30 s step: for a caller that
     /// ticks at the input rate (the bots). Usually one input, occasionally
     /// two or none while it steers the server's queue depth into `DEPTH_BAND`.
     pub fn step_inputs(&mut self, now: Instant, source: impl FnMut(&MoveState, &Welcome) -> Input) -> Option<Vec<u8>> {
-        self.run_inputs(now, 1.0, source)
+        // At most a batch's worth, so at most one batch.
+        self.run_inputs(now, 1.0, INPUT_REDUNDANCY, source).pop()
     }
 
     /// Advances the input clock by `elapsed` steps' worth of time.
-    fn run_inputs(&mut self, now: Instant, elapsed: f32, mut source: impl FnMut(&MoveState, &Welcome) -> Input) -> Option<Vec<u8>> {
-        let w = self.welcome?;
+    /// Makes at most `max` inputs; returns their batches, oldest first.
+    fn run_inputs(&mut self, now: Instant, elapsed: f32, max: usize, mut source: impl FnMut(&MoveState, &Welcome) -> Input) -> Vec<Vec<u8>> {
+        let Some(w) = self.welcome else { return Vec::new() };
         self.clock_at = Some(now);
         self.clock += self.rate * elapsed;
         self.bump_cooldown -= elapsed;
         let render = self.render_clock.render_at(now).map(msg::render_units);
         let mut made = 0;
-        // Never more than one batch carries, or the oldest new input would be lost.
-        while self.clock >= 1.0 && made < INPUT_REDUNDANCY {
+        while self.clock >= 1.0 && made < max {
             self.clock -= 1.0;
             let input = source(&self.state, &w);
             self.seq += 1;
@@ -544,24 +565,34 @@ impl ClientCore {
         match made {
             0 => {
                 self.stats.clock_skipped += 1;
-                return None;
+                return Vec::new();
             }
             1 => {}
             _ => self.stats.clock_extra += 1,
         }
+        // One batch per INPUT_REDUNDANCY new inputs, ending at the newest:
+        // each new input is in at least one batch, with older ones behind it.
+        let first = self.seq + 1 - made as u32;
+        let mut ends: Vec<u32> = (0..made.div_ceil(INPUT_REDUNDANCY)).map(|k| self.seq - (k * INPUT_REDUNDANCY) as u32).collect();
+        ends.reverse();
+        debug_assert!(ends[0] < first + INPUT_REDUNDANCY as u32);
+        ends.into_iter().map(|end| self.batch(end)).collect()
+    }
 
-        // Newest first, stopping at a gap (a resync skips seqs we never generated).
+    /// The batch whose newest input is `end`: newest first, stopping at a gap
+    /// (a resync skips seqs we never generated).
+    fn batch(&self, end: u32) -> Vec<u8> {
         let mut batch = [(Input::default(), None); INPUT_REDUNDANCY];
         let mut n = 0;
-        while n < INPUT_REDUNDANCY && (n as u32) < self.seq {
-            let p = self.history[(self.seq as usize - n) % HISTORY];
-            if p.seq != self.seq - n as u32 {
+        while n < INPUT_REDUNDANCY && (n as u32) < end {
+            let p = self.history[(end as usize - n) % HISTORY];
+            if p.seq != end - n as u32 {
                 break;
             }
             batch[n] = (p.input, p.render);
             n += 1;
         }
-        Some(msg::encode_inputs(self.seq, &batch[..n]))
+        msg::encode_inputs(end, &batch[..n])
     }
 }
 
@@ -599,5 +630,24 @@ mod tests {
         let max = steps.iter().cloned().fold(0.0, f32::max);
         assert!(mean > 0.02, "it runs: {mean} m per frame");
         assert!(max < 2.0 * mean, "smooth: max {max} vs mean {mean} m per frame");
+
+        // At 8 fps a frame makes ~4 inputs: two batches that cover them all.
+        let slow = Duration::from_millis(125);
+        let mut now = t0 + frame * (4 * 144);
+        for _ in 0..16 {
+            now += slow;
+            let before = c.seq;
+            let batches = c.tick_inputs(now, |_, _| run);
+            let mut covered = std::collections::BTreeSet::new();
+            for b in &batches {
+                msg::decode_inputs(b, |seq, _, _| {
+                    covered.insert(seq);
+                })
+                .unwrap();
+            }
+            assert!((before + 1..=c.seq).all(|s| covered.contains(&s)), "every new input is sent");
+            assert!(batches.len() <= 2);
+        }
+        assert!((c.seq as i64 - 121 - 60).abs() <= 2, "{} inputs: 30 a second, slow frames or not", c.seq);
     }
 }

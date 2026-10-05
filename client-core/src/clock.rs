@@ -70,6 +70,11 @@ impl RenderClock {
         self.delay
     }
 
+    /// The last render step handed out by `render_at`.
+    pub fn last_render(&self) -> Option<f64> {
+        self.render.map(|(_, r)| r)
+    }
+
     /// The newest step estimated to have arrived by `t`.
     pub fn newest_at(&self, t: Instant) -> Option<f64> {
         self.newest.map(|(t0, s0)| s0 + secs(t, t0) * self.rate)

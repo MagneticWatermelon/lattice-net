@@ -17,3 +17,5 @@ debug = 1
 [workspace]
 members = [".", "game", "client-core", "sim"]
 default-members = [".", "game", "client-core", "sim"]
+# The Bevy client is its own workspace (client/Cargo.toml).
+exclude = ["client"]

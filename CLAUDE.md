@@ -159,7 +159,31 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
         - render time never goes backwards.
 
         Far pops are measured, not barred: they decide whether mid/far need velocity bytes.
-    - **M3c Bevy client** on Windows (out of the workspace's default build): terrain, capsules, first-person and spectator cameras, net graph, server ghost, tier colors.
+    - **M3c Bevy client** (`client/`, `lattice-client`, scoped 2026-10-05): terrain, capsules, first-person and spectator cameras, net graph, server ghost, tier colors.
+      - **Its own Cargo workspace** (the root `exclude`s it), so `cargo test` and `clippy` at the root never build Bevy. It uses Bevy 0.19.1 without audio or gamepads, which need ALSA and libudev headers on Linux.
+      - **Networking in the frame loop.** `client/src/net.rs` (`Session`) is plain Rust, no Bevy: a non-blocking UDP socket, a `lattice_net::Client` and a `ClientCore`.
+        - Each frame: receive and deliver, then `tick_inputs` with the frame's keyboard and mouse, then flush.
+        - It mints its own dev connect token (`--token-key`, `--user`), like the bots, until a login service exists.
+        - It's tested against an in-process `SimServer` over loopback UDP.
+      - **Coordinates:** game (x, y, z up) maps to Bevy (x, z, −y).
+      - **Terrain:**
+        - 128 m chunks at the full 4 m resolution, streamed within ~1.5 km of the camera;
+        - one coarse 32 m mesh of the whole map, for the horizon;
+        - vertex colors by height and slope.
+      - **Cover:** every box, as a scaled unit cube.
+      - **Players:** capsules of the game's own size, colored by tier (near, mid, far, held, new), with a nose that shows yaw and pitch.
+      - **Cameras.** First person at eye height on `own_render`, with mouse look and WASD, sprint and jump. A spectator free-fly camera on F.
+      - **Server ghost** (G): our own last authoritative state, and each entity's newest sample, unsmoothed, drawn next to what's rendered.
+      - **Net graph** (N):
+        - text: fps and frame time, RTT, loss, bandwidth, server step and level, render delay, entities per tier, interpolated %, corrections and pops;
+        - sparklines of frame time and snapshot arrival gaps.
+      - **Windows build:** cross-compiled from WSL (`x86_64-pc-windows-gnu` with a user-space llvm-mingw, no sudo; `scripts/client-windows.sh`), or a native MSVC `cargo build`. It reaches the WSL server at the WSL IP.
+      - **Self-check without Windows:** it runs in WSL under WSLg. `--autoplay` drives it with the bots' AI, and `--screenshot PATH --after S` saves a frame, so renders can be looked at.
+      - **Pass bars:**
+        - 0 corrections when walking alone;
+        - net-graph smoothness matches the bots on the same link;
+        - frame time p99 under the display's refresh with a 1k blob in view on the Windows box;
+        - other players move without visible pops, judged by eye.
     - **M3d combat:**
       - health, death, respawn and teams;
       - a parallel "shots" phase with lag-compensated projectiles: capsule + head sphere, 3D history capped at 200 ms, blocked by terrain and cover;

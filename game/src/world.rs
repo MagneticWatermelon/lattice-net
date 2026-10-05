@@ -113,8 +113,10 @@ impl World {
         w
     }
 
+    /// Terrain height at sample (ix, iy), each < `TERRAIN_N`: the point
+    /// (ix, iy) × `TERRAIN_RES`. (Renderers mesh the samples directly.)
     #[inline]
-    fn sample(&self, ix: usize, iy: usize) -> f32 {
+    pub fn sample(&self, ix: usize, iy: usize) -> f32 {
         self.heights[iy * TERRAIN_N + ix] as f32 * CM
     }
 

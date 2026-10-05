@@ -364,6 +364,12 @@ impl Entities {
         self.tracks.get(&entity).map(|t| t.render(r))
     }
 
+    /// The newest sample of `entity`: where the server last said it was,
+    /// with no delay and no smoothing (the client's server ghost).
+    pub fn newest(&self, entity: u16) -> Option<Sample> {
+        self.tracks.get(&entity).map(|t| *t.newest())
+    }
+
     /// The near state received for `entity` at `tick`, if still in history.
     pub fn near_state(&self, entity: u16, tick: u32) -> Option<NearQ> {
         self.near.get(entity, tick)

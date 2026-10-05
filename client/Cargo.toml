@@ -1,0 +1,49 @@
+[package]
+name = "lattice-client"
+version = "0.1.0"
+edition = "2021"
+description = "The first playable client: a Bevy window on lattice-client-core. Its own workspace, so the server's builds and tests never compile Bevy."
+license = "MIT"
+publish = false
+
+# Its own workspace: `cargo test` / `clippy` at the root don't build Bevy.
+[workspace]
+
+[dependencies]
+lattice-net = { path = ".." }
+lattice-game = { path = "../game" }
+lattice-client-core = { path = "../client-core" }
+# No audio, gamepads or Wayland: on Linux they need ALSA, libudev and Wayland
+# headers (WSLg serves X11 too), and the client has no use for them yet.
+bevy = { version = "0.19.1", default-features = false, features = [
+  "std",
+  "default_app",
+  "multi_threaded",
+  "bevy_winit",
+  "x11",
+  "default_font",
+  "keyboard",
+  "mouse",
+  "3d_api",
+  "bevy_render",
+  "bevy_core_pipeline",
+  "bevy_pbr",
+  "bevy_gizmos_render",
+  "bevy_anti_alias",
+  "bevy_post_process",
+  "tonemapping_luts",
+  "ui_api",
+  "ui_bevy_render",
+] }
+
+[dev-dependencies]
+lattice-sim = { path = "../sim" }
+
+# Bevy is unusably slow unoptimized: optimize dependencies even in dev builds.
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+debug = 1
