@@ -31,13 +31,16 @@ use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{self, step, Input, MoveState, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
+use crate::shots::{self, Fire, FlyStats, History, Outcome, Projectile, Sky};
+use lattice_game::weapon::{self, shot_time, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
+use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::faction::{faction, FACTIONS, MAX_HEALTH, RESPAWN_STEPS};
 use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
 use crate::msg::{self, Blob, PacketFill, RenderTime, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
 use crate::rng::Rng;
 use crate::stats::Histogram;
 
-pub const PHASES: [&str; 9] = ["ingress", "events", "movement", "grid", "separate", "history", "serialize", "assembly", "transport"];
+pub const PHASES: [&str; 10] = ["ingress", "events", "movement", "grid", "separate", "history", "shots", "serialize", "assembly", "transport"];
 pub type Datagram = (SocketAddr, Vec<u8>);
 /// An inbound datagram with its arrival time, as the receive thread saw it.
 pub type InDatagram = (SocketAddr, Instant, Vec<u8>);
@@ -57,14 +60,32 @@ fn join_spans(a: Span, b: Span) -> Span {
 
 const NO_SPAN: Span = (Duration::ZERO, Duration::ZERO);
 
-/// Lag-compensation window: 200 ms.
-const HISTORY_TICKS: usize = (TICK_HZ as usize) / 5;
+/// Steps of a stand-in's seq a late shot may still fire for.
+const LATE_SHOT_STEPS: u32 = 8;
+/// Consumed steps an input queue remembers (for late shots' origins).
+const STEP_RING: usize = 16;
 /// Starved ticks that repeat the last input before movement freezes.
 pub const GRACE_TICKS: u32 = 2;
 /// A client can't queue more inputs than this (~0.5 s); beyond it the oldest
 /// are discarded unapplied rather than letting latency grow.
 const MAX_QUEUED_INPUTS: usize = 16;
 const GRID_CELL: f32 = 32.0;
+/// A projectile that hit a player.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HitRecord {
+    pub shooter: u16,
+    pub target: u16,
+    pub head: bool,
+    pub damage: u8,
+    pub killed: bool,
+    /// How far back the target was taken, in steps.
+    pub rewind: f64,
+    /// The shooter couldn't see the target any more when it landed.
+    pub after_cover: bool,
+    pub at: [f32; 3],
+    pub tick: u32,
+}
+
 /// Players closer than this (two radii) are pushed apart: by `SEP_RATE` of the
 /// overlap per tick, split between them, at most `MAX_PUSH` a tick (3 m/s).
 const SEP_DIST: f32 = 2.0 * RADIUS;
@@ -221,6 +242,29 @@ pub struct Counters {
     pub frozen: u64,
     /// Inputs whose render time was ahead of the server's step (bogus).
     pub render_ahead: u64,
+    /// Shots fired (late: their input was replaced by a stand-in, the shot
+    /// still fired), refused (too fast, from the dead, too late), and the
+    /// rewinds a cap clipped.
+    pub shots: u64,
+    pub shots_late: u64,
+    pub shots_refused: u64,
+    pub rewinds_capped: u64,
+    /// How projectiles ended: in a player (head or body), the ground, cover,
+    /// out of range. Kills by shots.
+    pub hits_head: u64,
+    pub hits_body: u64,
+    pub hits_ground: u64,
+    pub hits_cover: u64,
+    pub expired: u64,
+    pub kills: u64,
+    /// Hits on a target its shooter couldn't see any more (cover or terrain
+    /// between them at the present): lag compensation's cost to the target.
+    pub hits_after_cover: u64,
+    /// Hits on a target that had died since the shooter saw it: no damage.
+    pub hits_too_late: u64,
+    /// Projectile segments flown and player candidates tested.
+    pub segments: u64,
+    pub candidates: u64,
     /// Real inputs that arrived for a seq a stand-in had already consumed.
     pub late_inputs: u64,
     /// Inputs dropped unapplied because the client queued too many.
@@ -276,6 +320,8 @@ struct Body {
     /// Where it was sent to play (respawns come back there).
     anchor: [f32; 2],
     radius: f32,
+    /// Test aid: hits land but deal no damage.
+    invulnerable: bool,
 }
 
 impl Default for Body {
@@ -293,6 +339,7 @@ impl Default for Body {
             life: 0,
             anchor: [0.0; 2],
             radius: 0.0,
+            invulnerable: false,
         }
     }
 }
@@ -358,7 +405,9 @@ struct Tally {
 
 /// Per-entity input stream. Every tick consumes exactly one input seq, so each
 /// server step matches exactly one client step and replays stay consistent.
-#[derive(Default)]
+/// A queued input: seq, input, render time, shot, first arrival.
+type Queued = (u32, Input, Option<RenderTime>, Option<Shot>, Instant);
+
 struct InputQueue {
     /// Newest seq consumed, by a real input or a stand-in. 0 = none yet.
     last_seq: u32,
@@ -377,8 +426,36 @@ struct InputQueue {
     /// (near, mid/far), in steps: what lag compensation would rewind a target
     /// in that tier by. Set by `advance` when the input carried render times.
     rewind: Option<(f64, f64)>,
-    /// Sorted by seq, all > last_seq, each with its render time and first arrival.
-    pending: VecDeque<(u32, Input, Option<RenderTime>, Instant)>,
+    /// Sorted by seq, all > last_seq, each with its render time, shot and first arrival.
+    pending: VecDeque<Queued>,
+    /// The last consumed seqs: (seq, the step it moved to, state before,
+    /// state after), for shots' origins (late ones included).
+    steps: [(u32, u32, MoveState, MoveState); STEP_RING],
+    /// The newest shot fired (`weapon::shot_time`), for the rate and duplicates.
+    last_shot: Option<u64>,
+    /// Shots to fly this tick, and shots refused (too fast, from the dead,
+    /// too late), since last taken.
+    fires: Vec<Fire>,
+    refused: u32,
+}
+
+impl Default for InputQueue {
+    fn default() -> Self {
+        Self {
+            last_seq: 0,
+            last: Input::default(),
+            starved_run: 0,
+            stand_ins: 0,
+            depth: 0,
+            wait: 0,
+            rewind: None,
+            pending: VecDeque::new(),
+            steps: [(0, 0, MoveState::default(), MoveState::default()); STEP_RING],
+            last_shot: None,
+            fires: Vec::new(),
+            refused: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,11 +479,21 @@ enum Step {
 }
 
 impl InputQueue {
-    fn push(&mut self, seq: u32, input: Input, render: Option<RenderTime>, arrived: Instant) -> Push {
+    #[allow(clippy::too_many_arguments)]
+    fn push(&mut self, e: u16, seq: u32, input: Input, render: Option<RenderTime>, shot: Option<Shot>, arrived: Instant, dead: bool) -> Push {
         if seq <= self.last_seq {
             let age = self.last_seq - seq;
             if age < 32 && self.stand_ins & (1 << age) != 0 {
                 self.stand_ins &= !(1 << age); // count each late seq once
+                // Its movement is gone (a stand-in moved instead), but a shot
+                // in it still fires, from where the stand-in put the shooter.
+                if let Some(shot) = shot {
+                    if age < LATE_SHOT_STEPS && !dead {
+                        self.fire(e, seq, shot, render, true);
+                    } else {
+                        self.refused += 1;
+                    }
+                }
                 return Push::Late;
             }
             return Push::Duplicate;
@@ -415,13 +502,40 @@ impl InputQueue {
         if self.pending.get(at).is_some_and(|&(s, ..)| s == seq) {
             return Push::Duplicate; // keep the first arrival
         }
-        self.pending.insert(at, (seq, input, render, arrived));
+        self.pending.insert(at, (seq, input, render, shot, arrived));
         if self.pending.len() > MAX_QUEUED_INPUTS {
             let (s, ..) = self.pending.pop_front().unwrap();
             self.consume(s, false);
             return Push::Discarded;
         }
         Push::Queued
+    }
+
+    /// Fires `shot` from input `seq` (already consumed): from the shooter's
+    /// eye between its states before and after that seq, unless it comes too
+    /// soon after the last shot (or is a copy of one).
+    fn fire(&mut self, e: u16, seq: u32, shot: Shot, render: Option<RenderTime>, late: bool) {
+        let time = shot_time(seq, shot.frac);
+        if self.last_shot.is_some_and(|last| time < last + FIRE_STEPS as u64 * 256) {
+            self.refused += 1;
+            return;
+        }
+        let Some(&(_, step_no, before, after)) = self.steps.iter().find(|s| s.0 == seq) else {
+            self.refused += 1;
+            return;
+        };
+        self.last_shot = Some(time);
+        let tau0 = step_no as f64 - 1.0 + shot.frac as f64 / 256.0;
+        let mid_lag = render.map_or(0.0, |r| r.mid_lag as f64 / MID_LAG_UNITS);
+        let near = msg::render_age(step_no, shot.render) - (1.0 - shot.frac as f64 / 256.0);
+        self.fires.push(Fire {
+            shooter: e,
+            origin: weapon::muzzle(&before, &after, shot.frac),
+            dir: weapon::aim(shot.yaw, shot.pitch),
+            tau0,
+            behind: [near, near + mid_lag],
+            late,
+        });
     }
 
     fn consume(&mut self, seq: u32, stand_in: bool) {
@@ -432,12 +546,14 @@ impl InputQueue {
 
     /// Advance one movement step, consuming seq `last_seq + 1`. `now` is the
     /// tick's time, `step` the game step the result is at.
-    fn advance(&mut self, body: &mut Body, now: Instant, step_no: u32, world: &World) -> Step {
+    fn advance(&mut self, e: u16, body: &mut Body, now: Instant, step_no: u32, world: &World) -> Step {
         self.depth = self.pending.len().min(u8::MAX as usize) as u8;
         self.rewind = None;
         let next = self.last_seq + 1;
+        let mut fired = None;
         let (input, kind) = if self.pending.front().is_some_and(|&(s, ..)| s == next) {
-            let (_, input, render, arrived) = self.pending.pop_front().unwrap();
+            let (_, input, render, shot, arrived) = self.pending.pop_front().unwrap();
+            fired = shot.map(|s| (s, render));
             self.rewind = render.map(|r| r.ages(step_no));
             let waited = now.saturating_duration_since(arrived).as_micros() / 100;
             self.wait = waited.min(WAIT_STAND_IN as u128 - 1) as u16;
@@ -459,7 +575,9 @@ impl InputQueue {
                 (Input { yaw: self.last.yaw, ..Default::default() }, Step::Frozen)
             }
         };
+        let before = body.state;
         body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input });
+        self.steps[next as usize % STEP_RING] = (next, step_no, before, body.state);
         // A body keeps the aim it died with: the dead player's own camera
         // still turns (on its client), but a corpse doesn't spin for others.
         if !body.dead() {
@@ -467,6 +585,14 @@ impl InputQueue {
             body.pitch = input.pitch;
         }
         self.consume(next, kind != Step::Applied);
+        // Only real inputs fire: a stand-in repeats movement, never a shot.
+        if let Some((shot, render)) = fired {
+            if body.dead() {
+                self.refused += 1;
+            } else {
+                self.fire(e, next, shot, render, false);
+            }
+        }
         kind
     }
 }
@@ -511,7 +637,11 @@ pub struct SimServer {
     near_hist: Vec<Vec<NearQ>>,
     near_hist_tick: [u32; NEAR_HISTORY],
     far_blobs: Vec<Blob>,
-    history: Vec<Vec<[f32; 2]>>,
+    history: History,
+    projectiles: Vec<Projectile>,
+    next_projectile: u64,
+    /// Hits since the last `take_hits`.
+    hits: Vec<HitRecord>,
     /// Free entity ids, per faction (`faction::faction(id)`).
     free: [Vec<u16>; FACTIONS as usize],
     /// Damage to apply after this tick's movement: (entity, amount).
@@ -589,7 +719,10 @@ impl SimServer {
             near_hist: vec![Vec::new(); NEAR_HISTORY],
             near_hist_tick: [u32::MAX; NEAR_HISTORY],
             far_blobs: Vec::new(),
-            history: vec![Vec::new(); HISTORY_TICKS],
+            history: History::default(),
+            projectiles: Vec::new(),
+            next_projectile: 0,
+            hits: Vec::new(),
             free: Default::default(),
             pending_damage: Vec::new(),
             death_acc: 0.0,
@@ -797,14 +930,15 @@ impl SimServer {
             .bodies
             .par_iter_mut()
             .zip(self.inputs.par_iter_mut())
+            .enumerate()
             .with_min_len(256)
-            .filter(|(b, _)| b.alive)
-            .map(|(b, q)| {
+            .filter(|(_, (b, _))| b.alive)
+            .map(|(e, (b, q))| {
                 // A tick consumes `steps` 1/30 s movement steps (1 or 2 at 20 Hz).
                 let queued = q.pending.len();
                 let mut n = [0u64; 3];
                 for k in 0..steps {
-                    match q.advance(b, now, base_step + k + 1, world) {
+                    match q.advance(e as u16, b, now, base_step + k + 1, world) {
                         Step::Applied => n[0] += 1,
                         Step::Repeated => n[1] += 1,
                         Step::Frozen => n[2] += 1,
@@ -894,10 +1028,13 @@ impl SimServer {
         lap(4);
 
         // 6. lag-comp history
-        let slot = &mut self.history[self.tick as usize % HISTORY_TICKS];
-        slot.clear();
-        slot.extend(self.bodies.iter().map(|b| b.state.pos));
+        let entries = self.bodies.iter().map(|b| shots::HistEntry { pos: [b.state.pos[0], b.state.pos[1], b.state.z], life: b.life, live: b.alive && !b.dead() });
+        self.history.record(self.tick, self.step, entries);
         lap(5);
+
+        // 6b. shots: new projectiles, then every projectile flies to now
+        self.spans[6] = self.shots_phase();
+        lap(6);
 
         // 7. serialize each entity once per tier. Far blobs are needed for this
         // tick's due entities and last tick's far-due ones (budget carries).
@@ -919,7 +1056,7 @@ impl SimServer {
                     *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch, b.health);
                 }
             });
-        lap(6);
+        lap(7);
 
         // 8. per-client assembly, grouped by shard so each shard's snapshots
         // are ready for its transport task
@@ -944,7 +1081,7 @@ impl SimServer {
             max_message,
             packet_body,
         };
-        self.spans[7] = self
+        self.spans[8] = self
             .shard_clients
             .par_iter_mut()
             .zip(self.snapshots.par_iter_mut())
@@ -996,10 +1133,10 @@ impl SimServer {
             c.near_scanned += t.near_scanned;
             c.mid_scanned += t.mid_scanned;
         }
-        lap(7);
+        lap(8);
 
         // 8b. transport: queue, frame, ack and checksum, one task per shard
-        self.spans[8] = self
+        self.spans[9] = self
             .net
             .shards_mut()
             .par_iter_mut()
@@ -1018,11 +1155,168 @@ impl SimServer {
                 span(t0.elapsed())
             })
             .reduce(|| NO_SPAN, join_spans);
-        lap(8);
+        lap(9);
 
         self.tick = self.tick.wrapping_add(1);
         self.counters.ticks += 1;
         times
+    }
+
+    /// The shots phase: fires from this tick's inputs become projectiles; every
+    /// projectile flies up to now (in parallel); hits are applied in
+    /// projectile order. Returns the flight's task span.
+    fn shots_phase(&mut self) -> Span {
+        let t0 = Instant::now();
+        let mut fires: Vec<Fire> = Vec::new();
+        for q in &mut self.inputs {
+            if !q.fires.is_empty() {
+                fires.append(&mut q.fires);
+            }
+            self.counters.shots_refused += std::mem::take(&mut q.refused) as u64;
+        }
+        for f in &fires {
+            let (p, capped) = Projectile::new(self.next_projectile, f);
+            self.next_projectile += 1;
+            self.projectiles.push(p);
+            self.counters.shots += 1;
+            self.counters.shots_late += f.late as u64;
+            self.counters.rewinds_capped += capped as u64;
+        }
+        if self.projectiles.is_empty() {
+            return span(t0.elapsed());
+        }
+        // Shooters' near sets (last tick's): who they drew at the near delay.
+        let mut near: HashMap<u16, Vec<u16>> = self.projectiles.iter().map(|p| (p.shooter, Vec::new())).collect();
+        for slot in self.shard_clients.iter().flatten() {
+            if let Some(set) = near.get_mut(&slot.entity) {
+                set.extend(slot.near.entities());
+                set.sort_unstable();
+            }
+        }
+        let sky = Sky { world: &self.world, grid: &self.grid, history: &self.history, near: &near };
+        let until = self.step as f64;
+        // Fly in chunks of 64 projectiles; a chunk is a task (its time is
+        // the span's "longest task").
+        type Flown = (Vec<(u64, u16, Outcome, [f32; 3])>, FlyStats, Duration);
+        let flown: Vec<Flown> = self
+            .projectiles
+            .par_chunks_mut(64)
+            .map(|chunk| {
+                let t = Instant::now();
+                let (mut ends, mut st) = (Vec::new(), FlyStats::default());
+                for p in chunk {
+                    if let Some((o, at)) = shots::fly(p, until, &sky, &mut st) {
+                        ends.push((p.id, p.shooter, o, at));
+                    }
+                }
+                (ends, st, t.elapsed())
+            })
+            .collect();
+        let mut ended = Vec::new();
+        let mut task = NO_SPAN;
+        for (ends, st, t) in flown {
+            ended.extend(ends);
+            self.counters.segments += st.segments;
+            self.counters.candidates += st.candidates;
+            task = join_spans(task, span(t));
+        }
+        // Apply in projectile order, so the outcome doesn't depend on threads.
+        ended.sort_unstable_by_key(|&(id, ..)| id);
+        let gone: std::collections::HashSet<u64> = ended.iter().map(|&(id, ..)| id).collect();
+        self.projectiles.retain(|p| !gone.contains(&p.id));
+        for (_, shooter, outcome, at) in ended {
+            match outcome {
+                Outcome::Ground => self.counters.hits_ground += 1,
+                Outcome::Cover => self.counters.hits_cover += 1,
+                Outcome::Expired => self.counters.expired += 1,
+                Outcome::Player { target, head, rewind } => {
+                    let full = if head { DAMAGE_HEAD } else { DAMAGE_BODY };
+                    let after_cover = !self.in_sight(shooter, target);
+                    // The shooter saw it alive; if it has died since, no damage.
+                    let (damage, killed) = match self.hurt(target, full) {
+                        Some(killed) => (full, killed),
+                        None => (0, false),
+                    };
+                    let c = &mut self.counters;
+                    (c.hits_head, c.hits_body) = (c.hits_head + head as u64, c.hits_body + !head as u64);
+                    c.kills += killed as u64;
+                    c.hits_after_cover += after_cover as u64;
+                    c.hits_too_late += (damage == 0) as u64;
+                    self.hits.push(HitRecord { shooter, target, head, damage, killed, rewind, after_cover, at, tick: self.tick });
+                }
+            }
+        }
+        let _ = t0;
+        task
+    }
+
+    /// Whether `shooter`'s eye sees `target`'s chest now (no terrain or cover
+    /// between them).
+    fn in_sight(&self, shooter: u16, target: u16) -> bool {
+        let (Some(a), Some(b)) = (self.history.now(shooter), self.history.now(target)) else { return false };
+        let (p0, p1) = ([a.pos[0], a.pos[1], a.pos[2] + weapon::EYE_HEIGHT], [b.pos[0], b.pos[1], b.pos[2] + 1.0]);
+        if lattice_game::hit::terrain(&self.world, p0, p1).is_some() {
+            return false;
+        }
+        let mid = [(p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0];
+        let half = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt() / 2.0;
+        let mut blocked = false;
+        self.world.boxes_near(mid[0], mid[1], half + 1.0, |c| {
+            blocked |= lattice_game::hit::aabb(p0, p1, [c.min[0], c.min[1], c.bottom], [c.max[0], c.max[1], c.top]).is_some();
+        });
+        !blocked
+    }
+
+    /// Takes `amount` of health from `e` now: whether that killed it (it
+    /// respawns `RESPAWN_STEPS` from now), or `None` if it wasn't alive to
+    /// take it.
+    fn hurt(&mut self, e: u16, amount: u8) -> Option<bool> {
+        let step_no = self.step;
+        let b = self.bodies.get_mut(e as usize).filter(|b| b.alive && !b.dead())?;
+        if b.invulnerable {
+            return Some(false);
+        }
+        b.health = b.health.saturating_sub(amount);
+        if b.health > 0 {
+            return Some(false);
+        }
+        b.respawn_at = Some(step_no + RESPAWN_STEPS);
+        b.life = b.life.wrapping_add(1);
+        self.counters.deaths += 1;
+        Some(true)
+    }
+
+    /// Test aid: hits on `entity` land but deal no damage.
+    pub fn set_invulnerable(&mut self, entity: u16, on: bool) {
+        if let Some(b) = self.bodies.get_mut(entity as usize) {
+            b.invulnerable = on;
+        }
+    }
+
+    /// Hits since the last call.
+    pub fn take_hits(&mut self) -> Vec<HitRecord> {
+        std::mem::take(&mut self.hits)
+    }
+
+    /// Projectiles in flight.
+    pub fn projectiles(&self) -> usize {
+        self.projectiles.len()
+    }
+
+    /// Test aid: puts `entity` standing at `pos` before the next tick, and
+    /// makes that where it respawns. Its client sees a life change (a cut),
+    /// so prediction stays exact.
+    pub fn teleport(&mut self, entity: u16, pos: [f32; 2]) {
+        if let Some(b) = self.bodies.get_mut(entity as usize).filter(|b| b.alive) {
+            b.state = MoveState::standing(&self.world, pos);
+            b.life = b.life.wrapping_add(1);
+            (b.anchor, b.radius) = (pos, 1.0);
+        }
+    }
+
+    /// The world everyone plays in.
+    pub fn world(&self) -> &World {
+        &self.world
     }
 
     /// Damages `entity` after the next tick's movement (0 = no effect, a
@@ -1053,14 +1347,9 @@ impl SimServer {
                 }
             }
         }
+        let _ = step_no;
         for (e, amount) in std::mem::take(&mut self.pending_damage) {
-            let Some(b) = self.bodies.get_mut(e as usize).filter(|b| b.alive && !b.dead()) else { continue };
-            b.health = b.health.saturating_sub(amount);
-            if b.health == 0 {
-                b.respawn_at = Some(step_no + RESPAWN_STEPS);
-                b.life = b.life.wrapping_add(1);
-                self.counters.deaths += 1;
-            }
+            self.hurt(e, amount);
         }
     }
 
@@ -1158,8 +1447,9 @@ impl SimServer {
 
     fn on_input(&mut self, client: ClientId, data: &[u8], arrived: Instant) {
         let Some(&e) = self.by_client.get(&client) else { return };
+        let dead = self.bodies[e as usize].dead();
         let (q, c) = (&mut self.inputs[e as usize], &mut self.counters);
-        let ok = msg::decode_inputs(data, |seq, input, render| match q.push(seq, input, render, arrived) {
+        let ok = msg::decode_inputs(data, |seq, input, render, shot| match q.push(e, seq, input, render, shot, arrived, dead) {
             Push::Late => c.late_inputs += 1,
             Push::Discarded => c.discarded_inputs += 1,
             Push::Queued | Push::Duplicate => {}
@@ -1561,14 +1851,14 @@ mod tests {
         let ms = |n| t + Duration::from_millis(n);
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
-        q.push(1, fwd(), None, ms(0));
-        q.push(1, fwd(), None, ms(20)); // a redundant copy doesn't reset the clock
-        q.push(2, fwd(), None, ms(20));
-        assert_eq!(q.advance(&mut b, ms(33), 1, &tw()), Step::Applied);
+        q.push(0, 1, fwd(), None, None, ms(0), false);
+        q.push(0, 1, fwd(), None, None, ms(20), false); // a redundant copy doesn't reset the clock
+        q.push(0, 2, fwd(), None, None, ms(20), false);
+        assert_eq!(q.advance(0, &mut b, ms(33), 1, &tw()), Step::Applied);
         assert_eq!(q.wait, 330, "33 ms in 0.1 ms units");
-        assert_eq!(q.advance(&mut b, ms(66), 1, &tw()), Step::Applied);
+        assert_eq!(q.advance(0, &mut b, ms(66), 1, &tw()), Step::Applied);
         assert_eq!(q.wait, 460);
-        assert_eq!(q.advance(&mut b, ms(99), 1, &tw()), Step::Repeated);
+        assert_eq!(q.advance(0, &mut b, ms(99), 1, &tw()), Step::Repeated);
         assert_eq!(q.wait, WAIT_STAND_IN);
     }
 
@@ -1578,25 +1868,70 @@ mod tests {
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
 
-        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Waiting, "no input yet consumes nothing");
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Waiting, "no input yet consumes nothing");
         assert_eq!(q.last_seq, 0);
-        assert_eq!(q.push(2, fwd(), None, t), Push::Queued);
-        assert_eq!(q.push(1, fwd(), None, t), Push::Queued);
-        assert_eq!(q.push(2, fwd(), None, t), Push::Duplicate);
-        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Applied);
+        assert_eq!(q.push(0, 2, fwd(), None, None, t, false), Push::Queued);
+        assert_eq!(q.push(0, 1, fwd(), None, None, t, false), Push::Queued);
+        assert_eq!(q.push(0, 2, fwd(), None, None, t, false), Push::Duplicate);
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Applied);
         assert_eq!((q.last_seq, q.depth), (1, 2));
-        assert_eq!(q.push(1, fwd(), None, t), Push::Duplicate, "already applied");
-        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Applied);
+        assert_eq!(q.push(0, 1, fwd(), None, None, t, false), Push::Duplicate, "already applied");
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Applied);
         assert_eq!(q.last_seq, 2);
 
         // A backlog drains one per tick; overflow discards the oldest unapplied.
         for s in 3..=3 + MAX_QUEUED_INPUTS as u32 {
-            q.push(s, fwd(), None, t);
+            q.push(0, s, fwd(), None, None, t, false);
         }
         assert_eq!(q.pending.len(), MAX_QUEUED_INPUTS);
         assert_eq!(q.last_seq, 3, "seq 3 was discarded");
-        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Applied);
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Applied);
         assert_eq!(q.last_seq, 4);
+    }
+
+    #[test]
+    fn shots_fire_once_at_the_rifles_rate_and_never_from_stand_ins() {
+        let t = Instant::now();
+        let mut q = InputQueue::default();
+        let mut b = Body { alive: true, ..Default::default() };
+        let shot = |frac| Some(Shot { frac, yaw: 0, pitch: 0, render: 0 });
+        let w = tw();
+        // seq 1 fires; its redundant copy doesn't fire again.
+        q.push(0, 1, fwd(), None, shot(128), t, false);
+        q.advance(0, &mut b, t, 1, &w);
+        q.push(0, 1, fwd(), None, shot(128), t, false);
+        assert_eq!((q.fires.len(), q.refused), (1, 0));
+        let f = q.fires[0];
+        assert_eq!(f.tau0, 0.5, "half way through the step to 1");
+        // Seq 2 is too soon (one step later); seq 4 (three) is fine.
+        for seq in 2..=4 {
+            q.push(0, seq, fwd(), None, shot(128), t, false);
+            q.advance(0, &mut b, t, seq, &w);
+        }
+        assert_eq!((q.fires.len(), q.refused), (2, 2), "seqs 2 and 3 too soon");
+        // Seq 5 never arrives: the stand-in repeats its movement, not a shot.
+        assert_eq!(q.advance(0, &mut b, t, 5, &w), Step::Repeated);
+        assert_eq!(q.fires.len(), 2);
+        // ...and when seq 5 turns up late, its shot still fires (counted late),
+        // from where the stand-in left the shooter.
+        q.advance(0, &mut b, t, 6, &w); // seq 6: another stand-in (too soon anyway)
+        q.advance(0, &mut b, t, 7, &w);
+        // (frac 200: three steps after seq 4's shot at frac 128)
+        q.push(0, 7, fwd(), None, shot(200), t, false);
+        assert_eq!(q.push(0, 7, fwd(), None, shot(200), t, false), Push::Duplicate, "counted once");
+        assert_eq!(q.fires.len(), 3);
+        assert!(q.fires[2].late);
+        let (_, _, before, after) = q.steps[7 % STEP_RING];
+        assert_eq!(q.fires[2].origin, weapon::muzzle(&before, &after, 200), "from where the stand-in moved it");
+        // A shot whose seq is more than 8 steps gone, or from the dead, is refused.
+        for seq in 8..=20 {
+            q.advance(0, &mut b, t, seq, &w);
+        }
+        q.push(0, 10, fwd(), None, shot(0), t, false);
+        b.health = 0;
+        q.push(0, 21, fwd(), None, shot(0), t, false);
+        q.advance(0, &mut b, t, 21, &w);
+        assert_eq!((q.fires.len(), q.refused), (3, 4));
     }
 
     #[test]
@@ -1604,11 +1939,11 @@ mod tests {
         let t = Instant::now();
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
-        q.push(1, fwd(), None, t);
-        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Applied);
+        q.push(0, 1, fwd(), None, None, t, false);
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Applied);
 
         // Lag switch: nothing arrives for 10 ticks.
-        let kinds: Vec<Step> = (0..10).map(|_| q.advance(&mut b, t, 1, &tw())).collect();
+        let kinds: Vec<Step> = (0..10).map(|_| q.advance(0, &mut b, t, 1, &tw())).collect();
         assert_eq!(&kinds[..2], &[Step::Repeated; 2]);
         assert!(kinds[2..].iter().all(|&k| k == Step::Frozen));
         assert_eq!(q.last_seq, 11, "every stand-in consumes a seq");
@@ -1617,18 +1952,18 @@ mod tests {
 
         // The held-back burst arrives: all of it is too late to move anyone.
         for s in 2..=11 {
-            assert_eq!(q.push(s, fwd(), None, t), Push::Late);
-            assert_eq!(q.push(s, fwd(), None, t), Push::Duplicate, "a late seq counts once");
+            assert_eq!(q.push(0, s, fwd(), None, None, t, false), Push::Late);
+            assert_eq!(q.push(0, s, fwd(), None, None, t, false), Push::Duplicate, "a late seq counts once");
         }
         assert!(q.pending.is_empty());
         for _ in 0..30 {
-            q.advance(&mut b, t, 1, &tw());
+            q.advance(0, &mut b, t, 1, &tw());
         }
         assert!(b.state.vel == [0.0, 0.0] && b.state.pos[0] - frozen_at[0] < 0.5, "{:?}", b.state);
 
         // Fresh input for the next seq resumes movement and resets the grace.
-        assert_eq!(q.push(q.last_seq + 1, fwd(), None, t), Push::Queued);
-        assert_eq!(q.advance(&mut b, t, 1, &tw()), Step::Applied);
+        assert_eq!(q.push(0, q.last_seq + 1, fwd(), None, None, t, false), Push::Queued);
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Applied);
         assert_eq!(q.starved_run, 0);
         assert!(b.state.vel[0] > 0.0);
     }

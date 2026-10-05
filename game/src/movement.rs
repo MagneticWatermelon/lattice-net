@@ -34,6 +34,9 @@ pub const HEIGHT: f32 = 1.8;
 
 pub const BUTTON_SPRINT: u8 = 1;
 pub const BUTTON_JUMP: u8 = 2;
+/// On the wire only: this input carries a shot (`weapon::Shot`). Movement
+/// ignores it; decoded inputs never have it set.
+pub const BUTTON_FIRE: u8 = 4;
 
 /// One tick of player intent. `move_*` is a world-space stick in [-127, 127].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

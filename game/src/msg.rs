@@ -1,10 +1,12 @@
 //! Game messages carried in lattice-net channels. Each starts with a tag byte.
 //!
 //! ```text
-//! C->S unreliable  Input    tag | newest_seq:4 | n:1 | [mid_lag:1] | n × (move_x:1 move_y:1 yaw:2 pitch:2 buttons:1 [render:2])
+//! C->S unreliable  Input    tag | newest_seq:4 | n:1 | [mid_lag:1] | n × (move_x:1 move_y:1 yaw:2 pitch:2 buttons:1 [render:2]
+//!                           [shot: frac:1 yaw:2 pitch:2 render:2])
 //!                           newest first. n's top bit: render times follow. `render` is the client's
 //!                           near render step when the input was made (1/64 steps, wrapping; see
-//!                           RENDER_UNITS); mid and far entities were drawn `mid_lag` (1/8 steps) earlier
+//!                           RENDER_UNITS); mid and far entities were drawn `mid_lag` (1/8 steps) earlier.
+//!                           BUTTON_FIRE: a shot follows (weapon::Shot), at most one per input
 //! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32 | world_seed:8
 //! S->C unreliable  Snapshot tag | server_tick:4 | step:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
 //!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 grounded:1 | pushes:1 | health:1 | life:1
@@ -33,7 +35,8 @@ use lattice_net::Config;
 
 use crate::tier::Tier;
 use crate::faction::MAX_HEALTH;
-use crate::movement::{Input, MoveState, WORLD_SIZE};
+use crate::movement::{Input, MoveState, BUTTON_FIRE, WORLD_SIZE};
+use crate::weapon::Shot;
 
 pub const MSG_INPUT: u8 = 1;
 pub const MSG_WELCOME: u8 = 2;
@@ -142,32 +145,50 @@ impl RenderTime {
     }
 }
 
-/// Each input with its near render step (`render_units`), and the batch's mid
-/// lag. Render times are sent only when every input in the batch has one.
-pub fn encode_inputs(newest_seq: u32, newest_first: &[(Input, Option<u16>)], mid_lag: u8) -> Vec<u8> {
-    let timed = newest_first.iter().all(|(_, r)| r.is_some());
-    let mut w = Writer::with_capacity(7 + newest_first.len() * 9);
+/// An input as a batch carries it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputEntry {
+    pub input: Input,
+    /// Near render step when it was made (`render_units`).
+    pub render: Option<u16>,
+    pub shot: Option<Shot>,
+}
+
+/// Each input with its near render step (`render_units`) and shot, and the
+/// batch's mid lag. Render times are sent only when every input in the batch
+/// has one.
+pub fn encode_inputs(newest_seq: u32, newest_first: &[InputEntry], mid_lag: u8) -> Vec<u8> {
+    let timed = newest_first.iter().all(|e| e.render.is_some());
+    let mut w = Writer::with_capacity(7 + newest_first.len() * 16);
     w.u8(MSG_INPUT);
     w.u32(newest_seq);
     w.u8(newest_first.len() as u8 | if timed { RENDER_FLAG } else { 0 });
     if timed {
         w.u8(mid_lag);
     }
-    for (i, render) in newest_first {
+    for e in newest_first {
+        let i = &e.input;
         w.u8(i.move_x as u8);
         w.u8(i.move_y as u8);
         w.u16(i.yaw);
         w.u16(i.pitch as u16);
-        w.u8(i.buttons);
+        w.u8(i.buttons & !BUTTON_FIRE | if e.shot.is_some() { BUTTON_FIRE } else { 0 });
         if timed {
-            w.u16(render.unwrap());
+            w.u16(e.render.unwrap());
+        }
+        if let Some(s) = e.shot {
+            w.u8(s.frac);
+            w.u16(s.yaw);
+            w.u16(s.pitch as u16);
+            w.u16(s.render);
         }
     }
     w.into_inner()
 }
 
-/// Calls `f(seq, input, render)` for each input in the batch, newest first.
-pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input, Option<RenderTime>)) -> Result<(), DecodeError> {
+/// Calls `f(seq, input, render, shot)` for each input in the batch, newest
+/// first. A shot's render time shares the batch's mid lag.
+pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input, Option<RenderTime>, Option<Shot>)) -> Result<(), DecodeError> {
     let mut r = Reader::new(data);
     if r.u8()? != MSG_INPUT {
         return Err(DecodeError::Invalid);
@@ -180,10 +201,16 @@ pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input, Option<RenderTim
     }
     let mid_lag = if timed { r.u8()? } else { 0 };
     for k in 0..n {
-        let input =
+        let mut input =
             Input { move_x: r.u8()? as i8, move_y: r.u8()? as i8, yaw: r.u16()?, pitch: r.u16()? as i16, buttons: r.u8()? };
         let render = if timed { Some(RenderTime { near: r.u16()?, mid_lag }) } else { None };
-        f(newest - k, input, render);
+        let shot = if input.buttons & BUTTON_FIRE != 0 {
+            input.buttons &= !BUTTON_FIRE;
+            Some(Shot { frac: r.u8()?, yaw: r.u16()?, pitch: r.u16()? as i16, render: r.u16()? })
+        } else {
+            None
+        };
+        f(newest - k, input, render, shot);
     }
     r.finish()
 }
@@ -419,26 +446,28 @@ mod tests {
 
     #[test]
     fn inputs_roundtrip() {
+        let entry = |input, render| InputEntry { input, render, shot: None };
+        let shot = Shot { frac: 200, yaw: 1234, pitch: -500, render: 4321 };
         let ins = [
-            (Input { move_x: -127, move_y: 5, yaw: 40000, pitch: -32767, buttons: 3 }, Some(65535)),
-            (Input { move_x: 3, move_y: 127, yaw: 1, pitch: 1200, buttons: 0 }, Some(7)),
+            InputEntry { shot: Some(shot), ..entry(Input { move_x: -127, move_y: 5, yaw: 40000, pitch: -32767, buttons: 3 }, Some(65535)) },
+            entry(Input { move_x: 3, move_y: 127, yaw: 1, pitch: 1200, buttons: 0 }, Some(7)),
         ];
         let bytes = encode_inputs(10, &ins, 32);
-        assert_eq!(bytes.len(), 7 + 2 * 9);
+        assert_eq!(bytes.len(), 7 + 2 * 9 + 7, "a shot is 7 B");
         let mut got = Vec::new();
-        decode_inputs(&bytes, |s, i, r| got.push((s, i, r))).unwrap();
+        decode_inputs(&bytes, |s, i, r, sh| got.push((s, i, r, sh))).unwrap();
         let rt = |near| Some(RenderTime { near, mid_lag: 32 });
-        assert_eq!(got, vec![(10, ins[0].0, rt(65535)), (9, ins[1].0, rt(7))]);
+        assert_eq!(got, vec![(10, ins[0].input, rt(65535), Some(shot)), (9, ins[1].input, rt(7), None)]);
         assert_eq!(rt(render_units(1000.0)).unwrap().ages(1002), (2.0, 6.0), "mid: 4 steps further back");
         // Without a render time on every input, none is sent.
-        let untimed = [ins[0], (ins[1].0, None)];
+        let untimed = [InputEntry { shot: None, ..ins[0] }, entry(ins[1].input, None)];
         let bytes = encode_inputs(10, &untimed, 32);
         assert_eq!(bytes.len(), 6 + 2 * 7);
         got.clear();
-        decode_inputs(&bytes, |s, i, r| got.push((s, i, r))).unwrap();
-        assert_eq!(got, vec![(10, ins[0].0, None), (9, ins[1].0, None)]);
+        decode_inputs(&bytes, |s, i, r, sh| got.push((s, i, r, sh))).unwrap();
+        assert_eq!(got, vec![(10, ins[0].input, None, None), (9, ins[1].input, None, None)]);
         // a batch reaching back past seq 1 is malformed
-        assert!(decode_inputs(&encode_inputs(1, &ins, 0), |_, _, _| {}).is_err());
+        assert!(decode_inputs(&encode_inputs(1, &ins, 0), |_, _, _, _| {}).is_err());
     }
 
     #[test]

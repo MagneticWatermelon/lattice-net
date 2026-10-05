@@ -588,7 +588,8 @@ fn main() -> std::io::Result<()> {
                 kept.push(row);
                 let t = sim.tasks();
                 let us = |s: (Duration, Duration)| [s.0.as_micros() as u32, s.1.as_micros() as u32];
-                kept_spans.push([us(t[0]), us(t[7]), us(t[8]), us(egress_span)]);
+                // ingress, assembly, transport (PHASES order) + egress
+                kept_spans.push([us(t[0]), us(t[8]), us(t[9]), us(egress_span)]);
                 kept_overruns += (done - now > period) as u64;
             }
         }
@@ -785,6 +786,23 @@ fn summary_values(
     kv.put("despawns", c.despawns);
     kv.put("deaths", c.deaths);
     kv.put("respawns", c.respawns);
+    for (k, v) in [
+        ("shots", c.shots),
+        ("shots_late", c.shots_late),
+        ("shots_refused", c.shots_refused),
+        ("rewinds_capped", c.rewinds_capped),
+        ("hits_head", c.hits_head),
+        ("hits_body", c.hits_body),
+        ("hits_ground", c.hits_ground),
+        ("hits_cover", c.hits_cover),
+        ("projectiles_expired", c.expired),
+        ("kills", c.kills),
+        ("hits_after_cover", c.hits_after_cover),
+        ("projectile_segments", c.segments),
+        ("hit_candidates", c.candidates),
+    ] {
+        kv.put(k, v);
+    }
     kv.put("joins_deferred", sim.net().deferred_accepts());
     kv.put("bad_messages", c.bad_messages);
     kv.put("recv_errors", net.recv_errors.load(Relaxed));

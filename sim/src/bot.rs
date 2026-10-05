@@ -17,6 +17,18 @@ pub struct BotBrain {
     ai: Wander,
 }
 
+/// How a bot moves (tests use the scripted ones).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Moves {
+    /// The random walk around its anchor.
+    Wander,
+    /// Stands still (a gunner on a range).
+    Hold,
+    /// Runs side to side along y at run speed, turning every `period` steps:
+    /// the hard case for lag compensation.
+    Strafe { period: u32 },
+}
+
 impl BotBrain {
     /// A bot that only counts entities until `enable_tracking`.
     pub fn new(seed: u64) -> Self {
@@ -25,6 +37,10 @@ impl BotBrain {
 
     pub fn with_config(seed: u64, cfg: ClientConfig) -> Self {
         Self { core: ClientCore::new(cfg), ai: Wander::new(seed) }
+    }
+
+    pub fn set_moves(&mut self, m: Moves) {
+        self.ai.moves = m;
     }
 
     pub fn core(&self) -> &ClientCore {
@@ -88,15 +104,26 @@ struct Wander {
     rng: Rng,
     heading: f32,
     sprint: bool,
+    moves: Moves,
+    steps: u32,
 }
 
 impl Wander {
     fn new(seed: u64) -> Self {
         let mut rng = Rng::new(seed);
-        Self { heading: rng.range(0.0, std::f32::consts::TAU), rng, sprint: false }
+        Self { heading: rng.range(0.0, std::f32::consts::TAU), rng, sprint: false, moves: Moves::Wander, steps: 0 }
     }
 
     fn think(&mut self, s: &MoveState, w: &Welcome) -> Input {
+        self.steps += 1;
+        match self.moves {
+            Moves::Wander => {}
+            Moves::Hold => return Input::default(),
+            Moves::Strafe { period } => {
+                let dir = if (self.steps / period.max(1)).is_multiple_of(2) { 127 } else { -127 };
+                return Input { move_y: dir, ..Input::default() };
+            }
+        }
         let stopped = s.grounded && s.vel[0] * s.vel[0] + s.vel[1] * s.vel[1] < 0.25;
         if self.rng.chance(1.0 / 45.0) || (stopped && self.rng.chance(0.3)) {
             self.heading = self.rng.range(0.0, std::f32::consts::TAU);

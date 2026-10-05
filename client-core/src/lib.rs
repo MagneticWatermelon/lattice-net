@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use lattice_game::delta;
 use lattice_game::movement::{dead_input, step, Input, MoveState, TICK_HZ};
-use lattice_game::msg::{self, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
+use lattice_game::msg::{self, InputEntry, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
+use lattice_game::weapon::{shot_time, Shot, FIRE_STEPS};
 use lattice_game::tier::Tier;
 use lattice_game::world::World;
 
@@ -139,6 +140,8 @@ pub struct ClientStats {
     pub life_events: u64,
     /// Times the near render delay changed (it adapts).
     pub delay_changes: u64,
+    /// Shots sent (each rides its input).
+    pub shots: u64,
     /// From the latest snapshot: the server's pace (per mille) and levels.
     pub pace: u16,
     pub level: u8,
@@ -166,6 +169,8 @@ struct Predicted {
     sent_at: Option<Instant>,
     /// The render step then, as sent (`msg::render_units`).
     render: Option<u16>,
+    /// A shot fired during this input's step.
+    shot: Option<Shot>,
 }
 
 pub struct ClientCore {
@@ -207,6 +212,10 @@ pub struct ClientCore {
     near_delay: f64,
     near_bounds: (f64, f64),
     mid_delay: f64,
+    /// A shot waiting for the input whose step it was fired in: (seq, shot).
+    pending_shot: Option<(u32, Shot)>,
+    /// When the last shot fired (`weapon::shot_time`): the rifle's rate.
+    last_shot: Option<u64>,
     /// The newest snapshot's own state and its step: the server's view of us.
     server_own: Option<(MoveState, u32)>,
     /// Own-player correction being smoothed away, as of `own_offset_at`.
@@ -264,6 +273,8 @@ impl ClientCore {
             near_bounds: (steps(cfg.near_delay), steps(cfg.near_delay_max.max(cfg.near_delay))),
             mid_delay: steps(cfg.mid_delay),
             server_own: None,
+            pending_shot: None,
+            last_shot: None,
             own_offset: [0.0; 3],
             own_offset_at: None,
             sink: false,
@@ -516,7 +527,7 @@ impl ClientCore {
             self.seq = h.ack_seq;
             self.state = h.own;
             self.history[self.seq as usize % HISTORY] =
-                Predicted { seq: self.seq, input: Input::default(), state: h.own, sent_at: None, render: None };
+                Predicted { seq: self.seq, input: Input::default(), state: h.own, sent_at: None, render: None, shot: None };
             self.last_acked = h.ack_seq;
             return;
         }
@@ -601,6 +612,30 @@ impl ClientCore {
         self.state = s;
     }
 
+    /// Pulls the trigger at `now`, aiming at `yaw`/`pitch`. The shot rides
+    /// the input whose step `now` falls in (`frac` from the input clock's
+    /// phase), with the render step of `now`: what the player sees is what
+    /// the server tests it against. False while dead, before the render
+    /// clock runs, or faster than the rifle fires (`FIRE_STEPS`).
+    pub fn fire(&mut self, now: Instant, yaw: u16, pitch: i16) -> bool {
+        if self.welcome.is_none() || self.is_dead() || self.pending_shot.is_some() {
+            return false;
+        }
+        let since = self.clock_at.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32() * TICK_HZ as f32);
+        let phase = (self.clock + self.rate * since).max(0.0);
+        let ahead = phase.floor();
+        let frac = (((phase - ahead) * 256.0) as u32).min(255) as u8;
+        let seq = self.seq + 1 + ahead as u32;
+        let time = shot_time(seq, frac);
+        if self.last_shot.is_some_and(|last| time < last + FIRE_STEPS as u64 * 256) {
+            return false;
+        }
+        let Some(render) = self.render_clock.render_at(now) else { return false };
+        self.pending_shot = Some((seq, Shot { frac, yaw, pitch, render: msg::render_units(render) }));
+        self.last_shot = Some(time);
+        true
+    }
+
     /// Own health from the newest snapshot.
     pub fn health(&self) -> u8 {
         self.health
@@ -659,8 +694,14 @@ impl ClientCore {
             self.seq += 1;
             let applied = if self.is_dead() { dead_input(input) } else { input };
             self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied);
+            // A shot fired during this step (or one a resync skipped past).
+            let shot = self.pending_shot.filter(|&(seq, _)| seq <= self.seq).map(|(_, shot)| shot);
+            if shot.is_some() {
+                self.pending_shot = None;
+                self.stats.shots += 1;
+            }
             self.history[self.seq as usize % HISTORY] =
-                Predicted { seq: self.seq, input, state: self.state, sent_at: Some(now), render };
+                Predicted { seq: self.seq, input, state: self.state, sent_at: Some(now), render, shot };
             made += 1;
         }
         match made {
@@ -684,14 +725,14 @@ impl ClientCore {
     /// The batch whose newest input is `end`: newest first, stopping at a gap
     /// (a resync skips seqs we never generated).
     fn batch(&self, end: u32, mid_lag: u8) -> Vec<u8> {
-        let mut batch = [(Input::default(), None); INPUT_REDUNDANCY];
+        let mut batch = [InputEntry::default(); INPUT_REDUNDANCY];
         let mut n = 0;
         while n < INPUT_REDUNDANCY && (n as u32) < end {
             let p = self.history[(end as usize - n) % HISTORY];
             if p.seq != end - n as u32 {
                 break;
             }
-            batch[n] = (p.input, p.render);
+            batch[n] = InputEntry { input: p.input, render: p.render, shot: p.shot };
             n += 1;
         }
         msg::encode_inputs(end, &batch[..n], mid_lag)
@@ -742,7 +783,7 @@ mod tests {
             let batches = c.tick_inputs(now, |_, _| run);
             let mut covered = std::collections::BTreeSet::new();
             for b in &batches {
-                msg::decode_inputs(b, |seq, _, _| {
+                msg::decode_inputs(b, |seq, _, _, _| {
                     covered.insert(seq);
                 })
                 .unwrap();

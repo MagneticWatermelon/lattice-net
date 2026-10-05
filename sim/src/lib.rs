@@ -13,6 +13,7 @@ pub mod interest;
 pub mod ladder;
 pub mod rng;
 pub mod server;
+pub mod shots;
 pub mod stats;
 
 // The shared game rules live in `lattice-game`; re-exported so the server and

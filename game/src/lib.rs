@@ -8,7 +8,9 @@
 
 pub mod delta;
 pub mod faction;
+pub mod hit;
 pub mod movement;
 pub mod msg;
 pub mod tier;
+pub mod weapon;
 pub mod world;

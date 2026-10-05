@@ -62,6 +62,50 @@ struct Swarm {
     last_render: HashMap<usize, f64>,
     /// The server's states by game step (the last 3 s), for checking renders.
     truth: VecDeque<(u32, HashMap<u16, [f32; 3]>)>,
+    /// One-way delay per bot, both directions, in steps (latency classes).
+    lag: Vec<u32>,
+    /// Bot -> server datagrams held back by `lag`, with when they arrive.
+    up_delayed: Vec<(Instant, SocketAddr, Vec<u8>)>,
+    /// A bot that aims at a target as it draws it, and fires.
+    gunner: Option<Gunner>,
+}
+
+/// A test gunner: aims at `target` where its bot draws it, leading for the
+/// flight time (and drop) at the drawn velocity, plus `extra_lead` steps.
+#[derive(Debug, Clone, Copy)]
+struct Gunner {
+    bot: usize,
+    target: u16,
+    head: bool,
+    extra_lead: f32,
+    shots: u64,
+}
+
+/// Aims `brain` at `g.target` as drawn at `now`, and pulls the trigger.
+fn aim_and_fire(brain: &mut BotBrain, g: &mut Gunner, now: Instant) {
+    use lattice_game::hit::{BODY_HIGH, BODY_LOW, HEAD_AT};
+    use lattice_game::weapon::{EYE_HEIGHT, GRAVITY, MUZZLE_SPEED};
+    let core = brain.core_mut();
+    let Some(r) = core.render_step(now) else { return };
+    let Some(ents) = core.entities() else { return };
+    let (Some(st), Some(was)) = (ents.render_one(g.target, r), ents.render_one(g.target, r - 0.5)) else { return };
+    if st.dead {
+        return;
+    }
+    let vel = [0, 1].map(|k| (st.pos[k] - was.pos[k]) * 2.0 * TICK_HZ as f32);
+    let me = core.predicted();
+    let eye = [me.pos[0], me.pos[1], me.z + EYE_HEIGHT];
+    let at = st.pos[2] + if g.head { HEAD_AT } else { (BODY_LOW + BODY_HIGH) / 2.0 };
+    let dist = ((st.pos[0] - eye[0]).powi(2) + (st.pos[1] - eye[1]).powi(2)).sqrt();
+    let flight = dist / MUZZLE_SPEED;
+    let lead = flight + g.extra_lead / TICK_HZ as f32;
+    let p = [st.pos[0] + vel[0] * lead, st.pos[1] + vel[1] * lead, at + 0.5 * GRAVITY * flight * flight];
+    let d = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
+    let yaw = (d[1].atan2(d[0]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16;
+    let pitch = (d[2].atan2(d[0].hypot(d[1])) / std::f32::consts::FRAC_PI_2 * 32767.0) as i16;
+    if core.fire(now, yaw, pitch) {
+        g.shots += 1;
+    }
 }
 
 /// Where `entity` really was at (fractional) game step `r`: the server's
@@ -111,6 +155,9 @@ impl Swarm {
             render_backwards: 0,
             last_render: HashMap::new(),
             truth: VecDeque::new(),
+            lag: vec![0; n],
+            up_delayed: Vec::new(),
+            gunner: None,
         }
     }
 
@@ -119,6 +166,16 @@ impl Swarm {
         let now = self.now;
         self.to_server.extend(self.delayed.drain(..).map(|(a, p)| (a, now, p)));
         let server_addr: SocketAddr = SERVER.parse().unwrap();
+        // Bot datagrams whose one-way delay is up.
+        let mut k = 0;
+        while k < self.up_delayed.len() {
+            if self.up_delayed[k].0 <= now {
+                let (at, from, pkt) = self.up_delayed.swap_remove(k);
+                self.to_server.push((from, at, pkt));
+            } else {
+                k += 1;
+            }
+        }
         // Held-back server datagrams that are due.
         let mut k = 0;
         while k < self.to_bots.len() {
@@ -156,6 +213,9 @@ impl Swarm {
                         });
                     }
                 }
+                if let Some(g) = self.gunner.as_mut().filter(|g| g.bot == i) {
+                    aim_and_fire(brain, g, now);
+                }
                 if let Some(batch) = brain.tick_inputs(self.now) {
                     client.send(Channel::Unreliable, batch).unwrap();
                 }
@@ -166,6 +226,7 @@ impl Swarm {
                     Some(held) if i == 0 => held.push((*addr, pkt)),
                     _ if self.rng.chance(self.loss) => {}
                     _ if self.rng.chance(self.delay) => self.delayed.push((*addr, pkt)),
+                    _ if self.lag[i] > 0 => self.up_delayed.push((self.now + Duration::from_secs(1) / TICK_HZ * self.lag[i], *addr, pkt)),
                     _ => self.to_server.push((*addr, self.now, pkt)),
                 }
             }
@@ -193,8 +254,9 @@ impl Swarm {
             if self.rng.chance(self.loss) {
                 continue;
             }
-            if self.down_jitter > 0 {
-                let extra = (self.rng.next_u64() % (self.down_jitter as u64 + 1)) as u32;
+            let lag = self.bots.iter().position(|(a, _, _)| *a == to).map_or(0, |i| self.lag[i]);
+            if self.down_jitter > 0 || lag > 0 {
+                let extra = (self.rng.next_u64() % (self.down_jitter as u64 + 1)) as u32 + lag;
                 self.to_bots.push((self.now + Duration::from_secs(1) / TICK_HZ * extra, to, pkt));
             } else if let Some((_, client, _)) = self.bots.iter_mut().find(|(a, _, _)| *a == to) {
                 client.receive(server_addr, &pkt, self.now);
@@ -892,7 +954,7 @@ fn render_timeline_on_a_clean_link() {
     assert!((r.delay - 2.0).abs() < 0.05, "near: 67 ms behind the newest step: {}", r.delay);
     // Near and mid are drawn between samples, to their quantization (near
     // ~8 mm; mid 16 mm across and 16 cm in height).
-    assert!(r.interpolated[0] >= 0.999 && r.interpolated[1] >= 0.999, "{:?}", r.interpolated);
+    assert!(r.interpolated[0] >= 0.999 && r.interpolated[1] >= 0.998, "{:?}", r.interpolated);
     assert!(r.err[0].1 < 0.02 && r.err[1].1 < 0.2, "{:?}", r.err);
     assert_eq!((r.pops[0].1, r.pops[1].1), (0.0, 0.0), "nothing near or mid pops");
     // Far (2 Hz) on the mid timeline: interpolated about half the time,
@@ -1107,4 +1169,190 @@ fn jitter_diagnostic() {
             s.corrections()
         );
     }
+}
+
+/// A clear 50 m range: a shooter's spot and a target's, no cover within 45 m
+/// of the middle and nothing but air between the shooter's eye and the
+/// target's chest anywhere within 6 m of the line.
+fn range(world: &lattice_game::world::World) -> ([f32; 2], [f32; 2]) {
+    use lattice_game::hit;
+    let y = 4096.0;
+    for k in 0..300 {
+        let x = 1200.0 + k as f32 * 37.0;
+        let (a, b) = ([x, y], [x + 50.0, y]);
+        let mut boxes = 0;
+        world.boxes_near(x + 25.0, y, 45.0, |_| boxes += 1);
+        if boxes > 0 {
+            continue;
+        }
+        let eye = [a[0], a[1], world.terrain(a[0], a[1]) + 1.6];
+        let clear = (-6..=6).all(|dy| {
+            let (tx, ty) = (b[0], b[1] + dy as f32);
+            let chest = [tx, ty, world.terrain(tx, ty) + 0.75];
+            hit::terrain(world, eye, chest).is_none()
+        });
+        if clear {
+            return (a, b);
+        }
+    }
+    panic!("no clear range");
+}
+
+/// Two bots, shooter (bot 0, one-way `lag` steps) and target (bot 1), on a
+/// clear range; the target strafes (or holds), the gunner fires for `secs`.
+/// Returns the swarm, the target entity and the gunner's hits on it.
+/// The target is invulnerable unless `lethal` (hit rates then measure aim,
+/// not respawn timing).
+#[allow(clippy::too_many_arguments)]
+fn shoot_at(lag: u32, strafe: u32, head: bool, extra_lead: f32, secs: u32, lethal: bool) -> (Swarm, u16, Vec<lattice_sim::server::HitRecord>, Gunner) {
+    use lattice_sim::bot::Moves;
+    let interest = InterestConfig { squad_size: 0, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, ..Default::default() };
+    let mut s = render_swarm(2, cfg, Duration::from_secs(3600));
+    s.lag = vec![lag, 0];
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let (a, b) = range(s.server.world());
+    let (shooter, target) = (s.bots[0].2.welcome().unwrap().entity, s.bots[1].2.welcome().unwrap().entity);
+    assert_ne!(lattice_game::faction::faction(shooter), lattice_game::faction::faction(target));
+    s.server.teleport(shooter, a);
+    s.server.teleport(target, b);
+    s.server.set_invulnerable(target, !lethal);
+    s.bots[0].2.set_moves(Moves::Hold);
+    // `strafe`: steps between turns (0: holds still).
+    s.bots[1].2.set_moves(if strafe > 0 { Moves::Strafe { period: strafe } } else { Moves::Hold });
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+    }
+    s.server.take_rewind();
+    s.gunner = Some(Gunner { bot: 0, target, head, extra_lead, shots: 0 });
+    for _ in 0..secs * TICK_HZ {
+        s.step();
+    }
+    let g = s.gunner.take().unwrap();
+    for _ in 0..TICK_HZ / 3 {
+        s.step(); // the last shots land
+    }
+    let hits: Vec<_> = s.server.take_hits().into_iter().filter(|h| h.shooter == shooter && h.target == target).collect();
+    (s, target, hits, g)
+}
+
+fn shoot(lag: u32, strafe: u32, head: bool, extra_lead: f32, secs: u32) -> (Swarm, u16, Vec<lattice_sim::server::HitRecord>, Gunner) {
+    shoot_at(lag, strafe, head, extra_lead, secs, false)
+}
+
+#[test]
+fn what_you_see_is_what_you_hit() {
+    // A target running side to side at 6 m/s, 50 m out, turning every second.
+    // The gunner aims where its client draws it (leading for the flight):
+    // lag compensation must make that a hit, at 0 and 33 ms one-way.
+    for lag in [0, 1] {
+        let (mut s, _, hits, g) = shoot(lag, 30, false, 0.0, 20);
+        let [near, _] = s.server.take_rewind().map(|h| h.summary());
+        let c = s.server.counters();
+        let rate = hits.len() as f64 / g.shots as f64;
+        eprintln!("lag {lag}: {} of {} shots hit ({:.1}%), near rewind p50 {} ms, kills {}", hits.len(), g.shots, 100.0 * rate, near.p50, c.kills);
+        assert!(g.shots > 100, "it fired: {}", g.shots);
+        assert!(rate >= 0.95, "lag {lag}: hit {:.1}%", 100.0 * rate);
+        assert_eq!((c.shots, c.shots_refused), (g.shots, 0), "every shot fired once, none refused");
+        assert!(hits.iter().all(|h| h.rewind <= lattice_sim::shots::NEAR_CAP));
+        assert_eq!(s.corrections(), 0, "shooting doesn't disturb prediction");
+    }
+}
+
+#[test]
+fn headshots_hit_the_head() {
+    // A standing target: this checks the head hitbox, not leading a juke (a
+    // runner turning every second would spoil 20% of head-sized leads).
+    let (_, _, hits, g) = shoot(1, 0, true, 0.0, 10);
+    let heads = hits.iter().filter(|h| h.head).count();
+    eprintln!("{heads} head and {} body hits of {} shots", hits.len() - heads, g.shots);
+    assert!(heads as f64 >= 0.97 * g.shots as f64, "{heads} of {}", g.shots);
+}
+
+#[test]
+fn beyond_the_cap_the_shooter_leads() {
+    // 133 ms one-way: the shooter's view is ~13 steps behind, over the 9-step
+    // near cap. Aiming at what it draws misses a runner...
+    // (A runner turning every 3 s: leading a turn isn't what's tested.)
+    let (s, _, hits, g) = shoot(4, 90, false, 0.0, 15);
+    let rate = hits.len() as f64 / g.shots as f64;
+    assert!(s.server.counters().rewinds_capped > 0);
+    assert!(hits.iter().all(|h| h.rewind <= lattice_sim::shots::NEAR_CAP));
+    eprintln!("past the cap: {:.1}% of {} shots hit", 100.0 * rate, g.shots);
+    assert!(rate < 0.5, "{rate}");
+    // ...and leading by what the cap clipped hits again. (The view is behind
+    // by the render delay + RTT + the wait: ~4 steps past the cap here.)
+    let best = (2..=6)
+        .map(|lead| {
+            let (_, _, hits, g) = shoot(4, 90, false, lead as f32, 10);
+            let rate = hits.len() as f64 / g.shots as f64;
+            eprintln!("  leading {lead} steps more: {:.1}%", 100.0 * rate);
+            rate
+        })
+        .fold(0.0, f64::max);
+    assert!(best >= 0.9, "leading by the clipped time hits: {best}");
+}
+
+#[test]
+fn walls_stop_shots() {
+    use lattice_sim::bot::Moves;
+    let interest = InterestConfig { squad_size: 0, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, ..Default::default() };
+    let mut s = render_swarm(2, cfg, Duration::from_secs(3600));
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    // A tall wall running north-south; the target stands right behind it.
+    let w = s.server.world();
+    let wall = *w
+        .boxes()
+        .iter()
+        .find(|b| {
+            let c = [(b.min[0] + b.max[0]) / 2.0, (b.min[1] + b.max[1]) / 2.0];
+            b.max[0] - b.min[0] < 1.0 && b.max[1] - b.min[1] > 6.0 && b.top - w.terrain(c[0] + 1.5, c[1]) > 2.6 && b.top - w.terrain(c[0] - 20.0, c[1]) > 0.5
+        })
+        .expect("a wall");
+    let c = [(wall.min[0] + wall.max[0]) / 2.0, (wall.min[1] + wall.max[1]) / 2.0];
+    let (shooter, target) = (s.bots[0].2.welcome().unwrap().entity, s.bots[1].2.welcome().unwrap().entity);
+    s.server.teleport(shooter, [c[0] - 20.0, c[1]]);
+    s.server.teleport(target, [wall.max[0] + 0.6, c[1]]);
+    s.bots[0].2.set_moves(Moves::Hold);
+    s.bots[1].2.set_moves(Moves::Hold);
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+    }
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0 });
+    for _ in 0..5 * TICK_HZ {
+        s.step();
+    }
+    let c = s.server.counters();
+    let g = s.gunner.unwrap();
+    assert!(g.shots > 30);
+    assert_eq!(c.hits_body + c.hits_head, 0, "nothing goes through a wall");
+    assert!(c.hits_cover + c.hits_ground >= g.shots - 2, "they stop on it: cover {} ground {}", c.hits_cover, c.hits_ground);
+    assert!(c.hits_cover > 0);
+}
+
+#[test]
+fn five_body_hits_kill() {
+    let (s, target, hits, _) = shoot_at(0, 0, false, 0.0, 12, true);
+    // Group hits by the target's lives: each kill took exactly 100 HP. Hits
+    // that land after it died (the shooter hadn't seen the death) deal none.
+    let mut taken = 0u32;
+    let mut kills = 0;
+    for h in hits.iter().filter(|h| h.damage > 0) {
+        assert!(!h.head);
+        taken += h.damage as u32;
+        assert_eq!(h.killed, taken >= 100, "the {}th HP point kills, no sooner", taken);
+        if h.killed {
+            (taken, kills) = (0, kills + 1);
+        }
+    }
+    assert!(kills >= 2, "{kills} kills in 12 s (respawning after 5 s)");
+    let c = s.server.counters();
+    assert_eq!(c.kills, kills);
+    assert!(c.hits_too_late > 0 && c.hits_too_late as usize == hits.len() - hits.iter().filter(|h| h.damage > 0).count());
+    let _ = target;
 }

@@ -152,6 +152,11 @@ impl NearState {
         self.entries.len()
     }
 
+    /// The entities in the near set.
+    pub fn entities(&self) -> impl Iterator<Item = u16> + '_ {
+        self.entries.iter().map(|e| e.0)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
