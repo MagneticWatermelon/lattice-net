@@ -309,7 +309,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
              - a "target hint" per shot (+3 B: the entity under the crosshair and its exact drawn step), if transition-time misses show up in the measurements;
              - projectile-vs-projectile;
              - ammo and reload.
-        3. **M3d.3: events, tracers, client combat. Built** (2026-10-05):
+        3. **M3d.3: events, tracers, client combat. Done** (2026-10-05). The user played it: the network side is right; visuals (tracers etc.) are deliberately basic, not the focus:
            - **events:** reliable, one `Events` message per client per tick (`game/src/events.rs`); Hurt carries a server-computed direction;
            - **tracers:** unreliable `Shots` with each shot's step; the client starts a tracer when the shooter is drawn firing;
            - **contacts:** a hit makes shooter and target near-tier for each other for 5 s;
