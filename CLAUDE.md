@@ -239,7 +239,11 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
         - hit rate by latency class;
         - post-cover hits (target occluded from the shooter's present eye at hit time) with their rewind.
       - **Order:**
-        1. M3d.1: factions, health, death, respawn.
+        1. **M3d.1: factions, health, death, respawn. Done** (2026-10-05, checked by eye on Windows):
+           - a death or respawn is a life event (rebase, replay, never a correction) and a cut (never smoothed, never interpolated across);
+           - corpses keep the aim they died with;
+           - `--deaths-per-sec` stands in for weapons;
+           - UDP, 100 tracked bots, 10 deaths/s: 0 corrections, streak frames 67,994 → 742 after the fixes.
         2. M3d.2: shots, 3D history, projectiles, damage (server and swarm tests).
         3. M3d.3: events, tracers, client combat.
         4. M3d.4: fighting bots, latency classes, measurements.
