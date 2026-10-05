@@ -140,7 +140,7 @@ impl Swarm {
     }
 
     fn corrections(&self) -> u64 {
-        self.bots.iter().map(|(_, _, b)| b.stats.corrections).sum()
+        self.bots.iter().map(|(_, _, b)| b.stats().corrections).sum()
     }
 }
 
@@ -164,14 +164,14 @@ fn clean_link_predicts_bit_exactly() {
 
     for (_, _, b) in &s.bots {
         assert!(b.welcome().is_some());
-        let st = &b.stats;
+        let st = b.stats();
         assert_eq!((st.unmatched_acks, st.bad_messages, st.stale_snapshots), (0, 0, 0));
         let near = st.tier_seen[Tier::Near as usize] as f64 / st.snapshots as f64;
         assert!(near > 2.0, "near entities per snapshot {near}");
         assert_eq!(st.tier_seen[Tier::Far as usize], 0, "nobody is 500 m away");
     }
     // All 40 spawn in a 200 m disk; a 150 m near radius covers a good part of it.
-    let (seen, snaps) = s.bots.iter().fold((0, 0), |a, (_, _, b)| (a.0 + b.stats.tier_seen[0], a.1 + b.stats.snapshots));
+    let (seen, snaps) = s.bots.iter().fold((0, 0), |a, (_, _, b)| (a.0 + b.stats().tier_seen[0], a.1 + b.stats().snapshots));
     let avg = seen as f64 / snaps as f64;
     assert!(avg > 8.0, "swarm avg near entities per snapshot {avg}");
 }
@@ -204,7 +204,7 @@ fn loss_causes_corrections_then_reconverges() {
     assert_eq!(s.server.client_count(), 30);
 
     // And the bots' predicted positions agree with what everyone else sees.
-    let max_err = s.bots.iter().map(|(_, _, b)| b.stats.correction_error_max).fold(0.0, f32::max);
+    let max_err = s.bots.iter().map(|(_, _, b)| b.stats().correction_error_max).fold(0.0, f32::max);
     assert!(max_err < 5.0, "a correction moved a bot {max_err} m");
 }
 
@@ -218,8 +218,8 @@ fn input_clock_keeps_one_spare_input() {
         let depth = b.server_buffer();
         assert!((1.75..=2.5).contains(&depth), "server queue depth {depth}");
         // Lockstep starts at depth 1: the clock runs ahead once, then holds steady.
-        assert!(b.stats.clock_extra >= 1, "the clock must run ahead to build a spare");
-        assert!(b.stats.clock_extra + b.stats.clock_skipped <= 3, "clock hunting: {:?}", b.stats);
+        assert!(b.stats().clock_extra >= 1, "the clock must run ahead to build a spare");
+        assert!(b.stats().clock_extra + b.stats().clock_skipped <= 3, "clock hunting: {:?}", b.stats());
     }
     assert_eq!(stand_ins(&s), 0);
 
@@ -256,7 +256,7 @@ fn stalled_client_resyncs_instead_of_staying_late() {
     // The 1-2 inputs already buffered at the server cover the first stalled ticks.
     assert_eq!(c.repeated, 2, "2 ticks of grace");
     assert!((16..=18).contains(&c.frozen), "then frozen: {}", c.frozen);
-    assert_eq!(s.bots[0].2.stats.resyncs, 1);
+    assert_eq!(s.bots[0].2.stats().resyncs, 1);
 
     // Recovered: no more stand-ins and no more corrections.
     let (standins, corrections) = (stand_ins(&s), s.corrections());
@@ -299,7 +299,7 @@ fn lag_switch_buys_no_movement() {
     for _ in 0..2 * TICK_HZ {
         s.step();
     }
-    assert!(s.bots[0].2.stats.corrections > 0);
+    assert!(s.bots[0].2.stats().corrections > 0);
     let corrections = s.corrections();
     for _ in 0..2 * TICK_HZ {
         s.step();
@@ -320,7 +320,7 @@ fn one_tick_of_jitter_is_absorbed_from_the_start() {
     assert_eq!(stand_ins(&s), 0);
     assert_eq!(s.corrections(), 0);
     for (_, _, b) in &s.bots {
-        assert_eq!(b.stats.resyncs, 0);
+        assert_eq!(b.stats().resyncs, 0);
     }
 }
 
@@ -496,7 +496,7 @@ fn ladder_degrades_to_the_bottom_and_back_without_breaking_clients() {
     assert_eq!(s.server.rung().tick_hz, 20);
     assert!((s.server.pace() - 0.8).abs() < 0.01, "pace {}", s.server.pace());
     for (_, _, b) in &s.bots {
-        assert_eq!((b.stats.level, b.stats.pace), (lattice_sim::ladder::MAX_LEVEL, 800), "clients are told");
+        assert_eq!((b.stats().level, b.stats().pace), (lattice_sim::ladder::MAX_LEVEL, 800), "clients are told");
     }
     // Load gone: back to normal, one level per calm stretch.
     s.fake_load = Some(0.2);
@@ -555,8 +555,8 @@ fn sink_bots_keep_playing_and_only_count_what_they_get() {
     for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
         let mut samples = Vec::new();
         b.drain_latency(&mut samples);
-        assert!(b.stats.tier_seen[0] > 0, "bot {i} counts near entities");
-        assert_eq!(b.stats.pace, 1000, "and follows the pace");
+        assert!(b.stats().tier_seen[0] > 0, "bot {i} counts near entities");
+        assert_eq!(b.stats().pace, 1000, "and follows the pace");
         assert_eq!(samples.is_empty(), i % 2 == 1, "only full bots keep latency samples");
     }
 }
@@ -566,7 +566,7 @@ fn sink_bots_keep_playing_and_only_count_what_they_get() {
 fn assert_near_states_exact(s: &Swarm) -> usize {
     let mut checked = 0;
     for (_, _, b) in &s.bots {
-        assert_eq!(b.stats.near_decode_errors, 0, "a delta referred to a baseline the client lacks");
+        assert_eq!(b.stats().near_decode_errors, 0, "a delta referred to a baseline the client lacks");
         let t = b.tracker().unwrap();
         for (_, _, other) in &s.bots {
             let entity = other.welcome().unwrap().entity;
@@ -713,8 +713,8 @@ fn crowds_are_pushed_apart_and_clients_tell_pushes_from_mispredictions() {
     // Soft by design (at most 3 m/s): it can't stop players who keep walking
     // into an over-full crowd at 6 m/s, but it cuts the overlap by ~2x.
     assert!(with * 3 < without * 2, "separation keeps players apart: {without} -> {with} overlapping pairs");
-    let pushes: u64 = s.bots.iter().map(|(_, _, b)| b.stats.push_corrections).sum();
-    let max_push = s.bots.iter().map(|(_, _, b)| b.stats.push_error_max).fold(0.0f32, f32::max);
+    let pushes: u64 = s.bots.iter().map(|(_, _, b)| b.stats().push_corrections).sum();
+    let max_push = s.bots.iter().map(|(_, _, b)| b.stats().push_error_max).fold(0.0f32, f32::max);
     assert!(pushes > 0, "pushes reach the clients");
     assert!(max_push < 0.25, "a push correction is a couple of ticks of push at most: {max_push} m");
     assert_eq!(s.corrections(), 0, "and nothing else mispredicts");

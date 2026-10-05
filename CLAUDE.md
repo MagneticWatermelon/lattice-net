@@ -125,7 +125,31 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
       - Movement is 2.5D: pitch, jump, gravity, 45° max slope, 0.45 m steps, sliding along cover, ledge catch when falling.
       - Soft separation is a server phase (`separate`). Snapshots carry a push counter, so bots count push corrections apart from real ones.
       - Prediction stays bit-exact; on WSL there are 0 real corrections in the pile and blob, and the cost is +0.3–1 ms of tick. See sim/README.
-    - **M3b `lattice-client-core`:** extracted from `BotBrain` (bots and humans run the same client code); the one render timeline; the render time in each input; the bots measure smoothness.
+    - **M3b `lattice-client-core`** (`client-core/`, scoped 2026-10-05). Bots and humans run the same client code.
+      - **Extraction.** Prediction, the input clock and the entity store move out of `BotBrain`. The bot AI (`think`) stays in sim, as the input source passed to `tick_inputs`.
+      - **The timeline is game steps (1/30 s), not server ticks.** Snapshots carry `step`. Ticks map to steps 1:1 at 30 Hz but 1-or-2 at 20 Hz, so interpolating in ticks would play 20 Hz movement at alternating 0.67×/1.33× speed. Under dilation the clock runs at pace × 30 steps/s.
+      - **Render clock.** It tracks the envelope of snapshot arrivals: up at once when a step arrives earlier than expected, slow drift down when it arrives later. Render = newest − delay (100 ms default), slewed at most ±10% and never backwards; it snaps past 0.5 s of error.
+      - **Entities.** One sample timeline per entity across tiers.
+        - Bracketed: interpolate.
+        - Otherwise: extrapolate, with the near tier's velocity or one derived from the last two samples (mid/far), for at most 250 ms, then hold.
+        - A sample that changes what's on screen becomes a visual offset that decays (~100 ms), never a pop.
+        - Entities unheard for 2 s are dropped (explicit despawns come with M3d's events).
+      - **Mid/far blobs** fill their unused altitude (12 bits, 16 cm), pitch and airborne bits.
+      - **Inputs carry the render step** (u16, 1/64 step, wrapping; +2 B per input). The server records rewind = applied step − render step, the number M3d's 200 ms cap applies to.
+      - **The client's own player** is drawn between its last two predicted steps by the input clock's phase. A reconciliation becomes a decaying offset. The input clock runs on elapsed time, so a 144 Hz client works.
+      - **Measurement.** Tracked bots record, per tier:
+        - the share of frames interpolated, extrapolated or held;
+        - the size of corrections when samples arrive (pops, before smoothing);
+        - the actual render delay.
+
+        The swarm tests compare rendered positions with the server's history.
+      - **Pass bars:**
+        - prediction stays bit-exact;
+        - on a clean link, near and mid are interpolated in ≥99% of frames;
+        - under 5% loss and ±20 ms jitter, near is interpolated in ≥95%;
+        - render time never goes backwards.
+
+        Far pops are measured, not barred: they decide whether mid/far need velocity bytes.
     - **M3c Bevy client** on Windows (out of the workspace's default build): terrain, capsules, first-person and spectator cameras, net graph, server ghost, tier colors.
     - **M3d combat:**
       - health, death, respawn and teams;

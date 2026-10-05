@@ -283,15 +283,15 @@ impl Bot {
         if let Some((_, client)) = &self.net {
             if let (ClientState::Connected, Some(s)) = (client.state(), client.stats()) {
                 t.connected += 1;
-                t.pace_sum += brain.stats.pace as f64;
-                t.level_max = t.level_max.max(brain.stats.level);
-                t.client_degraded += (brain.stats.client_level > 0) as u64;
+                t.pace_sum += brain.stats().pace as f64;
+                t.level_max = t.level_max.max(brain.stats().level);
+                t.client_degraded += (brain.stats().client_level > 0) as u64;
                 t.rtt_sum += s.rtt_ms as f64;
                 t.loss_sum += s.loss as f64;
             }
         }
         t.welcomed += brain.welcome().is_some() as u64;
-        let s = &brain.stats;
+        let s = brain.stats();
         t.snapshots += s.snapshots;
         t.stale_snapshots += s.stale_snapshots;
         t.unmatched_acks += s.unmatched_acks;
@@ -515,7 +515,7 @@ fn main() -> std::io::Result<()> {
                         samples.drain(..).for_each(|t| latency.record(t, rtt));
                         brain.drain_intervals(&mut intervals);
                         // Intervals come in server ticks; a tick's length depends on the level.
-                        let hz = lattice_sim::ladder::RUNGS[(brain.stats.level as usize).min(lattice_sim::ladder::MAX_LEVEL as usize)].tick_hz;
+                        let hz = lattice_sim::ladder::RUNGS[(brain.stats().level as usize).min(lattice_sim::ladder::MAX_LEVEL as usize)].tick_hz;
                         for (h, v) in latency.intervals.iter_mut().zip(&mut intervals) {
                             v.drain(..).for_each(|g| h.record(g as u32 * 1000 / hz));
                         }

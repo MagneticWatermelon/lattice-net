@@ -1,0 +1,11 @@
+[package]
+name = "lattice-client-core"
+version = "0.1.0"
+edition = "2021"
+description = "The client both bots and humans run: input clock, prediction and reconciliation, the render timeline and entity interpolation. Sans-IO."
+license = "MIT"
+publish = false
+
+[dependencies]
+lattice-net = { path = ".." }
+lattice-game = { path = "../game" }

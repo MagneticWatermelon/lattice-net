@@ -15,5 +15,5 @@ ring = "0.17"
 debug = 1
 
 [workspace]
-members = [".", "game", "sim"]
-default-members = [".", "game", "sim"]
+members = [".", "game", "client-core", "sim"]
+default-members = [".", "game", "client-core", "sim"]

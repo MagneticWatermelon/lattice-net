@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 lattice-net = { path = ".." }
 lattice-game = { path = "../game" }
+lattice-client-core = { path = "../client-core" }
 rayon = "1"
 socket2 = { version = "0.5", features = ["all"] } # all: SO_REUSEPORT
 
