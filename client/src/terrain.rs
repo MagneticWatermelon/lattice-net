@@ -70,7 +70,14 @@ pub fn chunk(world: &World, cx: usize, cy: usize, stride: usize) -> MeshData {
             let nrm = Vec3::new(-dhdx, 1.0, dhdy).normalize();
             m.positions.push([ix as f32 * TERRAIN_RES, h, -(iy as f32) * TERRAIN_RES]);
             m.normals.push(nrm.into());
-            m.colors.push(color(h, dhdx.hypot(dhdy)));
+            let mut c = color(h, dhdx.hypot(dhdy));
+            // ±8% brightness per 4 m sample: texture to judge speed by.
+            let hash = (ix as u32).wrapping_mul(0x9E37_79B1) ^ (iy as u32).wrapping_mul(0x85EB_CA77);
+            let k = 0.92 + 0.16 * ((hash.wrapping_mul(0xC2B2_AE35) >> 24) as f32 / 255.0);
+            for v in &mut c[..3] {
+                *v *= k;
+            }
+            m.colors.push(c);
         }
     }
     let at = |i: usize, j: usize| (j * n + i) as u32;
