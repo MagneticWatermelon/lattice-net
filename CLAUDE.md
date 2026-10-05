@@ -244,7 +244,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
            - corpses keep the aim they died with;
            - `--deaths-per-sec` stands in for weapons;
            - UDP, 100 tracked bots, 10 deaths/s: 0 corrections, streak frames 67,994 → 742 after the fixes.
-        2. **M3d.2: shots, 3D history, projectiles, damage. Built** (2026-10-05; see sim/README).
+        2. **M3d.2: shots, 3D history, projectiles, damage. Done** (2026-10-05; see sim/README). The user played it on Windows against 300 bots: "looks great".
            - **Swarm:** a target strafing at 6 m/s 50 m out takes 200/200 hits at 0 and 33 ms one-way; headshots 100/100; past the cap 3% until leading the clipped 2–3 steps (92%); walls stop everything; kills exactly at 100 HP.
            - **WSL, `--fire-share`:**
              - uniform 5k at 20% (~9k shots/s): shots phase p50 2.0 ms;
