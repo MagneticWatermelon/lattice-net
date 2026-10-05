@@ -1046,9 +1046,15 @@ fn death_and_respawn_keep_prediction_exact() {
     }
     let later = s.server.entity_state(me).unwrap();
     assert!(((later.pos[0] - at[0]).powi(2) + (later.pos[1] - at[1]).powi(2)).sqrt() < 0.05, "the dead don't walk");
-    // Everyone tracking it sees it dead.
-    let seen_dead = s.bots[1..].iter().filter(|(_, _, b)| b.entities().and_then(|e| e.newest(me)).is_some_and(|x| x.dead)).count();
-    assert!(seen_dead > 0, "others see the body");
+    // Everyone tracking it sees it dead, lying still: its AI keeps turning
+    // (a stopped bot picks new headings), but the corpse keeps its aim.
+    let seen = |s: &Swarm| s.bots[1..].iter().filter_map(|(_, _, b)| b.entities().and_then(|e| e.newest(me))).find(|x| x.dead);
+    let body = seen(&s).expect("others see the body");
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let later = seen(&s).unwrap();
+    assert_eq!((later.yaw, later.pitch, later.pos), (body.yaw, body.pitch, body.pos), "a still corpse");
     // 5 s after death it's back, at full health, somewhere else.
     for _ in 0..4 * TICK_HZ {
         s.step();

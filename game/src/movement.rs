@@ -67,8 +67,9 @@ impl MoveState {
     }
 }
 
-/// What a dead player's inputs move: nothing. It can still look around (yaw
-/// and pitch are kept), and its body settles under gravity like any other.
+/// What a dead player's inputs move: nothing; its body settles under gravity
+/// like any other. (Yaw and pitch are kept for its own camera; the server
+/// keeps the body's aim as it died, so others see a still corpse.)
 /// The server and the client's prediction both apply this while dead.
 pub fn dead_input(i: Input) -> Input {
     Input { yaw: i.yaw, pitch: i.pitch, ..Input::default() }

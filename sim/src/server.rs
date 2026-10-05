@@ -460,8 +460,12 @@ impl InputQueue {
             }
         };
         body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input });
-        body.yaw = input.yaw;
-        body.pitch = input.pitch;
+        // A body keeps the aim it died with: the dead player's own camera
+        // still turns (on its client), but a corpse doesn't spin for others.
+        if !body.dead() {
+            body.yaw = input.yaw;
+            body.pitch = input.pitch;
+        }
         self.consume(next, kind != Step::Applied);
         kind
     }
