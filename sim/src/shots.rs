@@ -126,6 +126,8 @@ impl History {
 #[derive(Debug, Clone, Copy)]
 pub struct Fire {
     pub shooter: u16,
+    /// The input that carried it.
+    pub seq: u32,
     pub origin: [f32; 3],
     pub dir: [f32; 3],
     /// The aim as sent (for others' tracers).
@@ -313,7 +315,7 @@ mod tests {
 
     #[test]
     fn rewinds_are_capped() {
-        let f = Fire { shooter: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false, wait: 1.5 };
+        let f = Fire { shooter: 1, seq: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false, wait: 1.5 };
         let (p, cut) = Projectile::new(1, &f, None);
         assert_eq!((p.d, cut), ([4.0, 8.0], Cut::default()));
         let (p, cut) = Projectile::new(2, &Fire { behind: [12.0, 16.0], ..f }, None);

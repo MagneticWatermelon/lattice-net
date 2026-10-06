@@ -66,8 +66,10 @@ struct Swarm {
     lag: Vec<u32>,
     /// Bot -> server datagrams held back by `lag`, with when they arrive.
     up_delayed: Vec<(Instant, SocketAddr, Vec<u8>)>,
-    /// A bot that aims at a target as it draws it, and fires.
+    /// A bot that aims at a target as it draws it, and fires; and where its
+    /// client said each shot went.
     gunner: Option<Gunner>,
+    gunner_dirs: Vec<[f32; 3]>,
 }
 
 /// A test gunner: aims at `target` where its bot draws it, leading for the
@@ -79,19 +81,22 @@ struct Gunner {
     head: bool,
     extra_lead: f32,
     shots: u64,
+    /// Aims down sights (its bot's inputs must say so too: `set_ads`).
+    ads: bool,
     /// A cheat: aim where it drew the target this many steps earlier, and
     /// claim that render time ("backtrack").
     back: f32,
 }
 
 /// Aims `brain` at `g.target` as drawn at `now`, and pulls the trigger.
-fn aim_and_fire(brain: &mut BotBrain, g: &mut Gunner, now: Instant) {
+/// Returns where the client says the shot goes.
+fn aim_and_fire(brain: &mut BotBrain, g: &mut Gunner, now: Instant) -> Option<[f32; 3]> {
     let core = brain.core_mut();
-    let Some(r) = core.render_step(now) else { return };
-    let Some((yaw, pitch)) = lattice_sim::bot::aim_at(core, g.target, r - g.back as f64, g.head, g.extra_lead) else { return };
-    if core.fire_claiming(now, yaw, pitch, g.back as f64) {
-        g.shots += 1;
-    }
+    let r = core.render_step(now)?;
+    let (yaw, pitch) = lattice_sim::bot::aim_at(core, g.target, r - g.back as f64, g.head, g.extra_lead)?;
+    let dir = core.fire_claiming(now, yaw, pitch, g.ads, g.back as f64)?;
+    g.shots += 1;
+    Some(dir)
 }
 
 /// Where `entity` really was at (fractional) game step `r`: the server's
@@ -144,6 +149,7 @@ impl Swarm {
             lag: vec![0; n],
             up_delayed: Vec::new(),
             gunner: None,
+            gunner_dirs: Vec::new(),
         }
     }
 
@@ -200,7 +206,9 @@ impl Swarm {
                     }
                 }
                 if let Some(g) = self.gunner.as_mut().filter(|g| g.bot == i) {
-                    aim_and_fire(brain, g, now);
+                    if let Some(d) = aim_and_fire(brain, g, now) {
+                        self.gunner_dirs.push(d);
+                    }
                 }
                 if let Some(batch) = brain.tick_inputs(self.now) {
                     client.send(Channel::Unreliable, batch).unwrap();
@@ -1193,7 +1201,7 @@ fn range(world: &lattice_game::world::World) -> ([f32; 2], [f32; 2]) {
 fn shoot_at(lag: u32, strafe: u32, head: bool, extra_lead: f32, secs: u32, lethal: bool) -> (Swarm, u16, Vec<lattice_sim::server::HitRecord>, Gunner) {
     use lattice_sim::bot::Moves;
     let interest = InterestConfig { squad_size: 0, ..Default::default() };
-    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, cone_of_fire: false, ..Default::default() };
     let mut s = render_swarm(2, cfg, Duration::from_secs(3600));
     s.lag = vec![lag, 0];
     for _ in 0..TICK_HZ {
@@ -1212,7 +1220,7 @@ fn shoot_at(lag: u32, strafe: u32, head: bool, extra_lead: f32, secs: u32, letha
         s.step();
     }
     s.server.take_rewind();
-    s.gunner = Some(Gunner { bot: 0, target, head, extra_lead, shots: 0, back: 0.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head, extra_lead, shots: 0, ads: false, back: 0.0 });
     for _ in 0..secs * TICK_HZ {
         s.step();
     }
@@ -1286,7 +1294,7 @@ fn beyond_the_cap_the_shooter_leads() {
 fn walls_stop_shots() {
     use lattice_sim::bot::Moves;
     let interest = InterestConfig { squad_size: 0, ..Default::default() };
-    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, cone_of_fire: false, ..Default::default() };
     let mut s = render_swarm(2, cfg, Duration::from_secs(3600));
     for _ in 0..TICK_HZ {
         s.step();
@@ -1310,7 +1318,7 @@ fn walls_stop_shots() {
     for _ in 0..2 * TICK_HZ {
         s.step();
     }
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, back: 0.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0 });
     for _ in 0..5 * TICK_HZ {
         s.step();
     }
@@ -1370,11 +1378,16 @@ fn line_of_fire(world: &lattice_game::world::World, dist: f32) -> ([f32; 2], [f3
 }
 
 /// Three bots, no squads (three factions): bot 0 shoots bot 1 from `dist` m,
-/// bot 2 stands 5 m behind the shooter. All keep their combat news.
+/// bot 2 stands 5 m behind the shooter. All keep their combat news. No cone
+/// of fire: shots go exactly where aimed.
 fn firing_line(dist: f32, lethal: bool) -> (Swarm, [u16; 3]) {
+    firing_line_with(dist, lethal, false)
+}
+
+fn firing_line_with(dist: f32, lethal: bool, cone_of_fire: bool) -> (Swarm, [u16; 3]) {
     use lattice_sim::bot::Moves;
     let interest = InterestConfig { squad_size: 0, ..Default::default() };
-    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, cone_of_fire, ..Default::default() };
     let mut s = render_swarm(3, cfg, Duration::from_secs(3600));
     for _ in 0..TICK_HZ {
         s.step();
@@ -1408,7 +1421,7 @@ fn combat_news_reaches_the_right_players() {
     news(&mut s, 0);
     news(&mut s, 1);
     news(&mut s, 2);
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, back: 0.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0 });
     for _ in 0..10 * TICK_HZ {
         s.step();
     }
@@ -1458,7 +1471,7 @@ fn a_shooter_joins_its_targets_near_tier() {
     let (mut s, [shooter, target, _]) = firing_line(200.0, false);
     let tier = |s: &Swarm| s.bots[1].2.entities().and_then(|e| e.get(shooter)).map(|k| k.tier);
     assert_eq!(tier(&s), Some(Tier::Mid));
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, back: 0.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0 });
     for _ in 0..2 * TICK_HZ {
         s.step();
     }
@@ -1480,11 +1493,12 @@ fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64) {
     use lattice_sim::bot::FightConfig;
     let n = 9 * lags.len();
     let interest = InterestConfig { squad_size: 0, ..Default::default() };
-    let cfg = SimConfig { spawn: SpawnMode::Disk(40.0), interest, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Disk(40.0), interest, cone_of_fire: false, ..Default::default() };
     let mut s = Swarm::with_config(n, cfg);
     s.render = true;
     for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
-        b.set_fight(Some(FightConfig::default()));
+        // Not down the sights: that slows them, which hides what lag costs.
+        b.set_fight(Some(FightConfig { ads: false, ..FightConfig::default() }));
         s.lag[i] = lags[i % lags.len()];
     }
     for _ in 0..3 * TICK_HZ {
@@ -1552,7 +1566,7 @@ fn backtrack_claims_are_trimmed() {
     let (mut s, target, _, _) = shoot(0, 30, false, 0.0, 1);
     s.server.take_hits();
     let shots0 = s.server.counters().shots;
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, back: 10.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 10.0 });
     for _ in 0..10 * TICK_HZ {
         s.step();
     }
@@ -1574,7 +1588,7 @@ fn hits_from_an_earlier_life_deal_nothing() {
     // is a life change, like a respawn): every hit lands on a life the
     // shooter saw that has since ended, so none deals damage.
     let (mut s, [_, target, _]) = firing_line(100.0, true);
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, back: 0.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0 });
     for k in 0..4 * TICK_HZ {
         if k % 2 == 0 {
             let p = s.server.entity_state(target).unwrap().pos;
@@ -1675,4 +1689,43 @@ fn distant_fights_are_seen() {
     }
     let c = s.server.counters();
     assert!(c.activity_cells > 0 && c.activity_bytes > 0 && c.activity_cut == 0);
+}
+
+#[test]
+fn aiming_down_sights_hits_and_shots_go_where_the_shooter_saw() {
+    // A standing gunner 40 m from a standing target, with the cone of fire:
+    // from the hip (2 degrees, blooming) most shots miss; down the sights
+    // (0.1, blooming to 0.6) nearly all hit. Every shot goes exactly where
+    // the shooter's client said it would (same cone, same pick), so its
+    // tracers show the real shots.
+    let mut rates = Vec::new();
+    for ads in [false, true] {
+        let (mut s, [shooter, target, _]) = firing_line_with(40.0, false, true);
+        s.bots[0].2.set_ads(ads);
+        for _ in 0..TICK_HZ {
+            s.step();
+        }
+        s.server.take_hits();
+        s.server.take_fired();
+        s.gunner_dirs.clear();
+        s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads, back: 0.0 });
+        for _ in 0..6 * TICK_HZ {
+            s.step();
+        }
+        s.gunner = None;
+        for _ in 0..TICK_HZ {
+            s.step();
+        }
+        let fired: Vec<[f32; 3]> = s.server.take_fired().into_iter().filter(|f| f.0 == shooter).map(|f| f.2).collect();
+        assert_eq!(fired.len(), s.gunner_dirs.len(), "every shot the client fired, the server fired");
+        for (a, b) in fired.iter().zip(&s.gunner_dirs) {
+            let d = (0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0f32, f32::max);
+            assert!(d < 1e-6, "server {a:?} vs client {b:?}");
+        }
+        let hits = s.server.take_hits().len();
+        eprintln!("{}: {hits} of {} hit", if ads { "down the sights" } else { "from the hip" }, fired.len());
+        rates.push(hits as f64 / fired.len() as f64);
+    }
+    assert!(rates[0] < 0.4, "from the hip at 40 m, most miss: {rates:?}");
+    assert!(rates[1] > 0.85, "down the sights, nearly all hit: {rates:?}");
 }

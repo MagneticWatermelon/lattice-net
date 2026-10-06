@@ -464,6 +464,14 @@ Ticks were unchanged in the blob (p50 8.6 ms). Nothing was cut by the budget in 
 
 Worst case (every cell active): a 3.1 µs gather per client per window, and a 0.25 ms serial finish per window (`gather_cost`, ignored).
 
+**Cone of fire and aiming down sights** (PlanetSide 2's model; numbers and the client's side in client/README, The gun):
+- **Server-side spread:** every shot leaves within its cone of fire, picked by the server from the shooter's id and the shot's seq (`weapon::spread`).
+- **Bloom:** the server keeps each player's bloom (`InputQueue::bloom`). The cone comes from the shooter's state before the shot's step and the input's `BUTTON_ADS`.
+- **The client agrees:** it computes the same direction, so its tracers are the real shots. Others' tracers carry the spread aim.
+- **`SimConfig::cone_of_fire` / `lattice-server --no-cone`:** turns the cone off. The lag-compensation tests (`what_you_see_is_what_you_hit`, the fairness test, walls, headshots) run without it, since they measure geometry.
+- **Fighting bots aim down sights while they have a target:** they move at half speed. `FightConfig::ads: false` turns it off, as the fairness test does: slower targets hide what lag costs.
+- **Old baselines:** fight baselines before this (`baselines/2026-10-05-wsl2-fight`) had no cone and no sights.
+
 **M3d.4: bots that fight, in latency classes** (`baselines/2026-10-05-wsl2-fight`).
 - **Fighting bots** (`BotBrain::set_fight`; `lattice-bots --fight-every N --aim-error MRAD`) take the nearest enemy they draw within 150 m and in sight (`hit::line_clear`, the same test as the server's after-cover count). They aim with lead (`bot::aim_at`) plus Gaussian error, firing in bursts.
 - **Latency classes:** `lattice-bots --classes K` binds class k's sockets from port 16384 × (k + 1), so one `tc` u32 match (mask 0xc000) catches a class. `scripts/baseline.sh fight` gives each class its own netem band: 10 / 50 / 75 ms one-way, i.e. 20 / 100 / 150 ms RTT. The server listens below the ranges (port 14500). With `BOTS_SSH`, the bot box is shaped: egress by source port, ingress through ifb by destination port.

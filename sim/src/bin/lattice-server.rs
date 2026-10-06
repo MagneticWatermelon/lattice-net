@@ -68,7 +68,9 @@ lattice-server: M1 movement-only authoritative server
   --deaths-per-sec R   kill R random players a second, to exercise death and respawn
                        until there are weapons (they respawn after 5 s) [0]
   --immortal           hits land (and are confirmed) but deal no damage: hit rates then
-                       measure aim and lag compensation, not who died first";
+                       measure aim and lag compensation, not who died first
+  --no-cone            shots go exactly where aimed: no cone of fire or bloom (to compare
+                       with fight baselines from before it)";
 
 /// Columns of per-tick timing samples: the sim phases, then egress and total.
 const COLS: usize = PHASES.len() + 2;
@@ -362,6 +364,7 @@ fn main() -> std::io::Result<()> {
         separation: !a.flag("no-separation"),
         deaths_per_sec: a.get("deaths-per-sec", 0.0),
         immortal: a.flag("immortal"),
+        cone_of_fire: !a.flag("no-cone"),
         identity: lattice_net::ServerIdentity {
             token_key: a.get("token-key", HexKey::default()).0,
             server_id: a.get("server-id", 1),

@@ -28,7 +28,7 @@ use lattice_game::delta;
 use lattice_game::events::{self, Event, SeenShot};
 use lattice_game::movement::{dead_input, step, Input, MoveState, TICK_HZ};
 use lattice_game::msg::{self, InputEntry, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
-use lattice_game::weapon::{shot_time, Shot, FIRE_STEPS};
+use lattice_game::weapon::{self, shot_time, Bloom, Shot, FIRE_STEPS};
 use lattice_game::tier::Tier;
 use lattice_game::world::World;
 
@@ -241,6 +241,9 @@ pub struct ClientCore {
     pending_shot: Option<(u32, Shot)>,
     /// When the last shot fired (`weapon::shot_time`): the rifle's rate.
     last_shot: Option<u64>,
+    /// Our bloom, kept as the server keeps it, so our tracers go where the
+    /// server sends our shots.
+    bloom: Bloom,
     /// The newest snapshot's own state and its step: the server's view of us.
     server_own: Option<(MoveState, u32)>,
     /// Own-player correction being smoothed away, as of `own_offset_at`.
@@ -304,6 +307,7 @@ impl ClientCore {
             distant: Distant::new(1),
             pending_shot: None,
             last_shot: None,
+            bloom: Bloom::default(),
             own_offset: [0.0; 3],
             own_offset_at: None,
             sink: false,
@@ -719,40 +723,57 @@ impl ClientCore {
         self.state = s;
     }
 
-    /// Pulls the trigger at `now`, aiming at `yaw`/`pitch`. The shot rides
-    /// the input whose step `now` falls in (`frac` from the input clock's
-    /// phase), with the render step of `now`: what the player sees is what
-    /// the server tests it against. False while dead, before the render
-    /// clock runs, or faster than the rifle fires (`FIRE_STEPS`).
-    pub fn fire(&mut self, now: Instant, yaw: u16, pitch: i16) -> bool {
-        self.fire_claiming(now, yaw, pitch, 0.0)
+    /// Pulls the trigger at `now`, aiming at `yaw`/`pitch`, down the sights
+    /// or not (`ads`: the inputs must say so too, with `BUTTON_ADS`). The
+    /// shot rides the input whose step `now` falls in (`frac` from the input
+    /// clock's phase), with the render step of `now`: what the player sees is
+    /// what the server tests it against. Returns where it goes (its cone of
+    /// fire, as the server will pick it), or nothing while dead, before the
+    /// render clock runs, or faster than the rifle fires (`FIRE_STEPS`).
+    pub fn fire(&mut self, now: Instant, yaw: u16, pitch: i16, ads: bool) -> Option<[f32; 3]> {
+        self.fire_claiming(now, yaw, pitch, ads, 0.0)
     }
 
-    /// `fire`, claiming a render time `back` steps older than the real one:
-    /// the "backtrack" cheat, for testing that the server trims it.
-    #[doc(hidden)]
-    pub fn fire_claiming(&mut self, now: Instant, yaw: u16, pitch: i16, back: f64) -> bool {
-        if self.welcome.is_none() || self.is_dead() || self.pending_shot.is_some() {
-            return false;
-        }
+    /// The shot time (`weapon::shot_time`) and seq of a trigger pull at `now`.
+    fn shot_at(&self, now: Instant) -> (u64, u32, u8) {
         let since = self.clock_at.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32() * TICK_HZ as f32);
         let phase = (self.clock + self.rate * since).max(0.0);
         let ahead = phase.floor();
         let frac = (((phase - ahead) * 256.0) as u32).min(255) as u8;
         let seq = self.seq + 1 + ahead as u32;
-        let time = shot_time(seq, frac);
-        if self.last_shot.is_some_and(|last| time < last + FIRE_STEPS as u64 * 256) {
-            return false;
+        (shot_time(seq, frac), seq, frac)
+    }
+
+    /// The cone of fire (degrees) a shot at `now` would have: the crosshair.
+    pub fn cone(&self, now: Instant, ads: bool) -> f32 {
+        self.bloom.cone(self.shot_at(now).0, ads, &self.state)
+    }
+
+    /// `fire`, claiming a render time `back` steps older than the real one:
+    /// the "backtrack" cheat, for testing that the server trims it.
+    #[doc(hidden)]
+    pub fn fire_claiming(&mut self, now: Instant, yaw: u16, pitch: i16, ads: bool, back: f64) -> Option<[f32; 3]> {
+        if self.is_dead() || self.pending_shot.is_some() {
+            return None;
         }
-        let Some(render) = self.render_clock.render_at(now) else { return false };
+        let entity = self.welcome.as_ref()?.entity;
+        let (time, seq, frac) = self.shot_at(now);
+        if self.last_shot.is_some_and(|last| time < last + FIRE_STEPS as u64 * 256) {
+            return None;
+        }
+        let render = self.render_clock.render_at(now)?;
         self.pending_shot = Some((seq, Shot { frac, yaw, pitch, render: msg::render_units(render - back) }));
         self.last_shot = Some(time);
+        // As the server will: the cone from the state before the shot's step
+        // (ours now, unless the shot is for a later input this frame).
+        let cone = self.bloom.fire(time, ads, &self.state);
+        let dir = weapon::spread(yaw, pitch, cone, entity, seq);
         // Our own tracer is drawn at once: not again as distant ambience. The
         // server counts it about a round trip after the newest step we heard.
-        if let (Some(w), Some(newest)) = (&self.welcome, self.render_clock.newest_at(now)) {
-            self.distant.exact(self.state.pos, w.entity, newest as u32 + 3);
+        if let Some(newest) = self.render_clock.newest_at(now) {
+            self.distant.exact(self.state.pos, entity, newest as u32 + 3);
         }
-        true
+        Some(dir)
     }
 
     /// The world, once welcomed.

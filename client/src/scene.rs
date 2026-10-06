@@ -66,7 +66,7 @@ pub struct Nose;
 
 /// `Scene::players`' key for our own body (drawn in the chase and spectator
 /// views).
-const OWN: u16 = u16::MAX;
+pub const OWN: u16 = u16::MAX;
 
 pub fn setup_looks(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut mats: ResMut<Assets<StandardMaterial>>) {
     let mut mat = |c: Color| mats.add(StandardMaterial { base_color: c, perceptual_roughness: 0.8, ..default() });
@@ -209,6 +209,7 @@ struct Drawn {
     pitch: f32,
     airborne: bool,
     dead: bool,
+    ads: bool,
     mat: Handle<StandardMaterial>,
     tint: Color,
 }
@@ -249,6 +250,7 @@ pub fn sync_players(
     mut soldiers: Query<&mut Soldier>,
     mut anim: Query<(&mut AnimationPlayer, &mut AnimationTransitions)>,
     mut soldier_meshes: SoldierMeshes,
+    (gun, fire_times): (Res<crate::gun::Gun>, Res<crate::gun::FireTimes>),
 ) {
     if scene.world.is_none() {
         return;
@@ -265,7 +267,7 @@ pub fn sync_players(
     for (e, s) in &states {
         scene.drawn[s.tier as usize] += 1;
         let mat = material(&looks, *e, s, settings.tier_colors).clone();
-        drawn.push(Drawn { key: *e, feet: s.pos, yaw: s.yaw, pitch: s.pitch, airborne: s.airborne, dead: s.dead, mat, tint: tint(*e, s, settings.tier_colors) });
+        drawn.push(Drawn { key: *e, feet: s.pos, yaw: s.yaw, pitch: s.pitch, airborne: s.airborne, dead: s.dead, ads: s.ads, mat, tint: tint(*e, s, settings.tier_colors) });
     }
     if view.mode != crate::controls::Mode::FirstPerson && view.has_body {
         let dead = net.0.core.is_dead();
@@ -274,7 +276,7 @@ pub fn sync_players(
             None => (looks.plain.clone(), Color::WHITE),
         };
         let airborne = !net.0.core.predicted().grounded;
-        drawn.push(Drawn { key: OWN, feet: view.feet, yaw: view.yaw, pitch: view.pitch, airborne, dead, mat, tint });
+        drawn.push(Drawn { key: OWN, feet: view.feet, yaw: view.yaw, pitch: view.pitch, airborne, dead, ads: gun.ads, mat, tint });
     }
 
     // Everyone's a soldier (up to the cap, nearest first).
@@ -288,7 +290,7 @@ pub fn sync_players(
         let root_tf = Transform::from_translation(to_bevy(d.feet[0], d.feet[1], d.feet[2])).with_rotation(yaw_rotation(d.yaw));
         let Some(&root) = scene.players.get(&d.key) else {
             let root = commands
-                .spawn((Player, root_tf, Visibility::default(), Motion::default(), Aim { pitch: d.pitch }))
+                .spawn((Player, root_tf, Visibility::default(), Motion::default(), Aim { pitch: d.pitch, key: d.key }))
                 .with_children(|p| {
                     p.spawn((Capsule, Mesh3d(looks.capsule.clone()), MeshMaterial3d(d.mat.clone()), capsule(d.dead))).with_child((
                         Nose,
@@ -304,7 +306,8 @@ pub fn sync_players(
         let Ok((mut tf, mut motion, mut aim, children)) = roots.get_mut(root) else { continue };
         *tf = root_tf;
         aim.pitch = d.pitch;
-        let pose = Pose { feet: tf.translation, yaw: d.yaw, airborne: d.airborne, dead: d.dead, tint: d.tint, distance: distance(d) };
+        let since_shot = fire_times.0.get(&d.key).map_or(f32::MAX, |&t| frame.secs - t);
+        let pose = Pose { feet: tf.translation, yaw: d.yaw, airborne: d.airborne, dead: d.dead, tint: d.tint, distance: distance(d), ads: d.ads, since_shot };
         let child = children.iter().find(|&c| soldiers.contains(c));
         let mut soldier = child.and_then(|c| soldiers.get_mut(c).ok().map(|s| (c, s)));
         let arg = soldier.as_mut().map(|(c, s)| (*c, &mut **s));

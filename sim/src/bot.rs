@@ -6,7 +6,7 @@ use std::time::Instant;
 
 pub use lattice_client_core::{ClientConfig, ClientCore, ClientStats, Entities, InputTiming};
 
-use crate::movement::{Input, MoveState, BUTTON_JUMP, BUTTON_SPRINT};
+use crate::movement::{Input, MoveState, BUTTON_ADS, BUTTON_JUMP, BUTTON_SPRINT};
 use crate::msg::Welcome;
 use crate::rng::Rng;
 
@@ -19,6 +19,8 @@ pub struct BotBrain {
     trigger: bool,
     /// Fights: aims at the nearest enemy it draws (tracked bots only).
     fighter: Option<Fighter>,
+    /// Aims down sights (tests); fighters do whenever they have a target.
+    ads: bool,
     seed: u64,
 }
 
@@ -41,7 +43,7 @@ impl BotBrain {
     }
 
     pub fn with_config(seed: u64, cfg: ClientConfig) -> Self {
-        Self { core: ClientCore::new(cfg), ai: Wander::new(seed), trigger: false, fighter: None, seed }
+        Self { core: ClientCore::new(cfg), ai: Wander::new(seed), trigger: false, fighter: None, ads: false, seed }
     }
 
     /// Fights: aims at the nearest enemy it draws and fires in bursts. It
@@ -116,16 +118,30 @@ impl BotBrain {
         self.core.on_message(data, now);
     }
 
-    /// One tick of the input clock, with the AI choosing each input.
+    /// Aims down sights (slower, a tighter cone of fire) from now on.
+    pub fn set_ads(&mut self, on: bool) {
+        self.ads = on;
+    }
+
+    /// One tick of the input clock, with the AI choosing each input. Fighters
+    /// aim down sights while they have a target, as players do; trigger bots
+    /// spray from the hip.
     pub fn tick_inputs(&mut self, now: Instant) -> Option<Vec<u8>> {
         if let Some(f) = &mut self.fighter {
             f.tick(&mut self.core, now);
         } else if self.trigger {
             let yaw = (self.ai.heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16;
-            self.core.fire(now, yaw, 0);
+            self.core.fire(now, yaw, 0, self.ads);
         }
+        let ads = self.ads || self.fighter.as_ref().is_some_and(|f| f.cfg.ads && f.target.is_some());
         let ai = &mut self.ai;
-        self.core.step_inputs(now, |s, w| ai.think(s, w))
+        self.core.step_inputs(now, |s, w| {
+            let mut input = ai.think(s, w);
+            if ads {
+                input.buttons = (input.buttons | BUTTON_ADS) & !BUTTON_SPRINT;
+            }
+            input
+        })
     }
 }
 
@@ -184,11 +200,13 @@ pub struct FightConfig {
     pub aim_error: f32,
     /// Engages enemies within this range, in meters.
     pub range: f32,
+    /// Aims down sights while engaged (slower, a tight cone), as players do.
+    pub ads: bool,
 }
 
 impl Default for FightConfig {
     fn default() -> Self {
-        Self { aim_error: 0.006, range: 150.0 }
+        Self { aim_error: 0.006, range: 150.0, ads: true }
     }
 }
 
@@ -287,6 +305,6 @@ impl Fighter {
         let k = self.cfg.aim_error;
         let yaw = (yaw as f32 + self.normal() * k / std::f32::consts::TAU * 65536.0).rem_euclid(65536.0) as u16;
         let pitch = (pitch as f32 + self.normal() * k / std::f32::consts::FRAC_PI_2 * 32767.0).clamp(-32767.0, 32767.0) as i16;
-        core.fire(now, yaw, pitch);
+        core.fire(now, yaw, pitch, self.cfg.ads);
     }
 }

@@ -37,6 +37,9 @@ pub const BUTTON_JUMP: u8 = 2;
 /// On the wire only: this input carries a shot (`weapon::Shot`). Movement
 /// ignores it; decoded inputs never have it set.
 pub const BUTTON_FIRE: u8 = 4;
+/// Aiming down sights: slower (`weapon::ADS_SPEED`), no sprint, a tighter
+/// cone of fire.
+pub const BUTTON_ADS: u8 = 8;
 
 /// One tick of player intent. `move_*` is a world-space stick in [-127, 127].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,7 +87,13 @@ pub fn step(world: &World, s: MoveState, input: Input) -> MoveState {
     if len > 1.0 {
         wish = [wish[0] / len, wish[1] / len];
     }
-    let speed = if input.buttons & BUTTON_SPRINT != 0 { SPRINT_SPEED } else { RUN_SPEED };
+    let speed = if input.buttons & BUTTON_ADS != 0 {
+        RUN_SPEED * crate::weapon::ADS_SPEED
+    } else if input.buttons & BUTTON_SPRINT != 0 {
+        SPRINT_SPEED
+    } else {
+        RUN_SPEED
+    };
 
     let mut dv = [wish[0] * speed - s.vel[0], wish[1] * speed - s.vel[1]];
     let dv_len = (dv[0] * dv[0] + dv[1] * dv[1]).sqrt();
@@ -278,6 +287,22 @@ mod tests {
         assert!(t.grounded && t.z == s.z, "landed where it jumped: {t:?}");
         let height = peak - s.z;
         assert!(height > 0.55 && height < 0.75, "jump height {height}");
+    }
+
+    #[test]
+    fn aiming_down_sights_is_slower_and_never_sprints() {
+        let w = world();
+        let p = open_spot(&w, 30.0);
+        let run = |buttons| {
+            let mut s = MoveState::standing(&w, p);
+            for _ in 0..30 {
+                s = step(&w, s, Input { move_x: 127, buttons, ..Default::default() });
+            }
+            (s.vel[0] * s.vel[0] + s.vel[1] * s.vel[1]).sqrt()
+        };
+        let ads = run(BUTTON_ADS | BUTTON_SPRINT);
+        assert!((ads - RUN_SPEED * crate::weapon::ADS_SPEED).abs() < 1e-3, "{ads}");
+        assert!((run(BUTTON_SPRINT) - SPRINT_SPEED).abs() < 1e-3);
     }
 
     #[test]

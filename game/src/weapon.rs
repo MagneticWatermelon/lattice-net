@@ -1,6 +1,14 @@
 //! The rifle, and how its projectiles fly. The server simulates every
 //! projectile with this; the client flies its cosmetic tracers with it, so
 //! both draw the same arc.
+//!
+//! Accuracy follows PlanetSide 2's model (an assault rifle's numbers): a
+//! shot leaves somewhere in a *cone of fire*, tight aiming down sights, wide
+//! from the hip, wider moving or in the air, and *bloom* widens it with each
+//! shot of a burst. The server decides where every shot goes (`spread`, from
+//! the shooter's id and the shot's seq, so the shooter's client predicts the
+//! same direction for its tracer). *Recoil* kicks the shooter's view; it's the
+//! client's, since shots go where the view points.
 
 use crate::movement::{MoveState, TICK_HZ};
 
@@ -17,6 +25,121 @@ pub const DAMAGE_BODY: u8 = 20;
 pub const DAMAGE_HEAD: u8 = 40;
 /// Eyes (and the muzzle) above the feet.
 pub const EYE_HEIGHT: f32 = 1.6;
+
+/// Cone of fire, degrees across its radius: aiming down sights or from the
+/// hip, standing or moving (faster than `MOVING` m/s).
+pub const CONE_ADS: f32 = 0.1;
+pub const CONE_ADS_MOVING: f32 = 0.4;
+pub const CONE_HIP: f32 = 2.0;
+pub const CONE_HIP_MOVING: f32 = 2.75;
+pub const MOVING: f32 = 1.0;
+/// In the air the cone is this many times wider.
+pub const CONE_AIR: f32 = 2.5;
+/// Bloom: each shot widens the next one's cone by this much (degrees), up
+/// to the max; it starts recovering `BLOOM_DELAY` steps after a shot, at
+/// `BLOOM_RECOVERY` degrees a step.
+pub const BLOOM_ADS: f32 = 0.04;
+pub const BLOOM_HIP: f32 = 0.1;
+pub const BLOOM_MAX_ADS: f32 = 0.5;
+pub const BLOOM_MAX_HIP: f32 = 1.5;
+pub const BLOOM_DELAY: f32 = 4.0;
+pub const BLOOM_RECOVERY: f32 = 0.4;
+/// Recoil (the client's view): each shot kicks it up `RECOIL_UP` degrees
+/// (the first of a burst `RECOIL_FIRST` times that) and sideways within
+/// `RECOIL_SIDE`, a little more to the right; `RECOIL_DELAY` s after the
+/// last shot it drifts back down at `RECOIL_RECOVERY` degrees a second.
+pub const RECOIL_UP: f32 = 0.32;
+pub const RECOIL_FIRST: f32 = 1.75;
+pub const RECOIL_SIDE: [f32; 2] = [-0.16, 0.22];
+pub const RECOIL_DELAY: f32 = 0.12;
+pub const RECOIL_RECOVERY: f32 = 9.0;
+/// A shot this long (s) after the last starts a new burst.
+pub const BURST_GAP: f32 = 0.35;
+/// Aiming down sights: movement at this share of running speed (no sprint),
+/// and the view zoomed this many times.
+pub const ADS_SPEED: f32 = 0.5;
+pub const ADS_ZOOM: f32 = 1.35;
+
+/// A shooter's bloom. The server keeps one per player and the client one
+/// for its own shots; fed the same shots in the same order, they give the
+/// same cones.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Bloom {
+    deg: f32,
+    /// The last shot (`shot_time`).
+    last: Option<u64>,
+}
+
+impl Bloom {
+    /// The cone (degrees) of a shot at `time` (`shot_time`), aiming down
+    /// sights or not, from `state` (the shooter before its step); then the
+    /// shot blooms the next one.
+    pub fn fire(&mut self, time: u64, ads: bool, state: &MoveState) -> f32 {
+        let cone = self.cone(time, ads, state);
+        let (add, max) = if ads { (BLOOM_ADS, BLOOM_MAX_ADS) } else { (BLOOM_HIP, BLOOM_MAX_HIP) };
+        self.deg = (self.recovered(time) + add).min(max);
+        self.last = Some(time);
+        cone
+    }
+
+    /// The cone a shot at `time` would have (the crosshair shows it).
+    pub fn cone(&self, time: u64, ads: bool, state: &MoveState) -> f32 {
+        let speed = (state.vel[0] * state.vel[0] + state.vel[1] * state.vel[1]).sqrt();
+        let base = match (ads, speed > MOVING) {
+            (true, false) => CONE_ADS,
+            (true, true) => CONE_ADS_MOVING,
+            (false, false) => CONE_HIP,
+            (false, true) => CONE_HIP_MOVING,
+        };
+        (base + self.recovered(time)) * if state.grounded { 1.0 } else { CONE_AIR }
+    }
+
+    fn recovered(&self, time: u64) -> f32 {
+        match self.last {
+            Some(last) if time > last => {
+                let steps = (time - last) as f32 / 256.0;
+                (self.deg - (steps - BLOOM_DELAY).max(0.0) * BLOOM_RECOVERY).max(0.0)
+            }
+            _ => self.deg,
+        }
+    }
+}
+
+fn mix(mut h: u64) -> u64 {
+    // splitmix64
+    h = h.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^ (h >> 31)
+}
+
+/// Where a shot aimed at (`yaw`, `pitch`) with a `cone` (degrees) goes: a
+/// point of the cone picked by (`shooter`, `seq`), uniform over its disc.
+/// Unit vector.
+pub fn spread(yaw: u16, pitch: i16, cone: f32, shooter: u16, seq: u32) -> [f32; 3] {
+    let d = aim(yaw, pitch);
+    if cone <= 0.0 {
+        return d;
+    }
+    let h = mix((shooter as u64) << 32 | seq as u64);
+    let (u1, u2) = ((h >> 40) as f32 / (1u64 << 24) as f32, (h & 0xFF_FFFF) as f32 / (1u64 << 24) as f32);
+    let r = (cone.to_radians() * u1.sqrt()).tan();
+    let (s, c) = (u2 * std::f32::consts::TAU).sin_cos();
+    // Right and up around the aim (straight up or down: any right will do).
+    let flat = (d[0] * d[0] + d[1] * d[1]).sqrt();
+    let right = if flat > 1e-4 { [d[1] / flat, -d[0] / flat, 0.0] } else { [1.0, 0.0, 0.0] };
+    let up = [right[1] * d[2] - right[2] * d[1], right[2] * d[0] - right[0] * d[2], right[0] * d[1] - right[1] * d[0]];
+    let v = [0, 1, 2].map(|k| d[k] + right[k] * r * c + up[k] * r * s);
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    v.map(|x| x / len)
+}
+
+/// The aim (`yaw`, `pitch` in wire units) of a unit direction.
+pub fn angles(d: [f32; 3]) -> (u16, i16) {
+    let yaw = d[1].atan2(d[0]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0;
+    let pitch = d[2].clamp(-1.0, 1.0).asin() / std::f32::consts::FRAC_PI_2 * 32767.0;
+    (yaw as u32 as u16, pitch.clamp(-32767.0, 32767.0) as i16)
+}
 
 /// A shot as its input carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +223,46 @@ mod tests {
         let drop = 100.0 - f.pos[2];
         assert!((1.1..1.4).contains(&drop), "{drop} m after {segments} segments");
         assert_eq!(segments, 30, "10 m a segment");
+    }
+
+    #[test]
+    fn the_cone_is_tight_aiming_wide_from_the_hip_and_blooms() {
+        let stand = MoveState { grounded: true, ..Default::default() };
+        let run = MoveState { vel: [6.0, 0.0], grounded: true, ..Default::default() };
+        let air = MoveState { grounded: false, ..Default::default() };
+        let b = Bloom::default();
+        assert_eq!(b.cone(0, true, &stand), CONE_ADS);
+        assert_eq!(b.cone(0, true, &run), CONE_ADS_MOVING);
+        assert_eq!(b.cone(0, false, &stand), CONE_HIP);
+        assert!(b.cone(0, false, &air) > b.cone(0, false, &run));
+        // A burst at the rifle's rate blooms each shot, up to the max...
+        let mut b = Bloom::default();
+        let cones: Vec<f32> = (0..30).map(|k| b.fire(k * FIRE_STEPS as u64 * 256, true, &stand)).collect();
+        assert!(cones.windows(2).all(|w| w[1] >= w[0]), "{cones:?}");
+        assert!((cones[1] - CONE_ADS - BLOOM_ADS).abs() < 1e-6);
+        assert!((cones[29] - CONE_ADS - BLOOM_MAX_ADS).abs() < 1e-6);
+        // ...and a pause lets it recover.
+        let later = 30 * FIRE_STEPS as u64 * 256 + 30 * 256;
+        assert_eq!(b.cone(later, true, &stand), CONE_ADS);
+    }
+
+    #[test]
+    fn shots_spread_uniformly_over_the_cone_and_deterministically() {
+        let (yaw, pitch) = (12000u16, 2000i16);
+        let d = aim(yaw, pitch);
+        let mut far = 0;
+        for seq in 0..2000 {
+            let s = spread(yaw, pitch, 2.0, 7, seq);
+            assert_eq!(s, spread(yaw, pitch, 2.0, 7, seq), "same shooter and seq: same shot");
+            let angle = (d[0] * s[0] + d[1] * s[1] + d[2] * s[2]).clamp(-1.0, 1.0).acos().to_degrees();
+            assert!(angle <= 2.0 + 1e-3, "{angle}");
+            far += (angle > 2.0 * std::f32::consts::FRAC_1_SQRT_2) as u32;
+        }
+        // Uniform over the disc: half the area is past radius / sqrt 2.
+        assert!((900..1100).contains(&far), "{far} of 2000 in the outer half");
+        assert_ne!(spread(yaw, pitch, 2.0, 7, 1), spread(yaw, pitch, 2.0, 8, 1), "shooters differ");
+        let (y, p) = angles(d);
+        assert!((y as i32 - yaw as i32).abs() <= 1 && (p as i32 - pitch as i32).abs() <= 1);
     }
 
     #[test]

@@ -132,14 +132,15 @@ pub fn setup(mut commands: Commands) {
         TextFont { font_size: FontSize::Px(15.0), ..default() },
         TextColor(Color::WHITE),
     ));
-    // Crosshair and help.
+    // Crosshair (down the sights the red dot takes over) and help.
     commands.spawn((
+        crate::gun::CenterDot,
         Node { position_type: PositionType::Absolute, left: Val::Percent(50.0), top: Val::Percent(50.0), margin: UiRect { left: Val::Px(-2.0), top: Val::Px(-2.0), ..default() }, width: Val::Px(4.0), height: Val::Px(4.0), ..default() },
         BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
     ));
     commands.spawn((
         Node { position_type: PositionType::Absolute, left: Val::Px(8.0), bottom: Val::Px(6.0), ..default() },
-        Text::new("click: grab mouse, then fire  Esc: release  WASD Shift Space: move  V: view  G: server ghosts  T: tier/faction colors  N: net graph"),
+        Text::new("click: grab mouse, then fire  RMB: aim  Esc: release  WASD Shift Space: move  V: view  G: server ghosts  T: tier/faction colors  N: net graph"),
         TextFont { font_size: FontSize::Px(12.0), ..default() },
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
     ));

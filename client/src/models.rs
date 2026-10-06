@@ -51,7 +51,8 @@ const RIFLE_GRIP: Vec3 = Vec3::new(0.33, -0.12, 0.0);
 /// camera, so it never sinks into a wall).
 pub const VIEWMODEL_LAYER: usize = 1;
 
-/// Animation clips, in the graph's order.
+/// Animation clips, in the graph's order (`AimStand` last: it's `Aim`,
+/// held still).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Clip {
     Idle,
@@ -63,7 +64,14 @@ pub enum Clip {
     Sprint,
     Jump,
     Death,
+    /// Aiming (down the sights, or just fired) standing still: `Aim` frozen
+    /// on a frame with both feet down and the rifle shouldered.
+    AimStand,
 }
+/// `Aim`'s frame for `AimStand`, in seconds.
+const AIM_STAND_AT: f32 = 0.08;
+/// After a shot, a soldier holds its rifle up this long (s).
+const AIM_AFTER_SHOT: f32 = 0.6;
 const CLIP_FILES: [&str; 6] = ["anim_idle", "anim_run_aim", "anim_sprint", "anim_run", "anim_jump", "anim_death"];
 
 #[derive(Resource)]
@@ -72,6 +80,8 @@ pub struct Models {
     props: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
     rocks: (Handle<Mesh>, Handle<StandardMaterial>),
     pub rifle: (Handle<Mesh>, Handle<StandardMaterial>),
+    /// The muzzle flash.
+    pub flash: (Handle<Mesh>, Handle<StandardMaterial>),
     /// The first-person rifle: the same, with more detail.
     rifle_view: (Handle<Mesh>, Handle<StandardMaterial>),
     soldier: Handle<WorldAsset>,
@@ -88,7 +98,13 @@ fn model(name: &str) -> String {
     format!("models/{name}.glb")
 }
 
-pub fn load(mut commands: Commands, assets: Res<AssetServer>, mut graphs: ResMut<Assets<AnimationGraph>>) {
+pub fn load(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    mut graphs: ResMut<Assets<AnimationGraph>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut mats: ResMut<Assets<StandardMaterial>>,
+) {
     let prop = |name: &str| {
         let path = model(name);
         (assets.load(GltfAssetLabel::Primitive { mesh: 0, primitive: 0 }.from_asset(path.clone())), assets.load(format!("{path}#Material0/std")))
@@ -100,6 +116,7 @@ pub fn load(mut commands: Commands, assets: Res<AssetServer>, mut graphs: ResMut
         props,
         rocks: prop("rocks"),
         rifle: prop("rifle"),
+        flash: (meshes.add(Sphere::new(0.5)), crate::gun::flash_material(&mut mats)),
         rifle_view: prop("rifle_view"),
         soldier: assets.load(GltfAssetLabel::Scene(0).from_asset(model("soldier"))),
         soldier_meshes: ["soldier", "soldier_lod1", "soldier_lod2", "soldier_lod3"]
@@ -221,10 +238,12 @@ pub struct Motion {
     backward: bool,
 }
 
-/// On a player's root: where it aims, for its rifle.
+/// On a player's root: where it aims (for its rifle), and its key in the
+/// scene (for when it last fired).
 #[derive(Component, Default)]
 pub struct Aim {
     pub pitch: f32,
+    pub key: u16,
 }
 
 /// A rifle in a soldier's hands: it follows the right hand, pointed where
@@ -235,7 +254,13 @@ pub struct Aim {
 pub struct HeldBy {
     hand: Entity,
     root: Entity,
+    /// Its muzzle flash (shown for a moment after each shot).
+    flash: Entity,
 }
+
+/// A held rifle's muzzle flash.
+#[derive(Component)]
+pub struct Flash;
 
 /// What a player is doing, as the scene draws it.
 pub struct Pose {
@@ -246,6 +271,9 @@ pub struct Pose {
     pub tint: Color,
     /// From the camera, meters.
     pub distance: f32,
+    /// Aiming down sights, and seconds since its last shot.
+    pub ads: bool,
+    pub since_shot: f32,
 }
 
 /// `want` with hysteresis: on inside `range`, off past `range + MARGIN`.
@@ -373,10 +401,15 @@ pub fn drive<F: bevy::ecs::query::QueryFilter>(
 
     // Animation: by state and speed.
     let v = motion.speed;
+    let aiming = pose.ads || pose.since_shot < AIM_AFTER_SHOT;
     let (clip, rate) = if pose.dead {
         (Clip::Death, 1.0)
     } else if pose.airborne {
         (Clip::Jump, 1.4)
+    } else if aiming && v < 0.4 {
+        (Clip::AimStand, 0.0)
+    } else if aiming && v < 7.5 {
+        (Clip::Aim, (v / 1.54).clamp(0.6, 2.2))
     } else if v < 0.4 {
         (Clip::Idle, 1.0)
     } else if v < 4.5 {
@@ -388,9 +421,18 @@ pub fn drive<F: bevy::ecs::query::QueryFilter>(
     };
     let rate = if motion.backward && matches!(clip, Clip::Aim | Clip::Run) { -rate } else { rate };
     if let Ok((mut player, mut transitions)) = players.get_mut(player_entity) {
-        let node = models.clips[clip as usize];
+        let node = models.clips[node_of(clip)];
         if soldier.clip != Some(clip) {
-            play(&mut player, &mut transitions, node, clip, soldier.clip);
+            // Aim and AimStand are one clip: moving or held still.
+            let same = soldier.clip.is_some_and(|c| node_of(c) == node_of(clip));
+            if !same {
+                play(&mut player, &mut transitions, node, clip, soldier.clip);
+            }
+            if clip == Clip::AimStand {
+                if let Some(active) = player.animation_mut(node) {
+                    active.seek_to(AIM_STAND_AT);
+                }
+            }
             soldier.clip = Some(clip);
         }
         if let Some(active) = player.animation_mut(node) {
@@ -400,7 +442,16 @@ pub fn drive<F: bevy::ecs::query::QueryFilter>(
     true
 }
 
+/// Which clip of the graph plays for `clip`.
+fn node_of(clip: Clip) -> usize {
+    match clip {
+        Clip::AimStand => Clip::Aim as usize,
+        c => c as usize,
+    }
+}
+
 fn play(player: &mut AnimationPlayer, transitions: &mut AnimationTransitions, node: AnimationNodeIndex, clip: Clip, from: Option<Clip>) {
+    let clip = if clip == Clip::AimStand { Clip::Aim } else { clip };
     let fade = if clip == Clip::Death || from == Some(Clip::Death) { 0.1 } else { 0.2 };
     let active = transitions.play(player, node, Duration::from_secs_f32(fade));
     if clip == Clip::Death {
@@ -439,7 +490,12 @@ fn ready(
         if let Ok(mut player) = players.get_mut(e) {
             let mut transitions = AnimationTransitions::new();
             if let Some(&ViewerClip(Some(clip))) = viewer {
-                play(&mut player, &mut transitions, models.clips[clip as usize], clip, None);
+                play(&mut player, &mut transitions, models.clips[node_of(clip)], clip, None);
+                if clip == Clip::AimStand {
+                    if let Some(active) = player.animation_mut(models.clips[node_of(clip)]) {
+                        active.seek_to(AIM_STAND_AT).set_speed(0.0);
+                    }
+                }
             }
             // The viewer's bind-pose soldier gets no graph: nothing moves it.
             if !matches!(viewer, Some(ViewerClip(None))) {
@@ -452,8 +508,11 @@ fn ready(
             soldier.meshes.push(e);
         }
         if names.get(e).is_ok_and(|n| n.as_str() == "RightHand") {
+            let flash = commands
+                .spawn((Flash, Mesh3d(models.flash.0.clone()), MeshMaterial3d(models.flash.1.clone()), Transform::from_scale(Vec3::ZERO), bevy::light::NotShadowCaster))
+                .id();
             let rifle = commands
-                .spawn((Mesh3d(models.rifle.0.clone()), MeshMaterial3d(models.rifle.1.clone()), Transform::default(), HeldBy { hand: e, root }))
+                .spawn((Mesh3d(models.rifle.0.clone()), MeshMaterial3d(models.rifle.1.clone()), Transform::default(), HeldBy { hand: e, root, flash }))
                 .id();
             soldier.rifle = Some(rifle);
         }
@@ -461,24 +520,39 @@ fn ready(
 }
 
 /// Puts every held rifle at its soldier's right hand, pointed where the
-/// player aims (after the skeleton is posed, so it's this frame's hand). A
-/// rifle whose soldier is gone goes too.
+/// player aims (after the skeleton is posed, so it's this frame's hand),
+/// kicked back and up just after a shot, with its muzzle flash. A rifle
+/// whose soldier is gone goes too, with its flash.
+#[allow(clippy::type_complexity)]
 pub fn hold_rifles(
     mut commands: Commands,
+    frame: Res<crate::Frame>,
+    fire_times: Res<crate::gun::FireTimes>,
     mut rifles: Query<(Entity, &HeldBy, &mut Transform, &mut GlobalTransform)>,
-    hands: Query<&GlobalTransform, Without<HeldBy>>,
-    roots: Query<(&GlobalTransform, &Aim), Without<HeldBy>>,
+    mut flashes: Query<(&mut Transform, &mut GlobalTransform), (With<Flash>, Without<HeldBy>)>,
+    hands: Query<&GlobalTransform, (Without<HeldBy>, Without<Flash>)>,
+    roots: Query<(&GlobalTransform, &Aim), (Without<HeldBy>, Without<Flash>)>,
 ) {
     for (e, held, mut tf, mut gt) in &mut rifles {
         let (Ok(hand), Ok((root, aim))) = (hands.get(held.hand), roots.get(held.root)) else {
             commands.entity(e).despawn();
+            commands.entity(held.flash).despawn();
             continue;
         };
-        // The root faces -z; the rifle's muzzle is its -x.
-        let rot = root.rotation() * Quat::from_rotation_x(aim.pitch) * Quat::from_rotation_y(-FRAC_PI_2);
-        let at = hand.translation() - rot * (RIFLE_GRIP * RIFLE_LENGTH);
+        let since = fire_times.0.get(&aim.key).map_or(f32::MAX, |&t| frame.secs - t);
+        let kick = if since < 0.5 { (-since / 0.07).exp() } else { 0.0 };
+        // The root faces -z; the rifle's muzzle is its -x: a kick pushes it
+        // back (+x) and its muzzle up (about its -z).
+        let rot = root.rotation() * Quat::from_rotation_x(aim.pitch) * Quat::from_rotation_y(-FRAC_PI_2) * Quat::from_rotation_z(-0.08 * kick);
+        let at = hand.translation() - rot * (RIFLE_GRIP * RIFLE_LENGTH) + rot * Vec3::X * 0.04 * kick;
         *tf = Transform::from_translation(at).with_rotation(rot).with_scale(Vec3::splat(RIFLE_LENGTH));
         *gt = GlobalTransform::from(*tf);
+        if let Ok((mut ftf, mut fgt)) = flashes.get_mut(held.flash) {
+            let size = if since < 0.045 { 1.0 - since / 0.09 } else { 0.0 };
+            let muzzle = at + rot * (crate::gun::MUZZLE * RIFLE_LENGTH);
+            *ftf = Transform::from_translation(muzzle).with_rotation(rot).with_scale(Vec3::new(0.14, 0.08, 0.08) * size);
+            *fgt = GlobalTransform::from(*ftf);
+        }
     }
 }
 
@@ -497,11 +571,13 @@ pub fn spawn_viewer(mut commands: Commands, models: Res<Models>, mut meshes: Res
     ));
     let capsule = meshes.add(Capsule3d::new(RADIUS, HEIGHT - 2.0 * RADIUS));
     let glass = mats.add(StandardMaterial { base_color: Color::srgba(0.4, 0.8, 1.0, 0.25), alpha_mode: AlphaMode::Blend, ..default() });
-    let clips = [None, Some(Clip::Idle), Some(Clip::Aim), Some(Clip::Run), Some(Clip::Sprint), Some(Clip::Jump), Some(Clip::Death)];
+    let clips = [None, Some(Clip::Idle), Some(Clip::AimStand), Some(Clip::Aim), Some(Clip::Run), Some(Clip::Sprint), Some(Clip::Jump), Some(Clip::Death)];
     for (i, clip) in clips.into_iter().enumerate() {
-        let x = (i as f32 - 3.0) * 2.0;
+        let x = (i as f32 - 3.5) * 2.0;
         // A root like a player's (facing -z), turned to face the camera.
-        let root = commands.spawn((Transform::from_xyz(x, 0.0, 0.0).with_rotation(Quat::from_rotation_y(PI)), Visibility::default(), Aim::default())).id();
+        let root = commands
+            .spawn((Transform::from_xyz(x, 0.0, 0.0).with_rotation(Quat::from_rotation_y(PI)), Visibility::default(), Aim { pitch: 0.0, key: 0xFF00 + i as u16 }))
+            .id();
         let soldier = commands
             .spawn((WorldAssetRoot(models.soldier.clone()), Transform::from_rotation(Quat::from_rotation_y(PI)), Soldier::new(), ViewerClip(clip)))
             .observe(ready)
@@ -518,7 +594,7 @@ pub fn viewmodel(models: &Models) -> impl Bundle {
     (
         Mesh3d(models.rifle_view.0.clone()),
         MeshMaterial3d(models.rifle_view.1.clone()),
-        Transform::from_translation(Vec3::new(0.22, -0.24, -0.58)).with_rotation(Quat::from_rotation_y(-FRAC_PI_2)).with_scale(Vec3::splat(0.55)),
+        Transform::from_translation(Vec3::new(0.2, -0.2, -0.5)).with_rotation(Quat::from_rotation_y(-FRAC_PI_2)).with_scale(Vec3::splat(0.7)),
         RenderLayers::layer(VIEWMODEL_LAYER),
         bevy::light::NotShadowCaster,
     )

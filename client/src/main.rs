@@ -3,6 +3,7 @@
 
 mod controls;
 mod coords;
+mod gun;
 mod hud;
 mod models;
 mod net;
@@ -39,6 +40,7 @@ lattice-client: play on a lattice-server
   --ghosts             start with the server ghosts on (G)
   --autoplay           wander instead of reading the keyboard
   --autofire           hold the trigger (with --autoplay: a self-check)
+  --autoaim            hold the sights up (a self-check)
   --viewer             no game: a row of soldiers (bind pose, then each animation) beside
                        their collision capsules, to look at the models
   --screenshot PATH    save a frame to PATH after --after seconds [5], then
@@ -66,6 +68,7 @@ pub struct Settings {
     pub shadows: bool,
     pub autoplay: bool,
     pub autofire: bool,
+    pub autoaim: bool,
     pub viewer: bool,
     screenshot: Option<(String, f32)>,
     exit_after: Option<f32>,
@@ -95,6 +98,7 @@ struct Args {
     ghosts: bool,
     autoplay: bool,
     autofire: bool,
+    autoaim: bool,
     viewer: bool,
     screenshot: Option<(String, f32)>,
     exit_after: Option<f32>,
@@ -119,6 +123,7 @@ fn parse_args() -> Args {
         ghosts: false,
         autoplay: false,
         autofire: false,
+        autoaim: false,
         viewer: false,
         screenshot: None,
         exit_after: None,
@@ -157,6 +162,7 @@ fn parse_args() -> Args {
             "--ghosts" => a.ghosts = true,
             "--autoplay" => a.autoplay = true,
             "--autofire" => a.autofire = true,
+            "--autoaim" => a.autoaim = true,
             "--viewer" => a.viewer = true,
             "--screenshot" => a.screenshot = Some((val(), 0.0)),
             "--after" => after = val().parse().unwrap_or_else(|e| die(&format!("--after: {e}"))),
@@ -211,6 +217,7 @@ fn main() {
             shadows: args.shadows,
             autoplay: args.autoplay,
             autofire: args.autofire,
+            autoaim: args.autoaim,
             viewer: args.viewer,
             screenshot: args.screenshot,
             exit_after: args.exit_after,
@@ -222,12 +229,15 @@ fn main() {
         .init_resource::<controls::Tracers>()
         .init_gizmo_group::<controls::TracerGizmos>()
         .init_resource::<hud::Combat>()
+        .init_resource::<gun::Gun>()
+        .init_resource::<gun::FireTimes>()
         .add_systems(
             Startup,
             (
                 (models::load, setup_camera, models::spawn_viewer.run_if(|s: Res<Settings>| s.viewer)).chain(),
                 scene::setup_looks,
                 hud::setup,
+                gun::setup,
                 controls::setup_tracer_gizmos,
             ),
         )
@@ -237,12 +247,15 @@ fn main() {
             Update,
             (
                 controls::toggles,
+                gun::aim,
                 controls::play,
                 scene::build_world,
                 controls::place_camera,
                 scene::stream_terrain,
                 scene::sync_players,
                 controls::viewmodel,
+                gun::viewmodel,
+                gun::reticle,
                 controls::tracers,
                 hud::update,
                 hud::vitals,
@@ -284,7 +297,9 @@ fn setup_camera(mut commands: Commands, models: Res<models::Models>) {
                 Projection::Perspective(PerspectiveProjection { fov: 70f32.to_radians(), near: 0.01, far: 10.0, ..default() }),
                 bevy::camera::visibility::RenderLayers::layer(models::VIEWMODEL_LAYER),
             ))
-            .with_child((controls::ViewModel, models::viewmodel(&models)));
+            .with_children(|cam| {
+                cam.spawn((controls::ViewModel, models::viewmodel(&models))).with_child(gun::view_flash(&models));
+            });
         });
 }
 

@@ -80,6 +80,8 @@ pub struct Sample {
     /// Exact for near samples, to 1/15th for mid and far.
     pub health: u8,
     pub dead: bool,
+    /// Aiming down sights (near samples only).
+    pub ads: bool,
 }
 
 impl Sample {
@@ -95,6 +97,7 @@ impl Sample {
             airborne: q.flags & delta::FLAG_AIRBORNE != 0,
             health: q.health,
             dead: q.flags & delta::FLAG_DEAD != 0,
+            ads: q.flags & delta::FLAG_ADS != 0,
         }
     }
 
@@ -109,6 +112,7 @@ impl Sample {
             airborne: b.airborne,
             health: b.health,
             dead: b.dead,
+            ads: false,
         }
     }
 }
@@ -134,6 +138,8 @@ pub struct RenderState {
     pub health: u8,
     /// Dead, waiting to respawn (draw it lying down).
     pub dead: bool,
+    /// Aiming down sights.
+    pub ads: bool,
     /// The tier of its newest sample.
     pub tier: Tier,
     pub how: How,
@@ -247,6 +253,7 @@ impl Track {
             airborne: x.airborne,
             health: x.health,
             dead: x.dead,
+            ads: x.ads,
             tier: self.newest().tier,
             how,
             at: r,
@@ -272,6 +279,7 @@ impl Track {
                 airborne: if t < 0.5 { a.airborne } else { b.airborne },
                 health: if t < 0.5 { a.health } else { b.health },
                 dead: if t < 0.5 { a.dead } else { b.dead },
+                ads: if t < 0.5 { a.ads } else { b.ads },
                 tier: self.newest().tier,
                 how: How::Interpolated,
                 at: r,
@@ -614,7 +622,7 @@ mod tests {
     }
 
     fn s(step: f64, x: f32, vel: Option<[f32; 2]>) -> Sample {
-        Sample { step, tier: if vel.is_some() { Tier::Near } else { Tier::Far }, pos: [x, 0.0, 10.0], vel, yaw: 0.0, pitch: 0.0, airborne: false, health: 100, dead: false }
+        Sample { step, tier: if vel.is_some() { Tier::Near } else { Tier::Far }, pos: [x, 0.0, 10.0], vel, yaw: 0.0, pitch: 0.0, airborne: false, health: 100, dead: false, ads: false }
     }
 
     #[test]
@@ -714,7 +722,7 @@ mod tests {
         // An entity running east at 6 m/s (0.2 m a step), one sample a step.
         let mut e = Entities::new(MID_LAG);
         let k = |tier| Known { tick: 0, tier, pos: [0.0; 2] };
-        let at = |step: f64, tier| Sample { step, tier, pos: [step as f32 * 0.2, 0.0, 0.0], vel: Some([6.0, 0.0]), yaw: 0.0, pitch: 0.0, airborne: false, health: 100, dead: false };
+        let at = |step: f64, tier| Sample { step, tier, pos: [step as f32 * 0.2, 0.0, 0.0], vel: Some([6.0, 0.0]), yaw: 0.0, pitch: 0.0, airborne: false, health: 100, dead: false, ads: false };
         let draw = |e: &mut Entities, r: f64| {
             let mut got = None;
             e.render(r, |_, s| got = Some(*s));
@@ -784,7 +792,7 @@ mod tests {
     #[test]
     fn a_respawn_is_a_cut_not_a_streak() {
         let k = Known { tick: 0, tier: Tier::Near, pos: [0.0; 2] };
-        let at = |step: f64, x: f32, dead: bool| Sample { step, tier: Tier::Near, pos: [x, 0.0, 0.0], vel: Some([0.0; 2]), yaw: 0.0, pitch: 0.0, airborne: false, health: if dead { 0 } else { 100 }, dead };
+        let at = |step: f64, x: f32, dead: bool| Sample { step, tier: Tier::Near, pos: [x, 0.0, 0.0], vel: Some([0.0; 2]), yaw: 0.0, pitch: 0.0, airborne: false, health: if dead { 0 } else { 100 }, dead, ads: false };
         let mut t = Track::new_test(k, at(10.0, 5.0, true));
         t.add_test(at(11.0, 5.0, true), None);
         // Respawned 40 m away.

@@ -6,7 +6,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
-use lattice_game::movement::{Input, BUTTON_JUMP, BUTTON_SPRINT};
+use lattice_game::movement::{Input, BUTTON_ADS, BUTTON_JUMP, BUTTON_SPRINT};
 use lattice_game::weapon::{aim, Flight, RANGE_STEPS, SUBSTEPS};
 
 use crate::coords::{look_rotation, pitch_i16, stick, to_bevy, yaw_u16};
@@ -49,6 +49,11 @@ pub struct View {
 }
 
 impl View {
+    /// The mouse is ours (clicks fire, the right button aims).
+    pub fn grabbed(&self) -> bool {
+        self.grabbed
+    }
+
     pub fn new(mode: Mode) -> Self {
         Self {
             mode,
@@ -159,11 +164,14 @@ impl Tracer {
         Self { flight: Flight::new(origin, dir), start: origin, age: 0.0, owed: 0.0, ours }
     }
 
-    /// Ours: from the muzzle, converging on what the eye at `eye` aims at.
-    pub fn ours(eye: [f32; 3], yaw: f32, aim_dir: [f32; 3]) -> Self {
+    /// Ours: from the muzzle (low right from the hip, under the eye down the
+    /// sights: `hip` 1 to 0), converging on what the eye at `eye` aims at
+    /// along `aim_dir` (the shot's real direction, cone of fire included).
+    pub fn ours(eye: [f32; 3], yaw: f32, aim_dir: [f32; 3], hip: f32) -> Self {
         let (s, c) = yaw.sin_cos();
         let right = [s, -c, 0.0];
-        let muzzle = [0, 1, 2].map(|k| eye[k] + right[k] * 0.25 + aim_dir[k] * 0.6 - if k == 2 { 0.2 } else { 0.0 });
+        let down = 0.12 + 0.08 * hip;
+        let muzzle = [0, 1, 2].map(|k| eye[k] + right[k] * 0.25 * hip + aim_dir[k] * 0.6 - if k == 2 { down } else { 0.0 });
         let target = [0, 1, 2].map(|k| eye[k] + aim_dir[k] * CONVERGE);
         let d = [0, 1, 2].map(|k| target[k] - muzzle[k]);
         let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
@@ -191,10 +199,12 @@ pub fn play(
     settings: Res<Settings>,
     mut view: ResMut<View>,
     mut net: ResMut<Net>,
+    mut gun: ResMut<crate::gun::Gun>,
+    mut fire_times: ResMut<crate::gun::FireTimes>,
 ) {
     let view = &mut *view;
     if view.grabbed {
-        let d = motion.delta * SENSITIVITY;
+        let d = motion.delta * SENSITIVITY * gun.sensitivity();
         let (yaw, pitch) = if view.mode == Mode::Spectator { (&mut view.spec_yaw, &mut view.spec_pitch) } else { (&mut view.yaw, &mut view.pitch) };
         *yaw = (*yaw - d.x).rem_euclid(TAU);
         *pitch = (*pitch - d.y).clamp(-FRAC_PI_2 + 0.01, FRAC_PI_2 - 0.01);
@@ -228,7 +238,10 @@ pub fn play(
     } else {
         let (mx, my) = stick(view.yaw, fwd, right);
         let mut buttons = 0;
-        if keys.pressed(KeyCode::ShiftLeft) {
+        // Down the sights there's no sprint (the server agrees: BUTTON_ADS).
+        if gun.ads {
+            buttons |= BUTTON_ADS;
+        } else if keys.pressed(KeyCode::ShiftLeft) {
             buttons |= BUTTON_SPRINT;
         }
         if keys.pressed(KeyCode::Space) {
@@ -244,9 +257,11 @@ pub fn play(
     let trigger = view.grabbed && !view.swallow && view.mode != Mode::Spectator && buttons.pressed(MouseButton::Left);
     if trigger || settings.autofire {
         let (yaw, pitch) = (yaw_u16(view.yaw), pitch_i16(view.pitch));
-        if net.0.core.fire(frame.now, yaw, pitch) {
+        if let Some(dir) = net.0.core.fire(frame.now, yaw, pitch, gun.ads) {
             let f = view.feet;
-            tracers.flying.push(Tracer::ours([f[0], f[1], f[2] + EYE], view.yaw, aim(yaw, pitch)));
+            tracers.flying.push(Tracer::ours([f[0], f[1], f[2] + EYE], view.yaw, dir, 1.0 - gun.blend));
+            gun.shot(view, frame.secs);
+            fire_times.0.insert(crate::scene::OWN, frame.secs);
         }
     }
     net.0.send_inputs(frame.now, input);
@@ -265,7 +280,13 @@ pub fn play(
 /// Flies and draws tracers: a streak along each one's last segments, until
 /// it hits the ground or cover, or runs out of range. Others' shots start
 /// when their shooter is drawn at the moment it fired, from its drawn eye.
-pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, mut gizmos: Gizmos<TracerGizmos>) {
+pub fn tracers(
+    frame: Res<Frame>,
+    net: Res<Net>,
+    mut tracers: ResMut<Tracers>,
+    mut fire_times: ResMut<crate::gun::FireTimes>,
+    mut gizmos: Gizmos<TracerGizmos>,
+) {
     let Some(w) = net.0.core.welcome() else { return };
     let world = lattice_game::world::World::shared(w.world_seed);
     let core = &net.0.core;
@@ -276,6 +297,8 @@ pub fn tracers(frame: Res<Frame>, net: Res<Net>, mut tracers: ResMut<Tracers>, m
                 Some(st) if st.at >= shot.step => {
                     let o = [st.pos[0], st.pos[1], st.pos[2] + EYE];
                     tracers.flying.push(Tracer::new(o, aim(shot.yaw, shot.pitch), false));
+                    // Its rifle kicks and flashes as it's drawn firing.
+                    fire_times.0.insert(shot.shooter, frame.secs);
                     false
                 }
                 // Not drawn (yet): wait up to a second.

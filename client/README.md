@@ -82,17 +82,44 @@ Animations (on the rig): idle `01a10e0e-cc96-708b-8090-79afbad6b7b0`, Run and Sh
 |---|---|
 | click / Esc | grab / release the mouse |
 | left mouse (held) | fire the rifle: 10 shots/s, with a tracer (the grabbing click doesn't fire) |
+| right mouse (held) | aim down sights (see The gun) |
+| WASD, Shift, Space | move, sprint, jump |
+| V | view: first person → chase → spectator (free flight: WASD, Space/C, Shift) |
+| G | server ghosts: blue = each player's newest server sample (no delay, no smoothing); pink = our own last server state |
+| T | tier colors on/off |
+| N | net graph |
 
 **Combat feedback:**
 - **The hit marker** is an X on the crosshair: white for a body hit, orange for a head hit, larger and red for a kill.
 - **Red marks around the crosshair** point where hits came from, relative to your view.
 - **The kill feed** is top right, as "Faction #id > Faction #id (head)".
 - **Other players' tracers** are orange. Each starts when its shooter is drawn firing.
-| WASD, Shift, Space | move, sprint, jump |
-| V | view: first person → chase → spectator (free flight: WASD, Space/C, Shift) |
-| G | server ghosts: blue = each player's newest server sample (no delay, no smoothing); pink = our own last server state |
-| T | tier colors on/off |
-| N | net graph |
+
+## The gun (`gun.rs`, rules in `game/src/weapon.rs`)
+
+Modeled on PlanetSide 2's assault rifles.
+- **Aiming down sights** (right mouse, held):
+  - the rifle comes up to the center in 0.2 s, its sight posts just under a red dot;
+  - the view zooms 1.35× and the mouse slows to match;
+  - you move at half running speed and can't sprint (the input's `BUTTON_ADS`; the server moves you the same way);
+  - others see you shoulder the rifle (the near tier's `FLAG_ADS`).
+- **Cone of fire:**
+  - every shot leaves somewhere in a cone, uniform over its disc: 0.1° down the sights (0.4° moving), 2° from the hip (2.75° moving), 2.5× wider in the air;
+  - bloom adds 0.04° (sights) or 0.1° (hip) per shot of a burst, up to +0.5° / +1.5°, and recovers 133 ms after the last shot at 12°/s;
+  - the server decides where each shot goes, from the shooter's id and the shot's input seq. The client runs the same rule (`weapon::Bloom`, `weapon::spread`), so your tracers show your real shots: at 40 m, hip fire hit 4 of 60 and the sights 59 of 60, every direction equal to 1e-6 (`aiming_down_sights_hits_and_shots_go_where_the_shooter_saw`);
+  - the hip reticle's four ticks sit at the cone's edge: they spread as you fire and move.
+- **Recoil:**
+  - each shot kicks the view up 0.32° (the first of a burst 1.75× that) and 0.16° left to 0.22° right;
+  - 0.12 s after the last shot it drifts back down at 9°/s;
+  - it moves your view, and shots go where the view points: compensate by pulling down.
+- **The first-person rifle:**
+  - it kicks back and up per shot, with a muzzle flash;
+  - it bobs as you move (less down the sights);
+  - it lowers and turns in while you sprint.
+- **Others' rifles:**
+  - each one kicks and flashes when its player is drawn firing;
+  - a player who's aiming, or fired in the last 0.6 s, holds the rifle at the shoulder: "Run and Shoot" when moving, frozen on a feet-down frame when standing.
+- **`--autoaim`** holds the sights up, for self-checks with `--screenshot`.
 
 **Tier colors:**
 - green: near (30 Hz);
@@ -133,7 +160,8 @@ Animations (on the rig): idle `01a10e0e-cc96-708b-8090-79afbad6b7b0`, Run and Sh
 | `coords.rs` | Game (x, y, z up) → Bevy (x, z, −y); yaw/pitch encodings; movement stick from WASD and view yaw. |
 | `terrain.rs` | 64 × 64 chunks of 128 m: every 4 m sample within ~1 km of the camera, every 32 m beyond, skirts on every edge. Vertex colors by height and slope, ±8% noise per sample. |
 | `scene.rs` | The world on Welcome (terrain, cover, rocks, sun), terrain streaming, players (a root at the feet: capsule, or soldier when near) and ghosts. |
-| `models.rs` | The models: loading, cover fitted to its boxes, rocks, soldiers (spawn, tint, animation, rifle in hand), the first-person rifle. |
+| `models.rs` | The models: loading, cover fitted to its boxes, rocks, soldiers (spawn, tint, animation, rifle in hand, its kick and flash), the first-person rifle. |
+| `gun.rs` | Aiming down sights, recoil, the first-person rifle's motion and flash, the reticle. |
 | `../tools/import-assets` | Meshy's output → `assets/models` (see Models). |
 | `controls.rs` | Mouse look, the frame's input to `tick_inputs`, cameras, toggles, autoplay. |
 | `hud.rs` | The net graph, the crosshair and the help line. |

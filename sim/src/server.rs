@@ -31,9 +31,9 @@ use crate::grid::{Grid, Knn};
 use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
-use crate::movement::{self, step, Input, MoveState, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
+use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
 use crate::shots::{self, Fire, FlyStats, History, Outcome, Projectile, Sky};
-use lattice_game::weapon::{self, shot_time, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
+use lattice_game::weapon::{self, shot_time, Bloom, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
 use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::events::{self, Event};
 use lattice_game::faction::{faction, FACTIONS, MAX_HEALTH, RESPAWN_STEPS};
@@ -206,6 +206,9 @@ pub struct SimConfig {
     /// Measurement aid: hits land (and are confirmed) but deal no damage, so
     /// hit rates measure aim and lag compensation, not who died first.
     pub immortal: bool,
+    /// Shots leave within their cone of fire (`weapon::Bloom`, `spread`).
+    /// Off only for tests that measure lag compensation's geometry.
+    pub cone_of_fire: bool,
     /// Server id and token key, shared with whatever mints the clients'
     /// tokens (the bots, standing in for a login service).
     pub identity: ServerIdentity,
@@ -228,6 +231,7 @@ impl Default for SimConfig {
             separation: true,
             deaths_per_sec: 0.0,
             immortal: false,
+            cone_of_fire: true,
             identity: ServerIdentity { server_id: 1, token_key: lattice_net::token::DEV_TOKEN_KEY },
         }
     }
@@ -325,6 +329,8 @@ struct Body {
     state: MoveState,
     yaw: u16,
     pitch: i16,
+    /// Aiming down sights (its last input), for others to see.
+    ads: bool,
     /// Ticks this player was pushed apart from a crowd (wrapping), for the snapshot.
     pushes: u8,
     squad: u32,
@@ -353,6 +359,7 @@ impl Default for Body {
             state: MoveState::default(),
             yaw: 0,
             pitch: 0,
+            ads: false,
             pushes: 0,
             squad: NO_SQUAD,
             spawned: 0,
@@ -480,6 +487,10 @@ struct InputQueue {
     /// too late), since last taken.
     fires: Vec<Fire>,
     refused: u32,
+    /// The shooter's bloom, and whether shots leave within their cone of
+    /// fire (`SimConfig::cone_of_fire`).
+    bloom: Bloom,
+    cone: bool,
 }
 
 impl Default for InputQueue {
@@ -497,6 +508,8 @@ impl Default for InputQueue {
             last_shot: None,
             fires: Vec::new(),
             refused: 0,
+            bloom: Bloom::default(),
+            cone: true,
         }
     }
 }
@@ -532,7 +545,7 @@ impl InputQueue {
                 // in it still fires, from where the stand-in put the shooter.
                 if let Some(shot) = shot {
                     if age < LATE_SHOT_STEPS && !dead {
-                        self.fire(e, seq, shot, render, true);
+                        self.fire(e, seq, shot, render, true, input.buttons & BUTTON_ADS != 0);
                     } else {
                         self.refused += 1;
                     }
@@ -556,8 +569,10 @@ impl InputQueue {
 
     /// Fires `shot` from input `seq` (already consumed): from the shooter's
     /// eye between its states before and after that seq, unless it comes too
-    /// soon after the last shot (or is a copy of one).
-    fn fire(&mut self, e: u16, seq: u32, shot: Shot, render: Option<RenderTime>, late: bool) {
+    /// soon after the last shot (or is a copy of one). It leaves somewhere in
+    /// its cone of fire: aiming down sights (`ads`) or not, from the state
+    /// before the seq, with the shooter's bloom.
+    fn fire(&mut self, e: u16, seq: u32, shot: Shot, render: Option<RenderTime>, late: bool, ads: bool) {
         let time = shot_time(seq, shot.frac);
         if self.last_shot.is_some_and(|last| time < last + FIRE_STEPS as u64 * 256) {
             self.refused += 1;
@@ -568,15 +583,20 @@ impl InputQueue {
             return;
         };
         self.last_shot = Some(time);
+        let cone = if self.cone { self.bloom.fire(time, ads, &before) } else { 0.0 };
+        let dir = weapon::spread(shot.yaw, shot.pitch, cone, e, seq);
+        let (yaw, pitch) = weapon::angles(dir);
         let tau0 = step_no as f64 - 1.0 + shot.frac as f64 / 256.0;
         let mid_lag = render.map_or(0.0, |r| r.mid_lag as f64 / MID_LAG_UNITS);
         let near = msg::render_age(step_no, shot.render) - (1.0 - shot.frac as f64 / 256.0);
         self.fires.push(Fire {
             shooter: e,
+            seq,
             origin: weapon::muzzle(&before, &after, shot.frac),
-            dir: weapon::aim(shot.yaw, shot.pitch),
-            yaw: shot.yaw,
-            pitch: shot.pitch,
+            dir,
+            // Where it really went (others' tracers show the spread).
+            yaw,
+            pitch,
             tau0,
             behind: [near, near + mid_lag],
             late,
@@ -631,13 +651,14 @@ impl InputQueue {
             body.yaw = input.yaw;
             body.pitch = input.pitch;
         }
+        body.ads = !body.dead() && input.buttons & BUTTON_ADS != 0;
         self.consume(next, kind != Step::Applied);
         // Only real inputs fire: a stand-in repeats movement, never a shot.
         if let Some((shot, render)) = fired {
             if body.dead() {
                 self.refused += 1;
             } else {
-                self.fire(e, next, shot, render, false);
+                self.fire(e, next, shot, render, false, input.buttons & BUTTON_ADS != 0);
             }
         }
         kind
@@ -691,6 +712,8 @@ pub struct SimServer {
     next_projectile: u64,
     /// Hits since the last `take_hits`.
     hits: Vec<HitRecord>,
+    /// The latest shots fired (shooter, seq, direction), for tests.
+    fired: VecDeque<(u16, u32, [f32; 3])>,
     /// This tick's shots, sorted by shooter: (shooter, yaw, pitch, step fired),
     /// for the tracers of whoever has the shooter near-tier.
     tick_shots: Vec<(u16, u16, i16, f64)>,
@@ -779,6 +802,7 @@ impl SimServer {
             far_blobs: Vec::new(),
             history: History::default(),
             projectiles: Vec::new(),
+            fired: VecDeque::new(),
             activity: Activity::default(),
             next_projectile: 0,
             hits: Vec::new(),
@@ -1117,7 +1141,7 @@ impl SimServer {
             .filter(|(_, (_, b))| b.alive)
             .for_each(|(i, ((near, far), b))| {
                 let e = i as u16;
-                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health);
+                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health, b.ads);
                 let prev = tick.wrapping_sub(1);
                 if due(e, tick, mid_period) || due(e, tick, far_period) || due(e, prev, far_period) {
                     *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch, b.health);
@@ -1256,6 +1280,10 @@ impl SimServer {
         self.tick_shots.sort_unstable_by_key(|s| s.0);
         for f in &fires {
             self.activity.add(f.shooter, f.origin, f.yaw);
+            if self.fired.len() == 4096 {
+                self.fired.pop_front();
+            }
+            self.fired.push_back((f.shooter, f.seq, f.dir));
             // What this shooter could plausibly have seen: from its RTT (once
             // measured) and its input's wait. Older claims are trimmed.
             let rtt = self
@@ -1425,6 +1453,12 @@ impl SimServer {
     }
 
     /// Hits since the last call.
+    /// The latest shots fired (up to 4096): shooter, seq and direction,
+    /// cone of fire included.
+    pub fn take_fired(&mut self) -> Vec<(u16, u32, [f32; 3])> {
+        self.fired.drain(..).collect()
+    }
+
     pub fn take_hits(&mut self) -> Vec<HitRecord> {
         std::mem::take(&mut self.hits)
     }
@@ -1518,7 +1552,7 @@ impl SimServer {
                 let id = self.bodies.len() as u16;
                 self.bodies.push(Body::default());
                 self.pushes.push([0.0; 2]);
-                self.inputs.push(InputQueue::default());
+                self.inputs.push(InputQueue { cone: self.cfg.cone_of_fire, ..InputQueue::default() });
                 self.far_blobs.push([0; FAR_BLOB]);
                 if faction(id) as u64 == side {
                     break id;
@@ -1537,7 +1571,7 @@ impl SimServer {
             invulnerable: self.cfg.immortal,
             ..Body::default()
         };
-        self.inputs[i] = InputQueue::default();
+        self.inputs[i] = InputQueue { cone: self.cfg.cone_of_fire, ..InputQueue::default() };
         if squad != NO_SQUAD {
             self.squads.entry(squad).or_default().push(e);
         }

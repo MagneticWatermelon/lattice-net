@@ -341,6 +341,12 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
       - **The soldier and rifle are now the user's own Meshy models** (image-to-3d from concept art, ~800k triangles each). `tools/import-assets decimate` (meshoptimizer, keeps UVs) took the soldier to 60k for rigging. The import makes four soldier LODs on one skeleton and a 10k held / 40k first-person rifle.
       - **Measured on Windows:** a 1k blob in view, frame p50 6.5 / p99 8.0 ms (capsules: 3.5 / 4.7 ms). ~280 players of a 300-bot fight drawn as the user's soldiers: 6.6 / 7.5 ms in first person.
       - **Meshy:** 255 credits of ours for 10 models, a replacement soldier, rigs and clips; task ids are in client/README. Raw output stays out of git (`client/assets/meshy_output`); `tools/import-assets` makes `client/assets/models` (~25 MB) from it.
+    - **Aiming down sights, cone of fire, recoil** (2026-10-06, the user asked for PlanetSide 2's feel; see client/README, The gun):
+      - **Shared rules in `game/src/weapon.rs`:** the cone (0.1° down the sights, 2° from the hip, wider moving and in the air) plus per-burst bloom (`Bloom`). `spread` picks each shot's direction from (shooter, seq): the server decides, and the client predicts the same direction for its tracer (equal to 1e-6 in the swarm test).
+      - **`BUTTON_ADS`:** half speed, no sprint (movement, so prediction stays bit-exact). Others see it as the near tier's `FLAG_ADS`.
+      - **Recoil is the client's:** it kicks the view, and the shot carries the view's aim. A no-recoil cheat is possible; spread isn't.
+      - **Tests:** lag-compensation tests run with `SimConfig::cone_of_fire: false`. Fighters aim down sights unless `FightConfig::ads: false`. The fight baselines predate the cone.
+      - **Client:** rifle to the sights with zoom, view kick and recovery, rifle kick and muzzle flash (others' too), bob and sprint pose, hip reticle sized to the cone, red dot down the sights.
     - **M3e** one bare-metal validation session. It also runs a lethal 3k blob at mixed RTTs, and records `rewinds_trimmed`, which should be 0.
   - **Pass bars:**
     - prediction stays bit-exact (0 corrections on a clean link, outside separation pushes);
