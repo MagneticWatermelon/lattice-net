@@ -32,10 +32,11 @@
 #           latency costs in a real fight: shots into the already dead), and a
 #           lethal uniform 5k (load), 60 s each. summary.md gets a Fights table.
 #   fight-quick   one short immortal fight of 300 in a 60 m disk
-#   m3e     M3's pass bars at scale (~9 min, for bare metal): uniform 10k with 20%
-#           firing (and 200 aiming fighters), a 3k blob all firing (300 aiming),
-#           and uniform 10k with --sockets 1 / 4 / 8 / 16 (no fire, comparable
-#           with the 2026-10-04 baselines)
+#   m3e     M3's pass bars at scale (~11 min, for bare metal): uniform 10k with
+#           20% firing (and 200 aiming fighters), a 3k blob all firing (300
+#           aiming), a lethal 3k blob in latency classes (20 / 100 / 150 ms
+#           RTT, fairness under real load), and uniform 10k with --sockets 1 /
+#           4 / 8 / 16 (no fire, comparable with the 2026-10-04 baselines)
 #
 # Writes baselines/<date>-<name>/ (name defaults to the host name):
 #   env.txt      the machine and the preflight checks (scripts/preflight.sh)
@@ -58,9 +59,9 @@ cd "$(dirname "$0")/.."
 
 mode=${1:-full}
 name=${2:-$(hostname -s)}
-# Fights: below the classes' port ranges (16384 and up), so the server's own
-# port never matches a class filter.
-if [[ $mode == fight* ]]; then port=${PORT:-14500}; else port=${PORT:-40500}; fi
+# Fights (and m3e, which has a latency-class run): below the classes' port
+# ranges (16384 and up), so the server's own port never matches a class filter.
+if [[ $mode == fight* || $mode == m3e ]]; then port=${PORT:-14500}; else port=${PORT:-40500}; fi
 case $mode in
   full) repeat=${REPEAT:-2}; secs=60 ;;
   quick) repeat=${REPEAT:-1}; secs=20 ;;
@@ -114,6 +115,7 @@ elif [ "$mode" = m3e ]; then
   runs=(
     "m3e-uniform-10k-fire20|uniform|10000||profile|||--fire-share 0.2 --fight-every 50"
     "m3e-blob-3k-fight|blob|3000||profile|||--fire-share 1.0 --fight-every 10"
+    "m3e-blob-3k-classes|blob|3000||||classes:10,50,75|--classes 3 --fight-every 2 --fire-share 0.3"
     "m3e-uniform-10k-sockets-1|uniform|10000|--sockets 1|"
     "m3e-uniform-10k-sockets-4|uniform|10000|--sockets 4|"
     "m3e-uniform-10k-sockets-8|uniform|10000|--sockets 8|"

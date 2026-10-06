@@ -22,7 +22,7 @@ shift $(( $# < 2 ? $# : 2 ))
 
 on() { ssh -F .cloud/ssh_config -o BatchMode=yes "$@"; }
 for h in lattice-srv lattice-bots; do
-  rsync -a --delete -e "ssh -F .cloud/ssh_config" --exclude target --exclude results --exclude .cloud \
+  rsync -a --delete -e "ssh -F .cloud/ssh_config" --exclude target --exclude results --exclude .cloud --exclude client/assets --exclude /meshy_output \
     --exclude baselines ./ "$h:lattice-net/"
   on "$h" "source ~/.cargo/env && cd lattice-net && cargo build --release -q -p lattice-sim"
 done

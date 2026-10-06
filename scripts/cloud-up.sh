@@ -246,7 +246,7 @@ for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] &
 true
 EOF
   on "$1" "command -v cargo > /dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal > /dev/null"
-  rsync -a --delete -e "ssh -F .cloud/ssh_config" --exclude target --exclude results --exclude .cloud ./ "$1:lattice-net/"
+  rsync -a --delete -e "ssh -F .cloud/ssh_config" --exclude target --exclude results --exclude .cloud --exclude client/assets --exclude /meshy_output ./ "$1:lattice-net/"
   on "$1" "source ~/.cargo/env && cd lattice-net && cargo build --release -q -p lattice-sim"
 }
 say "installing the toolchain, copying the repo and building on both"
