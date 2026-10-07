@@ -43,7 +43,8 @@ report=$(python3 - << 'EOF'
 import re
 def load(p):
     return {k: int(v) for k, v in (l.strip().split('=', 1) for l in open(p) if '=' in l) if v.strip().lstrip('-').isdigit()}
-bad = re.compile(r'allowance|drop|discard|err|fail|miss|timeout|fifo', re.I)
+# Whole name parts: "interrupt" holds "err" but isn't one.
+bad = re.compile(r'allowance_exceeded|(^|_)(drops?|dropped|discards?|errs?|errors|fail|failed|missed|timeouts?|fifo)(_|$)', re.I)
 for box in ('srv', 'bots'):
     a, b = load(f'.cloud/nic-before-{box}.txt'), load(f'.cloud/nic-after-{box}.txt')
     grew = [(k, b[k] - a.get(k, 0)) for k in sorted(b) if bad.search(k) and b[k] - a.get(k, 0) > 0]

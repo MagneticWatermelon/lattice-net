@@ -72,13 +72,23 @@ fi
 # One availability zone that offers both types (a placement group is one AZ).
 az=$(aws ec2 describe-instance-type-offerings --location-type availability-zone \
   --filters "Name=instance-type,Values=$srv_type,$bot_type" | json "
-from collections import Counter
-c = Counter(o['Location'] for o in d['InstanceTypeOfferings'])
-print(sorted(z for z, n in c.items() if n == 2)[0])")
+from collections import defaultdict
+types = defaultdict(set)
+for o in d['InstanceTypeOfferings']:
+    types[o['Location']].add(o['InstanceType'])
+print(sorted(z for z, t in types.items() if t == {'$srv_type', '$bot_type'})[0])")
 
-price() { # TYPE -> on-demand USD/h (Linux, shared tenancy), or ?
-  local loc
-  loc=$(aws ssm get-parameter --name "/aws/service/global-infrastructure/regions/$region/longName" | json "print(d['Parameter']['Value'])")
+# The price list names regions by their long names.
+case $region in
+  eu-central-1) loc="EU (Frankfurt)" ;;
+  eu-west-1) loc="EU (Ireland)" ;;
+  eu-west-3) loc="EU (Paris)" ;;
+  eu-north-1) loc="EU (Stockholm)" ;;
+  us-east-1) loc="US East (N. Virginia)" ;;
+  *) loc= ;;
+esac
+price() { # TYPE -> on-demand USD/h (Linux, shared tenancy), or ? (needs pricing:GetProducts)
+  [ -n "$loc" ] || { echo "?"; return; }
   aws pricing get-products --region us-east-1 --service-code AmazonEC2 --filters \
     "Type=TERM_MATCH,Field=instanceType,Value=$1" "Type=TERM_MATCH,Field=location,Value=$loc" \
     "Type=TERM_MATCH,Field=operatingSystem,Value=Linux" "Type=TERM_MATCH,Field=tenancy,Value=Shared" \
@@ -91,7 +101,10 @@ for t in p['terms']['OnDemand'].values():
 srv_price=$(price "$srv_type")
 bot_price=$(price "$bot_type")
 total=$(python3 -c "print('%.2f' % ($srv_price + $bot_price))" 2> /dev/null || echo "?")
-ami=$(aws ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id | json "print(d['Parameter']['Value'])")
+# Canonical's newest Ubuntu 24.04 (x86-64, gp3) image.
+ami=$(aws ec2 describe-images --owners 099720109477 \
+  --filters "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*" Name=state,Values=available |
+  json "print(max(d['Images'], key=lambda i: i['CreationDate'])['ImageId'])")
 echo "server: $srv_type, USD $srv_price/h on demand"
 echo "bots:   $bot_type, USD $bot_price/h on demand"
 echo "$region ($az), Ubuntu 24.04 ($ami), cluster placement group, SSH key $key${spot:+, SPOT (cheaper than the above)}"

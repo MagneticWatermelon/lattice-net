@@ -1,0 +1,5 @@
+srv: queue_0_tx_unmask_interrupt +171102, queue_1_tx_unmask_interrupt +174435, queue_2_tx_unmask_interrupt +152981, queue_3_tx_unmask_interrupt +142777, queue_4_tx_unmask_interrupt +170403, queue_5_tx_unmask_interrupt +140136, queue_6_tx_unmask_interrupt +192399, queue_7_tx_unmask_interrupt +148874
+bots: queue_0_tx_unmask_interrupt +156055, queue_1_tx_unmask_interrupt +151857, queue_2_tx_unmask_interrupt +147094, queue_3_tx_unmask_interrupt +149567, queue_4_tx_unmask_interrupt +143130, queue_5_tx_unmask_interrupt +149980, queue_6_tx_unmask_interrupt +149449, queue_7_tx_unmask_interrupt +144953
+NIC=enp39s0 (via enp39s0) driver=ena pci=0x1d0f 0xec20 
+tx-udp-segmentation: off [fixed]
+USO=sw
