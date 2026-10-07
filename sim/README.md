@@ -711,6 +711,11 @@ With 8 busy threads competing for the 16 hardware threads (like bots on the same
 
 **The fix:** `lattice-server` runs each tick and its egress on a rayon worker (`pool::awake`), which broadcasts a job to every other worker: look for pool work (`rayon::yield_now`), yield to the OS when there's none, until the tick is done. Between ticks the workers sleep as before. `--keep-awake off` turns it off, and the summary records it (`keep_awake`).
 
+**That job must be the bottom frame on its worker.** A worker that picks it up while waiting inside a join (for the other half of a task it stole) loops on top of that unfinished task, and the tick never ends.
+- **The bug:** the first version (`f3dbaee`) hung like that. A worker idle as a tick started could steal the tick's first task before its own job arrived. Profiling caught it as a hung server, and a stress test (short ticks of small tasks) hung within 68–4,851 ticks.
+- **The gate:** the tick now waits until the other workers have started their jobs, up to 1 ms, before it makes any tasks, then closes a gate. A job that starts later returns at once, and its worker just isn't held that tick.
+- **Tested:** 150,000 stress ticks with 8 busy threads competing, without a hang; `pool::tests::ticks_never_wait_on_a_held_worker` runs 5,000 of them.
+
 **WSL, uniform 5k with 20% firing and fighters, ladder off, 45 s, 8 server threads, two interleaved pairs** (p50 in ms; "overhead" is the phase breakdown's, over ingress, assembly, transport and egress):
 
 | | off | on |
