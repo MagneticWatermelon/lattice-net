@@ -409,7 +409,9 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
       IFS='|' read -r id _ _ _ _ <<< "$spec"
       s=$dir/$id-$r/server.summary
       [ -f "$s" ] || continue
-      echo "| $id #$r | $(kv "$s" ingress) ($(kv "$s" rx_gather_us) us) | $(kv "$s" sockets) | $(kilo "$(kv "$s" in_pps)") | $(kv "$s" recv_per_call) | $(kv "$s" ingress_thread_busy_max_pct)% / $(kv "$s" ingress_thread_busy_mean_pct)% |"
+      ing=$(kv "$s" ingress)
+      [ "$ing" = recvmmsg ] && ing="$ing ($(kv "$s" rx_gather_us) us)"
+      echo "| $id #$r | $ing | $(kv "$s" sockets) | $(kilo "$(kv "$s" in_pps)") | $(kv "$s" recv_per_call) | $(kv "$s" ingress_thread_busy_max_pct)% / $(kv "$s" ingress_thread_busy_mean_pct)% |"
     done
   done
   echo

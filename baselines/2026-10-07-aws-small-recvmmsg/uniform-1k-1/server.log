@@ -1,0 +1,37 @@
+preallocated connections for 10000 clients in 264.396573ms
+listening on 172.31.27.101:40500 | spawn Uniform | tiers near 64@150 m, mid 500 m, far 1500 m, budget 6250 B/tick, squads of 4 | 8 rayon threads, 64 shards, 1 socket(s), 256 accepts/tick, egress SendMmsg, ingress RecvMmsg | socket buffers rcv 32768 KiB snd 32768 KiB
+[    5s] clients 1000 | level 0 (0-0 in window: 30 Hz, dilation 1.0), pace 1.00, 0.0% clients bandwidth-degraded | tick p50 2.06 p99 3.78 max 3.92 ms, 0 overruns | out 26.5k pps 59 kbps/client, 51 Mbps | in 26.5k pps 17 kbps/client, 46.1 per recv, receive thread busy 2% | stand-ins: repeated 0.00% frozen 0.00%, 0 late inputs | per client-tick: 209 B (near 34 B, 99% deltas), near 4.3 mid 4.1 far 6.2, far skipped 0 starved 0 | input wait p50 38.3 p99 71.2 ms | 1282 joins deferred | kernel drops rcv 0 snd 0
+         p50/p99 ms: ingress 0.20/0.48  events 0.18/2.07  movement 0.21/0.24  grid 0.16/0.18  separate 0.05/0.06  history 0.00/0.04  shots 0.01/0.02  serialize 0.04/0.08  assembly 0.43/0.55  transport 0.22/0.25  egress 0.52/0.65
+[   10s] clients 1000 | level 0 (0-0 in window: 30 Hz, dilation 1.0), pace 1.00, 0.0% clients bandwidth-degraded | tick p50 2.07 p99 2.19 max 2.19 ms, 0 overruns | out 30.0k pps 59 kbps/client, 59 Mbps | in 30.0k pps 15 kbps/client, 46.6 per recv, receive thread busy 3% | stand-ins: repeated 0.00% frozen 0.00%, 0 late inputs | per client-tick: 210 B (near 33 B, 100% deltas), near 4.3 mid 4.2 far 6.3, far skipped 0 starved 0 | input wait p50 38.1 p99 65.7 ms | 0 joins deferred | kernel drops rcv 0 snd 0
+         p50/p99 ms: ingress 0.21/0.22  events 0.18/0.21  movement 0.22/0.24  grid 0.16/0.18  separate 0.05/0.06  history 0.00/0.01  shots 0.01/0.02  serialize 0.04/0.06  assembly 0.43/0.47  transport 0.23/0.27  egress 0.53/0.62
+[   15s] clients 1000 | level 0 (0-0 in window: 30 Hz, dilation 1.0), pace 1.00, 0.0% clients bandwidth-degraded | tick p50 2.08 p99 2.20 max 2.27 ms, 0 overruns | out 30.0k pps 59 kbps/client, 59 Mbps | in 30.0k pps 15 kbps/client, 46.9 per recv, receive thread busy 3% | stand-ins: repeated 0.00% frozen 0.00%, 0 late inputs | per client-tick: 210 B (near 33 B, 100% deltas), near 4.3 mid 4.2 far 6.3, far skipped 0 starved 0 | input wait p50 38.1 p99 65.7 ms | 0 joins deferred | kernel drops rcv 0 snd 0
+         p50/p99 ms: ingress 0.21/0.23  events 0.18/0.21  movement 0.22/0.24  grid 0.16/0.18  separate 0.05/0.08  history 0.00/0.01  shots 0.01/0.02  serialize 0.04/0.06  assembly 0.43/0.48  transport 0.23/0.27  egress 0.54/0.63
+[   20s] clients 1000 | level 0 (0-0 in window: 30 Hz, dilation 1.0), pace 1.00, 0.0% clients bandwidth-degraded | tick p50 2.08 p99 2.26 max 2.29 ms, 0 overruns | out 30.0k pps 59 kbps/client, 59 Mbps | in 30.0k pps 15 kbps/client, 46.8 per recv, receive thread busy 3% | stand-ins: repeated 0.00% frozen 0.00%, 0 late inputs | per client-tick: 210 B (near 33 B, 100% deltas), near 4.3 mid 4.2 far 6.3, far skipped 0 starved 0 | input wait p50 38.1 p99 65.7 ms | 0 joins deferred | kernel drops rcv 0 snd 0
+         p50/p99 ms: ingress 0.21/0.22  events 0.19/0.21  movement 0.22/0.24  grid 0.16/0.18  separate 0.05/0.06  history 0.00/0.00  shots 0.01/0.02  serialize 0.04/0.07  assembly 0.42/0.49  transport 0.23/0.27  egress 0.54/0.62
+[   21s] clients 0 | level 0 (0-0 in window: 30 Hz, dilation 1.0), pace 1.00, 0.0% clients bandwidth-degraded | tick p50 2.05 p99 2.16 max 2.16 ms, 0 overruns | out 26.0k pps 58 kbps/client, 51 Mbps | in 32.8k pps 16 kbps/client, 47.6 per recv, receive thread busy 3% | stand-ins: repeated 0.00% frozen 0.00%, 0 late inputs | per client-tick: 208 B (near 33 B, 100% deltas), near 4.3 mid 4.1 far 6.2, far skipped 0 starved 0 | input wait p50 38.2 p99 65.7 ms | 0 joins deferred | kernel drops rcv 0 snd 0
+         p50/p99 ms: ingress 0.21/0.29  events 0.18/0.85  movement 0.21/0.24  grid 0.16/0.18  separate 0.04/0.06  history 0.00/0.00  shots 0.01/0.01  serialize 0.04/0.06  assembly 0.42/0.45  transport 0.22/0.24  egress 0.50/0.60
+
+== summary: 508 steady-state ticks (after warmup, before clients drain), peak 1000 clients ==
+  phase        p50 ms   p99 ms   max ms
+  ingress        0.21     0.23     0.23
+  events         0.18     0.21     0.22
+  movement       0.22     0.24     0.24
+  grid           0.16     0.18     0.19
+  separate       0.05     0.07     0.08
+  history        0.00     0.01     0.01
+  shots          0.01     0.02     0.02
+  serialize      0.04     0.06     0.07
+  assembly       0.43     0.48     0.49
+  transport      0.23     0.27     0.34
+  egress         0.54     0.62     0.65
+  tick           2.07     2.21     2.29
+  overruns 0 | spawns 1000 despawns 1000 (1282 joins deferred) | deaths 0 respawns 0 | stand-ins: repeated 0 frozen 0 | late inputs 0 discarded 0 | bad messages 0 | recv errors 0 send errors 0
+  egress (whole run): 597055 datagrams in 597055 sends (1.00 per send), 38464 syscalls
+  ingress (whole run): 599953 datagrams in 12865 receive calls (46.63 per call)
+  ticks per ladder level (whole run): L0: 617
+  input wait on the server (datagram arrival -> applied): p50 38.1 p99 65.8 max 97.9 mean 44.3 ms
+  steady state: stand-ins repeated 0 frozen 0 | late inputs 0 discarded 0
+  rewind of near targets (applied step - the input's render step for that tier): p50 133 p99 195 max 200 mean 135.9 ms (n=579633)
+  rewind of mid/far targets (applied step - the input's render step for that tier): p50 267 p99 300 max 300 mean 268.5 ms (n=579633)
+  render times ahead of the server (bogus) 0
+  shots 0 (late 0, refused 0, rewinds capped 0) | hits head 0 body 0 (after cover 0, too late 0), kills 0 | ground 0 cover 0 expired 0 | segments 0 candidates 0
