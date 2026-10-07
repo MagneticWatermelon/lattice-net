@@ -373,6 +373,8 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - `scripts/cloud-down.sh` copies back, deletes every server tagged `lattice-net`, and shows the server list.
     - `.claude/settings.json` asks before `cloud-up.sh` or any `scw` call that creates, changes or deletes; listing, `cloud-run.sh` and `cloud-down.sh` (which only deletes our tagged servers) are allowed.
     - **Never end a session with Scaleway servers running: always finish with `scripts/cloud-down.sh` and show the empty server list.** A €20/month budget alert exists, but alerts don't stop spending.
+    - **Scaleway is blocked for now** (2026-10-07): after a security review the account's quotas are 0 (private networks too), and support will only review it once the first invoice is paid.
+    - **AWS EC2 instead** (2026-10-07): `scripts/aws-up.sh` launches c7a.16xlarge (64 cores, no SMT, 25 Gbps) for the server and c7a.12xlarge (48 cores) for the bots in eu-central-1, in one cluster placement group, tagged `Project=lattice-net`. It checks the vCPU quota first (`L-1216C47A`; the account had 16, an increase to 128 was requested). `scripts/cloud-run.sh` drives either provider. `scripts/aws-down.sh` terminates everything tagged and lists what's left. The machine setup both providers share is `scripts/cloud-setup.sh`. `.claude/settings.json` asks before `aws-up.sh`, `run-instances` and `terminate-instances`. **The same rule: never end a session with instances running.**
     - Quirks, already handled:
       - offer names are case-sensitive (`EM-I620E-NVME`);
       - SSH comes up ~8 min after "ready";

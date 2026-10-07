@@ -13,6 +13,7 @@ state=.cloud/session.env
 if [ -s "$state" ]; then
   # shellcheck source=/dev/null
   . "$state"
+  [ "${PROVIDER:-scaleway}" = scaleway ] || { echo "this is an ${PROVIDER} session: end it with scripts/aws-down.sh" >&2; exit 1; }
   if [ "${1:-}" != --no-fetch ] && [ -n "${SRV_PUB:-}" ]; then
     rsync -a -e "ssh -F .cloud/ssh_config -o BatchMode=yes -o ConnectTimeout=10" \
       lattice-srv:lattice-net/baselines/ baselines/ 2> /dev/null &&

@@ -230,58 +230,9 @@ echo "SRV_PRIV=$srv_priv" >> "$state"
 echo "BOT_PRIV=$bot_priv" >> "$state"
 say "Private Network: lattice-srv $srv_priv, lattice-bots $bot_priv"
 
-# --- toolchain, tuning, repo, build (both machines at once) -------------------
-setup() {
-  on "$1" "sudo bash -s" << 'EOF'
-set -e
-export DEBIAN_FRONTEND=noninteractive
-apt-get -qq update
-apt-get -qq install -y build-essential iperf3 rsync > /dev/null
-# perf, for PROFILE=1; not every kernel has a matching package.
-apt-get -qq install -y linux-tools-common "linux-tools-$(uname -r)" > /dev/null 2>&1 || echo "no perf for this kernel"
-
-# The run-time fixes scripts/preflight.sh asks for (gone after a reboot).
-sysctl -q -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 kernel.perf_event_paranoid=1 kernel.kptr_restrict=0
-for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo performance > "$g"; done
-true
-EOF
-  on "$1" "command -v cargo > /dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal > /dev/null"
-  rsync -a --delete -e "ssh -F .cloud/ssh_config" --exclude target --exclude results --exclude .cloud --exclude client/assets --exclude /meshy_output ./ "$1:lattice-net/"
-  on "$1" "source ~/.cargo/env && cd lattice-net && cargo build --release -q -p lattice-sim"
-}
-say "installing the toolchain, copying the repo and building on both"
-setup lattice-srv > .cloud/setup-srv.log 2>&1 &
-s1=$!
-setup lattice-bots > .cloud/setup-bots.log 2>&1 &
-s2=$!
-wait $s1 || { echo "setup failed on lattice-srv: .cloud/setup-srv.log" >&2; exit 1; }
-wait $s2 || { echo "setup failed on lattice-bots: .cloud/setup-bots.log" >&2; exit 1; }
-
-# The server box drives the bots over ssh on the Private Network.
-on lattice-srv "test -f ~/.ssh/id_lattice || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_lattice"
-on lattice-srv "cat ~/.ssh/id_lattice.pub" | on lattice-bots "cat >> ~/.ssh/authorized_keys"
-on lattice-srv "printf 'Host %s\n  IdentityFile ~/.ssh/id_lattice\n  StrictHostKeyChecking accept-new\n' $bot_priv >> ~/.ssh/config && ssh -o BatchMode=yes ubuntu@$bot_priv true"
-
-# --- the link ------------------------------------------------------------------
-say "measuring the Private Network with iperf3"
-on lattice-bots "iperf3 -s -D -1 > /dev/null"
-sleep 1
-gbps() { json "print('%.1f' % (d['end']['sum_received']['bits_per_second'] / 1e9))"; }
-up=$(on lattice-srv "iperf3 -J -c $bot_priv -t 5 -P 8" | gbps)
-on lattice-bots "iperf3 -s -D -1 > /dev/null"
-sleep 1
-down=$(on lattice-srv "iperf3 -J -c $bot_priv -t 5 -P 8 -R" | gbps)
-echo "LINK_GBPS=$up/$down" >> "$state"
-say "link: $up Gbps server->bots, $down Gbps bots->server"
-if python3 -c "import sys; sys.exit(0 if min($up, $down) >= 5 else 1)"; then :; else
-  echo "WARNING: the link is far below 25 Gbps: 10k and the blob need several Gbps. Check before running." >&2
-fi
-
-echo "TOKEN_KEY=$(openssl rand -hex 32)" >> "$state"
-
-say "preflight"
-on lattice-srv "cd lattice-net && source ~/.cargo/env && scripts/preflight.sh 40500 10000" | tee .cloud/preflight-srv.txt | tail -12
-on lattice-bots "cd lattice-net && source ~/.cargo/env && scripts/preflight.sh 40999 10000" | tee .cloud/preflight-bots.txt | tail -12
+# Toolchain, repo, build, the link, the token key, preflight: shared with
+# scripts/aws-up.sh.
+scripts/cloud-setup.sh
 
 cat << EOF
 

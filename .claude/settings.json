@@ -7,7 +7,11 @@
       "Bash(scw baremetal server get:*)",
       "Bash(scw baremetal private-network list:*)",
       "Bash(scripts/cloud-run.sh:*)",
-      "Bash(scripts/cloud-down.sh:*)"
+      "Bash(scripts/cloud-down.sh:*)",
+      "Bash(scripts/aws-down.sh:*)",
+      "Bash(aws ec2 describe-instances:*)",
+      "Bash(aws service-quotas get-service-quota:*)",
+      "Bash(aws sts get-caller-identity:*)"
     ],
     "ask": [
       "Bash(scripts/cloud-up.sh:*)",
@@ -21,7 +25,12 @@
       "Bash(scw baremetal server start:*)",
       "Bash(scw baremetal private-network add:*)",
       "Bash(scw baremetal private-network set:*)",
-      "Bash(scw baremetal private-network delete:*)"
+      "Bash(scw baremetal private-network delete:*)",
+      "Bash(scripts/aws-up.sh:*)",
+      "Bash(./scripts/aws-up.sh:*)",
+      "Bash(bash scripts/aws-up.sh:*)",
+      "Bash(aws ec2 run-instances:*)",
+      "Bash(aws ec2 terminate-instances:*)"
     ]
   }
 }
