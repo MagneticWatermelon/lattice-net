@@ -224,8 +224,15 @@ pub struct ClientCore {
     render_clock: RenderClock,
     tick_steps: TickSteps,
     entities: Option<Entities>,
-    /// Mid and far entities are drawn this many steps behind near ones.
+    /// Mid and far entities are drawn this many steps behind near ones, and
+    /// what that's moving to after the near delay changed, as of `mid_lag_at`.
+    /// The near render clock slews to a new delay (10%), so the lag slews with
+    /// it: set at once, mid and far would be drawn (and claimed for lag
+    /// compensation) up to the change past their own delay while the near
+    /// clock caught up, which the server trimmed as a backtrack.
     mid_lag: f64,
+    mid_lag_target: f64,
+    mid_lag_at: Option<Instant>,
     /// The near render delay now, and its bounds; the mid one, all in steps.
     near_delay: f64,
     near_bounds: (f64, f64),
@@ -297,6 +304,8 @@ impl ClientCore {
             tick_steps: TickSteps::default(),
             entities: cfg.track_entities.then(|| Entities::new(mid_lag(&cfg))),
             mid_lag: mid_lag(&cfg),
+            mid_lag_target: mid_lag(&cfg),
+            mid_lag_at: None,
             near_delay: steps(cfg.near_delay),
             near_bounds: (steps(cfg.near_delay), steps(cfg.near_delay_max.max(cfg.near_delay))),
             mid_delay: steps(cfg.mid_delay),
@@ -387,7 +396,25 @@ impl ClientCore {
     /// The render step at `now` (advancing the render clock), or `None`
     /// before the first snapshot.
     pub fn render_step(&mut self, now: Instant) -> Option<f64> {
-        self.render_clock.render_at(now)
+        let r = self.render_clock.render_at(now);
+        self.slew_mid_lag(now);
+        r
+    }
+
+    /// Moves the mid lag toward its target as fast as the near render clock
+    /// catches a delay change (`clock::SLEW` of the steps since the last
+    /// call), so mid and far stay at their own delay behind the newest step.
+    fn slew_mid_lag(&mut self, now: Instant) {
+        let run = self.mid_lag_at.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64() * TICK_HZ as f64 * self.pace as f64);
+        self.mid_lag_at = Some(now);
+        let err = self.mid_lag_target - self.mid_lag;
+        if err != 0.0 {
+            let step = run * clock::SLEW;
+            self.mid_lag += err.clamp(-step, step);
+            if let Some(e) = &mut self.entities {
+                e.set_mid_lag(self.mid_lag);
+            }
+        }
     }
 
     /// One frame: draws every entity at the render step for `now` (mid and
@@ -396,10 +423,12 @@ impl ClientCore {
     /// drawn (`Entities::smooth`).
     pub fn render(&mut self, now: Instant, f: impl FnMut(u16, &RenderState)) -> Option<f64> {
         let r = self.render_clock.render_at(now)?;
+        self.slew_mid_lag(now);
         if let Some(newest) = self.render_clock.newest_at(now) {
             self.stats.render_frames += 1;
             self.stats.render_delay_sum += newest - r;
         }
+        let mut change = None;
         if let Some(e) = &mut self.entities {
             e.render(r, f);
             // The near delay follows what near updates need: up at once, down
@@ -412,15 +441,23 @@ impl ClientCore {
                 // 10% slow while the clock catches up (UDP disk of 100: ~4
                 // changes per client per 30 s at half a step).
                 if want > self.near_delay || want < self.near_delay - 1.0 {
-                    self.near_delay = want;
-                    self.stats.delay_changes += 1;
-                    self.render_clock.set_delay(want);
-                    self.mid_lag = (self.mid_delay - want).max(0.0);
-                    e.set_mid_lag(self.mid_lag);
+                    change = Some(want);
                 }
             }
         }
+        if let Some(want) = change {
+            self.set_near_delay(want);
+        }
         Some(r)
+    }
+
+    /// A new near render delay, in steps: the near clock slews to it, and
+    /// the mid lag with it (`slew_mid_lag`), so mid and far stay at theirs.
+    fn set_near_delay(&mut self, want: f64) {
+        self.near_delay = want;
+        self.stats.delay_changes += 1;
+        self.render_clock.set_delay(want);
+        self.mid_lag_target = (self.mid_delay - want).max(0.0);
     }
 
     /// The near render delay now, in steps (it adapts; see `ClientConfig`).
@@ -832,6 +869,7 @@ impl ClientCore {
         self.clock += self.rate * elapsed;
         self.bump_cooldown -= elapsed;
         let render = self.render_clock.render_at(now).map(msg::render_units);
+        self.slew_mid_lag(now);
         let mut made = 0;
         while self.clock >= 1.0 && made < max {
             self.clock -= 1.0;
@@ -887,6 +925,48 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mid_and_far_stay_at_their_delay_while_the_near_delay_changes() {
+        // Snapshots at 30 Hz; the near delay drops from 4 steps to 2, then
+        // grows back. Near slews to each (10% of a step per step), and mid
+        // and far, drawn the mid lag behind near, must stay at their own 6
+        // steps throughout: what a shot claims for them is what's drawn, and
+        // the server trims claims past the longest mid delay.
+        let t0 = Instant::now();
+        let mut c = ClientCore::new(ClientConfig { near_delay: Duration::from_secs(4) / TICK_HZ, ..Default::default() });
+        let mid = c.mid_delay;
+        let frame = Duration::from_secs_f64(1.0 / 144.0);
+        let (mut worst, mut changed) = (0.0f64, false);
+        for f in 0..20 * 144u32 {
+            let now = t0 + frame * f;
+            let step = (now - t0).as_secs_f64() * TICK_HZ as f64;
+            if f % (144 / 30 + 1) == 0 {
+                c.render_clock.on_snapshot(step as u32, 1.0, now);
+            }
+            match f {
+                720 => c.set_near_delay(2.0),
+                1440 => c.set_near_delay(4.0),
+                _ => {}
+            }
+            let Some(r) = c.render_step(now) else { continue };
+            let newest = c.render_clock.newest_at(now).unwrap();
+            if f > 144 {
+                // Mid is drawn the mid lag behind near: newest - (mid delay).
+                let behind = newest - (r - c.mid_lag);
+                worst = worst.max((behind - mid).abs());
+                // Caught mid-slew: near between its old and new delay.
+                changed |= f > 720 && (2.2..3.8).contains(&(newest - r));
+            }
+        }
+        assert!(changed, "near really moved between delays");
+        // Set at once, the mid lag strayed by the whole change (2 steps) until
+        // near caught up. What's left is the newest-step estimate's own jitter
+        // (these snapshots carry whole steps), which near smooths away out of
+        // the same 10% while it slews and the mid lag doesn't (0.18 here).
+        eprintln!("mid strayed at most {worst:.3} steps from its delay");
+        assert!(worst < 0.25, "mid strayed {worst:.2} steps from its delay");
+    }
 
     #[test]
     fn a_frame_loop_makes_30_inputs_a_second_and_draws_its_player_smoothly() {
