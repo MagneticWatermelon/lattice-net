@@ -161,6 +161,10 @@ impl NearState {
         self.entries.is_empty()
     }
 
+    pub fn contains(&self, entity: u16) -> bool {
+        self.entries.iter().any(|e| e.0 == entity)
+    }
+
     pub fn last_sent(&self, entity: u16) -> Option<u32> {
         self.entries.iter().find(|e| e.0 == entity).map(|e| e.1)
     }

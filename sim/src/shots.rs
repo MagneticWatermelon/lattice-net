@@ -13,8 +13,6 @@
 //! far one can have moved since the rewound time), placed from the lag-comp
 //! `History`. The nearest hit along the segment wins.
 
-use std::collections::HashMap;
-
 use lattice_game::faction::faction;
 use lattice_game::hit;
 use lattice_game::movement::{TICK_HZ, WORLD_SIZE};
@@ -22,6 +20,7 @@ use lattice_game::weapon::{Flight, SUBSTEPS};
 use lattice_game::world::World;
 
 use crate::grid::Grid;
+use crate::interest::NearState;
 
 /// Rewind caps, in steps: RTT ≤ 100 ms fully compensated (decided for M3d):
 /// near targets 300 ms, mid and far 367 ms.
@@ -238,16 +237,16 @@ pub struct Sky<'a> {
     pub world: &'a World,
     pub grid: &'a Grid,
     pub history: &'a History,
-    /// Each shooter's near set (sorted): targets in it are rewound by the
-    /// near delay, the rest by the mid one.
-    pub near: &'a HashMap<u16, Vec<u16>>,
+    /// Each shooter's near set, if it has a client: targets in it are
+    /// rewound by the near delay, the rest by the mid one.
+    pub near: &'a (dyn Fn(u16) -> Option<&'a NearState> + Sync),
 }
 
 /// Flies `p` up to step `until`, a half step at a time. Returns how it
 /// ended, with the point, if it did.
 pub fn fly(p: &mut Projectile, until: f64, sky: &Sky, stats: &mut FlyStats) -> Option<(Outcome, [f32; 3])> {
     let half = 1.0 / SUBSTEPS as f64;
-    let near = sky.near.get(&p.shooter);
+    let near = (sky.near)(p.shooter);
     let side = faction(p.shooter);
     while p.tau + half <= until + 1e-9 {
         if p.tau >= p.end {
@@ -282,7 +281,7 @@ pub fn fly(p: &mut Projectile, until: f64, sky: &Sky, stats: &mut FlyStats) -> O
                 return;
             }
             stats.candidates += 1;
-            let tier = if near.is_some_and(|n| n.binary_search(&j).is_ok()) { 0 } else { 1 };
+            let tier = if near.is_some_and(|n| n.contains(j)) { 0 } else { 1 };
             let Some((feet, life)) = brackets[tier].and_then(|br| sky.history.at(br, j)) else { return };
             if let Some((t, head)) = hit::player(p0, p1, feet) {
                 take(t, Outcome::Player { target: j, head, rewind: p.d[tier], life });

@@ -6,16 +6,17 @@
 //! |-----------|-----------------------------------------------------------------|
 //! | ingress   | each transport shard decodes its datagrams, acks, handshakes, timeouts, and queues its clients' inputs (parallel) |
 //! | events    | spawn/despawn (serial) |
-//! | movement  | one input seq per entity per tick, real or stand-in (parallel)  |
+//! | movement  | one input seq per entity per tick, real or stand-in, and gather the shots fired (parallel) |
 //! | grid      | rebuild the shared spatial grid, plus the mid/far due-set views |
-//! | history   | store positions for lag compensation (unused until M3)          |
+//! | separate  | push overlapping players apart (parallel), then apply damage     |
+//! | history   | store positions for lag compensation                            |
+//! | shots     | shots become projectiles and every projectile flies to now (parallel); hits apply in projectile order (serial) |
 //! | serialize | encode each entity once per tier: near blob for all, mid/far blob for due ones (parallel) |
 //! | assembly  | per client: pick near/mid/far per `interest.rs`, fit the byte budget, memcpy blobs into messages (parallel by shard) |
 //! | transport | each shard queues its clients' snapshots and builds packets (parallel) |
 //!
-//! Shots and event application (phases 3 and 4) come with M3. Egress (the socket
-//! writes) happens in the binary. Datagrams move in per-shard buckets both ways:
-//! route inbound ones with `router()`.
+//! Egress (the socket writes) happens in the binary. Datagrams move in
+//! per-shard buckets both ways: route inbound ones with `router()`.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -32,7 +33,7 @@ use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
-use crate::shots::{self, Fire, FlyStats, History, Outcome, Projectile, Sky};
+use crate::shots::{self, Cut, Fire, FlyStats, History, Outcome, Projectile, Sky};
 use lattice_game::weapon::{self, shot_time, Bloom, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
 use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::events::{self, Event};
@@ -690,6 +691,25 @@ impl InputQueue {
     }
 }
 
+/// Whether `shooter`'s eye sees `target`'s chest now (no terrain or cover
+/// between them).
+fn in_sight(world: &World, history: &History, shooter: u16, target: u16) -> bool {
+    let (Some(a), Some(b)) = (history.now(shooter), history.now(target)) else { return false };
+    let (p0, p1) = ([a.pos[0], a.pos[1], a.pos[2] + weapon::EYE_HEIGHT], [b.pos[0], b.pos[1], b.pos[2] + 1.0]);
+    lattice_game::hit::line_clear(world, p0, p1)
+}
+
+/// A projectile that ended this tick: where it was in the list, how, and
+/// (for a hit) whether its shooter still sees the target.
+struct Ended {
+    id: u64,
+    index: usize,
+    shooter: u16,
+    outcome: Outcome,
+    at: [f32; 3],
+    after_cover: bool,
+}
+
 /// How far player `i` at `p`, feet at `z`, is pushed this tick by player `j`
 /// at `q`, feet at `qz` (before the `MAX_PUSH` cap). Only bodies that
 /// overlap push: within `SEP_DIST` across, and less than a body height apart
@@ -751,6 +771,11 @@ pub struct SimServer {
     reliable_out: Vec<Vec<(ClientId, Vec<u8>)>>,
     /// Each entity's client, while connected.
     client_of: Vec<Option<ClientId>>,
+    /// Each entity's client slot while connected: its shard and its index in
+    /// that shard's list (shots look up a shooter's near set through it).
+    slot_of: Vec<Option<(u16, u32)>>,
+    /// This tick's shots, gathered in entity order by the movement phase.
+    fires: Vec<Fire>,
     /// Free entity ids, per faction (`faction::faction(id)`).
     free: [Vec<u16>; FACTIONS as usize],
     /// Damage to apply after this tick's movement: (entity, amount).
@@ -845,6 +870,8 @@ impl SimServer {
             outbox: Vec::new(),
             reliable_out: Vec::new(),
             client_of: Vec::new(),
+            slot_of: Vec::new(),
+            fires: Vec::new(),
             free: Default::default(),
             pending_damage: Vec::new(),
             death_acc: 0.0,
@@ -1074,35 +1101,49 @@ impl SimServer {
         self.respawn_due(self.step + steps);
         let world = &*self.world;
         let base_step = self.step;
-        let [applied, repeated, frozen] = self
+        // Movement also gathers the shots fired (here, or by late inputs at
+        // ingress) for the shots phase, in entity order.
+        let ([applied, repeated, frozen], fires, refused) = self
             .bodies
             .par_iter_mut()
             .zip(self.inputs.par_iter_mut())
             .enumerate()
             .with_min_len(256)
-            .filter(|(_, (b, _))| b.alive)
-            .map(|(e, (b, q))| {
-                let q = q.get_mut().unwrap();
-                // A tick consumes `steps` 1/30 s movement steps (1 or 2 at 20 Hz).
-                let queued = q.pending.len();
-                let mut n = [0u64; 3];
-                for k in 0..steps {
-                    match q.advance(e as u16, b, now, base_step + k + 1, world) {
-                        Step::Applied => n[0] += 1,
-                        Step::Repeated => n[1] += 1,
-                        Step::Frozen => n[2] += 1,
-                        Step::Waiting => {}
+            .fold(
+                || ([0u64; 3], Vec::new(), 0u64),
+                |(mut n, mut fires, refused), (e, (b, q))| {
+                    let q = q.get_mut().unwrap();
+                    if b.alive {
+                        // A tick consumes `steps` 1/30 s movement steps (1 or 2 at 20 Hz).
+                        let queued = q.pending.len();
+                        for k in 0..steps {
+                            match q.advance(e as u16, b, now, base_step + k + 1, world) {
+                                Step::Applied => n[0] += 1,
+                                Step::Repeated => n[1] += 1,
+                                Step::Frozen => n[2] += 1,
+                                Step::Waiting => {}
+                            }
+                        }
+                        // Reported depth means "due now + spares", whatever the step count.
+                        q.depth = (queued + 1).saturating_sub(steps as usize).min(u8::MAX as usize) as u8;
                     }
-                }
-                // Reported depth means "due now + spares", whatever the step count.
-                q.depth = (queued + 1).saturating_sub(steps as usize).min(u8::MAX as usize) as u8;
-                n
-            })
-            .reduce(|| [0u64; 3], |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]]);
+                    fires.append(&mut q.fires);
+                    (n, fires, refused + std::mem::take(&mut q.refused) as u64)
+                },
+            )
+            .reduce(
+                || ([0; 3], Vec::new(), 0),
+                |(a, mut fa, ra), (b, mut fb, rb)| {
+                    fa.append(&mut fb);
+                    ([a[0] + b[0], a[1] + b[1], a[2] + b[2]], fa, ra + rb)
+                },
+            );
+        self.fires = fires;
         self.step = base_step + steps;
         self.counters.inputs_applied += applied;
         self.counters.repeated += repeated;
         self.counters.frozen += frozen;
+        self.counters.shots_refused += refused;
         for (b, q) in self.bodies.iter().zip(&mut self.inputs) {
             let q = q.get_mut().unwrap();
             if b.alive && q.last_seq > 0 && q.wait != WAIT_STAND_IN {
@@ -1332,43 +1373,42 @@ impl SimServer {
         times
     }
 
-    /// The shots phase: fires from this tick's inputs become projectiles; every
-    /// projectile flies up to now (in parallel); hits are applied in
-    /// projectile order. Returns the flight's task span.
+    /// The shots phase: this tick's fires (gathered by movement) become
+    /// projectiles; every projectile flies up to now (in parallel); hits are
+    /// applied in projectile order. Returns the flight's task span.
     fn shots_phase(&mut self) -> Span {
-        let t0 = Instant::now();
-        let mut fires: Vec<Fire> = Vec::new();
-        for q in &mut self.inputs {
-            let q = q.get_mut().unwrap();
-            if !q.fires.is_empty() {
-                fires.append(&mut q.fires);
-            }
-            self.counters.shots_refused += std::mem::take(&mut q.refused) as u64;
-        }
+        let fires = std::mem::take(&mut self.fires);
         self.tick_shots.clear();
         self.tick_shots.extend(fires.iter().map(|f| (f.shooter, f.yaw, f.pitch, f.tau0)));
         self.tick_shots.sort_unstable_by_key(|s| s.0);
         // The latest a recent tick sent: what a shooter drew from was up to
         // that much older than its RTT alone says.
         let send = self.send_delays.iter().copied().fold(0.0, f64::max);
-        for f in &fires {
+        // What each shooter could plausibly have seen: from its RTT (once
+        // measured) and its input's wait. Older claims are trimmed. In
+        // parallel: the RTT lookups are the work.
+        let (net, client_of, first) = (&self.net, &self.client_of, self.next_projectile);
+        let made: Vec<(Projectile, Cut)> = fires
+            .par_iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let rtt = client_of
+                    .get(f.shooter as usize)
+                    .copied()
+                    .flatten()
+                    .and_then(|c| net.client_stats(c))
+                    .map(|s| s.rtt_ms as f64 / 1000.0 * TICK_HZ as f64)
+                    .filter(|&r| r > 0.0);
+                Projectile::new(first + i as u64, f, shots::plausible(rtt, f.wait, send))
+            })
+            .collect();
+        self.next_projectile += fires.len() as u64;
+        for (f, (p, cut)) in fires.iter().zip(made) {
             self.activity.add(f.shooter, f.origin, f.yaw);
             if self.fired.len() == 4096 {
                 self.fired.pop_front();
             }
             self.fired.push_back((f.shooter, f.seq, f.dir));
-            // What this shooter could plausibly have seen: from its RTT (once
-            // measured) and its input's wait. Older claims are trimmed.
-            let rtt = self
-                .client_of
-                .get(f.shooter as usize)
-                .copied()
-                .flatten()
-                .and_then(|c| self.net.client_stats(c))
-                .map(|s| s.rtt_ms as f64 / 1000.0 * TICK_HZ as f64)
-                .filter(|&r| r > 0.0);
-            let (p, cut) = Projectile::new(self.next_projectile, f, shots::plausible(rtt, f.wait, send));
-            self.next_projectile += 1;
             self.projectiles.push(p);
             self.counters.shots += 1;
             self.counters.shots_late += f.late as u64;
@@ -1380,30 +1420,32 @@ impl SimServer {
             }
         }
         if self.projectiles.is_empty() {
-            return span(t0.elapsed());
+            return NO_SPAN;
         }
-        // Shooters' near sets (last tick's): who they drew at the near delay.
-        let mut near: HashMap<u16, Vec<u16>> = self.projectiles.iter().map(|p| (p.shooter, Vec::new())).collect();
-        for slot in self.shard_clients.iter().flatten() {
-            if let Some(set) = near.get_mut(&slot.entity) {
-                set.extend(slot.near.entities());
-                set.sort_unstable();
-            }
-        }
-        let sky = Sky { world: &self.world, grid: &self.grid, history: &self.history, near: &near };
+        // A shooter's near set is what its client was sent last tick: who it
+        // drew at the near delay.
+        let (clients, slot_of) = (&self.shard_clients, &self.slot_of);
+        let near = |shooter: u16| match slot_of.get(shooter as usize) {
+            Some(&Some((k, i))) => Some(&clients[k as usize][i as usize].near),
+            _ => None,
+        };
+        let (world, history) = (&*self.world, &self.history);
+        let sky = Sky { world, grid: &self.grid, history, near: &near };
         let until = self.step as f64;
         // Fly in chunks of 64 projectiles; a chunk is a task (its time is
-        // the span's "longest task").
-        type Flown = (Vec<(u64, u16, Outcome, [f32; 3])>, FlyStats, Duration);
-        let flown: Vec<Flown> = self
+        // the span's "longest task"). A hit also learns whether the shooter
+        // still sees the target now (lag compensation's cost, for counting).
+        let flown: Vec<(Vec<Ended>, FlyStats, Duration)> = self
             .projectiles
             .par_chunks_mut(64)
-            .map(|chunk| {
+            .enumerate()
+            .map(|(c, chunk)| {
                 let t = Instant::now();
                 let (mut ends, mut st) = (Vec::new(), FlyStats::default());
-                for p in chunk {
-                    if let Some((o, at)) = shots::fly(p, until, &sky, &mut st) {
-                        ends.push((p.id, p.shooter, o, at));
+                for (i, p) in chunk.iter_mut().enumerate() {
+                    if let Some((outcome, at)) = shots::fly(p, until, &sky, &mut st) {
+                        let after_cover = matches!(outcome, Outcome::Player { target, .. } if !in_sight(world, history, p.shooter, target));
+                        ends.push(Ended { id: p.id, index: c * 64 + i, shooter: p.shooter, outcome, at, after_cover });
                     }
                 }
                 (ends, st, t.elapsed())
@@ -1417,18 +1459,22 @@ impl SimServer {
             self.counters.candidates += st.candidates;
             task = join_spans(task, span(t));
         }
+        // Ended projectiles leave the list. Its order doesn't matter: each
+        // flies alone, and hits apply in id order below.
+        let mut gone: Vec<usize> = ended.iter().map(|e| e.index).collect();
+        gone.sort_unstable_by(|a, b| b.cmp(a));
+        for i in gone {
+            self.projectiles.swap_remove(i);
+        }
         // Apply in projectile order, so the outcome doesn't depend on threads.
-        ended.sort_unstable_by_key(|&(id, ..)| id);
-        let gone: std::collections::HashSet<u64> = ended.iter().map(|&(id, ..)| id).collect();
-        self.projectiles.retain(|p| !gone.contains(&p.id));
-        for (_, shooter, outcome, at) in ended {
+        ended.sort_unstable_by_key(|e| e.id);
+        for Ended { shooter, outcome, at, after_cover, .. } in ended {
             match outcome {
                 Outcome::Ground => self.counters.hits_ground += 1,
                 Outcome::Cover => self.counters.hits_cover += 1,
                 Outcome::Expired => self.counters.expired += 1,
                 Outcome::Player { target, head, rewind, life } => {
                     let full = if head { DAMAGE_HEAD } else { DAMAGE_BODY };
-                    let after_cover = !self.in_sight(shooter, target);
                     // The shooter saw it alive, in the life it hit; if it has
                     // died (or respawned) since, no damage.
                     let same_life = self.bodies[target as usize].life == life;
@@ -1448,7 +1494,6 @@ impl SimServer {
                 }
             }
         }
-        let _ = t0;
         task
     }
 
@@ -1493,14 +1538,6 @@ impl SimServer {
         }
         outbox.clear();
         self.outbox = outbox;
-    }
-
-    /// Whether `shooter`'s eye sees `target`'s chest now (no terrain or cover
-    /// between them).
-    fn in_sight(&self, shooter: u16, target: u16) -> bool {
-        let (Some(a), Some(b)) = (self.history.now(shooter), self.history.now(target)) else { return false };
-        let (p0, p1) = ([a.pos[0], a.pos[1], a.pos[2] + weapon::EYE_HEIGHT], [b.pos[0], b.pos[1], b.pos[2] + 1.0]);
-        lattice_game::hit::line_clear(&self.world, p0, p1)
     }
 
     /// Takes `amount` of health from `e` now: whether that killed it (it
@@ -1665,7 +1702,12 @@ impl SimServer {
             ladder: ClientLadder::default(),
             sent_ring: (0..SENT_RING).map(|_| (u32::MAX, Vec::new())).collect(),
         };
-        self.shard_clients[self.net.shard_of_client(client)].push(slot);
+        let k = self.net.shard_of_client(client);
+        self.shard_clients[k].push(slot);
+        if self.slot_of.len() <= i {
+            self.slot_of.resize(i + 1, None);
+        }
+        self.slot_of[i] = Some((k as u16, (self.shard_clients[k].len() - 1) as u32));
         self.counters.spawns += 1;
         let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius, world_seed: self.cfg.world_seed });
         let _ = self.net.send(client, Channel::Reliable, welcome);
@@ -1673,9 +1715,15 @@ impl SimServer {
 
     fn despawn(&mut self, client: ClientId) {
         if let Some(e) = self.by_client.remove(&client) {
-            let list = &mut self.shard_clients[self.net.shard_of_client(client)];
-            if let Some(i) = list.iter().position(|s| s.client == client) {
-                list.swap_remove(i);
+            let k = self.net.shard_of_client(client);
+            let list = &mut self.shard_clients[k];
+            if let Some((_, i)) = self.slot_of[e as usize].take() {
+                debug_assert_eq!(list[i as usize].client, client);
+                list.swap_remove(i as usize);
+                // The last slot moved into its place.
+                if let Some(moved) = list.get(i as usize) {
+                    self.slot_of[moved.entity as usize] = Some((k as u16, i));
+                }
             }
             self.client_of[e as usize] = None;
             let body = &mut self.bodies[e as usize];

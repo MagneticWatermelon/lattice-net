@@ -742,6 +742,38 @@ With 8 busy threads competing for the 16 hardware threads (like bots on the same
 - **Input waits:** in the blob they rose ~1 ms at p50 and 3.5 ms at p99 (66.4 → 69.9 ms), with no stand-ins; uniform didn't change. Probably shorter ticks moved when snapshots reach the bots, and so when they send.
 - **CPU:** the workers keep their cores busy through each tick, so CPU profiles show the pool busy for the whole tick, not just its work. The receive threads compete with them; the workers yield to the OS on every idle check, so a waking receive thread gets a core. Worth checking on the 64-core box, where 63 workers share it with 4 receive threads.
 
+### The shots phase's serial work (2026-10-07)
+
+**Profiled** on WSL (8 threads, workers kept awake), µs per tick:
+
+| | uniform 5k, 20% firing | 3k blob, all firing |
+|---|---|---|
+| shots fired / projectiles alive / ended, per tick | ~315 / ~7,800 / ~315 | ~690 / ~17,000 / ~690 |
+| near sets: each shooter's, copied and sorted every tick (serial) | 745–793 | 3,772–3,800 |
+| flight (parallel) | 1,146–1,158 | 1,924–1,986 |
+| dropping ended projectiles: a hash set, then `retain` over all (serial) | 164–172 | 327–364 |
+| per shot: RTT lookup, projectile, counters (serial) | 104–111 | 129 |
+| gathering fires from every input queue (serial) | 66–71 | 54 |
+| applying hits (serial) | 16–19 | 69–70 |
+
+**Changes:**
+- **Near sets:** a flight asks only whether a candidate target is in its shooter's near set, ~250 times a tick in the uniform run and ~10,000 in the blob. So it now asks the shooter's own near state, from last tick's assembly (`NearState::contains`, a scan of ≤100 entries), found through a per-entity slot index that spawn and despawn keep. Nothing is built per tick.
+- **Ended projectiles:** removed by index (`swap_remove`, highest first). The list's order doesn't matter: each projectile flies alone, and hits apply in id order.
+- **Per shot:** projectiles, with their RTT lookups, are made in parallel; ids still follow the shots' order.
+- **Fires:** the movement pass gathers them (`fold`, in entity order), so the shots phase doesn't walk every input queue.
+- **Hits:** whether the shooter still sees its target (`after_cover`) is worked out in the flight's task.
+
+**WSL A/B** (ladder off, 45 s, two interleaved pairs uniform, one pair blob; ms):
+
+| | before | after |
+|---|---|---|
+| uniform 5k, 20% firing: shots p50 / p99 | 2.31–2.41 / 2.84–3.24 | 1.16–1.20 / 1.64–1.66 |
+| uniform 5k, 20% firing: tick p50 / p99 | 18.06–18.27 / 22.73–23.00 | 17.02–17.10 / 20.02–21.25 |
+| 3k blob, all firing: shots p50 / p99 | 6.29 / 7.24 | 1.95 / 2.58 |
+| 3k blob, all firing: tick p50 / p99 | 24.45 / 28.01 | 20.10 / 22.40 |
+
+Movement grew 0.02–0.04 ms for the gathering. Hits, kills and trims (0) are alike before and after.
+
 ### Running it on bare metal (the desktop, dual-booted)
 
 The repo has no remote, so carry it over as a git bundle.
