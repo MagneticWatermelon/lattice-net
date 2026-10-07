@@ -64,6 +64,10 @@ const NO_SPAN: Span = (Duration::ZERO, Duration::ZERO);
 
 /// Steps of a stand-in's seq a late shot may still fire for.
 const LATE_SHOT_STEPS: u32 = 8;
+
+/// Ticks of send delays kept for the backtrack bound: a shot's claim
+/// reaches back a render delay plus a round trip, well under 16 ticks.
+const SEND_DELAY_TICKS: usize = 16;
 /// Consumed steps an input queue remembers (for late shots' origins).
 const STEP_RING: usize = 16;
 /// Starved ticks that repeat the last input before movement freezes.
@@ -209,6 +213,13 @@ pub struct SimConfig {
     /// Shots leave within their cone of fire (`weapon::Bloom`, `spread`).
     /// Off only for tests that measure lag compensation's geometry.
     pub cone_of_fire: bool,
+    /// Ticks take real time (the `lattice-server` binary): the transport
+    /// stamps each shard's sends when it flushes them, so RTTs and the hold
+    /// times acks report leave out the tick's processing (stamped at the
+    /// tick's start, a 10k tick read 15-20 ms too much RTT), and the backtrack
+    /// bound adds that send delay back. Off for in-process swarms, whose
+    /// ticks are instants of simulated time.
+    pub real_time: bool,
     /// Server id and token key, shared with whatever mints the clients'
     /// tokens (the bots, standing in for a login service).
     pub identity: ServerIdentity,
@@ -232,6 +243,7 @@ impl Default for SimConfig {
             deaths_per_sec: 0.0,
             immortal: false,
             cone_of_fire: true,
+            real_time: false,
             identity: ServerIdentity { server_id: 1, token_key: lattice_net::token::DEV_TOKEN_KEY },
         }
     }
@@ -749,6 +761,9 @@ pub struct SimServer {
     rewind: [Histogram; 2],
     /// Trimmed shots: how far past the plausible bound they claimed, in 0.1 steps.
     trim_excess: Histogram,
+    /// How long after each of the last `SEND_DELAY_TICKS` ticks' start its
+    /// sends were stamped (0 unless `SimConfig::real_time`), in steps.
+    send_delays: [f64; SEND_DELAY_TICKS],
     /// The shared spatial index (all entities).
     grid: Grid,
     /// Networking's views of it: entities due this tick for mid and for far.
@@ -796,6 +811,7 @@ impl SimServer {
             input_wait: Histogram::new(INPUT_WAIT_CAP),
             rewind: [Histogram::new(REWIND_CAP_MS), Histogram::new(REWIND_CAP_MS)],
             trim_excess: Histogram::new(200),
+            send_delays: [0.0; SEND_DELAY_TICKS],
             rng: Rng::new(cfg.seed),
             cfg,
             tick: 0,
@@ -956,6 +972,7 @@ impl SimServer {
     /// datagrams must be bucketed by `router()`, and are consumed; outgoing ones
     /// are appended to their shard's bucket.
     pub fn tick(&mut self, inbound: &mut [Vec<InDatagram>], now: Instant, out: &mut [Vec<Datagram>]) -> PhaseTimes {
+        let started = Instant::now();
         assert_eq!(inbound.len(), self.shard_count(), "one inbound bucket per shard");
         assert_eq!(out.len(), self.shard_count(), "one outgoing bucket per shard");
         let mut times = PhaseTimes::default();
@@ -1242,8 +1259,11 @@ impl SimServer {
         }
         lap(8);
 
-        // 8b. transport: queue, frame, ack and checksum, one task per shard
-        self.spans[9] = self
+        // 8b. transport: queue, frame, ack and checksum, one task per shard.
+        // Sends are stamped when each shard flushes (real time) or at the
+        // tick's instant (simulated), and the latest stamp is kept.
+        let real = self.cfg.real_time;
+        let (transport, sent) = self
             .net
             .shards_mut()
             .par_iter_mut()
@@ -1261,11 +1281,14 @@ impl SimServer {
                         None => shard.send(client, Channel::Unreliable, snap),
                     };
                 }
-                shard.flush(now);
+                let at = if real { now + started.elapsed() } else { now };
+                shard.flush(at);
                 out.extend(shard.drain_outgoing());
-                span(t0.elapsed())
+                (span(t0.elapsed()), at - now)
             })
-            .reduce(|| NO_SPAN, join_spans);
+            .reduce(|| (NO_SPAN, Duration::ZERO), |a, b| (join_spans(a.0, b.0), a.1.max(b.1)));
+        self.spans[9] = transport;
+        self.send_delays[self.tick as usize % SEND_DELAY_TICKS] = sent.as_secs_f64() * TICK_HZ as f64;
         lap(9);
 
         self.tick = self.tick.wrapping_add(1);
@@ -1288,6 +1311,9 @@ impl SimServer {
         self.tick_shots.clear();
         self.tick_shots.extend(fires.iter().map(|f| (f.shooter, f.yaw, f.pitch, f.tau0)));
         self.tick_shots.sort_unstable_by_key(|s| s.0);
+        // The latest a recent tick sent: what a shooter drew from was up to
+        // that much older than its RTT alone says.
+        let send = self.send_delays.iter().copied().fold(0.0, f64::max);
         for f in &fires {
             self.activity.add(f.shooter, f.origin, f.yaw);
             if self.fired.len() == 4096 {
@@ -1304,7 +1330,7 @@ impl SimServer {
                 .and_then(|c| self.net.client_stats(c))
                 .map(|s| s.rtt_ms as f64 / 1000.0 * TICK_HZ as f64)
                 .filter(|&r| r > 0.0);
-            let (p, cut) = Projectile::new(self.next_projectile, f, shots::plausible(rtt, f.wait));
+            let (p, cut) = Projectile::new(self.next_projectile, f, shots::plausible(rtt, f.wait, send));
             self.next_projectile += 1;
             self.projectiles.push(p);
             self.counters.shots += 1;

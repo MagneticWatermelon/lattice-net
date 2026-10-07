@@ -147,10 +147,13 @@ pub struct Fire {
 pub const TRIM_SLACK: f64 = 2.0;
 
 /// The most rewind (near, mid/far) an honest client can need for a shot:
-/// its RTT and its input's wait on the server (in steps), plus the longest
-/// render delays the protocol allows, plus slack. `None`: no RTT yet.
-pub fn plausible(rtt: Option<f64>, wait: f64) -> Option<[f64; 2]> {
-    let base = rtt? + wait + TRIM_SLACK;
+/// its RTT and its input's wait on the server, plus how late in its tick
+/// the server sent the snapshots the client drew from (`send`; RTTs leave
+/// it out, since sends are stamped when they go, but what the client saw was
+/// that much older), all in steps, plus the longest render delays the
+/// protocol allows, plus slack. `None`: no RTT yet.
+pub fn plausible(rtt: Option<f64>, wait: f64, send: f64) -> Option<[f64; 2]> {
+    let base = rtt? + wait + send + TRIM_SLACK;
     Some([base + lattice_game::msg::MAX_NEAR_DELAY, base + lattice_game::msg::MAX_MID_DELAY])
 }
 
@@ -333,7 +336,8 @@ mod tests {
         let (p, cut) = Projectile::new(2, &Fire { behind: [12.0, 16.0], ..f }, None);
         assert_eq!((p.d, cut.capped, cut.trimmed), ([NEAR_CAP, MID_CAP], true, false));
         // RTT 1 step + wait 1.5: honest near rewinds are at most 1 + 1.5 + 4 + 2.
-        let ok = plausible(Some(1.0), 1.5);
+        assert_eq!(plausible(Some(1.0), 1.5, 0.5), plausible(Some(1.5), 1.5, 0.0), "a late send counts like RTT");
+        let ok = plausible(Some(1.0), 1.5, 0.0);
         let (p, cut) = Projectile::new(3, &f, ok);
         assert_eq!((p.d, cut), ([4.0, 8.0], Cut::default()), "an honest claim stands");
         let (p, cut) = Projectile::new(4, &Fire { behind: [8.0 + 4.0, 10.5 + 4.0], ..f }, ok);

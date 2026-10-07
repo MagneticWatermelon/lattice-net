@@ -574,6 +574,8 @@ fn main() -> std::io::Result<()> {
         deaths_per_sec: a.get("deaths-per-sec", 0.0),
         immortal: a.flag("immortal"),
         cone_of_fire: !a.flag("no-cone"),
+        // Ticks take real time here: stamp sends when they're flushed.
+        real_time: true,
         identity: lattice_net::ServerIdentity {
             token_key: a.get("token-key", HexKey::default()).0,
             server_id: a.get("server-id", 1),

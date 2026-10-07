@@ -328,7 +328,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
            - **Lethal, the same blob hits 23.8 / 21.1 / 18.7%:** what latency costs in a real fight. Shots go into the already dead (13k "too late" hits); that's not lag compensation.
            - **Corrections in the lethal WSL runs** (144 in the blob) all fall in two windows with server tick spikes (41 and 50 ms) on the shared box. The uniform 5k is overloaded on WSL (tick p50 39 ms). Both are for bare metal (M3e).
         5. **Anti-backtrack and life-keyed hits. Done** (2026-10-05, from a review):
-           - a shot's claimed rewind is trimmed to RTT + input wait + the longest render delay (4 near / 6 mid/far steps) + 2 steps of slack, and counted (`rewinds_trimmed`); honest shooters are never trimmed, and a 10-step backtrack hits 10% of the time;
+           - a shot's claimed rewind is trimmed to RTT + input wait + the server's send delay (the latest of the last 16 ticks) + the longest render delay (4 near / 6 mid/far steps) + 2 steps of slack, and counted (`rewinds_trimmed`); honest shooters are never trimmed, and a 10-step backtrack hits 10% of the time;
            - history keeps each entity's life, and a hit deals damage only to the life the shooter saw.
         6. **Distant fights. Done** (2026-10-05, from the same review): before this, only near-tier shooters' tracers reached a client, so a big fight 400 m away was invisible.
            - **Server** (`sim/src/activity.rs`, format in `game/src/activity.rs`): every shot is counted into its 128 m cell per faction over 15-tick windows, and encoded once as 5 B (`cell:2 | faction:2 shots:6 | yaw:1 | at:1`). Each client gets the finished window's cells within its far radius, once per window, on its own tick of it, after far and inside its byte budget (nearest first if cut).
@@ -368,7 +368,10 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
         - Uniform goes over at ~16k.
         - netem at 10k, corrections per bot-minute: 0.13–0.30 on LAN, up to 1.08 on far.
       - **Open:**
-        - **RTT reads 15–20 ms too high at 10k.** Sends are stamped with the tick's start, which loosens the backtrack bound. Fix candidate: stamp at the transport phase.
+        - ~~RTT reads 15–20 ms too high at 10k~~ **fixed** (2026-10-07):
+          - **Stamping:** the binary stamps each shard's sends at its flush (`SimConfig::real_time`). WSL uniform 5k reads RTT 4.3 ms instead of 18; the fight classes read 20.6 / 100.5 / 150.6 ms against netem's 20 / 100 / 150.
+          - **The bound:** the backtrack bound adds the server's send delay explicitly. The inflated RTT used to cover it by accident; without it, accurate RTTs trimmed 3 honest shots per 538k at a 21 ms tick, with it 0.
+          - **Still open:** whether this clears the 62 small trims at 10k on AWS needs the next rig session. WSL doesn't reproduce them.
         - **The serial events phase** (4.1 ms at 10k) is the floor.
         - **On AWS,** the server's ~4 ms egress burst exceeds its 25 Gbps allowance (11–14% of packets queued), and GSO is slower than `sendmmsg` on ENA (no USO).
         - **Bot capacity:** a bot thread carries ~360 bots at most. The tail of a bot's tick (p99 10× the median) decides it, not the 30–40% average.

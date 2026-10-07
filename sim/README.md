@@ -660,7 +660,15 @@ Late inputs match WSL's 1k netem runs (0.39% under lossy and jittery against 0.3
    - **The bug:** when the adaptive near delay changed, the near render clock slewed to it but the mid lag jumped at once. So mid and far were drawn, and claimed, up to the whole change past their 200 ms.
    - **The fix:** the mid lag now slews with the near clock.
    - **Still open:** the 62 remaining trims at 10k (each ≤ 0.4 steps over) aren't explained.
-5. **RTT reads 15–20 ms too high at 10k.** The server stamps its sends (and the hold it reports in `ack_delay`) with the tick's start, but sends 15–20 ms later. That's cosmetic for the input clock, which steers on queue depth. It does make the server's backtrack bound that much more lenient. Fix candidate: stamp with the transport phase's time.
+5. **RTT read 15–20 ms too high at 10k. Fixed the same day.**
+   - **The cause:** the server stamped its sends (and the hold it reports in `ack_delay`) with the tick's start, but sent 15–20 ms later. That was cosmetic for the input clock, which steers on queue depth, but it loosened the server's backtrack bound by the same amount.
+   - **The stamping fix:** `lattice-server` now stamps each shard's sends when it flushes them (`SimConfig::real_time`; in-process swarms keep the tick's instant).
+     - On WSL, uniform 5k reads RTT 4.3 ms instead of 18.0, and the bots' input → applied estimate becomes 52 ms, against a measured server wait of 50.
+     - The fight classes read 20.6 / 100.5 / 150.6 ms against netem's 20 / 100 / 150; on AWS they read 7 ms high.
+   - **The bound fix:** the inflated RTT used to cover, by accident, how late in its tick the server sent what a shooter drew from. So the backtrack bound now adds that send delay explicitly: the latest of the last 16 ticks.
+     - Uniform 5k with 20% firing and fighters (tick p50 21 ms), 538k shots: 0 trims.
+     - With accurate RTTs but no send term: 3 honest trims.
+     - The old code here also gave 0, so WSL doesn't reproduce the 62 at 10k on AWS. Whether those are cleared needs the next rig session.
 6. **GSO is slower on ENA:** there's no UDP segmentation offload (`USO=sw`), so egress is 1.80 vs 1.44 ms p50 for `sendmmsg` in the blob. Keep `sendmmsg` on AWS.
 7. **The serial events phase is the floor at 10k:** 4.1 ms p50 (2.4 ms on 2026-10-04's code), next to egress 4.1 and assembly 3.3. Rayon's idle spinning is ~22% of the CPU in profiles, as on Scaleway.
 
