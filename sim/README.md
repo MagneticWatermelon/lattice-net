@@ -29,7 +29,7 @@ cargo run --release --bin lattice-bots -- --help
 | transport | each shard's `send` + `flush`: framing, acks, sealing | per shard |
 | egress | `send_to` per packet (in the binary) | per shard |
 
-The transport is 64 `lattice_net::Shard`s by default (`--shards`). The binary's receive thread buckets each datagram by `Router::shard`, so routing costs no tick time. It receives with `recvmmsg` (`--ingress`, default on Linux): up to 64 datagrams a call, each stamped by the kernel on arrival, then a 250 µs wait after a short batch (`--rx-gather-us`) so the next call finds a batch.
+The transport is 64 `lattice_net::Shard`s by default (`--shards`). The binary's receive thread buckets each datagram by `Router::shard`, so routing costs no tick time. It receives with `recvmmsg` (`--ingress`, default on Linux): up to 64 datagrams a call, each stamped by the kernel on arrival, then a wait of up to 1 ms after a short batch (`--rx-gather-us`) so the next call finds a batch. The main loop publishes when the next tick starts, and a wait ends 200 µs before it, so gathering never makes a datagram miss its tick.
 
 Shots and event application (phases 3–4) arrive with M3.
 
@@ -117,6 +117,17 @@ Stand-ins can exceed bot corrections: a stand-in whose input matches what the bo
   | uniform 5k, gather 250 µs, `--sockets 4` | 11.6k/s | 13 | 7.9% each | 16.6 / 19.1 ms |
   | blob 3k, `recvfrom` | 90k/s | 1 | 32.5% | 20.2 / 22.8 ms |
   | blob 3k, gather 250 µs | 3.1k/s | 29 | 11.3% | 16.3 / 18.8 ms |
+
+  **Then the gather was capped at the tick** (a wait ends 200 µs before the next tick starts), which made a longer one free. Uniform 5k, same day:
+
+  | gather | sockets | datagrams per call | receive thread busy | input wait p50 / p99 | tick p50 / p99 |
+  |---|---|---|---|---|---|
+  | 250 µs | 1 | 39 | 16.0% | 50.7 / 66.4 ms | 16.5 / 19.7 ms |
+  | **1 ms (default)** | 1 | 55 | 12.4% | 47.7 / 64.6 ms | 16.1 / 18.7 ms |
+  | 250 µs | 16 | 3.4 | 6.2% each (99% of a core in all) | 50.0 / 66.1 ms | 17.7 / 22.2 ms |
+  | **1 ms (default)** | 16 | 9.9 | 2.6% each (42% in all) | 49.9 / 66.1 ms | 16.7 / 19.6 ms |
+
+  Input waits didn't grow, so nothing missed a tick.
 
   - **The wake-ups were the cost.** Batching alone barely moved the thread (3 datagrams a call, still 40% busy).
   - **The tick got faster** because WSL's oversubscribed cores got the time back. Expect less on bare metal.

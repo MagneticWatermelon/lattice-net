@@ -51,7 +51,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - Accept budget per tick (`Config::max_accepts_per_tick`).
   - `sendmmsg` egress.
   - **`recvmmsg` ingress** (2026-10-07, `lattice-server --ingress`, default on Linux).
-    - **How:** up to 64 datagrams a call, kernel arrival stamps (`SO_TIMESTAMPNS`, so input waits and `ack_delay` count time queued in the socket), then a 250 µs gather after a short batch (`--rx-gather-us`).
+    - **How:** up to 64 datagrams a call, kernel arrival stamps (`SO_TIMESTAMPNS`, so input waits and `ack_delay` count time queued in the socket), then a gather of up to 1 ms after a short batch (`--rx-gather-us`), cut off 200 µs before the next tick starts (the main loop publishes it), so a gather never makes a datagram miss its tick.
     - **Why the gather:** waking was the receive thread's cost, not syscalls. On WSL, 150k pps: 40% → 16% of a core; 3k blob 32% → 11%.
     - **Measured:** each thread's CPU share (`ingress_thread_busy_*_pct`) and datagrams per call, in summary.md's Ingress table.
     - **Shared code:** `sim/src/udp.rs`, also used by the bots.

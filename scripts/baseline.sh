@@ -400,7 +400,7 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
   echo
   echo "## Ingress"
   echo
-  echo "One receive thread per socket (\`--sockets\`). recvmmsg gathers for \`--rx-gather-us\` after a short batch; busy is each thread's CPU time over the steady state (near 100%: that socket can't keep up)."
+  echo "One receive thread per socket (\`--sockets\`). recvmmsg gathers for up to \`--rx-gather-us\` after a short batch, stopping 200 us before the next tick; busy is each thread's CPU time over the steady state (near 100%: that socket can't keep up)."
   echo
   echo "| run | ingress | sockets | in kpps | datagrams per call | receive thread busy max / mean |"
   echo "|---|---|---|---|---|---|"

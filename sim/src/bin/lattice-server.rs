@@ -56,9 +56,11 @@ lattice-server: M1 movement-only authoritative server
   --ingress MODE       recvmmsg | recvfrom   [recvmmsg on Linux, else recvfrom]
                        recvmmsg: up to 64 datagrams per syscall, stamped by the kernel on
                        arrival; recvfrom: one syscall per datagram, stamped when read
-  --rx-gather-us U     recvmmsg: after a batch that wasn't full, wait U microseconds so the
-                       next call finds a batch (a receive thread waking per datagram or
-                       three costs more than the receiving; 0 = receive again at once) [250]
+  --rx-gather-us U     recvmmsg: after a batch that wasn't full, wait up to U microseconds so
+                       the next call finds a batch (a receive thread waking per datagram or
+                       three costs more than the receiving), but never past just before the
+                       next tick starts, so no datagram misses a tick for it; 0 = receive
+                       again at once [1000]
   --duration S         stop after S seconds (0 = run forever) [0]
   --until-empty        stop once clients connected and then all left
   --report S           report interval, seconds [5]
@@ -151,8 +153,36 @@ impl std::str::FromStr for Ingress {
 }
 
 /// Datagrams per `recvmmsg`. At 10k clients one socket takes ~300 a
-/// millisecond: with `--rx-gather-us` 250, a call finds ~75 queued.
+/// millisecond, so a call finds a full batch after ~0.2 ms of gathering.
 const RX_BATCH: usize = 64;
+
+/// How long before a tick starts the receive threads stop gathering and take
+/// whatever arrives at once: covers a sleep's overshoot (timer slack is 50 us).
+const RX_DRAIN_BEFORE_TICK: Duration = Duration::from_micros(200);
+
+/// When the next tick starts, published by the main loop for the receive
+/// threads (nanoseconds since `base`).
+struct TickClock {
+    base: Instant,
+    next: AtomicU64,
+}
+
+impl TickClock {
+    fn new(base: Instant) -> Self {
+        Self { base, next: AtomicU64::new(0) }
+    }
+
+    fn publish(&self, next_tick: Instant) {
+        self.next.store(next_tick.saturating_duration_since(self.base).as_nanos() as u64, Relaxed);
+    }
+
+    /// How long a receive thread may gather at `now`: up to `gather`, but it
+    /// wakes `RX_DRAIN_BEFORE_TICK` before the next tick (zero once inside that).
+    fn gather_for(&self, now: Instant, gather: Duration) -> Duration {
+        let until = self.base + Duration::from_nanos(self.next.load(Relaxed));
+        until.saturating_duration_since(now).saturating_sub(RX_DRAIN_BEFORE_TICK).min(gather)
+    }
+}
 
 /// What a receive thread needs: its socket, and where its group's datagrams go.
 struct Receiver {
@@ -163,13 +193,14 @@ struct Receiver {
     inbox: Arc<Mutex<Vec<Vec<InDatagram>>>>,
     net: Arc<NetCounters>,
     stop: Arc<AtomicBool>,
-    /// recvmmsg: after a batch that wasn't full, sleep this long so the next
-    /// one finds more queued (zero: receive again at once). Waking is what a
-    /// receive thread pays for: on WSL at 150k pps, receiving whatever was there
-    /// (3 a call) kept it 40% busy, the same as `recv_from`; gathering for
+    /// recvmmsg: after a batch that wasn't full, sleep up to this long so the
+    /// next one finds more queued (zero: receive again at once). Waking is what
+    /// a receive thread pays for: on WSL at 150k pps, receiving whatever was
+    /// there (3 a call) kept it 40% busy, the same as `recv_from`; gathering for
     /// 250 us (42 a call), 16%. The kernel's arrival stamps keep the waits exact,
-    /// and 250 us is under 1% of a tick.
+    /// and `tick` keeps a gather from making a datagram miss its tick.
     gather: Duration,
+    tick: Arc<TickClock>,
 }
 
 impl Receiver {
@@ -238,8 +269,11 @@ impl Receiver {
                     inbox[shard].push(d);
                 }
             }
-            if n < RX_BATCH && !self.gather.is_zero() {
-                std::thread::sleep(self.gather);
+            if n < RX_BATCH {
+                let wait = self.tick.gather_for(clocks.instant, self.gather);
+                if !wait.is_zero() {
+                    std::thread::sleep(wait);
+                }
             }
         }
     }
@@ -506,7 +540,7 @@ fn main() -> std::io::Result<()> {
     let bind: SocketAddr = a.get("bind", "0.0.0.0:40000".parse().unwrap());
     let egress: Egress = a.get("egress", Egress::default());
     let ingress: Ingress = a.get("ingress", Ingress::default());
-    let gather = Duration::from_micros(a.get("rx-gather-us", 250));
+    let gather = Duration::from_micros(a.get("rx-gather-us", 1000));
     let cfg = SimConfig {
         spawn: a.get("spawn", SpawnMode::Uniform),
         max_clients: a.get("max-clients", 10_000),
@@ -626,6 +660,7 @@ fn main() -> std::io::Result<()> {
     let inboxes: Vec<Arc<Mutex<Vec<Vec<InDatagram>>>>> =
         (0..groups).map(|_| Arc::new(Mutex::new(vec![Vec::new(); per_group]))).collect();
     let stop = Arc::new(AtomicBool::new(false));
+    let tick_clock = Arc::new(TickClock::new(start));
     let mut receivers = Vec::with_capacity(groups);
     for (group, sock) in socks.iter().enumerate() {
         let rx = Receiver {
@@ -637,6 +672,7 @@ fn main() -> std::io::Result<()> {
             net: net.clone(),
             stop: stop.clone(),
             gather,
+            tick: tick_clock.clone(),
         };
         receivers.push(std::thread::Builder::new().name(format!("ingress-{group}")).spawn(move || rx.run(ingress))?);
     }
@@ -681,6 +717,8 @@ fn main() -> std::io::Result<()> {
                 std::mem::swap(bucket, held);
             }
         }
+        // What's received from here on is for the next tick.
+        tick_clock.publish(next_tick + sim.tick_period());
 
         if let Some(map) = &debug_map {
             // Fall back when the chosen client left (or nobody was chosen).
@@ -1307,6 +1345,21 @@ fn kernel_udp_drops() -> [u64; 2] {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gathering_stops_before_the_next_tick() {
+        let base = Instant::now();
+        let clock = TickClock::new(base);
+        let ms = Duration::from_millis;
+        clock.publish(base + ms(33));
+        // Mid-tick: the full gather.
+        assert_eq!(clock.gather_for(base + ms(10), ms(1)), ms(1));
+        // Near the tick: only until the drain window before it.
+        assert_eq!(clock.gather_for(base + ms(32), ms(1)), ms(1) - RX_DRAIN_BEFORE_TICK);
+        // Inside the drain window, or past the tick: none.
+        assert_eq!(clock.gather_for(base + ms(33) - Duration::from_micros(100), ms(1)), Duration::ZERO);
+        assert_eq!(clock.gather_for(base + ms(40), ms(1)), Duration::ZERO);
+    }
 
     #[test]
     fn gso_runs_follow_udp_segment_rules() {
