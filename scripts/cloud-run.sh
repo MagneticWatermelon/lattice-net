@@ -27,7 +27,32 @@ for h in lattice-srv lattice-bots; do
   on "$h" "source ~/.cargo/env && cd lattice-net && cargo build --release -q -p lattice-sim"
 done
 
+# The cards' counters around the run: drops, errors and (on AWS) the
+# platform's allowance limits must not grow, or the run measured the cloud.
+counters() { on lattice-srv "lattice-net/scripts/nic-check.sh counters $BOT_PRIV" > ".cloud/nic-$1-srv.txt"; on lattice-bots "lattice-net/scripts/nic-check.sh counters $SRV_PRIV" > ".cloud/nic-$1-bots.txt"; }
+counters before
+
 echo "running baseline.sh $mode $name on lattice-srv ($SRV_PRIV), bots on lattice-bots ($BOT_PRIV)"
 on lattice-srv "source ~/.cargo/env && cd lattice-net && env SERVER_IP=$SRV_PRIV BOTS_SSH=ubuntu@$BOT_PRIV TOKEN_KEY=$TOKEN_KEY $* scripts/baseline.sh $mode $name"
 rsync -a -e "ssh -F .cloud/ssh_config" lattice-srv:lattice-net/baselines/ baselines/
 echo "copied back: baselines/ (commit what you want to keep)"
+
+counters after
+out=$(ls -dt baselines/*-"$name" 2> /dev/null | head -1)
+report=$(python3 - << 'EOF'
+import re
+def load(p):
+    return {k: int(v) for k, v in (l.strip().split('=', 1) for l in open(p) if '=' in l) if v.strip().lstrip('-').isdigit()}
+bad = re.compile(r'allowance|drop|discard|err|fail|miss|timeout|fifo', re.I)
+for box in ('srv', 'bots'):
+    a, b = load(f'.cloud/nic-before-{box}.txt'), load(f'.cloud/nic-after-{box}.txt')
+    grew = [(k, b[k] - a.get(k, 0)) for k in sorted(b) if bad.search(k) and b[k] - a.get(k, 0) > 0]
+    print(f'{box}: ' + (', '.join(f'{k} +{d}' for k, d in grew) if grew else 'no drops, errors or allowance limits'))
+EOF
+)
+echo "network cards over the run:"
+echo "$report"
+[ -n "$out" ] && { echo "$report"; cat .cloud/nic-srv.txt 2> /dev/null; } > "$out/nic.txt"
+if echo "$report" | grep -q '+'; then
+  echo "WARNING: counters grew (above): check $out/nic.txt before trusting this run's loss and corrections" >&2
+fi

@@ -69,6 +69,13 @@ fi
 
 echo "TOKEN_KEY=$(openssl rand -hex 32)" >> "$state"
 
+# What the server's card does for GSO (and on the bots' side, for the record).
+say "network cards"
+on lattice-srv "lattice-net/scripts/nic-check.sh info $bot_priv" | tee .cloud/nic-srv.txt
+on lattice-bots "lattice-net/scripts/nic-check.sh info $SRV_PRIV" > .cloud/nic-bots.txt
+sed -i '/^NIC_USO=/d' "$state"
+echo "NIC_USO=$(sed -n 's/^USO=//p' .cloud/nic-srv.txt)" >> "$state"
+
 say "preflight"
 on lattice-srv "cd lattice-net && source ~/.cargo/env && scripts/preflight.sh 40500 10000" | tee .cloud/preflight-srv.txt | tail -12
 on lattice-bots "cd lattice-net && source ~/.cargo/env && scripts/preflight.sh 40999 10000" | tee .cloud/preflight-bots.txt | tail -12
