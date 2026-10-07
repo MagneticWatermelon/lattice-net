@@ -67,18 +67,23 @@ impl Histogram {
         if self.n == 0 {
             return Summary::default();
         }
-        let at = |p: f64| {
-            let rank = ((self.n as f64 * p).ceil() as u64).clamp(1, self.n);
-            let mut seen = 0;
-            for (v, &c) in self.counts.iter().enumerate() {
-                seen += c;
-                if seen >= rank {
-                    return v as u32;
-                }
+        Summary { p50: self.quantile(0.50), p99: self.quantile(0.99), max: self.max }
+    }
+
+    /// The nearest-rank `p` quantile (0 when empty).
+    pub fn quantile(&self, p: f64) -> u32 {
+        if self.n == 0 {
+            return 0;
+        }
+        let rank = ((self.n as f64 * p).ceil() as u64).clamp(1, self.n);
+        let mut seen = 0;
+        for (v, &c) in self.counts.iter().enumerate() {
+            seen += c;
+            if seen >= rank {
+                return v as u32;
             }
-            self.max
-        };
-        Summary { p50: at(0.50), p99: at(0.99), max: self.max }
+        }
+        self.max
     }
 }
 

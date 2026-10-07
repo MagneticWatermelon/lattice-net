@@ -1,6 +1,7 @@
 //! M1 bot swarm: N `lattice_net::Client`s driven by `BotBrain`s, one UDP
 //! socket per bot (the server identifies clients by address), sharded over a
-//! few threads that each tick all their bots at 30 Hz.
+//! few threads that each tick all their bots at 30 Hz, in slots spread over
+//! the period (`--slots`) so inputs reach the server at many phases of its tick.
 //!
 //! Reports prediction corrections, bytes and snapshot contents per bot, and join
 //! latency (connect request to Welcome). If the swarm itself overruns its tick,
@@ -25,6 +26,9 @@ lattice-bots: M1 bot swarm
   --server ADDR        [127.0.0.1:40000]
   --count N            bots [1000]
   --threads N          [min(8, cores / 2)]
+  --slots N            each thread ticks its bots in N groups spread over the period, so
+                       inputs reach the server at threads x N phases of its tick, like
+                       real players' (1 = all of a thread's bots at once) [8]
   --ramp R             bots joining per second (0 = all at once) [0]
   --duration S         seconds from start until every bot disconnects [60]
   --report S           report interval, seconds [5]
@@ -80,6 +84,7 @@ struct Totals {
     bytes_up: u64,
     rtt_sum: f64,
     loss_sum: f64,
+    /// Slots that ran into the next slot's time (the thread is behind).
     tick_overruns: u64,
     /// Bot threads' time spent working vs. elapsed, summed over threads.
     busy_us: u64,
@@ -426,6 +431,14 @@ fn bot_socket(server: SocketAddr, port: Option<u16>) -> std::io::Result<UdpSocke
     Ok(sock)
 }
 
+/// Each bot thread ticks its bots in this many groups by default (`--slots`),
+/// interleaved over the period, so the server sees inputs arrive at threads x
+/// slots phases of its tick, spread like real players'. With every bot of a
+/// thread at once, 4 threads on another machine made 4 phases, and the median
+/// input wait moved with where they fell in the server's tick (38 or 60 ms from
+/// run to run).
+const SLOTS: usize = 8;
+
 /// Datagrams received per `recvmmsg` call. A bot gets 2-3 per tick, so one
 /// call drains its socket without the extra empty `recv` that ends a loop.
 const RX_BATCH: usize = 8;
@@ -436,6 +449,7 @@ fn main() -> std::io::Result<()> {
     let count: usize = a.get("count", 1000);
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads: usize = a.get("threads", (cores / 2).clamp(1, 8));
+    let slots: usize = a.get::<usize>("slots", SLOTS).max(1);
     let ramp: f64 = a.get("ramp", 0.0);
     let duration = Duration::from_secs_f64(a.get("duration", 60.0));
     let report = Duration::from_secs_f64(a.get("report", 5.0));
@@ -457,7 +471,7 @@ fn main() -> std::io::Result<()> {
     }
 
     println!(
-        "{count} bots -> {server} on {threads} threads, ramp {ramp}/s, {duration:?}, {} full + {} sink bots",
+        "{count} bots -> {server} on {threads} threads x {slots} slots, ramp {ramp}/s, {duration:?}, {} full + {} sink bots",
         count.div_ceil(full_every),
         count - count.div_ceil(full_every)
     );
@@ -507,8 +521,11 @@ fn main() -> std::io::Result<()> {
             .collect();
         handles.push(std::thread::Builder::new().name(format!("bots-{t}")).spawn(move || -> std::io::Result<()> {
             let period = Duration::from_secs(1) / TICK_HZ;
-            // Spread the threads' ticks across the period, like real clients.
-            let mut next = start + period * t as u32 / threads as u32;
+            // Every bot once a period, a slot (every slots-th bot) at a time;
+            // thread t's slot s runs at (s + t / threads) / slots of the period.
+            let slot_period = period / slots as u32;
+            let mut next = start + slot_period * t as u32 / threads as u32;
+            let mut slot = 0;
             let mut rx = RecvBatch::new(RX_BATCH);
             let (mut busy, thread_start) = (Duration::ZERO, Instant::now());
             let mut overruns = 0;
@@ -529,7 +546,7 @@ fn main() -> std::io::Result<()> {
                     break;
                 }
                 let work = Instant::now();
-                for bot in &mut bots {
+                for bot in bots.iter_mut().skip(slot).step_by(slots) {
                     joins.extend(bot.tick(server, &login, &clocks, &mut rx)?);
                     if bot.sink {
                         continue;
@@ -551,7 +568,9 @@ fn main() -> std::io::Result<()> {
                     }
                 }
                 busy += work.elapsed();
-                next += period;
+                next += slot_period;
+                slot = (slot + 1) % slots;
+                // Behind schedule: this slot ran into the next one's time.
                 if Instant::now() > next {
                     overruns += 1;
                     next = Instant::now();

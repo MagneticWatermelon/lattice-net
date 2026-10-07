@@ -140,9 +140,13 @@ Stand-ins can exceed bot corrections: a stand-in whose input matches what the bo
 
   - **The tick got 12–13% faster:** the server runs one rayon thread per core, so the receive thread's CPU comes out of the tick.
   - **No errors:** 0 corrections, 0 late inputs, and no drops, errors or allowance limits on either card.
-  - **Input wait p50 isn't comparable between runs on the rig.** It came out 38–41 ms in some runs and 58–62 ms in others, in either mode, and the old `recv_from` rehearsal did the same (40 and 58.6 ms). p99 stays ~66–68 ms (uniform).
-  - **Why:** each bot thread sends its bots' inputs together, once per period. With 4 bot threads on another machine, arrivals come at 4 phases of the server's tick, set by where the two machines' ticks happen to fall, so the median moves with them. Real players' phases are spread out.
-  - On one box (WSL, 8 threads) the phases come out spread, and the p50 holds at ~50 ms.
+  - **Input wait p50 wasn't comparable between runs on the rig.** It came out 38–41 ms in some runs and 58–62 ms in others, in either mode, and the old `recv_from` rehearsal did the same (40 and 58.6 ms). p99 stayed ~66–68 ms (uniform).
+  - **Why:** each bot thread sent all its bots' inputs together, once per period. With 4 bot threads on another machine, arrivals came at only 4 phases of the server's tick, so the median moved with where those fell. Real players' phases are spread out.
+  - **Fixed (2026-10-07):** each bot thread now ticks its bots in 8 slots interleaved over the period (`lattice-bots --slots`; `--slots 1` is the old behaviour). That's threads × 8 phases.
+    - WSL, uniform 1k, 2 bot threads, 3 runs each:
+      - `--slots 1`: p10 / p50 / p90 of 56 / 59 / 66 ms in one run, 36–41 / 59–61 / 62–64 ms in the others;
+      - `--slots 8`: 36–38 / 49–50 / 63–66 ms in every run.
+    - The server summary now has `input_wait_p10_ms` and `input_wait_p90_ms`, so one run shows whether arrivals are spread.
 
   - **The wake-ups were the cost.** Batching alone barely moved the thread (3 datagrams a call, still 40% busy).
   - **The tick got faster** because WSL's oversubscribed cores got the time back. Expect less on bare metal.

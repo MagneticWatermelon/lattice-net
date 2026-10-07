@@ -1024,7 +1024,11 @@ fn summary_values(
         kv.put("discarded_inputs", e.discarded_inputs - w.discarded_inputs);
     }
     let ws = wait.summary();
+    // p10 and p90 too: arrivals spread over the tick make the wait roughly
+    // uniform over one period above the spare.
+    kv.put("input_wait_p10_ms", format!("{:.1}", wait.quantile(0.10) as f64 / 10.0));
     kv.put("input_wait_p50_ms", format!("{:.1}", ws.p50 as f64 / 10.0));
+    kv.put("input_wait_p90_ms", format!("{:.1}", wait.quantile(0.90) as f64 / 10.0));
     kv.put("input_wait_p99_ms", format!("{:.1}", ws.p99 as f64 / 10.0));
 
     // Whole run.
