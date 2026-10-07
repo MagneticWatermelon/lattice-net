@@ -17,6 +17,7 @@ use lattice_sim::bot::{BotBrain, ClientConfig, FightConfig, InputTiming};
 use lattice_sim::cli::{Args, HexKey};
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::stats::{summarize, Histogram, KeyValues};
+use lattice_sim::udp::{enable_rx_timestamps, Clocks, RecvBatch};
 
 const USAGE: &str = "\
 lattice-bots: M1 bot swarm
@@ -224,23 +225,6 @@ impl Latency {
     }
 }
 
-/// Converts kernel receive timestamps (wall clock) to `Instant`s, using one
-/// pair of clock readings per tick.
-struct Clocks {
-    instant: Instant,
-    system: SystemTime,
-}
-
-impl Clocks {
-    fn now() -> Self {
-        Self { instant: Instant::now(), system: SystemTime::now() }
-    }
-
-    fn instant_of(&self, t: SystemTime) -> Instant {
-        self.system.duration_since(t).map_or(self.instant, |ago| self.instant - ago)
-    }
-}
-
 /// Stands in for the login service: mints each bot's connect token.
 #[derive(Clone, Copy)]
 struct Login {
@@ -307,13 +291,13 @@ impl Bot {
         let (sock, client) = self.net.as_mut().unwrap();
         let brain = self.brain.as_mut().unwrap();
         loop {
-            match rx.recv(sock) {
+            match rx.recv(sock, false) {
                 Ok(n) => {
                     for i in 0..n {
                         // Pass the arrival time, not the tick: the transport's RTT
                         // (and the input -> applied estimate built on it) must not
                         // include the up-to-a-tick wait for our own tick.
-                        let (data, stamp) = rx.get(i);
+                        let (data, _, stamp) = rx.get(i);
                         client.receive(server, data, stamp.map_or(now, |t| clocks.instant_of(t)));
                     }
                     if n < RX_BATCH {
@@ -438,111 +422,13 @@ fn bot_socket(server: SocketAddr, port: Option<u16>) -> std::io::Result<UdpSocke
     };
     sock.connect(server)?;
     sock.set_nonblocking(true)?;
-    #[cfg(target_os = "linux")]
     enable_rx_timestamps(&sock)?;
     Ok(sock)
-}
-
-#[cfg(target_os = "linux")]
-fn enable_rx_timestamps(sock: &UdpSocket) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let on: libc::c_int = 1;
-    // SAFETY: a plain setsockopt with a valid fd and an int option value.
-    let r = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_TIMESTAMPNS,
-            &on as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 /// Datagrams received per `recvmmsg` call. A bot gets 2-3 per tick, so one
 /// call drains its socket without the extra empty `recv` that ends a loop.
 const RX_BATCH: usize = 8;
-
-/// Batched receive with the kernel's arrival timestamps (`SO_TIMESTAMPNS`).
-/// One per bot thread, reused for every bot.
-struct RecvBatch {
-    bufs: Vec<[u8; 1500]>,
-    lens: [usize; RX_BATCH],
-    stamps: [Option<SystemTime>; RX_BATCH],
-    #[cfg(target_os = "linux")]
-    control: Vec<[u64; 8]>,
-}
-
-impl RecvBatch {
-    fn new() -> Self {
-        Self {
-            bufs: vec![[0; 1500]; RX_BATCH],
-            lens: [0; RX_BATCH],
-            stamps: [None; RX_BATCH],
-            #[cfg(target_os = "linux")]
-            control: vec![[0; 8]; RX_BATCH],
-        }
-    }
-
-    fn get(&self, i: usize) -> (&[u8], Option<SystemTime>) {
-        (&self.bufs[i][..self.lens[i]], self.stamps[i])
-    }
-
-    /// Receives whatever is waiting, up to `RX_BATCH`, without blocking.
-    #[cfg(target_os = "linux")]
-    fn recv(&mut self, sock: &UdpSocket) -> std::io::Result<usize> {
-        use std::os::fd::AsRawFd;
-        let mut iovs: [libc::iovec; RX_BATCH] = std::array::from_fn(|i| libc::iovec {
-            iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
-            iov_len: self.bufs[i].len(),
-        });
-        let mut msgs: [libc::mmsghdr; RX_BATCH] = std::array::from_fn(|i| {
-            // SAFETY: msghdr is plain data; all-zero is a valid empty header.
-            let mut h: libc::msghdr = unsafe { std::mem::zeroed() };
-            h.msg_iov = &mut iovs[i];
-            h.msg_iovlen = 1;
-            h.msg_control = self.control[i].as_mut_ptr() as *mut libc::c_void;
-            h.msg_controllen = std::mem::size_of::<[u64; 8]>() as _;
-            libc::mmsghdr { msg_hdr: h, msg_len: 0 }
-        });
-        // SAFETY: every header points into `iovs` (into `self.bufs`) and
-        // `self.control`, all alive and unmoved for the duration of the call.
-        let n = unsafe {
-            libc::recvmmsg(sock.as_raw_fd(), msgs.as_mut_ptr(), RX_BATCH as u32, libc::MSG_DONTWAIT, std::ptr::null_mut())
-        };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        for (i, m) in msgs.iter().enumerate().take(n as usize) {
-            self.lens[i] = m.msg_len as usize;
-            self.stamps[i] = None;
-            // SAFETY: walking the control messages the kernel just wrote.
-            unsafe {
-                let mut c = libc::CMSG_FIRSTHDR(&m.msg_hdr);
-                while !c.is_null() {
-                    if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_TIMESTAMPNS {
-                        let ts: libc::timespec = std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::timespec);
-                        self.stamps[i] = Some(SystemTime::UNIX_EPOCH + Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
-                    }
-                    c = libc::CMSG_NXTHDR(&m.msg_hdr, c);
-                }
-            }
-        }
-        Ok(n as usize)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn recv(&mut self, sock: &UdpSocket) -> std::io::Result<usize> {
-        let n = sock.recv(&mut self.bufs[0])?;
-        (self.lens[0], self.stamps[0]) = (n, None);
-        Ok(1)
-    }
-}
 
 fn main() -> std::io::Result<()> {
     let mut a = Args::parse(USAGE);
@@ -623,7 +509,7 @@ fn main() -> std::io::Result<()> {
             let period = Duration::from_secs(1) / TICK_HZ;
             // Spread the threads' ticks across the period, like real clients.
             let mut next = start + period * t as u32 / threads as u32;
-            let mut rx = RecvBatch::new();
+            let mut rx = RecvBatch::new(RX_BATCH);
             let (mut busy, thread_start) = (Duration::ZERO, Instant::now());
             let mut overruns = 0;
             let mut joins = Vec::new();

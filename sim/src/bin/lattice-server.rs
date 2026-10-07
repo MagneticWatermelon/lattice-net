@@ -1,7 +1,8 @@
 //! M1 headless server: `SimServer` on a real UDP socket at 30 Hz, reporting
 //! per-phase tick times, bandwidth and pps.
 //!
-//! A dedicated thread blocks on `recv_from` and queues datagrams into per-shard
+//! A dedicated thread per socket receives in `recvmmsg` batches on Linux (each
+//! datagram stamped by the kernel on arrival) and queues them into per-shard
 //! buckets, so arrivals spread across the tick don't have to fit in the kernel
 //! buffer and routing costs no tick time. Egress is one rayon task per shard,
 //! batched with `sendmmsg` on Linux, optionally with GSO (`--egress gso`): each
@@ -21,6 +22,7 @@ use lattice_sim::interest::InterestConfig;
 use lattice_sim::ladder::{LadderConfig, RUNGS};
 use lattice_sim::server::{Counters, Datagram, InDatagram, SimConfig, SimServer, SpawnMode, PHASES};
 use lattice_sim::stats::{summarize, Histogram, KeyValues};
+use lattice_sim::udp::{enable_rx_timestamps, Clocks, RecvBatch};
 use rayon::prelude::*;
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -51,6 +53,12 @@ lattice-server: M1 movement-only authoritative server
   --egress MODE        gso | sendmmsg | sendto   [sendmmsg on Linux, else sendto]
                        gso: sendmmsg with one UDP_SEGMENT send per client (pads
                        all but a client's last packet to full size; Linux 4.18+)
+  --ingress MODE       recvmmsg | recvfrom   [recvmmsg on Linux, else recvfrom]
+                       recvmmsg: up to 64 datagrams per syscall, stamped by the kernel on
+                       arrival; recvfrom: one syscall per datagram, stamped when read
+  --rx-gather-us U     recvmmsg: after a batch that wasn't full, wait U microseconds so the
+                       next call finds a batch (a receive thread waking per datagram or
+                       three costs more than the receiving; 0 = receive again at once) [250]
   --duration S         stop after S seconds (0 = run forever) [0]
   --until-empty        stop once clients connected and then all left
   --report S           report interval, seconds [5]
@@ -108,6 +116,169 @@ impl std::str::FromStr for Egress {
             _ => Err(format!("unknown egress mode {s:?} (gso|sendmmsg|sendto)")),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ingress {
+    /// One `recv_from` syscall per datagram, stamped when it's read.
+    RecvFrom,
+    /// `recvmmsg` batches of up to `RX_BATCH`, stamped by the kernel when they
+    /// arrived (`SO_TIMESTAMPNS`), so time queued in the socket counts as
+    /// waiting (Linux only).
+    RecvMmsg,
+}
+
+impl Default for Ingress {
+    fn default() -> Self {
+        if cfg!(target_os = "linux") {
+            Ingress::RecvMmsg
+        } else {
+            Ingress::RecvFrom
+        }
+    }
+}
+
+impl std::str::FromStr for Ingress {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "recvfrom" => Ok(Ingress::RecvFrom),
+            "recvmmsg" if cfg!(target_os = "linux") => Ok(Ingress::RecvMmsg),
+            "recvmmsg" => Err("recvmmsg needs Linux".into()),
+            _ => Err(format!("unknown ingress mode {s:?} (recvmmsg|recvfrom)")),
+        }
+    }
+}
+
+/// Datagrams per `recvmmsg`. At 10k clients one socket takes ~300 a
+/// millisecond: with `--rx-gather-us` 250, a call finds ~75 queued.
+const RX_BATCH: usize = 64;
+
+/// What a receive thread needs: its socket, and where its group's datagrams go.
+struct Receiver {
+    sock: Arc<UdpSocket>,
+    group: usize,
+    per_group: usize,
+    router: lattice_net::Router,
+    inbox: Arc<Mutex<Vec<Vec<InDatagram>>>>,
+    net: Arc<NetCounters>,
+    stop: Arc<AtomicBool>,
+    /// recvmmsg: after a batch that wasn't full, sleep this long so the next
+    /// one finds more queued (zero: receive again at once). Waking is what a
+    /// receive thread pays for: on WSL at 150k pps, receiving whatever was there
+    /// (3 a call) kept it 40% busy, the same as `recv_from`; gathering for
+    /// 250 us (42 a call), 16%. The kernel's arrival stamps keep the waits exact,
+    /// and 250 us is under 1% of a tick.
+    gather: Duration,
+}
+
+impl Receiver {
+    fn run(&self, mode: Ingress) {
+        match mode {
+            Ingress::RecvFrom => self.each(),
+            Ingress::RecvMmsg => self.batched(),
+        }
+    }
+
+    /// One `recv_from`, one lock and one count per datagram.
+    fn each(&self) {
+        let mut buf = [0u8; 1500];
+        while !self.stop.load(Relaxed) {
+            match self.sock.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    // Arrival time: the start of the input's server-side wait and
+                    // of the transport's ack_delay.
+                    let arrived = Instant::now();
+                    self.net.in_pkts.fetch_add(1, Relaxed);
+                    self.net.in_bytes.fetch_add(n as u64, Relaxed);
+                    self.net.recv_calls.fetch_add(1, Relaxed);
+                    let shard = self.router.shard_in(self.group, &from) - self.group * self.per_group;
+                    self.inbox.lock().unwrap()[shard].push((from, arrived, buf[..n].to_vec()));
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
+                Err(_) => {
+                    self.net.recv_errors.fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Whatever is queued, up to `RX_BATCH`, per syscall; routed, then queued
+    /// under one lock and counted once.
+    fn batched(&self) {
+        let mut rx = RecvBatch::new(RX_BATCH);
+        let mut routed: Vec<(usize, InDatagram)> = Vec::with_capacity(RX_BATCH);
+        while !self.stop.load(Relaxed) {
+            let n = match rx.recv(&self.sock, true) {
+                Ok(n) => n,
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => continue,
+                Err(_) => {
+                    self.net.recv_errors.fetch_add(1, Relaxed);
+                    continue;
+                }
+            };
+            let clocks = Clocks::now();
+            let mut bytes = 0;
+            for i in 0..n {
+                let (data, from, stamp) = rx.get(i);
+                let Some(from) = from else { continue };
+                bytes += data.len();
+                // The kernel's arrival time: the input's server-side wait and the
+                // transport's ack_delay include time queued in the socket.
+                let arrived = stamp.map_or(clocks.instant, |t| clocks.instant_of(t));
+                let shard = self.router.shard_in(self.group, &from) - self.group * self.per_group;
+                routed.push((shard, (from, arrived, data.to_vec())));
+            }
+            self.net.in_pkts.fetch_add(n as u64, Relaxed);
+            self.net.in_bytes.fetch_add(bytes as u64, Relaxed);
+            self.net.recv_calls.fetch_add(1, Relaxed);
+            {
+                let mut inbox = self.inbox.lock().unwrap();
+                for (shard, d) in routed.drain(..) {
+                    inbox[shard].push(d);
+                }
+            }
+            if n < RX_BATCH && !self.gather.is_zero() {
+                std::thread::sleep(self.gather);
+            }
+        }
+    }
+}
+
+/// CPU time each receive thread has used so far (Linux; empty elsewhere).
+fn thread_cpu(threads: &[std::thread::JoinHandle<()>]) -> Vec<Duration> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::thread::JoinHandleExt;
+        threads
+            .iter()
+            .filter_map(|h| {
+                let mut clock: libc::clockid_t = 0;
+                // SAFETY: the thread is alive (joined only after the last call) and
+                // both out-pointers are valid.
+                let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+                let ok = unsafe {
+                    libc::pthread_getcpuclockid(h.as_pthread_t(), &mut clock) == 0 && libc::clock_gettime(clock, &mut ts) == 0
+                };
+                ok.then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = threads;
+        Vec::new()
+    }
+}
+
+/// The busiest and the mean receive thread's share of one core between two
+/// `thread_cpu` readings `secs` apart, in percent.
+fn busy_pct(from: &[Duration], to: &[Duration], secs: f64) -> Option<(f64, f64)> {
+    if from.is_empty() || from.len() != to.len() || secs <= 0.0 {
+        return None;
+    }
+    let pct: Vec<f64> = from.iter().zip(to).map(|(a, b)| 100.0 * b.saturating_sub(*a).as_secs_f64() / secs).collect();
+    Some((pct.iter().cloned().fold(0.0, f64::max), pct.iter().sum::<f64>() / pct.len() as f64))
 }
 
 /// What one bucket's egress took.
@@ -321,6 +492,8 @@ struct NetCounters {
     in_pkts: AtomicU64,
     in_bytes: AtomicU64,
     recv_errors: AtomicU64,
+    /// Receive syscalls that returned datagrams.
+    recv_calls: AtomicU64,
     send_errors: AtomicU64,
     /// Datagrams sent, and the sends (a GSO run counts once) and syscalls it took.
     out_pkts: AtomicU64,
@@ -332,6 +505,8 @@ fn main() -> std::io::Result<()> {
     let mut a = Args::parse(USAGE);
     let bind: SocketAddr = a.get("bind", "0.0.0.0:40000".parse().unwrap());
     let egress: Egress = a.get("egress", Egress::default());
+    let ingress: Ingress = a.get("ingress", Ingress::default());
+    let gather = Duration::from_micros(a.get("rx-gather-us", 250));
     let cfg = SimConfig {
         spawn: a.get("spawn", SpawnMode::Uniform),
         max_clients: a.get("max-clients", 10_000),
@@ -411,6 +586,9 @@ fn main() -> std::io::Result<()> {
         if egress == Egress::Gso && !gso_supported(&sock) {
             return Err(std::io::Error::other("--egress gso: this kernel has no UDP_SEGMENT (needs Linux 4.18+)"));
         }
+        if ingress == Ingress::RecvMmsg {
+            enable_rx_timestamps(&sock)?;
+        }
         sock.set_read_timeout(Some(Duration::from_millis(50)))?;
         socks.push(Arc::new(sock));
     }
@@ -424,7 +602,7 @@ fn main() -> std::io::Result<()> {
     let start = Instant::now();
 
     println!(
-        "listening on {bind} | spawn {:?} | tiers near {}@{} m, mid {} m, far {} m, budget {} B/tick, squads of {} | {} rayon threads, {shards} shards, {groups} socket(s), {} accepts/tick, egress {egress:?} | socket buffers rcv {} KiB snd {} KiB",
+        "listening on {bind} | spawn {:?} | tiers near {}@{} m, mid {} m, far {} m, budget {} B/tick, squads of {} | {} rayon threads, {shards} shards, {groups} socket(s), {} accepts/tick, egress {egress:?}, ingress {ingress:?} | socket buffers rcv {} KiB snd {} KiB",
         cfg.spawn,
         cfg.interest.near_per_tick,
         cfg.interest.near_radius,
@@ -450,28 +628,17 @@ fn main() -> std::io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let mut receivers = Vec::with_capacity(groups);
     for (group, sock) in socks.iter().enumerate() {
-        let (sock, net, inbox, stop) = (sock.clone(), net.clone(), inboxes[group].clone(), stop.clone());
-        let router = sim.router();
-        receivers.push(std::thread::Builder::new().name(format!("ingress-{group}")).spawn(move || {
-            let mut buf = [0u8; 1500];
-            while !stop.load(Relaxed) {
-                match sock.recv_from(&mut buf) {
-                    Ok((n, from)) => {
-                        // Arrival time: the start of the input's server-side wait and
-                        // of the transport's ack_delay.
-                        let arrived = Instant::now();
-                        net.in_pkts.fetch_add(1, Relaxed);
-                        net.in_bytes.fetch_add(n as u64, Relaxed);
-                        let shard = router.shard_in(group, &from) - group * per_group;
-                        inbox.lock().unwrap()[shard].push((from, arrived, buf[..n].to_vec()));
-                    }
-                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-                    Err(_) => {
-                        net.recv_errors.fetch_add(1, Relaxed);
-                    }
-                }
-            }
-        })?);
+        let rx = Receiver {
+            sock: sock.clone(),
+            group,
+            per_group,
+            router: sim.router(),
+            inbox: inboxes[group].clone(),
+            net: net.clone(),
+            stop: stop.clone(),
+            gather,
+        };
+        receivers.push(std::thread::Builder::new().name(format!("ingress-{group}")).spawn(move || rx.run(ingress))?);
     }
 
     let mut csv = csv_path.map(open_csv).transpose()?;
@@ -491,7 +658,7 @@ fn main() -> std::io::Result<()> {
     let mut kept_rewind = [Histogram::new(1000), Histogram::new(1000)];
     let mut kept_overruns = 0u64;
     let mut out: Vec<Vec<Datagram>> = vec![Vec::new(); shards];
-    let mut window = Window::new(start, &sim, &net);
+    let mut window = Window::new(start, &sim, &net, thread_cpu(&receivers));
     let mut kept: Vec<Row> = Vec::new();
     // Per steady tick, for ingress, assembly, transport and egress: the longest
     // shard task and the total of all tasks, in microseconds.
@@ -577,14 +744,14 @@ fn main() -> std::io::Result<()> {
         window.client_ticks += clients as u64;
         if warm.is_some() && cool.is_none() && clients < peak_clients * 9 / 10 {
             cool = Some(sim.counters().clone());
-            steady_state.net_end = Some(net_snapshot(&net));
+            steady_state.net_end = Some(net_snapshot(&net, &receivers));
         }
         let steady = |warm: &Option<Counters>, cool: &Option<Counters>| warm.is_some() && cool.is_none();
         if clients > 0 {
             let first = *first_client.get_or_insert(now);
             if now - first >= warmup && cool.is_none() {
                 warm.get_or_insert_with(|| sim.counters().clone());
-                steady_state.net_start.get_or_insert_with(|| net_snapshot(&net));
+                steady_state.net_start.get_or_insert_with(|| net_snapshot(&net, &receivers));
                 steady_state.first.get_or_insert(now);
                 steady_state.last = Some(done);
                 steady_state.client_ticks += clients as u64;
@@ -607,8 +774,9 @@ fn main() -> std::io::Result<()> {
                 kept_wait.merge(&wait);
                 kept_rewind.iter_mut().zip(&rewind).for_each(|(k, r)| k.merge(r));
             }
-            window.report(done - start, &sim, &wait, &net, csv.as_mut())?;
-            window = Window::new(done, &sim, &net);
+            let cpu = thread_cpu(&receivers);
+            window.report(done - start, &sim, &wait, &net, &cpu, csv.as_mut())?;
+            window = Window::new(done, &sim, &net, cpu);
         }
 
         let finished = (!duration.is_zero() && done - start >= duration) || (until_empty && peak_clients > 0 && clients == 0);
@@ -632,15 +800,16 @@ fn main() -> std::io::Result<()> {
             kept_wait.merge(&wait);
             kept_rewind.iter_mut().zip(&rewind).for_each(|(k, r)| k.merge(r));
         }
-        window.report(Instant::now() - start, &sim, &wait, &net, csv.as_mut())?;
+        window.report(Instant::now() - start, &sim, &wait, &net, &thread_cpu(&receivers), csv.as_mut())?;
     }
+    // Before the receive threads end: their CPU clocks go with them.
+    steady_state.net_end.get_or_insert_with(|| net_snapshot(&net, &receivers));
     stop.store(true, Relaxed);
     for r in receivers {
         let _ = r.join();
     }
     if let Some(path) = summary_path {
-        steady_state.net_end.get_or_insert_with(|| net_snapshot(&net));
-        let run = RunInfo { egress, peak_clients, overruns: kept_overruns };
+        let run = RunInfo { egress, ingress, gather, peak_clients, overruns: kept_overruns };
         let mut kv = summary_values(&kept, &run, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net, &steady_state);
         for (tier, h) in ["near", "mid"].iter().zip(&kept_rewind) {
             let r = h.summary();
@@ -691,18 +860,33 @@ struct Steady {
     /// Ticks run at each ladder level.
     level_ticks: [u64; RUNGS.len()],
     /// `net_snapshot` when the steady state began and ended.
-    net_start: Option<[u64; 4]>,
-    net_end: Option<[u64; 4]>,
+    net_start: Option<NetSnap>,
+    net_end: Option<NetSnap>,
 }
 
-/// Datagrams and bytes received, and the kernel's UDP drops so far.
-fn net_snapshot(net: &NetCounters) -> [u64; 4] {
+/// What had been received so far, and what receiving had cost.
+struct NetSnap {
+    at: Instant,
+    /// Datagrams, bytes and receive syscalls, then the kernel's UDP receive and
+    /// send buffer drops.
+    counters: [u64; 5],
+    /// CPU time of each receive thread.
+    cpu: Vec<Duration>,
+}
+
+fn net_snapshot(net: &NetCounters, receivers: &[std::thread::JoinHandle<()>]) -> NetSnap {
     let [rcv, snd] = kernel_udp_drops();
-    [net.in_pkts.load(Relaxed), net.in_bytes.load(Relaxed), rcv, snd]
+    NetSnap {
+        at: Instant::now(),
+        counters: [net.in_pkts.load(Relaxed), net.in_bytes.load(Relaxed), net.recv_calls.load(Relaxed), rcv, snd],
+        cpu: thread_cpu(receivers),
+    }
 }
 
 struct RunInfo {
     egress: Egress,
+    ingress: Ingress,
+    gather: Duration,
     peak_clients: usize,
     /// Steady-state ticks over their period.
     overruns: u64,
@@ -723,6 +907,8 @@ fn summary_values(
     let cfg = sim.config();
     kv.put("spawn", format!("{:?}", cfg.spawn).to_lowercase());
     kv.put("egress", format!("{:?}", run.egress).to_lowercase());
+    kv.put("ingress", format!("{:?}", run.ingress).to_lowercase());
+    kv.put("rx_gather_us", run.gather.as_micros());
     kv.put("ladder", if cfg.ladder.enabled { "on" } else { "off" });
     kv.put("threads", rayon::current_num_threads());
     kv.put("shards", cfg.shards);
@@ -757,8 +943,9 @@ fn summary_values(
     let ticks = kept.len().max(1) as f64;
     let clients_avg = steady.client_ticks as f64 / ticks;
     let per_client_secs = (clients_avg * secs).max(1e-9);
-    let [in0, inb0, rcv0, snd0] = steady.net_start.unwrap_or_default();
-    let [in1, inb1, rcv1, snd1] = steady.net_end.unwrap_or_default();
+    let counters = |s: &Option<NetSnap>| s.as_ref().map_or([0; 5], |s| s.counters);
+    let [in0, inb0, calls0, rcv0, snd0] = counters(&steady.net_start);
+    let [in1, inb1, calls1, rcv1, snd1] = counters(&steady.net_end);
     kv.put("clients_avg", format!("{clients_avg:.0}"));
     kv.put("out_pps", format!("{:.0}", steady.out_pkts as f64 / secs.max(1e-9)));
     kv.put("in_pps", format!("{:.0}", in1.saturating_sub(in0) as f64 / secs.max(1e-9)));
@@ -767,6 +954,15 @@ fn summary_values(
     kv.put("wire_bytes_per_client_tick", format!("{:.0}", steady.out_bytes as f64 / steady.client_ticks.max(1) as f64));
     kv.put("down_kbps_per_client", format!("{:.1}", steady.out_bytes as f64 * 8.0 / 1000.0 / per_client_secs));
     kv.put("up_kbps_per_client", format!("{:.1}", inb1.saturating_sub(inb0) as f64 * 8.0 / 1000.0 / per_client_secs));
+    kv.put("recv_per_call", format!("{:.2}", in1.saturating_sub(in0) as f64 / calls1.saturating_sub(calls0).max(1) as f64));
+    // How much of a core each receive thread used: near 100% means one socket
+    // can't keep up (more --sockets).
+    if let (Some(a), Some(b)) = (&steady.net_start, &steady.net_end) {
+        if let Some((max, mean)) = busy_pct(&a.cpu, &b.cpu, (b.at - a.at).as_secs_f64()) {
+            kv.put("ingress_thread_busy_max_pct", format!("{max:.1}"));
+            kv.put("ingress_thread_busy_mean_pct", format!("{mean:.1}"));
+        }
+    }
     kv.put("kernel_rcvbuf_drops", rcv1.saturating_sub(rcv0));
     kv.put("kernel_sndbuf_drops", snd1.saturating_sub(snd0));
 
@@ -843,6 +1039,9 @@ struct Window {
     counters: Counters,
     in_pkts: u64,
     in_bytes: u64,
+    recv_calls: u64,
+    /// Receive threads' CPU time at the start.
+    cpu: Vec<Duration>,
     kernel: [u64; 2],
     deferred: u64,
     level_min: u8,
@@ -850,7 +1049,7 @@ struct Window {
 }
 
 impl Window {
-    fn new(start: Instant, sim: &SimServer, net: &NetCounters) -> Self {
+    fn new(start: Instant, sim: &SimServer, net: &NetCounters, cpu: Vec<Duration>) -> Self {
         Self {
             start,
             rows: Vec::new(),
@@ -861,6 +1060,8 @@ impl Window {
             counters: sim.counters().clone(),
             in_pkts: net.in_pkts.load(Relaxed),
             in_bytes: net.in_bytes.load(Relaxed),
+            recv_calls: net.recv_calls.load(Relaxed),
+            cpu,
             kernel: kernel_udp_drops(),
             deferred: sim.net().deferred_accepts(),
             level_min: sim.level(),
@@ -874,6 +1075,7 @@ impl Window {
         sim: &SimServer,
         wait: &Histogram,
         net: &NetCounters,
+        cpu: &[Duration],
         csv: Option<&mut BufWriter<File>>,
     ) -> std::io::Result<()> {
         let ws = wait.summary();
@@ -885,6 +1087,8 @@ impl Window {
         let c = sim.counters();
         let in_pkts = net.in_pkts.load(Relaxed) - self.in_pkts;
         let in_bytes = net.in_bytes.load(Relaxed) - self.in_bytes;
+        let per_call = in_pkts as f64 / (net.recv_calls.load(Relaxed) - self.recv_calls).max(1) as f64;
+        let busy = busy_pct(&self.cpu, cpu, secs);
         let (repeated, frozen) = (c.repeated - self.counters.repeated, c.frozen - self.counters.frozen);
         let entity_ticks = ((c.inputs_applied - self.counters.inputs_applied) + repeated + frozen).max(1) as f64;
         let (repeated_pct, frozen_pct) = (100.0 * repeated as f64 / entity_ticks, 100.0 * frozen as f64 / entity_ticks);
@@ -910,7 +1114,7 @@ impl Window {
             .collect();
         let tick = sums[COLS - 1];
         println!(
-            "[{:>5.0}s] clients {} | level {} ({}-{} in window: {} Hz, dilation {:.1}), pace {:.2}, {:.1}% clients bandwidth-degraded | tick p50 {} p99 {} max {} ms, {} overruns | out {:.1}k pps {:.0} kbps/client, {:.0} Mbps | in {:.1}k pps {:.0} kbps/client | stand-ins: repeated {:.2}% frozen {:.2}%, {} late inputs | per client-tick: {:.0} B (near {:.0} B, {:.0}% deltas), near {:.1} mid {:.1} far {:.1}, far skipped {} starved {} | input wait p50 {:.1} p99 {:.1} ms | {} joins deferred | kernel drops rcv {} snd {}",
+            "[{:>5.0}s] clients {} | level {} ({}-{} in window: {} Hz, dilation {:.1}), pace {:.2}, {:.1}% clients bandwidth-degraded | tick p50 {} p99 {} max {} ms, {} overruns | out {:.1}k pps {:.0} kbps/client, {:.0} Mbps | in {:.1}k pps {:.0} kbps/client, {:.1} per recv, receive thread busy {} | stand-ins: repeated {:.2}% frozen {:.2}%, {} late inputs | per client-tick: {:.0} B (near {:.0} B, {:.0}% deltas), near {:.1} mid {:.1} far {:.1}, far skipped {} starved {} | input wait p50 {:.1} p99 {:.1} ms | {} joins deferred | kernel drops rcv {} snd {}",
             t.as_secs_f64(),
             sim.client_count(),
             sim.level(),
@@ -929,6 +1133,8 @@ impl Window {
             self.out_bytes as f64 * 8.0 / 1e6 / secs,
             in_pkts as f64 / secs / 1000.0,
             up_kbps,
+            per_call,
+            busy.map_or("?".to_string(), |(max, _)| format!("{max:.0}%")),
             repeated_pct,
             frozen_pct,
             late,
@@ -956,7 +1162,7 @@ impl Window {
                 line += &format!(",{},{},{}", s.p50, s.p99, s.max);
             }
             line += &format!(
-                ",{:.0},{:.0},{:.1},{:.1},{:.1},{:.3},{:.3},{},{:.0},{:.1},{:.1},{:.1},{},{},{:.1},{:.1},{},{},{},{},{},{:.3},{:.4}",
+                ",{:.0},{:.0},{:.1},{:.1},{:.1},{:.3},{:.3},{},{:.0},{:.1},{:.1},{:.1},{},{},{:.1},{:.1},{},{},{},{},{},{:.3},{:.4},{:.2},{:.1}",
                 self.out_pkts as f64 / secs,
                 in_pkts as f64 / secs,
                 down_kbps,
@@ -979,7 +1185,9 @@ impl Window {
                 sim.level(),
                 rung.tick_hz,
                 sim.pace(),
-                degraded
+                degraded,
+                per_call,
+                busy.map_or(0.0, |(max, _)| max)
             );
             writeln!(w, "{line}")?;
             w.flush()?;
@@ -997,7 +1205,7 @@ fn open_csv(path: String) -> std::io::Result<BufWriter<File>> {
             let n = col_name(i);
             h += &format!(",{n}_p50_us,{n}_p99_us,{n}_max_us");
         }
-        h += ",out_pps,in_pps,down_kbps_per_client,up_kbps_per_client,egress_mbps,repeated_pct,frozen_pct,late_inputs,snapshot_bytes_per_tick,near_per_tick,mid_per_tick,far_per_tick,far_skipped,far_starved,input_wait_p50_ms,input_wait_p99_ms,deferred_accepts,kernel_rcvbuf_drops,kernel_sndbuf_drops,level,tick_hz,pace,degraded_client_share";
+        h += ",out_pps,in_pps,down_kbps_per_client,up_kbps_per_client,egress_mbps,repeated_pct,frozen_pct,late_inputs,snapshot_bytes_per_tick,near_per_tick,mid_per_tick,far_per_tick,far_skipped,far_starved,input_wait_p50_ms,input_wait_p99_ms,deferred_accepts,kernel_rcvbuf_drops,kernel_sndbuf_drops,level,tick_hz,pace,degraded_client_share,recv_per_call,receive_thread_busy_max_pct";
         writeln!(w, "{h}")?;
     }
     Ok(w)
@@ -1044,6 +1252,8 @@ fn print_summary(
         "  egress (whole run): {pkts} datagrams in {sends} sends ({:.2} per send), {calls} syscalls",
         pkts as f64 / sends.max(1) as f64
     );
+    let (got, calls) = (net.in_pkts.load(Relaxed), net.recv_calls.load(Relaxed));
+    println!("  ingress (whole run): {got} datagrams in {calls} receive calls ({:.2} per call)", got as f64 / calls.max(1) as f64);
     let levels: Vec<String> = c
         .level_ticks
         .iter()

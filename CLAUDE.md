@@ -40,7 +40,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   2. per-connection bandwidth budget (token bucket)
   3. fragmentation for >1.2 KB messages
   4. serialize-once fan-out without copying bodies
-  5. syscall batching: `recvmmsg` (`SO_REUSEPORT` socket groups are built)
+  5. ~~syscall batching~~ (done: `sendmmsg`, GSO, `SO_REUSEPORT` socket groups, `recvmmsg`)
 - **Done:**
   - **Connect tokens and sealed packets (protocol `LATTICE3`).**
     - **Tokens:** netcode.io-style (`token.rs`). ChaCha20-Poly1305 under a key the login service shares with the servers, holding the user id, both connection keys and 32 B of user data. Server id and expiry are clear associated data.
@@ -50,6 +50,11 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
   - Connection sharding: `Server` is N `Shard`s routed by a keyed address hash, and the sim drives them from rayon.
   - Accept budget per tick (`Config::max_accepts_per_tick`).
   - `sendmmsg` egress.
+  - **`recvmmsg` ingress** (2026-10-07, `lattice-server --ingress`, default on Linux).
+    - **How:** up to 64 datagrams a call, kernel arrival stamps (`SO_TIMESTAMPNS`, so input waits and `ack_delay` count time queued in the socket), then a 250 µs gather after a short batch (`--rx-gather-us`).
+    - **Why the gather:** waking was the receive thread's cost, not syscalls. On WSL, 150k pps: 40% → 16% of a core; 3k blob 32% → 11%.
+    - **Measured:** each thread's CPU share (`ingress_thread_busy_*_pct`) and datagrams per call, in summary.md's Ingress table.
+    - **Shared code:** `sim/src/udp.rs`, also used by the bots.
   - Connection memory ~130 → ~36 KB: windows of 256 sent / 128 received / 256 reliable, reliable ids inline, reliable windows lazy.
   - A per-shard connection pool (`Server::preallocate`); an accept costs about 4 µs.
   - `ack_delay` in the header, so RTT excludes the peer's hold.

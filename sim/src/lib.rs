@@ -16,6 +16,7 @@ pub mod rng;
 pub mod server;
 pub mod shots;
 pub mod stats;
+pub mod udp;
 
 // The shared game rules live in `lattice-game`; re-exported so the server and
 // bots keep their paths.

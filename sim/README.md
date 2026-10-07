@@ -29,7 +29,7 @@ cargo run --release --bin lattice-bots -- --help
 | transport | each shard's `send` + `flush`: framing, acks, sealing | per shard |
 | egress | `send_to` per packet (in the binary) | per shard |
 
-The transport is 64 `lattice_net::Shard`s by default (`--shards`). The binary's receive thread buckets each datagram by `Router::shard`, so routing costs no tick time.
+The transport is 64 `lattice_net::Shard`s by default (`--shards`). The binary's receive thread buckets each datagram by `Router::shard`, so routing costs no tick time. It receives with `recvmmsg` (`--ingress`, default on Linux): up to 64 datagrams a call, each stamped by the kernel on arrival, then a 250 µs wait after a short batch (`--rx-gather-us`) so the next call finds a batch.
 
 Shots and event application (phases 3–4) arrive with M3.
 
@@ -99,12 +99,31 @@ Stand-ins can exceed bot corrections: a stand-in whose input matches what the bo
 - At exit, p50/p99/max per phase over the **steady state**: after warmup, and before clients drain below 90% of peak. A mass disconnect loses some Disconnect packets, and those entities sit frozen until they time out, so the drain is left out.
 - The system-wide kernel `RcvbufErrors`/`SndbufErrors` deltas from `/proc/net/snmp`.
 - **Joins deferred** by the accept budget (`--accepts-per-tick`, default 256 per tick server-wide).
-- **Input wait**: from an input's datagram arriving (stamped by the receive thread) to the tick that applies it.
+- **Input wait**: from an input's datagram arriving to the tick that applies it. With `recvmmsg` the kernel stamps the arrival (`SO_TIMESTAMPNS`), so time queued in the socket counts; with `--ingress recvfrom` the receive thread stamps it when read.
+- **Ingress**: datagrams per receive call, and each receive thread's CPU time as a share of one core (`ingress_thread_busy_max_pct`; near 100% means that socket can't keep up: add `--sockets`).
 - **The ladder**: level, tick rate, dilation and pace per window, the share of clients degraded by their own bandwidth ladder, and ticks spent at each level.
 
 **Threads and sockets:**
 - `--threads` defaults to one per physical core; SMT siblings only add scheduler overhead.
 - `--sockets N` opens N receiving sockets on the port (`SO_REUSEPORT`). Each has its own receive thread and an equal run of the shards, and each shard sends from its group's socket.
+- **`recvmmsg` ingress** (2026-10-07, WSL, same load, A/B against `--ingress recvfrom`):
+
+  | run | receive calls | datagrams per call | receive thread busy | tick p50 / p99 |
+  |---|---|---|---|---|
+  | uniform 5k, `recvfrom` | 150k/s | 1 | 39.7% | 19.9 / 22.6 ms |
+  | uniform 5k, `recvmmsg`, no gather | 48k/s | 3.1 | 40.4% | 18.6 / 20.7 ms |
+  | uniform 5k, gather 250 µs | 3.5k/s | 42 | 15.8% | 16.7 / 20.1 ms |
+  | uniform 5k, gather 1 ms | 2.7k/s | 55 | 13.0% | 16.2 / 20.4 ms |
+  | uniform 5k, gather 250 µs, `--sockets 4` | 11.6k/s | 13 | 7.9% each | 16.6 / 19.1 ms |
+  | blob 3k, `recvfrom` | 90k/s | 1 | 32.5% | 20.2 / 22.8 ms |
+  | blob 3k, gather 250 µs | 3.1k/s | 29 | 11.3% | 16.3 / 18.8 ms |
+
+  - **The wake-ups were the cost.** Batching alone barely moved the thread (3 datagrams a call, still 40% busy).
+  - **The tick got faster** because WSL's oversubscribed cores got the time back. Expect less on bare metal.
+  - **Waits stay exact.** Input wait is unchanged: p50 ~50 ms, p99 ~66 ms.
+  - **No errors:** 0 corrections, 0 kernel drops, 0 late inputs.
+  - **Still per datagram:** a `Vec` per datagram and the keyed hash route. Pooled buffers are the next step if the 10k bare-metal run shows a busy thread.
+  - M3e's `m3e-uniform-10k-recvfrom` repeats the A/B at 10k.
 
 **Phase breakdown:**
 - For the phases split by shard (ingress, assembly, transport, egress), the server records the longest shard task and the total work each tick.

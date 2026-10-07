@@ -32,11 +32,12 @@
 #           latency costs in a real fight: shots into the already dead), and a
 #           lethal uniform 5k (load), 60 s each. summary.md gets a Fights table.
 #   fight-quick   one short immortal fight of 300 in a 60 m disk
-#   m3e     M3's pass bars at scale (~11 min, for bare metal): uniform 10k with
+#   m3e     M3's pass bars at scale (~12 min, for bare metal): uniform 10k with
 #           20% firing (and 200 aiming fighters), a 3k blob all firing (300
 #           aiming), a lethal 3k blob in latency classes (20 / 100 / 150 ms
 #           RTT, fairness under real load), and uniform 10k with --sockets 1 /
-#           4 / 8 / 16 (no fire, comparable with the 2026-10-04 baselines)
+#           4 / 8 / 16 and with --ingress recvfrom (no fire, comparable with
+#           the 2026-10-04 baselines)
 #
 # Writes baselines/<date>-<name>/ (name defaults to the host name):
 #   env.txt      the machine and the preflight checks (scripts/preflight.sh)
@@ -120,6 +121,7 @@ elif [ "$mode" = m3e ]; then
     "m3e-uniform-10k-sockets-4|uniform|10000|--sockets 4|"
     "m3e-uniform-10k-sockets-8|uniform|10000|--sockets 8|"
     "m3e-uniform-10k-sockets-16|uniform|10000|--sockets 16|"
+    "m3e-uniform-10k-recvfrom|uniform|10000|--sockets 1 --ingress recvfrom|"
   )
   max_bots=10000
 elif [ "$mode" = fight-quick ]; then
@@ -393,6 +395,21 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
           'BEGIN {if (l == "-") {print o; exit} i = (l > k / t) ? l : k / t; printf "%.2f", o + w - i}')
       done
       echo "| $id #$r | $th | $(kv "$s" tick_p50_ms) | $(cell ingress) | $(cell assembly) | $(cell transport) | $(cell egress) | $over | $serial |"
+    done
+  done
+  echo
+  echo "## Ingress"
+  echo
+  echo "One receive thread per socket (\`--sockets\`). recvmmsg gathers for \`--rx-gather-us\` after a short batch; busy is each thread's CPU time over the steady state (near 100%: that socket can't keep up)."
+  echo
+  echo "| run | ingress | sockets | in kpps | datagrams per call | receive thread busy max / mean |"
+  echo "|---|---|---|---|---|---|"
+  for r in $(seq 1 "$repeat"); do
+    for spec in "${runs[@]}"; do
+      IFS='|' read -r id _ _ _ _ <<< "$spec"
+      s=$dir/$id-$r/server.summary
+      [ -f "$s" ] || continue
+      echo "| $id #$r | $(kv "$s" ingress) ($(kv "$s" rx_gather_us) us) | $(kv "$s" sockets) | $(kilo "$(kv "$s" in_pps)") | $(kv "$s" recv_per_call) | $(kv "$s" ingress_thread_busy_max_pct)% / $(kv "$s" ingress_thread_busy_mean_pct)% |"
     done
   done
   echo
