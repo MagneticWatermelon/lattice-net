@@ -1495,7 +1495,9 @@ fn a_shooter_joins_its_targets_near_tier() {
 /// with the same aim error in a 40 m disk; everyone invulnerable (hit rates
 /// then measure aim and lag compensation, not respawns). Returns per class
 /// (shots, hits, near rewind p50 ms) and the rewinds capped.
-fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64) {
+/// Per class (shots, hits, hits' near rewind p50 in ms), then rewinds capped
+/// and rewinds trimmed during the fight.
+fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64, u64) {
     use lattice_sim::bot::FightConfig;
     let n = 9 * lags.len();
     let interest = InterestConfig { squad_size: 0, ..Default::default() };
@@ -1515,7 +1517,7 @@ fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64) {
         s.server.set_invulnerable(e, true);
     }
     s.server.take_hits();
-    let capped0 = s.server.counters().rewinds_capped;
+    let (capped0, trimmed0) = (s.server.counters().rewinds_capped, s.server.counters().rewinds_trimmed);
     let shots0: Vec<u64> = s.bots.iter().map(|(_, _, b)| b.stats().shots).collect();
     for _ in 0..secs * TICK_HZ {
         s.step();
@@ -1534,18 +1536,19 @@ fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64) {
         rw.clear();
         (shots, hits, p50)
     }).collect();
-    (out, s.server.counters().rewinds_capped - capped0)
+    let c = s.server.counters();
+    (out, c.rewinds_capped - capped0, c.rewinds_trimmed - trimmed0)
 }
 
 #[test]
 #[ignore = "measurement: cargo test --release --test swarm fight_classes_sweep -- --ignored --nocapture"]
 fn fight_classes_sweep() {
     let lags = [0, 1, 4, 6];
-    let (per, capped) = fight(&lags, 30);
+    let (per, capped, trimmed) = fight(&lags, 30);
     for (lag, (shots, hits, rw)) in lags.iter().zip(&per) {
         eprintln!("one-way {} ms: {hits} of {shots} shots hit ({:.1}%), hits' near rewind p50 {rw:.0} ms", lag * 33, 100.0 * *hits as f64 / *shots as f64);
     }
-    eprintln!("rewinds capped: {capped}");
+    eprintln!("rewinds capped: {capped}, trimmed: {trimmed}");
 }
 
 #[test]
@@ -1554,9 +1557,13 @@ fn latency_classes_hit_alike_within_the_cap() {
     // compensated (rewinds under the 300 ms near cap) and must hit alike;
     // ~300 ms RTT is ~100 ms past the cap: aiming at what it draws (not
     // leading by the clipped time), it hits measurably less.
-    let (per, capped) = fight(&[0, 1, 4], 20);
+    let (per, capped, trimmed) = fight(&[0, 1, 4], 20);
     let rate: Vec<f64> = per.iter().map(|&(shots, hits, _)| hits as f64 / shots as f64).collect();
-    eprintln!("hit rates by class: {rate:?}, rewinds capped {capped}");
+    eprintln!("hit rates by class: {rate:?}, rewinds capped {capped}, trimmed {trimmed}");
+    // Honest shooters at every RTT: past the cap they lead, never trimmed
+    // (the mid lag used to jump while the near clock slewed to a new delay,
+    // claiming mid targets up to a step past their delay).
+    assert_eq!(trimmed, 0, "an honest fighter is never trimmed");
     assert!(per.iter().all(|p| p.0 > 600), "{per:?}");
     assert!((rate[0] - rate[1]).abs() <= 0.1 * rate[0], "within the cap, alike: {rate:?}");
     assert!(rate[2] < 0.8 * rate[0], "past the cap, measurably less: {rate:?}");

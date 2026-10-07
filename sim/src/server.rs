@@ -276,6 +276,8 @@ pub struct Counters {
     /// Shots whose claimed render time was older than the shooter could
     /// plausibly have seen (a "backtrack" cheat): trimmed to what it could.
     pub rewinds_trimmed: u64,
+    /// Of those, the ones whose larger excess was the mid/far claim.
+    pub rewinds_trimmed_mid: u64,
     /// Projectile segments flown and player candidates tested.
     pub segments: u64,
     pub candidates: u64,
@@ -745,6 +747,8 @@ pub struct SimServer {
     /// Rewinds (see `InputQueue::rewind`) for near and for mid/far targets
     /// since the last `take_rewind`, in ms of game time.
     rewind: [Histogram; 2],
+    /// Trimmed shots: how far past the plausible bound they claimed, in 0.1 steps.
+    trim_excess: Histogram,
     /// The shared spatial index (all entities).
     grid: Grid,
     /// Networking's views of it: entities due this tick for mid and for far.
@@ -791,6 +795,7 @@ impl SimServer {
             shard_events: (0..cfg.shards).map(|_| Vec::new()).collect(),
             input_wait: Histogram::new(INPUT_WAIT_CAP),
             rewind: [Histogram::new(REWIND_CAP_MS), Histogram::new(REWIND_CAP_MS)],
+            trim_excess: Histogram::new(200),
             rng: Rng::new(cfg.seed),
             cfg,
             tick: 0,
@@ -918,6 +923,11 @@ impl SimServer {
     /// How far back each applied input's render steps were, for near and
     /// for mid/far targets (what lag compensation rewinds each by), in ms of
     /// game time, since the last call.
+    /// Trimmed shots' excess over the plausible bound, in 0.1 steps (whole run).
+    pub fn trim_excess(&self) -> &Histogram {
+        &self.trim_excess
+    }
+
     pub fn take_rewind(&mut self) -> [Histogram; 2] {
         std::mem::replace(&mut self.rewind, [Histogram::new(REWIND_CAP_MS), Histogram::new(REWIND_CAP_MS)])
     }
@@ -1301,6 +1311,10 @@ impl SimServer {
             self.counters.shots_late += f.late as u64;
             self.counters.rewinds_capped += cut.capped as u64;
             self.counters.rewinds_trimmed += cut.trimmed as u64;
+            if cut.trimmed {
+                self.counters.rewinds_trimmed_mid += cut.mid as u64;
+                self.trim_excess.record((cut.excess * 10.0).round() as u32);
+            }
         }
         if self.projectiles.is_empty() {
             return span(t0.elapsed());

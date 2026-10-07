@@ -1042,6 +1042,7 @@ fn summary_values(
         ("shots_refused", c.shots_refused),
         ("rewinds_capped", c.rewinds_capped),
         ("rewinds_trimmed", c.rewinds_trimmed),
+        ("rewinds_trimmed_mid", c.rewinds_trimmed_mid),
         ("hits_head", c.hits_head),
         ("hits_body", c.hits_body),
         ("hits_ground", c.hits_ground),
@@ -1061,6 +1062,10 @@ fn summary_values(
     ] {
         kv.put(k, v);
     }
+    let te = sim.trim_excess();
+    kv.put("trim_excess_p50_steps", format!("{:.1}", te.quantile(0.5) as f64 / 10.0));
+    kv.put("trim_excess_p99_steps", format!("{:.1}", te.quantile(0.99) as f64 / 10.0));
+    kv.put("trim_excess_max_steps", format!("{:.1}", te.summary().max as f64 / 10.0));
     kv.put("joins_deferred", sim.net().deferred_accepts());
     kv.put("bad_messages", c.bad_messages);
     kv.put("recv_errors", net.recv_errors.load(Relaxed));

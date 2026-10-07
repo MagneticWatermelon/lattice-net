@@ -168,12 +168,18 @@ pub struct Projectile {
 }
 
 /// How a shot's claimed rewinds were cut.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Cut {
     /// Past a cap: the shooter leads (fair).
     pub capped: bool,
     /// Past what it could plausibly have seen: trimmed (a backtrack claim).
     pub trimmed: bool,
+    /// How far past what it could plausibly have seen, in steps (the larger
+    /// tier's, below its cap); 0 when not trimmed. Honest shooters that get
+    /// trimmed land just past the bound; a backtrack lands far past it.
+    pub excess: f64,
+    /// The trimmed tier with the larger excess was mid/far (else near).
+    pub mid: bool,
 }
 
 impl Projectile {
@@ -184,7 +190,13 @@ impl Projectile {
         let d = [0, 1].map(|t| {
             let limit = plausible.map_or(caps[t], |p| p[t].min(caps[t]));
             cut.capped |= f.behind[t] > caps[t];
-            cut.trimmed |= plausible.is_some_and(|p| f.behind[t] > p[t] && p[t] < caps[t]);
+            if let Some(p) = plausible.filter(|p| f.behind[t] > p[t] && p[t] < caps[t]) {
+                cut.trimmed = true;
+                let over = f.behind[t].min(caps[t]) - p[t];
+                if over > cut.excess {
+                    (cut.excess, cut.mid) = (over, t == 1);
+                }
+            }
             f.behind[t].clamp(0.0, limit)
         });
         let end = f.tau0 + lattice_game::weapon::RANGE_STEPS as f64;
