@@ -32,8 +32,10 @@ done
 counters() { on lattice-srv "lattice-net/scripts/nic-check.sh counters $BOT_PRIV" > ".cloud/nic-$1-srv.txt"; on lattice-bots "lattice-net/scripts/nic-check.sh counters $SRV_PRIV" > ".cloud/nic-$1-bots.txt"; }
 counters before
 
+# Quoted for the remote shell, so SERVER_ARGS="--sockets 4 --ingress recvfrom" stays one value.
+vars=$( [ $# -eq 0 ] || printf '%q ' "$@")
 echo "running baseline.sh $mode $name on lattice-srv ($SRV_PRIV), bots on lattice-bots ($BOT_PRIV)"
-on lattice-srv "source ~/.cargo/env && cd lattice-net && env SERVER_IP=$SRV_PRIV BOTS_SSH=ubuntu@$BOT_PRIV TOKEN_KEY=$TOKEN_KEY $* scripts/baseline.sh $mode $name"
+on lattice-srv "source ~/.cargo/env && cd lattice-net && env SERVER_IP=$SRV_PRIV BOTS_SSH=ubuntu@$BOT_PRIV TOKEN_KEY=$TOKEN_KEY $vars scripts/baseline.sh $mode $name"
 rsync -a -e "ssh -F .cloud/ssh_config" lattice-srv:lattice-net/baselines/ baselines/
 echo "copied back: baselines/ (commit what you want to keep)"
 
