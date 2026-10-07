@@ -5,7 +5,9 @@
 # drives either.
 #
 #   scripts/aws-up.sh [--yes]
-#   scripts/aws-up.sh --resume     (finish setting up a session whose instances exist)
+#   scripts/aws-up.sh --resume     (finish setting up a session whose instances exist;
+#                                   if the bot box never launched, e.g. no capacity for
+#                                   its type in the server's zone, launch BOT_TYPE there)
 #
 # BILLING STARTS WHEN THE INSTANCES LAUNCH and runs until they're terminated:
 # end every session with scripts/aws-down.sh. Without --yes it shows the
@@ -18,7 +20,8 @@
 # once, so aws-down can always clean up); then scripts/cloud-setup.sh.
 #
 # Env: REGION (eu-central-1), SRV_TYPE (c7a.16xlarge: 64 cores, no SMT, 25
-#      Gbps), BOT_TYPE (c7a.12xlarge: 48 cores), SSH_KEY
+#      Gbps), BOT_TYPE (c7a.8xlarge: 32 cores, 12.5 Gbps; the pair fits a vCPU
+#      quota of 96, and 10k bots took at most ~4.3 Gbps), SSH_KEY
 #      (~/.ssh/id_ed25519_scaleway), SPOT=1 for spot instances (cheaper; AWS
 #      may take them back, and spot has its own vCPU quota).
 # Needs the AWS CLI configured (aws configure) with EC2 rights.
@@ -27,7 +30,7 @@ cd "$(dirname "$0")/.."
 
 region=${REGION:-eu-central-1}
 srv_type=${SRV_TYPE:-c7a.16xlarge}
-bot_type=${BOT_TYPE:-c7a.12xlarge}
+bot_type=${BOT_TYPE:-c7a.8xlarge}
 key=${SSH_KEY:-$HOME/.ssh/id_ed25519_scaleway}
 spot=${SPOT:-}
 yes=
@@ -42,11 +45,64 @@ json() { python3 -c "import json, sys; d = json.load(sys.stdin); $1"; }
 say() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
 tag="ResourceType=instance,Tags=[{Key=Project,Value=lattice-net}"
 
+# The price list names regions by their long names.
+case $region in
+  eu-central-1) loc="EU (Frankfurt)" ;;
+  eu-west-1) loc="EU (Ireland)" ;;
+  eu-west-3) loc="EU (Paris)" ;;
+  eu-north-1) loc="EU (Stockholm)" ;;
+  us-east-1) loc="US East (N. Virginia)" ;;
+  *) loc= ;;
+esac
+price() { # TYPE -> on-demand USD/h (Linux, shared tenancy), or ? (needs pricing:GetProducts)
+  [ -n "$loc" ] || { echo "?"; return; }
+  aws pricing get-products --region us-east-1 --service-code AmazonEC2 --filters \
+    "Type=TERM_MATCH,Field=instanceType,Value=$1" "Type=TERM_MATCH,Field=location,Value=$loc" \
+    "Type=TERM_MATCH,Field=operatingSystem,Value=Linux" "Type=TERM_MATCH,Field=tenancy,Value=Shared" \
+    "Type=TERM_MATCH,Field=preInstalledSw,Value=NA" "Type=TERM_MATCH,Field=capacitystatus,Value=Used" 2> /dev/null | json "
+p = json.loads(d['PriceList'][0])
+for t in p['terms']['OnDemand'].values():
+    for dim in t['priceDimensions'].values():
+        print('%.3f' % float(dim['pricePerUnit']['USD']))" 2> /dev/null || echo "?"
+}
+# Uses $ami, $subnet and $sg, set before it's called.
+launch() { # NAME TYPE -> instance id, or the error on stderr
+  local out market=()
+  [ -n "$spot" ] && market=(--instance-market-options "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}")
+  out=$(aws ec2 run-instances --image-id "$ami" --instance-type "$2" --key-name lattice \
+    --subnet-id "$subnet" --security-group-ids "$sg" --placement "GroupName=lattice-net" \
+    --associate-public-ip-address --instance-initiated-shutdown-behavior terminate "${market[@]}" \
+    --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true}" \
+    --tag-specifications "$tag,{Key=Name,Value=$1}]" 2>&1) || {
+    echo "$out" >&2
+    return 1
+  }
+  echo "$out" | json "print(d['Instances'][0]['InstanceId'])"
+}
+
 if [ -n "$resume" ]; then
   # shellcheck source=/dev/null
   . "$state"
   [ "${PROVIDER:-}" = aws ] || { echo "the session in $state isn't an AWS one" >&2; exit 1; }
   srv_id=$SRV_ID
+  if [ -z "${BOT_ID:-}" ]; then
+    # The bot box never launched: launch BOT_TYPE next to the server, with the
+    # server's own zone, image, subnet and security group (its placement group
+    # is one zone).
+    eval "$(aws ec2 describe-instances --instance-ids "$srv_id" | json "
+i = d['Reservations'][0]['Instances'][0]
+print('ami=%s subnet=%s sg=%s srv_type=%s az=%s' % (i['ImageId'], i['SubnetId'], i['SecurityGroups'][0]['GroupId'], i['InstanceType'], i['Placement']['AvailabilityZone']))")"
+    say "launching lattice-bots ($bot_type) next to lattice-srv ($srv_type) in $az"
+    if ! bot_id=$(launch lattice-bots "$bot_type"); then
+      echo "launching lattice-bots failed (see above); lattice-srv is still billing: --resume with another BOT_TYPE, or scripts/aws-down.sh" >&2
+      exit 1
+    fi
+    echo "BOT_ID=$bot_id" >> "$state"
+    total=$(python3 -c "print('%.2f' % ($(price "$srv_type") + $(price "$bot_type")))" 2> /dev/null || echo "?")
+    sed -i "s/^PRICE_PER_HOUR=.*/PRICE_PER_HOUR=$total/" "$state"
+    BOT_ID=$bot_id
+    PRICE_PER_HOUR=$total
+  fi
   bot_id=$BOT_ID
   total=$PRICE_PER_HOUR
   sed -i '/^\(SRV_PUB\|BOT_PUB\|SRV_PRIV\|BOT_PRIV\|LINK_GBPS\|TOKEN_KEY\)=/d' "$state"
@@ -78,26 +134,6 @@ for o in d['InstanceTypeOfferings']:
     types[o['Location']].add(o['InstanceType'])
 print(sorted(z for z, t in types.items() if t == {'$srv_type', '$bot_type'})[0])")
 
-# The price list names regions by their long names.
-case $region in
-  eu-central-1) loc="EU (Frankfurt)" ;;
-  eu-west-1) loc="EU (Ireland)" ;;
-  eu-west-3) loc="EU (Paris)" ;;
-  eu-north-1) loc="EU (Stockholm)" ;;
-  us-east-1) loc="US East (N. Virginia)" ;;
-  *) loc= ;;
-esac
-price() { # TYPE -> on-demand USD/h (Linux, shared tenancy), or ? (needs pricing:GetProducts)
-  [ -n "$loc" ] || { echo "?"; return; }
-  aws pricing get-products --region us-east-1 --service-code AmazonEC2 --filters \
-    "Type=TERM_MATCH,Field=instanceType,Value=$1" "Type=TERM_MATCH,Field=location,Value=$loc" \
-    "Type=TERM_MATCH,Field=operatingSystem,Value=Linux" "Type=TERM_MATCH,Field=tenancy,Value=Shared" \
-    "Type=TERM_MATCH,Field=preInstalledSw,Value=NA" "Type=TERM_MATCH,Field=capacitystatus,Value=Used" 2> /dev/null | json "
-p = json.loads(d['PriceList'][0])
-for t in p['terms']['OnDemand'].values():
-    for dim in t['priceDimensions'].values():
-        print('%.3f' % float(dim['pricePerUnit']['USD']))" 2> /dev/null || echo "?"
-}
 srv_price=$(price "$srv_type")
 bot_price=$(price "$bot_type")
 total=$(python3 -c "print('%.2f' % ($srv_price + $bot_price))" 2> /dev/null || echo "?")
@@ -146,19 +182,6 @@ aws ec2 describe-placement-groups --group-names lattice-net > /dev/null 2>&1 ||
   echo "PRICE_PER_HOUR=$total"
   echo "CREATED=$(date -Is)"
 } > "$state"
-launch() { # NAME TYPE -> instance id, or the error on stderr
-  local out market=()
-  [ -n "$spot" ] && market=(--instance-market-options "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}")
-  out=$(aws ec2 run-instances --image-id "$ami" --instance-type "$2" --key-name lattice \
-    --subnet-id "$subnet" --security-group-ids "$sg" --placement "GroupName=lattice-net" \
-    --associate-public-ip-address --instance-initiated-shutdown-behavior terminate "${market[@]}" \
-    --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true}" \
-    --tag-specifications "$tag,{Key=Name,Value=$1}]" 2>&1) || {
-    echo "$out" >&2
-    return 1
-  }
-  echo "$out" | json "print(d['Instances'][0]['InstanceId'])"
-}
 if ! srv_id=$(launch lattice-srv "$srv_type"); then
   rm -f "$state"
   echo "launching lattice-srv failed (see above); nothing was launched" >&2
@@ -166,7 +189,9 @@ if ! srv_id=$(launch lattice-srv "$srv_type"); then
 fi
 echo "SRV_ID=$srv_id" >> "$state"
 if ! bot_id=$(launch lattice-bots "$bot_type"); then
-  echo "launching lattice-bots failed (see above); lattice-srv exists and is billing: run scripts/aws-down.sh" >&2
+  echo "launching lattice-bots failed (see above); lattice-srv exists and is billing." >&2
+  echo "Launch a bot box of another type next to it: BOT_TYPE=<type> scripts/aws-up.sh --resume (32 vCPUs or fewer" >&2
+  echo "fits a quota of 96 with the server; c7a.8xlarge worked when c6in.8xlarge had no capacity). Or end it: scripts/aws-down.sh" >&2
   exit 1
 fi
 echo "BOT_ID=$bot_id" >> "$state"

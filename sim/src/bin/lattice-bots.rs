@@ -84,7 +84,7 @@ struct Totals {
     bytes_up: u64,
     rtt_sum: f64,
     loss_sum: f64,
-    /// Slots that ran into the next slot's time (the thread is behind).
+    /// Slots that started more than a slot's time late (the thread is behind).
     tick_overruns: u64,
     /// Bot threads' time spent working vs. elapsed, summed over threads.
     busy_us: u64,
@@ -196,6 +196,10 @@ struct Latency {
     /// Pops per tier: what each arriving sample moved on screen before
     /// smoothing, in mm (tracked bots only).
     pops: [Histogram; 3],
+    /// Each slot's work, and how late it started, in 0.1 ms: a thread's
+    /// average busy share hides the stalls that delay its bots' inputs.
+    slot_work: Histogram,
+    slot_late: Histogram,
 }
 
 impl Latency {
@@ -206,6 +210,8 @@ impl Latency {
             applied: Histogram::new(LATENCY_CAP_MS),
             intervals: std::array::from_fn(|_| Histogram::new(10_000)),
             pops: std::array::from_fn(|_| Histogram::new(20_000)),
+            slot_work: Histogram::new(2_000),
+            slot_late: Histogram::new(2_000),
         }
     }
 
@@ -227,6 +233,8 @@ impl Latency {
         for (a, b) in self.pops.iter_mut().zip(&o.pops) {
             a.merge(b);
         }
+        self.slot_work.merge(&o.slot_work);
+        self.slot_late.merge(&o.slot_late);
     }
 }
 
@@ -545,6 +553,12 @@ fn main() -> std::io::Result<()> {
                 if now >= end {
                     break;
                 }
+                // Started more than a slot late: the thread fell behind (its
+                // bots' inputs leave late; it catches up below).
+                if now > next + slot_period {
+                    overruns += 1;
+                }
+                latency.slot_late.record((now.saturating_duration_since(next).as_micros() / 100) as u32);
                 let work = Instant::now();
                 for bot in bots.iter_mut().skip(slot).step_by(slots) {
                     joins.extend(bot.tick(server, &login, &clocks, &mut rx)?);
@@ -567,13 +581,21 @@ fn main() -> std::io::Result<()> {
                         }
                     }
                 }
-                busy += work.elapsed();
+                let worked = work.elapsed();
+                busy += worked;
+                latency.slot_work.record((worked.as_micros() / 100) as u32);
+                // Keep the schedule: a slot that ran long delays the next ones,
+                // which then run back to back until caught up, so every bot
+                // still ticks 30 times a second. Restarting the schedule from
+                // now lost the overrun each time: with slots overrunning often,
+                // bots ticked under 30 Hz and sent fewer inputs than the server
+                // used (stand-ins, late inputs and corrections at 10k on AWS).
                 next += slot_period;
                 slot = (slot + 1) % slots;
-                // Behind schedule: this slot ran into the next one's time.
-                if Instant::now() > next {
-                    overruns += 1;
-                    next = Instant::now();
+                // A whole period behind: give up catching up.
+                let now = Instant::now();
+                if now > next + period {
+                    next = now;
                 }
                 if now - last_publish >= Duration::from_millis(500) {
                     last_publish = now;
@@ -674,9 +696,12 @@ fn summary_values(t: &Totals, secs: f64, joins: &mut [u32], latency: &Latency) -
     hist("input_applied", &latency.applied, 1.0);
     hist("server_wait", &latency.wait, 0.1);
     hist("round_trip", &latency.seen, 1.0);
+    hist("slot_work", &latency.slot_work, 0.1);
+    hist("slot_late", &latency.slot_late, 0.1);
     for (name, h) in ["near", "mid", "far"].iter().zip(&latency.intervals) {
         hist(&format!("{name}_interval"), h, 1.0);
     }
+    kv.put("slot_late_max_ms", format!("{:.1}", latency.slot_late.summary().max as f64 / 10.0));
     for (i, tier) in ["near", "mid", "far"].iter().enumerate() {
         let f = &t.frames[i];
         let n = f.iter().sum::<u64>().max(1) as f64;
