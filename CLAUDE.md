@@ -112,7 +112,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - a per-phase breakdown (wall vs longest shard task vs work ÷ threads);
     - `SO_REUSEPORT` socket groups (`Server::with_socket_groups`, `lattice-server --sockets N`).
   - **Next:**
-    - a short bare-metal session to measure these (`--sockets` 1/4/8/16 at 10k, and netem at 10k);
+    - ~~a short bare-metal session to measure these~~ **done on AWS** (a VM, 2026-10-07, see M3e): 4 sockets is best at 10k, and netem at 10k is valid now;
     - ~~the nearest-player search~~ **done: `Grid::knn`** (2026-10-04, per `reports/Nearest player search algorithms.md`). Exact (oracle-tested), with packed keys and a running threshold, positions inline, sub-cells only in cells over 256 items, and a box-pruned walk. A 10k pile query scans ~490 candidates instead of 10,000 (30–40× faster single-threaded). The pile's assembly is now linear in its size: on WSL it crosses 33 ms at ~5,500 instead of ~2,800. Blob 3k assembly 9.0 → 5.9 ms; uniform 7% slower per query. Not yet on bare metal.
     - then M3 with a CPU budget.
 - **M3: combat and the first playable client** (scoped 2026-10-04). The client is part of M3; there's no walk-only release first.
@@ -352,7 +352,26 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
       - **Recoil is the client's:** it kicks the view, and the shot carries the view's aim. A no-recoil cheat is possible; spread isn't.
       - **Tests:** lag-compensation tests run with `SimConfig::cone_of_fire: false`. Fighters aim down sights unless `FightConfig::ads: false`. The fight baselines predate the cone.
       - **Client:** rifle to the sights with zoom, view kick and recovery, rifle kick and muzzle flash (others' too), bob and sprint pose, hip reticle sized to the cone, red dot down the sights.
-    - **M3e** one bare-metal validation session. It also runs a lethal 3k blob at mixed RTTs, and records `rewinds_trimmed`, which should be 0.
+    - **M3e: run on AWS** (2026-10-07, `baselines/2026-10-07-aws-*`, see sim/README). The rig was a c7a.16xlarge server (64 cores, a VM) and an m6in.8xlarge bot box with 28 bot threads; about 2 h, ~$12.
+      - **Pass bars:**
+        - 10k with 20% firing: p99 24.1 ms (23.2 in a rerun). Met, but close.
+        - 3k blob all fighting: p99 20.5 ms. Met.
+        - Fairness, immortal 1k blob: 20 / 100 / 150 ms RTT hit 99.3 / 99.2 / 96.9%. Met.
+        - Corrections: only in the join burst. Met in the steady state.
+        - Honest shooters never trimmed: met after a client fix (below), except 62 of 724k shots at 10k with firing, each at most 0.4 steps over. Unexplained.
+      - **Fixed during the session:**
+        - **Bots' schedule.** Bot threads keep their schedule on overruns: restarting it lost time, so bots ticked under 30 Hz and starved the server.
+        - **Mid lag.** The client's mid lag slews with the near render clock. It used to jump when the adaptive near delay changed, which drew (and claimed) mid/far targets up to a step past 200 ms. Every trim in the fight runs was that: 107 / 334 / 45, now 1 / 0 / 0.
+      - **Measured:**
+        - `recvmmsg` saves 1.5 ms of tick at 10k, and 4 sockets another 1.1 ms (15.87 / 17.39 ms).
+        - The 25 m pile holds 10k within budget (p99 25.2 ms; on Scaleway before `Grid::knn` it went over at 7.2k).
+        - Uniform goes over at ~16k.
+        - netem at 10k, corrections per bot-minute: 0.13–0.30 on LAN, up to 1.08 on far.
+      - **Open:**
+        - **RTT reads 15–20 ms too high at 10k.** Sends are stamped with the tick's start, which loosens the backtrack bound. Fix candidate: stamp at the transport phase.
+        - **The serial events phase** (4.1 ms at 10k) is the floor.
+        - **On AWS,** the server's ~4 ms egress burst exceeds its 25 Gbps allowance (11–14% of packets queued), and GSO is slower than `sendmmsg` on ENA (no USO).
+        - **Bot capacity:** a bot thread carries ~360 bots at most. The tail of a bot's tick (p99 10× the median) decides it, not the 30–40% average.
   - **Pass bars:**
     - prediction stays bit-exact (0 corrections on a clean link, outside separation pushes);
     - 10k at level 0 with heavy fire (~20% of players at 10 Hz), p99 < 25 ms on the 64-core box;
@@ -379,7 +398,11 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - `.claude/settings.json` asks before `cloud-up.sh` or any `scw` call that creates, changes or deletes; listing, `cloud-run.sh` and `cloud-down.sh` (which only deletes our tagged servers) are allowed.
     - **Never end a session with Scaleway servers running: always finish with `scripts/cloud-down.sh` and show the empty server list.** A €20/month budget alert exists, but alerts don't stop spending.
     - **Scaleway is blocked for now** (2026-10-07): after a security review the account's quotas are 0 (private networks too), and support will only review it once the first invoice is paid.
-    - **AWS EC2 instead** (2026-10-07): `scripts/aws-up.sh` launches c7a.16xlarge (64 cores, no SMT, 25 Gbps) for the server and c7a.12xlarge (48 cores) for the bots in eu-central-1, in one cluster placement group, tagged `Project=lattice-net`. It checks the vCPU quota first (`L-1216C47A`; the account had 16, an increase to 128 was requested). `scripts/cloud-run.sh` drives either provider. `scripts/aws-down.sh` terminates everything tagged and lists what's left. The machine setup both providers share is `scripts/cloud-setup.sh`. `.claude/settings.json` asks before `aws-up.sh`, `run-instances` and `terminate-instances`. **The same rule: never end a session with instances running.**
+    - **AWS EC2 instead** (2026-10-07): `scripts/aws-up.sh` launches c7a.16xlarge (64 cores, no SMT, 25 Gbps) for the server and a 32-vCPU bot box in eu-central-1, in one cluster placement group, tagged `Project=lattice-net`. It checks the vCPU quota first (`L-1216C47A`: 96, so the bot box gets 32).
+      - **The bot box must be network-optimized:** `BOT_TYPE=m6in.8xlarge` (50 Gbps). The default c7a.8xlarge (12.5 Gbps) hit its inbound bandwidth and packets-per-second allowances at 10k: 34% of the server's packets queued or dropped, so inputs ran late.
+      - **c6in.8xlarge** had no capacity in eu-central-1a. When the bot box fails to launch, `BOT_TYPE=<another> scripts/aws-up.sh --resume` launches it next to the server.
+      - **Bot threads:** two-machine `baseline.sh` gives the bots all but 4 of the bot box's threads (28 on the m6in.8xlarge). Half (16) couldn't carry 10k bots.
+      - **Watch the allowance counters:** `cloud-run.sh` reports their growth per mode (`nic.txt`). `scripts/cloud-run.sh` drives either provider. `scripts/aws-down.sh` terminates everything tagged and lists what's left. The machine setup both providers share is `scripts/cloud-setup.sh`. `.claude/settings.json` asks before `aws-up.sh`, `run-instances` and `terminate-instances`. **The same rule: never end a session with instances running.**
     - Quirks, already handled:
       - offer names are case-sensitive (`EM-I620E-NVME`);
       - SSH comes up ~8 min after "ready";

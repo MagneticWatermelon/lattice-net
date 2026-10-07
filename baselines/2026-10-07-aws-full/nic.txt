@@ -1,0 +1,5 @@
+srv: bw_out_allowance_exceeded +12716119
+bots: no drops, errors or allowance limits
+NIC=enp55s0 (via enp55s0) driver=ena pci=0x1d0f 0xec20 
+tx-udp-segmentation: off [fixed]
+USO=sw

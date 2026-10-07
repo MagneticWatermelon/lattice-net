@@ -1,0 +1,47 @@
+== blob, 1000 bots, 60s -> baselines/2026-10-07-aws-fight-midlag/fight-blob-1k-1
+== summary: 1709 steady-state ticks (after warmup, before clients drain), peak 1000 clients ==
+  phase        p50 ms   p99 ms   max ms
+  ingress        0.53     0.63     0.73
+  events         0.43     0.57     0.60
+  movement       0.34     0.37     0.47
+  grid           0.18     0.22     0.43
+  separate       0.16     0.19     0.46
+  history        0.01     0.01     0.02
+  shots          1.09     1.36     1.60
+  serialize      0.06     0.10     0.13
+  assembly       1.33     2.84     3.30
+  transport      0.33     0.53     0.78
+  egress         0.55     0.74     0.87
+  tick           5.03     6.92     7.38
+  overruns 0 | spawns 1000 despawns 1000 (57 joins deferred) | deaths 4037 respawns 3761 | stand-ins: repeated 0 frozen 0 | late inputs 0 discarded 0 | bad messages 0 | recv errors 0 send errors 0
+  egress (whole run): 3594638 datagrams in 3594638 sends (1.00 per send), 115323 syscalls
+  ingress (whole run): 1796689 datagrams in 63193 receive calls (28.43 per call)
+  ticks per ladder level (whole run): L0: 1818
+  input wait on the server (datagram arrival -> applied): p50 49.3 p99 67.0 max 85.3 mean 49.9 ms
+  steady state: stand-ins repeated 0 frozen 0 | late inputs 0 discarded 0
+  rewind of near targets (applied step - the input's render step for that tier): p50 242 p99 366 max 367 mean 240.0 ms (n=1776930)
+  rewind of mid/far targets (applied step - the input's render step for that tier): p50 367 p99 433 max 435 mean 359.4 ms (n=1776930)
+  render times ahead of the server (bogus) 0
+  shots 149726 (late 0, refused 2909, rewinds capped 99164) | hits head 2093 body 28234 (after cover 896, too late 10020), kills 4037 | ground 86814 cover 7809 expired 23444 | segments 4674090 candidates 2561731
+== bots summary ==
+  started 1000 welcomed 1000 failed 0
+  join latency ms: p50 348 p99 569 max 669 (n=1000)
+  corrections 0 (0.00/bot-minute), mean error 0.000 m, max 0.000 m
+  push corrections (the server pushed us apart from a crowd) 34271 (34.27/bot-minute), max 0.478 m
+  snapshots 1777055 (entities per snapshot: near 64.1 mid 86.1 far 0.0), stale 0, unmatched acks 0, resyncs 0
+  input -> applied on server (est. RTT/2 + server wait): p50 103.0 p99 144.0 max 149.0 mean 97.3 ms (n=1774165)
+    of which server wait (arrival -> applied): p50 49.3 p99 67.0 max 85.3 mean 49.9 ms (n=1774165)
+  input -> seen acked (round trip): p50 167.0 p99 233.0 max 244.0 mean 161.9 ms (n=1774165)
+  near entity update interval (tracked bots): p50 66.0 p99 66.0 max 2233.0 mean 54.9 ms (n=56641817)
+  mid entity update interval (tracked bots): p50 100.0 p99 133.0 max 2200.0 mean 101.4 ms (n=75395537)
+  far entity update interval (tracked bots): p50 0.0 p99 0.0 max 0.0 mean 0.0 ms (n=0)
+  near drawn (tracked bots): 96.66% interpolated, 1.32% extrapolated, 1.23% held, 0.78% new | pops p50 0 p99 0 max 65535 mm
+  mid drawn (tracked bots): 90.93% interpolated, 3.24% extrapolated, 3.41% held, 2.41% new | pops p50 0 p99 0 max 65535 mm
+  far drawn (tracked bots): 0.00% interpolated, 0.00% extrapolated, 0.00% held, 0.00% new | pops p50 0 p99 0 max 0 mm
+  render delay (near) 94.7 ms behind the newest step, clock snaps 0 (backwards 0), slewing 10.77% of frames, near delay changes 4215 | streak entity-frames (drawn > 20 m/s) 16715
+  fighters, class 0: 167 at rtt 24.8 ms | 32484 shots, 7391 hits (22.8%), 1379 kills
+  fighters, class 1: 166 at rtt 104.8 ms | 31500 shots, 6293 hits (20.0%), 1299 kills
+  fighters, class 2: 167 at rtt 154.8 ms | 32283 shots, 6033 hits (18.7%), 1267 kills
+  others' shots (tracked bots): 8369709 as tracers | distant fights: 937922 cell entries counting 73733821 shots, 17691721 ambient shots made
+  input clock: 1467 extra inputs, 459 skipped ticks, 0 backlog skips | near decode errors (tracked bots) 0
+  bytes down 2741.3 MB up 116.0 MB | swarm busy 12% of its threads' time, tick overruns 106

@@ -584,6 +584,86 @@ This measures behavior, not capacity, so WSL is fine for it. The blob rows match
 3. **Loss and jitter turn inputs late, not lost.** Inputs go out three times, so almost every stand-in is an input that arrived after its tick. With 5% loss, a lost packet's inputs come one packet (33 ms) later. With ±20 ms jitter, the tail outruns the spare. Either way it's ~0.33% of input ticks.
 4. **Under jitter the input clock hunts.** At ±20 ms it sends ~13 extra inputs and skips ~13 ticks per bot-minute (about 2 of each on a clean link), with 300 backlog skips. A spare sized to each client's measured jitter (a jitter buffer) would settle it, and cut stand-ins on bad links while keeping the spare small on good ones.
 
+### M3e on AWS EC2, 2026-10-07 (`baselines/2026-10-07-aws-*`)
+
+Scaleway was blocked, so M3e ran on AWS:
+- **Server:** c7a.16xlarge (EPYC 9R14, 64 cores without SMT, 25 Gbps). It's a VM, so tick times include virtualization.
+- **Bots:** m6in.8xlarge (16 cores / 32 threads, 50 Gbps), with 28 bot threads (`BOT_THREADS=28`).
+- **Link:** one cluster placement group; `iperf3` measured 24.8 Gbps.
+- **Session:** about 2 h, ~$12.
+
+**M3's pass bars:**
+
+| bar | result |
+|---|---|
+| 10k at level 0 with ~20% firing, tick p99 under 25 ms | **met:** p99 24.1 ms (p50 21.1); a rerun gave 23.2 ms |
+| a 3k blob all fighting, p99 under 25 ms | **met:** 20.5 ms (p50 17.6) |
+| 20 and 100 ms RTT hit alike, 150 ms measurably less (1k blob, immortal) | **met:** 99.3 / 99.2 / 96.9% |
+| corrections only from pushes and respawns | **met** in the steady state; the 10k runs' 30–90 corrections all come in the join burst (first 5 s) |
+| honest shooters never trimmed | **mostly met, after a client fix** (below): 107 / 334 / 45 trims per fight run fell to 1 / 0 / 0; 62 of 724k shots remain at 10k with firing, each at most 0.4 steps over |
+
+**Receiving at 10k** (uniform, no firing):
+
+| | 1 socket | 4 | 8 | 16 | 1 socket, `recvfrom` |
+|---|---|---|---|---|---|
+| tick p50 / p99 (ms) | 16.98 / 18.42 | **15.87 / 17.39** | 16.20 / 17.66 | 16.43 / 18.01 | 18.45 / 20.04 |
+| receive thread busy | 31% | 8.2% | 4.8% | 3.0% | 59% |
+
+**The `full` matrix against Scaleway** (tick p50 / p99 in ms; two runs each, agreeing within ~0.5 ms). The code changed in between (all of M3, `Grid::knn`, `recvmmsg`), so this mixes VM cost with code changes:
+
+| run | AWS, 64 cores (VM) | Scaleway 2026-10-04, 128 threads |
+|---|---|---|
+| uniform 1k | 2.75–2.77 / 3.0–3.2 | 2.9 / 3.3 |
+| uniform 5k | 7.9–8.0 / 8.8–9.1 | 7.0–7.1 / 8.0–8.1 |
+| uniform 10k | 17.2–17.6 / 19.1–20.2 | 14.1 / 15.4–15.5 |
+| uniform 10k, ladder off | 17.0–17.3 / 18.8–18.9 | 13.9 / 15.4–15.6 |
+| hotspots 5k | 9.4–9.5 / 10.3–10.4 | 7.8 / 8.9–9.1 |
+| blob 3k, `sendmmsg` | 7.1 / 7.8–7.9 | 7.7 / 8.5–8.6 |
+| blob 3k, GSO | 7.3–7.6 / 8.3–8.9 | 8.2–8.3 / 9.0–9.4 |
+| joins 5k + 500 | 8.4–8.5 / 9.4–9.5 | 7.3–7.5 / 8.3 |
+
+**Limits** (`limits`):
+
+| ramp | AWS | Scaleway 2026-10-04 |
+|---|---|---|
+| everyone in a 25 m disk, ladder off | **within budget to 10k** (p99 25.2 ms) | over at 7,217 (before `Grid::knn`) |
+| everyone in a 200 m disk, ladder off | within budget to 10k (p99 23.8 ms) | within budget (p99 19.3 ms) |
+| uniform, ladder off | over at 15,961 | over at 17,954 |
+
+**netem at 10k** (`netem`, `NETEM_BOTS=10000`; the first valid run at this load). The tick holds at 16.7–17.4 / 18.5–19.3 ms on every profile:
+
+| profile | late inputs (60 s) | corrections per bot-minute (uniform / blob) |
+|---|---|---|
+| clean | 0 | 0.009 / 0.004 (join burst) |
+| lan | 1,145 / 130 | 0.13 / 0.30 |
+| typical | 9,682 / 11,751 | 0.32 / 0.59 |
+| far | 29,659 / 34,262 | 0.66 / 1.08 |
+| lossy | 70,739 / 64,607 | 0.79 / 0.62 |
+| jittery | 71,082 / 63,794 | 0.49 / 0.43 |
+
+Late inputs match WSL's 1k netem runs (0.39% under lossy and jittery against 0.33%). Corrections run higher than WSL's ≤0.2 per bot-minute.
+
+**Findings:**
+
+1. **The bot box must be network-optimized.**
+   - **First choice, failed:** the first bot box, a c7a.8xlarge (12.5 Gbps), queued or dropped 34% of the server's packets at its inbound bandwidth allowance and hit its packets-per-second allowance 18M times (ENA's `bw_in_allowance_exceeded`, `pps_allowance_exceeded`). RTT read ~20 ms inside the placement group, inputs ran late, and bots saw corrections.
+   - **What worked:** an m6in.8xlarge (50 Gbps) showed no allowance hits. c6in.8xlarge had no capacity in eu-central-1a; `aws-up.sh --resume` now launches a missing bot box of another type next to the server.
+   - **Why it matters:** the server sends each tick in a ~4 ms burst (~27 Gbps, ~4 Mpps for that moment), and that burst is what counts against an allowance.
+2. **The server's own allowance queues its bursts too:** 11–14% of its packets at 10k (`bw_out_allowance_exceeded` on its 25 Gbps). The delay is well under a millisecond here, but a real AWS deployment at more load would want paced egress or a bigger instance.
+3. **How many bots a thread carries depends on the tail of a bot's tick, not its mean.**
+   - **16 threads:** with 625 bots each (78 per slot), slot work was p50 0.7 ms but p99 7.0 ms, longer than the 4.2 ms slot. Lateness reached p99 31.5 ms (a tick), so inputs missed their steps: 340k late inputs in 40 s and 3 corrections per bot-minute, with the box 79% idle.
+   - **28 threads:** slot work p99 3.7 ms, 0 late inputs.
+   - **Rule of thumb:** keep under ~360 bots per thread on these VMs. The 20k `limits` ramp is over that, so only its server numbers count.
+   - `lattice-bots` now reports `slot_work` and `slot_late`. The 10× tail itself isn't explained yet.
+4. **Honest trims were a client bug.**
+   - **The diagnostic:** every trim in the first fight runs was a mid/far claim, 0.3 steps past the bound at the median and 1.0 at most (`trim_excess_*`, `rewinds_trimmed_mid` in the server summary).
+   - **The bug:** when the adaptive near delay changed, the near render clock slewed to it but the mid lag jumped at once. So mid and far were drawn, and claimed, up to the whole change past their 200 ms.
+   - **The fix:** the mid lag now slews with the near clock.
+   - **Still open:** the 62 remaining trims at 10k (each ≤ 0.4 steps over) aren't explained.
+5. **RTT reads 15–20 ms too high at 10k.** The server stamps its sends (and the hold it reports in `ack_delay`) with the tick's start, but sends 15–20 ms later. That's cosmetic for the input clock, which steers on queue depth. It does make the server's backtrack bound that much more lenient. Fix candidate: stamp with the transport phase's time.
+6. **GSO is slower on ENA:** there's no UDP segmentation offload (`USO=sw`), so egress is 1.80 vs 1.44 ms p50 for `sendmmsg` in the blob. Keep `sendmmsg` on AWS.
+7. **The serial events phase is the floor at 10k:** 4.1 ms p50 (2.4 ms on 2026-10-04's code), next to egress 4.1 and assembly 3.3. Rayon's idle spinning is ~22% of the CPU in profiles, as on Scaleway.
+
 ### Running it on bare metal (the desktop, dual-booted)
 
 The repo has no remote, so carry it over as a git bundle.
@@ -632,7 +712,7 @@ scripts/cloud-down.sh                                # copies baselines back, de
   - the server listens on its Private Network address only;
   - the bots run on the other box over ssh;
   - both use the session key, never the public dev key.
-- **`baseline.sh` two-machine mode** works on any pair: `BOTS_SSH=user@host SERVER_IP=<address> TOKEN_KEY=<hex>`. The server then takes every core and the bots half of theirs. The bot machine's preflight goes into `env.txt` too.
+- **`baseline.sh` two-machine mode** works on any pair: `BOTS_SSH=user@host SERVER_IP=<address> TOKEN_KEY=<hex>`. The server then takes every core and the bots all but 4 of their threads (`BOT_THREADS` overrides it). The bot machine's preflight goes into `env.txt` too.
 - **What to read in the results:**
   - the 8-thread run against the WSL reference: was the blob's p99 WSL, or the code?
   - 8 against 64 threads: does the tick scale with cores, and does 10k fit at level 0?

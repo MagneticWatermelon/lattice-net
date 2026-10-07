@@ -20,8 +20,10 @@
 # once, so aws-down can always clean up); then scripts/cloud-setup.sh.
 #
 # Env: REGION (eu-central-1), SRV_TYPE (c7a.16xlarge: 64 cores, no SMT, 25
-#      Gbps), BOT_TYPE (c7a.8xlarge: 32 cores, 12.5 Gbps; the pair fits a vCPU
-#      quota of 96, and 10k bots took at most ~4.3 Gbps), SSH_KEY
+#      Gbps), BOT_TYPE (m6in.8xlarge: 16 cores / 32 threads, 50 Gbps; the pair
+#      fits a vCPU quota of 96. Network-optimized on purpose: a c7a.8xlarge's
+#      12.5 Gbps allowances queued a third of the server's 10k bursts. Run the
+#      bots with BOT_THREADS=28), SSH_KEY
 #      (~/.ssh/id_ed25519_scaleway), SPOT=1 for spot instances (cheaper; AWS
 #      may take them back, and spot has its own vCPU quota).
 # Needs the AWS CLI configured (aws configure) with EC2 rights.
@@ -30,7 +32,7 @@ cd "$(dirname "$0")/.."
 
 region=${REGION:-eu-central-1}
 srv_type=${SRV_TYPE:-c7a.16xlarge}
-bot_type=${BOT_TYPE:-c7a.8xlarge}
+bot_type=${BOT_TYPE:-m6in.8xlarge}
 key=${SSH_KEY:-$HOME/.ssh/id_ed25519_scaleway}
 spot=${SPOT:-}
 yes=
@@ -191,7 +193,7 @@ echo "SRV_ID=$srv_id" >> "$state"
 if ! bot_id=$(launch lattice-bots "$bot_type"); then
   echo "launching lattice-bots failed (see above); lattice-srv exists and is billing." >&2
   echo "Launch a bot box of another type next to it: BOT_TYPE=<type> scripts/aws-up.sh --resume (32 vCPUs or fewer" >&2
-  echo "fits a quota of 96 with the server; c7a.8xlarge worked when c6in.8xlarge had no capacity). Or end it: scripts/aws-down.sh" >&2
+  echo "fits a quota of 96 with the server; prefer network-optimized: m6in, c6in or r6in .8xlarge). Or end it: scripts/aws-down.sh" >&2
   exit 1
 fi
 echo "BOT_ID=$bot_id" >> "$state"

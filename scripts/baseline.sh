@@ -278,9 +278,12 @@ trap clear_netem EXIT
 cores=$(nproc)
 if [ -n "$remote" ]; then
   # Alone on the machine: the server takes a thread per physical core (SMT
-  # siblings only add overhead), the bots half of their machine's threads.
-  server_threads=${SERVER_THREADS:-$(lscpu -p=core,socket | grep -v '^#' | sort -u | wc -l)}
-  bot_threads=${BOT_THREADS:-$(( $(ssh -o BatchMode=yes "$remote" nproc) / 2 ))}
+  # siblings only add overhead). The bots take all but 4 of their machine's
+  # threads: a thread carries ~360 bots at most, because the tail of a bot's
+  # tick (not its mean) decides it, and 16 threads couldn't carry 10k on AWS
+  # (sim/README, M3e on AWS).
+  bot_cpus=$(ssh -o BatchMode=yes "$remote" nproc)
+  bot_threads=${BOT_THREADS:-$(( bot_cpus > 8 ? bot_cpus - 4 : (bot_cpus + 1) / 2 ))}
 else
   server_threads=${SERVER_THREADS:-$(( cores / 2 ))}
   bot_threads=${BOT_THREADS:-$(( cores / 2 > 8 ? 8 : cores / 2 ))}

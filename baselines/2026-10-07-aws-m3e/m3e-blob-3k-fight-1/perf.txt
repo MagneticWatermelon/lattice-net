@@ -1,0 +1,61 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 228K of event 'cpu/cycles/P'
+# Event count (approx.): 630222519989
+#
+# Overhead  Shared Object      Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+# ........  .................  .......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    19.70%  [kernel.kallsyms]  [k] __pv_queued_spin_lock_slowpath
+    13.09%  lattice-server     [.] crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard>
+     6.74%  lattice-server     [.] <crossbeam_epoch::internal::Global>::try_advance
+     4.36%  lattice-server     [.] <&<lattice_sim::server::SimServer>::tick::{closure#17} as core::ops::function::FnMut<((((&mut alloc::vec::Vec<lattice_sim::server::ClientSlot>, &mut alloc::vec::Vec<(u32, alloc::vec::Vec<u8>, core::option::Option<u32>)>), &mut lattice_sim::server::Scratch), &mut lattice_net::server::Shard),)>>::call_mut
+     1.70%  lattice-server     [.] <crossbeam_deque::deque::Stealer<rayon_core::job::JobRef>>::steal
+     1.48%  lattice-server     [.] lattice_game::delta::put_var
+     1.43%  lattice-server     [.] <lattice_sim::grid::Grid>::scan::<<lattice_sim::server::View>::assemble::{closure#1}>
+     1.32%  lattice-server     [.] core::slice::sort::select::partition_at_index::<u64, <u64 as core::cmp::PartialOrd>::lt>
+     1.12%  libc.so.6          [.] __sched_yield
+     1.06%  lattice-server     [.] <lattice_game::world::World>::terrain
+     1.06%  lattice-server     [.] <lattice_sim::grid::Grid>::scan::<<lattice_sim::server::View>::assemble::{closure#2}>
+     0.89%  lattice-server     [.] lattice_sim::shots::fly
+     0.88%  lattice-server     [.] ring_core_0_17_14__chacha20_poly1305_seal_avx2
+     0.86%  libc.so.6          [.] 0x00000000000ab3ed
+     0.78%  lattice-server     [.] <lattice_sim::interest::NearState>::select
+     0.75%  [kernel.kallsyms]  [k] update_curr
+     0.73%  [kernel.kallsyms]  [k] _raw_spin_lock
+     0.73%  [kernel.kallsyms]  [k] do_syscall_64
+     0.72%  lattice-server     [.] <rayon_core::sleep::Sleep>::wake_specific_thread
+     0.72%  lattice-server     [.] <lattice_sim::interest::SelectScratch>::index
+     0.70%  [kernel.kallsyms]  [k] __raw_callee_save___pv_queued_spin_unlock
+     0.70%  lattice-server     [.] lattice_game::delta::encode_near
+     0.70%  libc.so.6          [.] malloc
+     0.70%  lattice-server     [.] <lattice_sim::grid::Grid>::for_each_within::<lattice_sim::shots::fly::{closure#2}>::{closure#0}
+     0.62%  lattice-server     [.] <lattice_sim::grid::Grid>::knn::<<lattice_sim::server::View>::assemble::{closure#2}>::{closure#0}
+     0.61%  lattice-server     [.] <core::iter::adapters::chain::Chain<core::ops::range::Range<usize>, core::ops::range::Range<usize>> as core::iter::traits::iterator::Iterator>::try_fold::<(), core::iter::adapters::filter::filter_try_fold<usize, (), core::ops::control_flow::ControlFlow<rayon_core::job::JobRef>, <rayon_core::registry::WorkerThread>::steal::{closure#0}, core::iter::traits::iterator::Iterator::find_map::check<usize, rayon_core::job::JobRef, <rayon_core::registry::WorkerThread>::steal::{closure#1}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<rayon_core::job::JobRef>>
+     0.56%  [kernel.kallsyms]  [k] __alloc_skb
+     0.56%  lattice-server     [.] <std::sys::sync::mutex::futex::Mutex>::lock_contended
+     0.55%  [kernel.kallsyms]  [k] __irqentry_text_start
+     0.53%  lattice-server     [.] <lattice_net::connection::Connection>::receive_sealed
+     0.49%  [kernel.kallsyms]  [k] memset_orig
+     0.47%  libc.so.6          [.] realloc
+     0.47%  [kernel.kallsyms]  [k] entry_SYSCALL_64
+     0.44%  [kernel.kallsyms]  [k] asm_sysvec_apic_timer_interrupt
+     0.44%  [kernel.kallsyms]  [k] entry_SYSRETQ_unsafe_stack
+     0.41%  libc.so.6          [.] __lll_lock_wait_private
+     0.39%  lattice-server     [.] <lattice_sim::grid::Grid>::for_each_near::<<lattice_sim::server::View>::assemble::{closure#3}>
+     0.36%  [kernel.kallsyms]  [k] pick_task_fair
+     0.35%  [kernel.kallsyms]  [k] native_write_msr
+     0.35%  [kernel.kallsyms]  [k] futex_wake
+     0.35%  [kernel.kallsyms]  [k] _raw_spin_unlock
+     0.35%  lattice-server     [.] <lattice_game::world::World>::boxes_near::<lattice_sim::shots::fly::{closure#1}>
+     0.34%  [kernel.kallsyms]  [k] futex_q_lock
+     0.34%  [kernel.kallsyms]  [k] __schedule
+     0.30%  [kernel.kallsyms]  [k] entry_SYSCALL_64_after_hwframe
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
