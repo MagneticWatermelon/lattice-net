@@ -4,8 +4,8 @@
 //!
 //! | phase     | work                                                            |
 //! |-----------|-----------------------------------------------------------------|
-//! | ingress   | each transport shard decodes its datagrams, acks, handshakes, timeouts (parallel) |
-//! | events    | spawn/despawn, queue inputs into per-entity queues (serial) |
+//! | ingress   | each transport shard decodes its datagrams, acks, handshakes, timeouts, and queues its clients' inputs (parallel) |
+//! | events    | spawn/despawn (serial) |
 //! | movement  | one input seq per entity per tick, real or stand-in (parallel)  |
 //! | grid      | rebuild the shared spatial grid, plus the mid/far due-set views |
 //! | history   | store positions for lag compensation (unused until M3)          |
@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lattice_net::wire::Writer;
@@ -549,6 +549,17 @@ enum Step {
 }
 
 impl InputQueue {
+    /// Queues the inputs of one message. Counts into `n`: inputs late (a
+    /// stand-in took their seq) and discarded (queue full), and bad messages.
+    fn receive(&mut self, e: u16, data: &[u8], arrived: Instant, dead: bool, n: &mut [u64; 3]) {
+        let ok = msg::decode_inputs(data, |seq, input, render, shot| match self.push(e, seq, input, render, shot, arrived, dead) {
+            Push::Late => n[0] += 1,
+            Push::Discarded => n[1] += 1,
+            Push::Queued | Push::Duplicate => {}
+        });
+        n[2] += ok.is_err() as u64;
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn push(&mut self, e: u16, seq: u32, input: Input, render: Option<RenderTime>, shot: Option<Shot>, arrived: Instant, dead: bool) -> Push {
         if seq <= self.last_seq {
@@ -710,7 +721,10 @@ pub struct SimServer {
     /// Game time in 1/30 s movement steps, as of the last tick's states.
     step: u32,
     bodies: Vec<Body>,
-    inputs: Vec<InputQueue>,
+    /// Each entity's input queue. Locked so ingress tasks can queue their
+    /// shards' inputs in parallel; never contended, since all of a client's
+    /// messages come through its shard. Phases with `&mut` skip the lock.
+    inputs: Vec<Mutex<InputQueue>>,
     /// Serialized once per tick: every entity's quantized near state, kept
     /// for `NEAR_HISTORY` ticks as delta baselines, and mid/far blobs for the
     /// entities due this tick (and last tick's far-due, for carries). Near
@@ -751,9 +765,9 @@ pub struct SimServer {
     squad_anchor: HashMap<u32, [f32; 2]>,
     /// Per-shard snapshot buffers, reused every tick.
     snapshots: Vec<Vec<Snap>>,
-    /// Per-shard transport events, each with the arrival time of the datagram
-    /// that caused it.
-    shard_events: Vec<Vec<(Instant, ServerEvent)>>,
+    /// Per shard: connects (true) and disconnects (false), in the order the
+    /// transport reported them.
+    lifecycle: Vec<Vec<(ClientId, bool)>>,
     /// Input waits (arrival -> applied) since the last `take_input_wait`, in 0.1 ms.
     input_wait: Histogram,
     /// Rewinds (see `InputQueue::rewind`) for near and for mid/far targets
@@ -807,7 +821,7 @@ impl SimServer {
             squads: HashMap::new(),
             squad_anchor: HashMap::new(),
             snapshots: vec![Vec::new(); cfg.shards],
-            shard_events: (0..cfg.shards).map(|_| Vec::new()).collect(),
+            lifecycle: vec![Vec::new(); cfg.shards],
             input_wait: Histogram::new(INPUT_WAIT_CAP),
             rewind: [Histogram::new(REWIND_CAP_MS), Histogram::new(REWIND_CAP_MS)],
             trim_excess: Histogram::new(200),
@@ -856,14 +870,15 @@ impl SimServer {
         self.watch = entity;
     }
 
-    /// The latest capture, if one was taken since the last call.
-    /// For the last tick's phases split by shard (ingress, assembly, transport):
-    /// the longest shard task and the total of all of them. With the phase's
-    /// wall time this separates serial work, imbalance and dispatch overhead.
+    /// For the last tick's phases split into parallel tasks (ingress, shots,
+    /// assembly, transport): the longest task and the total of all of them.
+    /// With the phase's wall time this separates serial work, imbalance and
+    /// dispatch overhead.
     pub fn tasks(&self) -> &PhaseSpans {
         &self.spans
     }
 
+    /// The latest capture, if one was taken since the last call.
     pub fn take_debug_frame(&mut self) -> Option<DebugFrame> {
         self.debug.take()
     }
@@ -992,46 +1007,65 @@ impl SimServer {
         self.counters.level_ticks[self.ladder.level() as usize] += 1;
 
         // 1. ingress: the per-packet transport work, one task per shard
-        // (wall-clock time only matters for connect-token expiry)
+        // (wall-clock time only matters for connect-token expiry), which also
+        // queues its clients' inputs: a client sends only once it's accepted,
+        // and `Accepted` leaves at the end of the tick that spawned it, so its
+        // entity is there. Connects and disconnects wait for the events phase.
         let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         self.spans = [NO_SPAN; PHASES.len()];
-        self.spans[0] = self
+        let (by_client, bodies, inputs) = (&self.by_client, &self.bodies, &self.inputs);
+        let (ingress, [late, discarded, bad]) = self
             .net
             .shards_mut()
             .par_iter_mut()
             .zip(inbound.par_iter_mut())
-            .zip(self.shard_events.par_iter_mut())
-            .map(|((shard, bucket), events)| {
+            .zip(self.lifecycle.par_iter_mut())
+            .map(|((shard, bucket), lifecycle)| {
                 let t0 = Instant::now();
+                let mut n = [0u64; 3];
+                let mut handle = |ev, arrived| match ev {
+                    ServerEvent::Message { client, channel: Channel::Unreliable, data } => {
+                        if let Some(&e) = by_client.get(&client) {
+                            let dead = bodies[e as usize].dead();
+                            inputs[e as usize].lock().unwrap().receive(e, &data, arrived, dead, &mut n);
+                        }
+                    }
+                    ServerEvent::Message { .. } => n[2] += 1,
+                    ServerEvent::Connected { client, .. } => lifecycle.push((client, true)),
+                    ServerEvent::Disconnected { client, .. } => lifecycle.push((client, false)),
+                };
                 for (from, arrived, data) in bucket.drain(..) {
                     shard.receive(from, &data, arrived);
                     while let Some(ev) = shard.poll_event() {
-                        events.push((arrived, ev));
+                        handle(ev, arrived);
                     }
                 }
                 shard.update(now, unix_now);
                 while let Some(ev) = shard.poll_event() {
-                    events.push((now, ev));
+                    handle(ev, now);
                 }
-                span(t0.elapsed())
+                (span(t0.elapsed()), n)
             })
-            .reduce(|| NO_SPAN, join_spans);
+            .reduce(|| (NO_SPAN, [0; 3]), |a, b| (join_spans(a.0, b.0), [a.1[0] + b.1[0], a.1[1] + b.1[1], a.1[2] + b.1[2]]));
+        self.spans[0] = ingress;
+        self.counters.late_inputs += late;
+        self.counters.discarded_inputs += discarded;
+        self.counters.bad_messages += bad;
         lap(0);
 
-        // 1b. events: these touch the world, so they're applied on one thread
+        // 1b. events: connects and disconnects touch the world, so they're
+        // applied on one thread, in shard order
         for k in 0..self.shard_count() {
-            let mut events = std::mem::take(&mut self.shard_events[k]);
-            for (arrived, ev) in events.drain(..) {
-                match ev {
-                    ServerEvent::Connected { client, .. } => self.spawn(client),
-                    ServerEvent::Disconnected { client, .. } => self.despawn(client),
-                    ServerEvent::Message { client, channel: Channel::Unreliable, data } => {
-                        self.on_input(client, &data, arrived)
-                    }
-                    ServerEvent::Message { .. } => self.counters.bad_messages += 1,
+            let mut events = std::mem::take(&mut self.lifecycle[k]);
+            for &(client, joined) in &events {
+                if joined {
+                    self.spawn(client);
+                } else {
+                    self.despawn(client);
                 }
             }
-            self.shard_events[k] = events; // keep the allocation
+            events.clear();
+            self.lifecycle[k] = events; // keep the allocation
         }
         lap(1);
 
@@ -1048,6 +1082,7 @@ impl SimServer {
             .with_min_len(256)
             .filter(|(_, (b, _))| b.alive)
             .map(|(e, (b, q))| {
+                let q = q.get_mut().unwrap();
                 // A tick consumes `steps` 1/30 s movement steps (1 or 2 at 20 Hz).
                 let queued = q.pending.len();
                 let mut n = [0u64; 3];
@@ -1068,7 +1103,8 @@ impl SimServer {
         self.counters.inputs_applied += applied;
         self.counters.repeated += repeated;
         self.counters.frozen += frozen;
-        for (b, q) in self.bodies.iter().zip(&self.inputs) {
+        for (b, q) in self.bodies.iter().zip(&mut self.inputs) {
+            let q = q.get_mut().unwrap();
             if b.alive && q.last_seq > 0 && q.wait != WAIT_STAND_IN {
                 self.input_wait.record(q.wait as u32);
             }
@@ -1303,6 +1339,7 @@ impl SimServer {
         let t0 = Instant::now();
         let mut fires: Vec<Fire> = Vec::new();
         for q in &mut self.inputs {
+            let q = q.get_mut().unwrap();
             if !q.fires.is_empty() {
                 fires.append(&mut q.fires);
             }
@@ -1592,7 +1629,7 @@ impl SimServer {
                 let id = self.bodies.len() as u16;
                 self.bodies.push(Body::default());
                 self.pushes.push([0.0; 2]);
-                self.inputs.push(InputQueue { cone: self.cfg.cone_of_fire, ..InputQueue::default() });
+                self.inputs.push(Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, ..InputQueue::default() }));
                 self.far_blobs.push([0; FAR_BLOB]);
                 if faction(id) as u64 == side {
                     break id;
@@ -1611,7 +1648,7 @@ impl SimServer {
             invulnerable: self.cfg.immortal,
             ..Body::default()
         };
-        self.inputs[i] = InputQueue { cone: self.cfg.cone_of_fire, ..InputQueue::default() };
+        self.inputs[i] = Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, ..InputQueue::default() });
         if squad != NO_SQUAD {
             self.squads.entry(squad).or_default().push(e);
         }
@@ -1656,20 +1693,6 @@ impl SimServer {
         }
     }
 
-    fn on_input(&mut self, client: ClientId, data: &[u8], arrived: Instant) {
-        let Some(&e) = self.by_client.get(&client) else { return };
-        let dead = self.bodies[e as usize].dead();
-        let (q, c) = (&mut self.inputs[e as usize], &mut self.counters);
-        let ok = msg::decode_inputs(data, |seq, input, render, shot| match q.push(e, seq, input, render, shot, arrived, dead) {
-            Push::Late => c.late_inputs += 1,
-            Push::Discarded => c.discarded_inputs += 1,
-            Push::Queued | Push::Duplicate => {}
-        });
-        if ok.is_err() {
-            self.counters.bad_messages += 1;
-        }
-    }
-
     /// Returns (spawn point, wander anchor, wander radius).
     fn pick_spawn(&mut self, squad: u32) -> ([f32; 2], [f32; 2], f32) {
         const HOTSPOTS: [[f32; 2]; 3] = [[2048.0, 2048.0], [6144.0, 2048.0], [4096.0, 6144.0]];
@@ -1704,7 +1727,7 @@ struct View<'a> {
     tick: u32,
     step: u32,
     bodies: &'a [Body],
-    inputs: &'a [InputQueue],
+    inputs: &'a [Mutex<InputQueue>],
     near_hist: &'a [Vec<NearQ>],
     near_hist_tick: &'a [u32; NEAR_HISTORY],
     far_blobs: &'a [Blob],
@@ -1947,16 +1970,19 @@ impl View<'_> {
         sc.tally.degraded += (slot.ladder.level() > 0) as u64;
 
         // Messages.
-        let inp = &self.inputs[e as usize];
+        let (ack_seq, buffered, wait) = {
+            let q = self.inputs[e as usize].lock().unwrap();
+            (q.last_seq, q.depth, q.wait)
+        };
         let mut w = Writer::with_capacity(SNAPSHOT_LEN);
         msg::write_snapshot(
             &mut w,
             &SnapshotHeader {
                 server_tick: tick,
                 step: self.step,
-                ack_seq: inp.last_seq,
-                buffered: inp.depth,
-                wait: inp.wait,
+                ack_seq,
+                buffered,
+                wait,
                 pace: self.pace,
                 level: self.level,
                 client_level: slot.ladder.level(),

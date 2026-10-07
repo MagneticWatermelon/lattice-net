@@ -590,7 +590,7 @@ Scaleway was blocked, so M3e ran on AWS:
 - **Server:** c7a.16xlarge (EPYC 9R14, 64 cores without SMT, 25 Gbps). It's a VM, so tick times include virtualization.
 - **Bots:** m6in.8xlarge (16 cores / 32 threads, 50 Gbps), with 28 bot threads (`BOT_THREADS=28`).
 - **Link:** one cluster placement group; `iperf3` measured 24.8 Gbps.
-- **Session:** about 2 h, ~$12.
+- **Session:** about 1 h 40 min, ~$10.40.
 
 **M3's pass bars:**
 
@@ -670,7 +670,28 @@ Late inputs match WSL's 1k netem runs (0.39% under lossy and jittery against 0.3
      - With accurate RTTs but no send term: 3 honest trims.
      - The old code here also gave 0, so WSL doesn't reproduce the 62 at 10k on AWS. Whether those are cleared needs the next rig session.
 6. **GSO is slower on ENA:** there's no UDP segmentation offload (`USO=sw`), so egress is 1.80 vs 1.44 ms p50 for `sendmmsg` in the blob. Keep `sendmmsg` on AWS.
-7. **The serial events phase is the floor at 10k:** 4.1 ms p50 (2.4 ms on 2026-10-04's code), next to egress 4.1 and assembly 3.3. Rayon's idle spinning is ~22% of the CPU in profiles, as on Scaleway.
+7. **The serial events phase was the floor at 10k:** 4.1 ms p50 (2.4 ms on 2026-10-04's code), next to egress 4.1 and assembly 3.3. Rayon's idle spinning is ~22% of the CPU in profiles, as on Scaleway. **Fixed the same day:** inputs are now queued at ingress (next section).
+
+### Inputs queued at ingress (2026-10-07)
+
+**The problem:** the events phase queued every client's input message on one thread. At 10k players that's ~10k messages a tick, each a client lookup, a decode and a push into the entity's queue: 4.0 ms p50 / 5.1 ms p99 on AWS, the largest serial cost in a 24 ms p99 tick.
+
+**The fix:** each ingress task (one per transport shard) queues its own clients' inputs right after decrypting them. Each entity's input queue is behind a `Mutex` that's never contended, since all of a client's messages come through its shard; phases holding `&mut` skip the lock. The events phase keeps only connects and disconnects. No input has to wait for its spawn: a client sends only once accepted, and `Accepted` leaves at the end of the tick that spawned it.
+
+**WSL, uniform 5k with 20% firing and fighters, ladder off, 45 s, 8 server threads, two interleaved pairs** (ms):
+
+| | before | after |
+|---|---|---|
+| events p50 / p99 | 1.66–1.74 / 2.40–2.65 | 0.00 / 0.00 |
+| ingress p50 / p99 | 2.16–2.19 / 2.92–3.07 | 2.49 / 3.19–3.91 |
+| tick p50 / p99 | 23.12–23.17 / 30.13–30.34 | 21.76–21.77 / 25.61–27.42 |
+| overruns (steady state) | 6–7 | 3–4 |
+
+Ingress grows by the queueing, ~0.3 ms on 8 threads. Spread over 64 cores at 10k it should be ~0.1 ms against the ~4 ms the events phase took; that waits for a rig.
+
+**A first try** kept a separate phase after the connects: route each shard's messages to their entities, then queue them in parallel by entity range. It was correct, but on WSL each of its two parallel passes took ~0.2 ms longer than its work split over the threads, so events only went 1.49 → 0.80 ms p50, and its p99 didn't improve.
+
+**What that shows:** a parallel pass has a fixed cost beyond its work (waking and joining rayon's workers). On AWS the phase breakdown's overhead is ~0.5 ms per split phase at 10k, ~2 ms a tick over four phases, and the tick runs about eight parallel passes. Fewer passes, or workers kept awake through a tick, is worth a look next.
 
 ### Running it on bare metal (the desktop, dual-booted)
 

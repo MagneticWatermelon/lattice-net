@@ -352,7 +352,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
       - **Recoil is the client's:** it kicks the view, and the shot carries the view's aim. A no-recoil cheat is possible; spread isn't.
       - **Tests:** lag-compensation tests run with `SimConfig::cone_of_fire: false`. Fighters aim down sights unless `FightConfig::ads: false`. The fight baselines predate the cone.
       - **Client:** rifle to the sights with zoom, view kick and recovery, rifle kick and muzzle flash (others' too), bob and sprint pose, hip reticle sized to the cone, red dot down the sights.
-    - **M3e: run on AWS** (2026-10-07, `baselines/2026-10-07-aws-*`, see sim/README). The rig was a c7a.16xlarge server (64 cores, a VM) and an m6in.8xlarge bot box with 28 bot threads; about 2 h, ~$12.
+    - **M3e: run on AWS** (2026-10-07, `baselines/2026-10-07-aws-*`, see sim/README). The rig was a c7a.16xlarge server (64 cores, a VM) and an m6in.8xlarge bot box with 28 bot threads; about 1 h 40 min, ~$10.40.
       - **Pass bars:**
         - 10k with 20% firing: p99 24.1 ms (23.2 in a rerun). Met, but close.
         - 3k blob all fighting: p99 20.5 ms. Met.
@@ -372,7 +372,10 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
           - **Stamping:** the binary stamps each shard's sends at its flush (`SimConfig::real_time`). WSL uniform 5k reads RTT 4.3 ms instead of 18; the fight classes read 20.6 / 100.5 / 150.6 ms against netem's 20 / 100 / 150.
           - **The bound:** the backtrack bound adds the server's send delay explicitly. The inflated RTT used to cover it by accident; without it, accurate RTTs trimmed 3 honest shots per 538k at a 21 ms tick, with it 0.
           - **Still open:** whether this clears the 62 small trims at 10k on AWS needs the next rig session. WSL doesn't reproduce them.
-        - **The serial events phase** (4.1 ms at 10k) is the floor.
+        - ~~The serial events phase (4.1 ms at 10k) is the floor~~ **fixed** (2026-10-07):
+          - **How:** the ingress tasks queue their own clients' inputs. Each entity's input queue is behind a `Mutex` that's never contended (a client's messages all come through its shard), so events is only connects and disconnects.
+          - **WSL**, uniform 5k with 20% firing: events 1.7 → 0 ms, ingress +0.3 ms, tick p50 23.1 → 21.8 ms. The 10k gain (~4 ms expected) needs the rig.
+          - **Found on the way:** each rayon pass costs ~0.2–0.5 ms beyond its work split over the threads (dispatch and wake-ups), and the tick runs about eight. A first try with two extra passes saved little for that reason.
         - **On AWS,** the server's ~4 ms egress burst exceeds its 25 Gbps allowance (11–14% of packets queued), and GSO is slower than `sendmmsg` on ENA (no USO).
         - **Bot capacity:** a bot thread carries ~360 bots at most. The tail of a bot's tick (p99 10× the median) decides it, not the 30–40% average.
   - **Pass bars:**
