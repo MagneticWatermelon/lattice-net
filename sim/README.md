@@ -691,7 +691,51 @@ Ingress grows by the queueing, ~0.3 ms on 8 threads. Spread over 64 cores at 10k
 
 **A first try** kept a separate phase after the connects: route each shard's messages to their entities, then queue them in parallel by entity range. It was correct, but on WSL each of its two parallel passes took ~0.2 ms longer than its work split over the threads, so events only went 1.49 → 0.80 ms p50, and its p99 didn't improve.
 
-**What that shows:** a parallel pass has a fixed cost beyond its work (waking and joining rayon's workers). On AWS the phase breakdown's overhead is ~0.5 ms per split phase at 10k, ~2 ms a tick over four phases, and the tick runs about eight parallel passes. Fewer passes, or workers kept awake through a tick, is worth a look next.
+**What that shows:** a parallel pass has a fixed cost beyond its work (waking and joining rayon's workers). On AWS the phase breakdown's overhead is ~0.5 ms per split phase at 10k, ~2 ms a tick over four phases, and the tick runs about eight parallel passes. Keeping the workers awake through a tick removes most of it (next section).
+
+### Workers kept awake through a tick (2026-10-07)
+
+**The problem:** an idle rayon worker yields a few dozen times and then sleeps. The serial steps between the tick's phases (the grid rebuild, hit application, ...) are longer than that, so nearly every parallel pass started by waking sleeping workers. The tick also ran outside the pool, so its own thread slept through each pass and was woken after it.
+
+**Measured** with a microbenchmark on WSL: 8 threads, a pass of 64 tasks of 5 µs (ideal 40 µs), after a serial gap (p50 / p90, µs):
+
+| gap before the pass | from outside the pool (the tick, before) | from a worker | from a worker, the others kept awake |
+|---|---|---|---|
+| none | 76 / 267 | 46 / 49 | 45 / 49 |
+| 20 µs | 269 / 487 | 46 / 55 | 46 / 50 |
+| 100 µs | 274 / 514 | 256 / 477 | 46 / 50 |
+| 500 µs | 286 / 578 | 241 / 434 | 47 / 51 |
+| 2 ms | 315 / 367 | 257 / 529 | 48 / 51 |
+
+With 8 busy threads competing for the 16 hardware threads (like bots on the same box), kept-awake passes still took 47–49 µs p50 (p90 57–67), against 247–277 µs from outside the pool.
+
+**The fix:** `lattice-server` runs each tick and its egress on a rayon worker (`pool::awake`), which broadcasts a job to every other worker: look for pool work (`rayon::yield_now`), yield to the OS when there's none, until the tick is done. Between ticks the workers sleep as before. `--keep-awake off` turns it off, and the summary records it (`keep_awake`).
+
+**WSL, uniform 5k with 20% firing and fighters, ladder off, 45 s, 8 server threads, two interleaved pairs** (p50 in ms; "overhead" is the phase breakdown's, over ingress, assembly, transport and egress):
+
+| | off | on |
+|---|---|---|
+| tick p50 / p99 | 19.95–20.30 / 24.91–25.25 | 17.16–17.38 / 21.45–21.54 |
+| ingress | 2.26–2.29 | 1.86–1.94 |
+| movement | 0.93–0.95 | 0.55–0.56 |
+| separate | 0.53–0.55 | 0.04–0.05 |
+| serialize | 0.52–0.54 | 0.05 |
+| assembly | 5.67 | 5.23–5.26 |
+| transport | 3.78–3.84 | 3.30–3.42 |
+| egress | 3.69–3.78 | 3.26–3.28 |
+| grid (serial) | 0.27–0.28 | 0.39 |
+| overhead | 2.93–2.95 | 1.26–1.34 |
+
+**The 3k blob, everyone firing** (one pair): tick p50 / p99 25.44 / 30.11 → 23.34 / 25.93 ms, overhead 2.99 → 1.47 ms.
+
+**What it gains and costs:**
+- **Wake-ups:** separation and serialization were nearly all wake-up.
+- **Serial work runs slower:** the grid rebuild went 0.27 → 0.39 ms, and in the blob the shots phase, whose fire processing and hit application are serial, went 5.49 → 6.17 ms.
+  - **Why:** the tick's thread shares its core with a busy worker on the other SMT sibling. In the microbenchmark a serial step's p90 rose 499 → 677 µs (p50 unchanged), and pausing before yielding didn't help.
+  - **Where it applies:** this box's 16 threads also run the bots. The AWS server has no SMT, and with one worker per physical core (the default) a bare-metal server's scheduler normally gives each worker a core of its own.
+- **Bots on the same box:** no corrections or late inputs either way, and slot lateness p99 stayed at 0.1 ms. Their overruns rose a little (blob 26 → 63, uniform 90–113 → 113–140).
+- **Input waits:** in the blob they rose ~1 ms at p50 and 3.5 ms at p99 (66.4 → 69.9 ms), with no stand-ins; uniform didn't change. Probably shorter ticks moved when snapshots reach the bots, and so when they send.
+- **CPU:** the workers keep their cores busy through each tick, so CPU profiles show the pool busy for the whole tick, not just its work. The receive threads compete with them; the workers yield to the OS on every idle check, so a waking receive thread gets a core. Worth checking on the 64-core box, where 63 workers share it with 4 receive threads.
 
 ### Running it on bare metal (the desktop, dual-booted)
 

@@ -12,6 +12,7 @@ pub mod cli;
 pub mod grid;
 pub mod interest;
 pub mod ladder;
+pub mod pool;
 pub mod rng;
 pub mod server;
 pub mod shots;

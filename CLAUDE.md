@@ -376,6 +376,11 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
           - **How:** the ingress tasks queue their own clients' inputs. Each entity's input queue is behind a `Mutex` that's never contended (a client's messages all come through its shard), so events is only connects and disconnects.
           - **WSL**, uniform 5k with 20% firing: events 1.7 → 0 ms, ingress +0.3 ms, tick p50 23.1 → 21.8 ms. The 10k gain (~4 ms expected) needs the rig.
           - **Found on the way:** each rayon pass costs ~0.2–0.5 ms beyond its work split over the threads (dispatch and wake-ups), and the tick runs about eight. A first try with two extra passes saved little for that reason.
+        - **Rayon wake-ups: fixed** (2026-10-07, `lattice-server --keep-awake`, default on):
+          - **The cause:** idle workers slept between phases, so nearly every parallel pass waited for them to wake (~0.2 ms p50 on WSL, ~0.5 ms per split phase on AWS).
+          - **The fix:** the binary runs each tick and its egress on a worker (`pool::awake`) and keeps the others looking for work (`rayon::yield_now`, yielding to the OS) until it's done; between ticks they sleep.
+          - **WSL**, uniform 5k with 20% firing: tick p50 20.1 → 17.3 ms, p99 25.1 → 21.5 ms. Separation and serialization were almost all wake-up (0.54 → 0.05 ms each).
+          - **To check on the 64-core box:** 4 receive threads share the cores with 63 busy workers.
         - **On AWS,** the server's ~4 ms egress burst exceeds its 25 Gbps allowance (11–14% of packets queued), and GSO is slower than `sendmmsg` on ENA (no USO).
         - **Bot capacity:** a bot thread carries ~360 bots at most. The tail of a bot's tick (p99 10× the median) decides it, not the 30–40% average.
   - **Pass bars:**
