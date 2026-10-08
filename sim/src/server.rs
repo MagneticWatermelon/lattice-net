@@ -45,6 +45,10 @@ use crate::stats::Histogram;
 
 pub const PHASES: [&str; 10] = ["ingress", "events", "movement", "grid", "separate", "history", "shots", "serialize", "assembly", "transport"];
 pub type Datagram = (SocketAddr, Vec<u8>);
+/// Sends one shard's datagrams (`SimServer::tick_sending`): given the shard
+/// and its bucket, which it should leave empty. Called from that shard's
+/// task, so it must be thread-safe.
+pub type Sender<'a> = &'a (dyn Fn(usize, &mut Vec<Datagram>) + Sync);
 /// An inbound datagram with its arrival time, as the receive thread saw it.
 pub type InDatagram = (SocketAddr, Instant, Vec<u8>);
 pub type PhaseTimes = [Duration; PHASES.len()];
@@ -810,6 +814,23 @@ impl InputQueue {
     }
 }
 
+/// Hands one shard's reliable news and snapshots to its connections, flushes
+/// them stamped `at`, and appends the datagrams to `out`. Returns `at`.
+fn frame(shard: &mut lattice_net::Shard, snaps: &mut Vec<(ClientId, Vec<u8>, Option<u32>)>, news: &mut Vec<(ClientId, Vec<u8>)>, out: &mut Vec<Datagram>, at: Instant) -> Instant {
+    for (client, msg) in news.drain(..) {
+        let _ = shard.send(client, Channel::Reliable, msg);
+    }
+    for (client, snap, tag) in snaps.drain(..) {
+        let _ = match tag {
+            Some(tag) => shard.send_tagged(client, snap, tag),
+            None => shard.send(client, Channel::Unreliable, snap),
+        };
+    }
+    shard.flush(at);
+    out.extend(shard.drain_outgoing());
+    at
+}
+
 /// Whether `shooter`'s eye sees `target`'s chest now (no terrain or cover
 /// between them).
 fn in_sight(world: &World, history: &History, shooter: u16, target: u16) -> bool {
@@ -1152,6 +1173,16 @@ impl SimServer {
     /// datagrams must be bucketed by `router()`, and are consumed; outgoing ones
     /// are appended to their shard's bucket.
     pub fn tick(&mut self, inbound: &mut [Vec<InDatagram>], now: Instant, out: &mut [Vec<Datagram>]) -> PhaseTimes {
+        self.tick_sending(inbound, now, out, None)
+    }
+
+    /// `tick`, handing each shard's datagrams to `send` as soon as they're
+    /// framed, from the shard's own task: packets leave while other shards
+    /// still assemble, instead of all after the last one (a burst that
+    /// queued at AWS's bandwidth allowance), and two phase boundaries go.
+    /// Assembly's phase time and task spans then include framing and
+    /// sending; transport's spans are the framing alone.
+    pub fn tick_sending(&mut self, inbound: &mut [Vec<InDatagram>], now: Instant, out: &mut [Vec<Datagram>], send: Option<Sender>) -> PhaseTimes {
         let started = Instant::now();
         assert_eq!(inbound.len(), self.shard_count(), "one inbound bucket per shard");
         assert_eq!(out.len(), self.shard_count(), "one outgoing bucket per shard");
@@ -1434,13 +1465,20 @@ impl SimServer {
             max_message,
             packet_body,
         };
-        self.spans[8] = self
+        // With a sender, each shard's task frames its clients' messages and
+        // sends them as soon as they're assembled (8b and egress folded in).
+        let real = self.cfg.real_time;
+        let stamp = move || if real { now + started.elapsed() } else { now };
+        let (assembly, framing, sent) = self
             .shard_clients
             .par_iter_mut()
             .zip(self.snapshots.par_iter_mut())
             .zip(self.scratch.par_iter_mut())
             .zip(self.net.shards_mut().par_iter_mut())
-            .map(|(((clients, snaps), scratch), shard)| {
+            .zip(self.reliable_out.par_iter_mut())
+            .zip(out.par_iter_mut())
+            .enumerate()
+            .map(|(k, (((((clients, snaps), scratch), shard), news), out))| {
                 let t0 = Instant::now();
                 scratch.tally = Tally::default();
                 if scratch.stamp.len() < view.bodies.len() {
@@ -1452,9 +1490,16 @@ impl SimServer {
                     shard.take_acked(slot.client, &mut scratch.acked);
                     view.assemble(slot, scratch, snaps);
                 }
-                span(t0.elapsed())
+                let Some(send) = send else { return (span(t0.elapsed()), NO_SPAN, Duration::ZERO) };
+                let t1 = Instant::now();
+                let at = frame(shard, snaps, news, out, stamp());
+                let framed = span(t1.elapsed());
+                send(k, out);
+                // The whole task: assembly, framing and sending.
+                (span(t0.elapsed()), framed, at - now)
             })
-            .reduce(|| NO_SPAN, join_spans);
+            .reduce(|| (NO_SPAN, NO_SPAN, Duration::ZERO), |a, b| (join_spans(a.0, b.0), join_spans(a.1, b.1), a.2.max(b.2)));
+        self.spans[8] = assembly;
         if let Some(watched) = self.scratch.iter_mut().find_map(|sc| sc.watched.take()) {
             let rung = self.ladder.rung();
             self.debug = Some(DebugFrame {
@@ -1492,34 +1537,26 @@ impl SimServer {
         }
         lap(8);
 
-        // 8b. transport: queue, frame, ack and checksum, one task per shard.
-        // Sends are stamped when each shard flushes (real time) or at the
-        // tick's instant (simulated), and the latest stamp is kept.
-        let real = self.cfg.real_time;
-        let (transport, sent) = self
-            .net
-            .shards_mut()
-            .par_iter_mut()
-            .zip(self.snapshots.par_iter_mut())
-            .zip(self.reliable_out.par_iter_mut())
-            .zip(out.par_iter_mut())
-            .map(|(((shard, snaps), news), out)| {
-                let t0 = Instant::now();
-                for (client, msg) in news.drain(..) {
-                    let _ = shard.send(client, Channel::Reliable, msg);
-                }
-                for (client, snap, tag) in snaps.drain(..) {
-                    let _ = match tag {
-                        Some(tag) => shard.send_tagged(client, snap, tag),
-                        None => shard.send(client, Channel::Unreliable, snap),
-                    };
-                }
-                let at = if real { now + started.elapsed() } else { now };
-                shard.flush(at);
-                out.extend(shard.drain_outgoing());
-                (span(t0.elapsed()), at - now)
-            })
-            .reduce(|| (NO_SPAN, Duration::ZERO), |a, b| (join_spans(a.0, b.0), a.1.max(b.1)));
+        // 8b. transport: queue, frame, ack and checksum, one task per shard
+        // (done already, with a sender). Sends are stamped when each shard
+        // flushes (real time) or at the tick's instant (simulated), and the
+        // latest stamp is kept.
+        let (transport, sent) = match send {
+            Some(_) => (framing, sent),
+            None => self
+                .net
+                .shards_mut()
+                .par_iter_mut()
+                .zip(self.snapshots.par_iter_mut())
+                .zip(self.reliable_out.par_iter_mut())
+                .zip(out.par_iter_mut())
+                .map(|(((shard, snaps), news), out)| {
+                    let t0 = Instant::now();
+                    let at = frame(shard, snaps, news, out, stamp());
+                    (span(t0.elapsed()), at - now)
+                })
+                .reduce(|| (NO_SPAN, Duration::ZERO), |a, b| (join_spans(a.0, b.0), a.1.max(b.1))),
+        };
         self.spans[9] = transport;
         self.send_delays[self.tick as usize % SEND_DELAY_TICKS] = sent.as_secs_f64() * TICK_HZ as f64;
         lap(9);

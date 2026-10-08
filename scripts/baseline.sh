@@ -380,7 +380,7 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
   echo
   echo "## Phase breakdown (p50)"
   echo
-  echo "For each phase split by shard: **wall / longest shard task / total work ÷ threads**, in ms. With perfect scheduling a phase would take max(longest, work ÷ threads); **overhead** sums wall minus that over the four phases (rayon dispatch, waiting, imbalance). Serial is events + grid + history, which run on one thread."
+  echo "For each phase split by shard: **wall / longest shard task / total work ÷ threads**, in ms. With perfect scheduling a phase would take max(longest, work ÷ threads); **overhead** sums wall minus that over the four phases (rayon dispatch, waiting, imbalance). Serial is events + grid + history, which run on one thread. Sending during assembly (\`send_during_assembly=on\`), each shard's assembly task also frames and sends: assembly's columns cover all three, and transport and egress show only their (near-zero) wall time."
   echo
   echo "| run | threads | tick | ingress | assembly | transport | egress | overhead | serial |"
   echo "|---|---|---|---|---|---|---|---|---|"

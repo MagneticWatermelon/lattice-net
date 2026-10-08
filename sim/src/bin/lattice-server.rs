@@ -6,9 +6,11 @@
 //! buckets, so arrivals spread across the tick don't have to fit in the kernel
 //! buffer and routing costs no tick time. Egress is one rayon task per shard,
 //! batched with `sendmmsg` on Linux, optionally with GSO (`--egress gso`): each
-//! client's datagrams for the tick go out as one `UDP_SEGMENT` send. The tick
-//! and its egress run on a rayon worker with the others kept awake until they
-//! finish (`--keep-awake`), so a parallel pass doesn't wait for them to wake.
+//! client's datagrams for the tick go out as one `UDP_SEGMENT` send, from
+//! the shard's own assembly task as soon as its clients' messages are framed
+//! (`--send-during-assembly`). The tick and its egress run on a rayon worker
+//! with the others kept awake until they finish (`--keep-awake`), so a
+//! parallel pass doesn't wait for them to wake.
 
 use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
@@ -50,6 +52,11 @@ lattice-server: M1 movement-only authoritative server
   --keep-awake on|off  during a tick, idle rayon workers keep looking for work instead of
                        sleeping between phases, so a parallel pass doesn't wait for them
                        to wake (they still yield to the OS); between ticks they sleep [on]
+  --send-during-assembly on|off
+                       each shard sends its datagrams as soon as its clients' messages
+                       are framed, while other shards still assemble, instead of all
+                       shards after the last; the assembly phase's time then includes
+                       framing and sending [on]
   --shards N           transport shards [64]
   --sockets N          receiving sockets on the port (SO_REUSEPORT), each with its own receive
                        thread and an equal run of the shards; each shard sends from its
@@ -601,11 +608,13 @@ fn main() -> std::io::Result<()> {
         },
     };
     let threads: usize = a.get("threads", physical_cores());
-    let keep_awake = match a.get("keep-awake", "on".to_string()).as_str() {
+    let mut on_off = |flag: &str| match a.get(flag, "on".to_string()).as_str() {
         "on" => true,
         "off" => false,
-        other => panic!("--keep-awake {other:?}: expected on or off"),
+        other => panic!("--{flag} {other:?}: expected on or off"),
     };
+    let keep_awake = on_off("keep-awake");
+    let send_early = on_off("send-during-assembly");
     let duration = Duration::from_secs_f64(a.get("duration", 0.0));
     let until_empty = a.flag("until-empty");
     let report = Duration::from_secs_f64(a.get("report", 5.0));
@@ -657,7 +666,7 @@ fn main() -> std::io::Result<()> {
     let start = Instant::now();
 
     println!(
-        "listening on {bind} | spawn {:?} | tiers near {}@{} m, mid {} m, far {} m, budget {} B/tick, squads of {} | {} rayon threads (keep awake {}), {shards} shards, {groups} socket(s), {} accepts/tick, egress {egress:?}, ingress {ingress:?} | socket buffers rcv {} KiB snd {} KiB",
+        "listening on {bind} | spawn {:?} | tiers near {}@{} m, mid {} m, far {} m, budget {} B/tick, squads of {} | {} rayon threads (keep awake {}), {shards} shards (send during assembly {}), {groups} socket(s), {} accepts/tick, egress {egress:?}, ingress {ingress:?} | socket buffers rcv {} KiB snd {} KiB",
         cfg.spawn,
         cfg.interest.near_per_tick,
         cfg.interest.near_radius,
@@ -667,6 +676,7 @@ fn main() -> std::io::Result<()> {
         cfg.interest.squad_size,
         rayon::current_num_threads(),
         if keep_awake { "on" } else { "off" },
+        if send_early { "on" } else { "off" },
         cfg.net.max_accepts_per_tick,
         rcvbuf >> 10,
         sndbuf >> 10
@@ -716,6 +726,9 @@ fn main() -> std::io::Result<()> {
     let mut kept_rewind = [Histogram::new(1000), Histogram::new(1000)];
     let mut kept_overruns = 0u64;
     let mut out: Vec<Vec<Datagram>> = vec![Vec::new(); shards];
+    // With --send-during-assembly: each shard's datagrams, bytes and send time
+    // this tick, written by its own task.
+    let early_sent: Vec<(AtomicU64, AtomicU64, AtomicU64)> = (0..shards).map(|_| Default::default()).collect();
     let mut window = Window::new(start, &sim, &net, thread_cpu(&receivers));
     let mut kept: Vec<Row> = Vec::new();
     // Per steady tick, for ingress, assembly, transport and egress: the longest
@@ -753,24 +766,47 @@ fn main() -> std::io::Result<()> {
         let level = sim.level();
         // The tick and its egress, the pool's workers kept awake between their
         // phases (`--keep-awake`).
+        // Sends one shard's bucket; returns its datagrams, bytes and time.
+        let send_bucket = |shard: usize, bucket: &mut Vec<Datagram>| {
+            let t0 = Instant::now();
+            let sock = &socks[shard / per_group];
+            let (n, bytes) = (bucket.len(), bucket.iter().map(|(_, p)| p.len()).sum::<usize>());
+            let sent = send_all(sock, bucket, egress);
+            if sent.errors > 0 {
+                net.send_errors.fetch_add(sent.errors as u64, Relaxed);
+            }
+            net.sends.fetch_add(sent.sends as u64, Relaxed);
+            net.send_syscalls.fetch_add(sent.syscalls as u64, Relaxed);
+            bucket.clear();
+            (n, bytes, t0.elapsed())
+        };
         let mut run = || {
+            if send_early {
+                // Each shard's task sends its own bucket once it's framed; its
+                // totals are gathered here after.
+                let early = &early_sent;
+                let sender = |shard: usize, bucket: &mut Vec<Datagram>| {
+                    let (n, bytes, d) = send_bucket(shard, bucket);
+                    let e = &early[shard];
+                    e.0.store(n as u64, Relaxed);
+                    e.1.store(bytes as u64, Relaxed);
+                    e.2.store(d.as_nanos() as u64, Relaxed);
+                };
+                let times = sim.tick_sending(&mut inbound, now, &mut out, Some(&sender));
+                let t_egress = Instant::now();
+                let egress = early.iter().fold((0, 0, (Duration::ZERO, Duration::ZERO)), |a, e| {
+                    let (n, bytes, d) = (e.0.swap(0, Relaxed) as usize, e.1.swap(0, Relaxed) as usize, Duration::from_nanos(e.2.swap(0, Relaxed)));
+                    (a.0 + n, a.1 + bytes, (a.2 .0.max(d), a.2 .1 + d))
+                });
+                return (times, t_egress, egress);
+            }
             let times = sim.tick(&mut inbound, now, &mut out);
             let t_egress = Instant::now();
             let egress = out
                 .par_iter_mut()
                 .enumerate()
                 .map(|(shard, bucket)| {
-                    let t0 = Instant::now();
-                    let sock = &socks[shard / per_group];
-                    let (n, bytes) = (bucket.len(), bucket.iter().map(|(_, p)| p.len()).sum::<usize>());
-                    let sent = send_all(sock, bucket, egress);
-                    if sent.errors > 0 {
-                        net.send_errors.fetch_add(sent.errors as u64, Relaxed);
-                    }
-                    net.sends.fetch_add(sent.sends as u64, Relaxed);
-                    net.send_syscalls.fetch_add(sent.syscalls as u64, Relaxed);
-                    bucket.clear();
-                    let d = t0.elapsed();
+                    let (n, bytes, d) = send_bucket(shard, bucket);
                     (n, bytes, (d, d))
                 })
                 .reduce(
@@ -874,7 +910,7 @@ fn main() -> std::io::Result<()> {
         let _ = r.join();
     }
     if let Some(path) = summary_path {
-        let run = RunInfo { egress, keep_awake, ingress, gather, peak_clients, overruns: kept_overruns };
+        let run = RunInfo { egress, keep_awake, send_early, ingress, gather, peak_clients, overruns: kept_overruns };
         let mut kv = summary_values(&kept, &run, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net, &steady_state);
         for (tier, h) in ["near", "mid"].iter().zip(&kept_rewind) {
             let r = h.summary();
@@ -885,6 +921,13 @@ fn main() -> std::io::Result<()> {
         // Where a split phase's time goes: wall = longest task + dispatch and
         // waiting; longest - work / threads = imbalance.
         for (i, name) in ["ingress", "assembly", "transport", "egress"].iter().enumerate() {
+            // Sending during assembly, assembly's tasks frame and send too:
+            // transport and egress have no phase of their own to judge.
+            if send_early && i >= 2 {
+                kv.put(format!("{name}_longest_p50_ms"), "-");
+                kv.put(format!("{name}_work_p50_ms"), "-");
+                continue;
+            }
             let mut longest: Vec<u32> = kept_spans.iter().map(|s| s[i][0]).collect();
             let mut work: Vec<u32> = kept_spans.iter().map(|s| s[i][1]).collect();
             kv.put_ms(format!("{name}_longest_p50_ms"), summarize(&mut longest).p50);
@@ -951,6 +994,7 @@ fn net_snapshot(net: &NetCounters, receivers: &[std::thread::JoinHandle<()>]) ->
 struct RunInfo {
     egress: Egress,
     keep_awake: bool,
+    send_early: bool,
     ingress: Ingress,
     gather: Duration,
     peak_clients: usize,
@@ -978,6 +1022,7 @@ fn summary_values(
     kv.put("ladder", if cfg.ladder.enabled { "on" } else { "off" });
     kv.put("threads", rayon::current_num_threads());
     kv.put("keep_awake", if run.keep_awake { "on" } else { "off" });
+    kv.put("send_during_assembly", if run.send_early { "on" } else { "off" });
     kv.put("shards", cfg.shards);
     kv.put("sockets", cfg.socket_groups);
     kv.put("peak_clients", run.peak_clients);

@@ -11,7 +11,7 @@ use lattice_sim::bot::BotBrain;
 use lattice_sim::movement::TICK_HZ;
 use lattice_sim::rng::Rng;
 use lattice_sim::interest::{InterestConfig, Tier, FAR_PERIOD, MID_PERIOD};
-use lattice_sim::server::{SimConfig, SimServer, SpawnMode};
+use lattice_sim::server::{Datagram, SimConfig, SimServer, SpawnMode};
 
 const SERVER: &str = "10.0.0.1:40000";
 
@@ -73,6 +73,8 @@ struct Swarm {
     /// aim and the direction its client drew the tracer along.
     gunner: Option<Gunner>,
     gunner_dirs: Vec<([f32; 3], [f32; 3])>,
+    /// Tick with `tick_sending`: each shard sends from its own task.
+    send_early: bool,
 }
 
 /// A test gunner: aims at `target` where its bot draws it, leading for the
@@ -185,6 +187,7 @@ impl Swarm {
             up_delayed: Vec::new(),
             gunner: None,
             gunner_dirs: Vec::new(),
+            send_early: false,
         }
     }
 
@@ -279,7 +282,18 @@ impl Swarm {
         }
         let mut out = vec![Vec::new(); router.shard_count()];
         let t = Instant::now();
-        self.server.tick(&mut inbound, self.now, &mut out);
+        if self.send_early {
+            // Each shard's datagrams arrive through the sender, from its task.
+            let sent: Vec<std::sync::Mutex<Vec<Datagram>>> = (0..out.len()).map(|_| Default::default()).collect();
+            let sender = |k: usize, bucket: &mut Vec<Datagram>| sent[k].lock().unwrap().append(bucket);
+            self.server.tick_sending(&mut inbound, self.now, &mut out, Some(&sender));
+            assert!(out.iter().all(|b| b.is_empty()), "the sender empties every bucket");
+            for (b, s) in out.iter_mut().zip(sent) {
+                *b = s.into_inner().unwrap();
+            }
+        } else {
+            self.server.tick(&mut inbound, self.now, &mut out);
+        }
         let work = self.fake_load.map_or(t.elapsed(), |f| period.mul_f32(f));
         self.server.observe_tick(work);
         self.last_out.clear();
@@ -1541,15 +1555,22 @@ fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64, u64, u64) {
     fight_on(lags, secs, (0.0, 0.0, 0))
 }
 
-/// `fight` on links that lose `link.0` of datagrams, hold `link.1` of the
-/// bots' back a step, and hold the server's back up to `link.2` steps.
+/// `fight_with`, the server ticking the usual way.
 fn fight_on(lags: &[u32], secs: u32, link: (f32, f32, u32)) -> (Vec<(u64, u64, f64)>, u64, u64, u64) {
+    fight_with(lags, secs, link, false)
+}
+
+/// `fight` on links that lose `link.0` of datagrams, hold `link.1` of the
+/// bots' back a step, and hold the server's back up to `link.2` steps; with
+/// `send_early`, the server sends each shard's datagrams from its own task.
+fn fight_with(lags: &[u32], secs: u32, link: (f32, f32, u32), send_early: bool) -> (Vec<(u64, u64, f64)>, u64, u64, u64) {
     use lattice_sim::bot::FightConfig;
     let n = 9 * lags.len();
     let interest = InterestConfig { squad_size: 0, ..Default::default() };
     let cfg = SimConfig { spawn: SpawnMode::Disk(40.0), interest, cone_of_fire: false, ..Default::default() };
     let mut s = Swarm::with_config(n, cfg);
     s.render = true;
+    s.send_early = send_early;
     (s.loss, s.delay, s.down_jitter) = link;
     for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
         // Not down the sights: that slows them, which hides what lag costs.
@@ -1604,6 +1625,22 @@ fn honest_fighters_on_bad_links_are_never_held_or_trimmed() {
     // whose input came in late (its server wait gone) sometimes lands up to
     // a step past it, about 1 shot in 60,000 (1 in 30 runs of ~2,000).
     assert!(trimmed <= 2, "{trimmed} trimmed");
+}
+
+#[test]
+fn sending_during_assembly_fights_the_same() {
+    // The server hands each shard's datagrams over from the shard's own task
+    // (`tick_sending`, lattice-server's default) instead of after the tick:
+    // the same fight, no corrections, nobody trimmed or held, alike hit rates.
+    let clean = (0.0, 0.0, 0);
+    let (late, ..) = fight_with(&[0, 1], 10, clean, false);
+    let (early, _, trimmed, held) = fight_with(&[0, 1], 10, clean, true);
+    let rate = |p: &[(u64, u64, f64)]| p.iter().map(|&(s, h, _)| h as f64 / s as f64).collect::<Vec<_>>();
+    eprintln!("hit rates: after the tick {:?}, during assembly {:?}", rate(&late), rate(&early));
+    assert_eq!((trimmed, held), (0, 0));
+    for (a, b) in rate(&late).iter().zip(rate(&early)) {
+        assert!((a - b).abs() < 0.1, "{a} vs {b}");
+    }
 }
 
 #[test]
