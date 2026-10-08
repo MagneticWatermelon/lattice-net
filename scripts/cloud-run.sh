@@ -7,6 +7,9 @@
 #
 # VAR=value pairs go to baseline.sh, e.g. SERVER_THREADS=8 to match the
 # 16-thread dev box (the default is every core of the server box), PROFILE=1.
+# IRQ_CPUS=0-3 in this script's environment first steers the server card's
+# interrupts to those CPUs (scripts/irq-affinity.sh): pair it with
+# SERVER_ARGS="--rx-cpus 0-3 --worker-cpus 4-63".
 # Syncs this working tree to both machines first (and rebuilds), so local
 # changes are what runs.
 set -euo pipefail
@@ -31,6 +34,10 @@ done
 # platform's allowance limits must not grow, or the run measured the cloud.
 counters() { on lattice-srv "lattice-net/scripts/nic-check.sh counters $BOT_PRIV" > ".cloud/nic-$1-srv.txt"; on lattice-bots "lattice-net/scripts/nic-check.sh counters $SRV_PRIV" > ".cloud/nic-$1-bots.txt"; }
 counters before
+
+if [ -n "${IRQ_CPUS:-}" ]; then
+  on lattice-srv "iface=\$(ip -o route get $BOT_PRIV | grep -o 'dev [^ ]*' | cut -d' ' -f2); lattice-net/scripts/irq-affinity.sh \"\$iface\" $IRQ_CPUS"
+fi
 
 # Quoted for the remote shell, so SERVER_ARGS="--sockets 4 --ingress recvfrom" stays one value.
 vars=$( [ $# -eq 0 ] || printf '%q ' "$@")

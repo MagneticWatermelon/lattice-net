@@ -51,12 +51,18 @@ lattice-server: M1 movement-only authoritative server
                        scheduler overhead (on 64 cores, 128 threads ran slower than 64)]
   --keep-awake on|off  during a tick, idle rayon workers keep looking for work instead of
                        sleeping between phases, so a parallel pass doesn't wait for them
-                       to wake (they still yield to the OS); between ticks they sleep [on]
+                       to wake (they still yield to the OS); between ticks they sleep.
+                       Assumes one server per machine: two would starve each other [on]
   --send-during-assembly on|off
                        each shard sends its datagrams as soon as its clients' messages
                        are framed, while other shards still assemble, instead of all
                        shards after the last; the assembly phase's time then includes
                        framing and sending [on]
+  --worker-cpus LIST   pin the rayon workers to these CPUs (`0-59`; one each when the list has
+                       one per thread); --threads defaults to the list's length [unpinned]
+  --rx-cpus LIST       pin the receive threads (and the main thread) to these CPUs, apart
+                       from the workers; steer the NIC's interrupts there too
+                       (scripts/irq-affinity.sh) [unpinned]
   --shards N           transport shards [64]
   --sockets N          receiving sockets on the port (SO_REUSEPORT), each with its own receive
                        thread and an equal run of the shards; each shard sends from its
@@ -607,7 +613,12 @@ fn main() -> std::io::Result<()> {
             ..SimConfig::default().net
         },
     };
-    let threads: usize = a.get("threads", physical_cores());
+    let cpu_list = |list: Option<String>, flag: &str| {
+        list.map(|l| lattice_sim::cpus::parse_list(&l).unwrap_or_else(|e| panic!("--{flag}: {e}")))
+    };
+    let worker_cpus = cpu_list(a.opt("worker-cpus"), "worker-cpus");
+    let rx_cpus = cpu_list(a.opt("rx-cpus"), "rx-cpus");
+    let threads: usize = a.get("threads", worker_cpus.as_ref().map_or_else(physical_cores, |c| c.len()));
     let mut on_off = |flag: &str| match a.get(flag, "on".to_string()).as_str() {
         "on" => true,
         "off" => false,
@@ -624,7 +635,18 @@ fn main() -> std::io::Result<()> {
     let debug_http: Option<SocketAddr> = a.opt("debug-http");
     a.finish();
 
-    rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().expect("rayon pool");
+    let mut pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
+    if let Some(cpus) = worker_cpus.clone() {
+        pool = pool.start_handler(move |i| {
+            lattice_sim::cpus::pin(lattice_sim::cpus::for_thread(&cpus, i, threads)).expect("--worker-cpus: pinning a worker");
+        });
+    }
+    pool.build_global().expect("rayon pool");
+    // The main thread runs no tick work (that's on a worker): it goes with the
+    // receive threads, off the workers' cores.
+    if let Some(cpus) = &rx_cpus {
+        lattice_sim::cpus::pin(cpus).expect("--rx-cpus: pinning the main thread");
+    }
 
     let groups = cfg.socket_groups;
     if groups == 0 || !cfg.shards.is_multiple_of(groups) {
@@ -694,6 +716,8 @@ fn main() -> std::io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let tick_clock = Arc::new(TickClock::new(start));
     let mut receivers = Vec::with_capacity(groups);
+    // Each receive thread's kernel id, for its scheduler stats.
+    let rx_tids: Arc<Vec<std::sync::atomic::AtomicI32>> = Arc::new((0..groups).map(|_| Default::default()).collect());
     for (group, sock) in socks.iter().enumerate() {
         let rx = Receiver {
             sock: sock.clone(),
@@ -706,7 +730,14 @@ fn main() -> std::io::Result<()> {
             gather,
             tick: tick_clock.clone(),
         };
-        receivers.push(std::thread::Builder::new().name(format!("ingress-{group}")).spawn(move || rx.run(ingress))?);
+        let (cpus, tids) = (rx_cpus.clone(), rx_tids.clone());
+        receivers.push(std::thread::Builder::new().name(format!("ingress-{group}")).spawn(move || {
+            if let Some(cpus) = cpus {
+                lattice_sim::cpus::pin(lattice_sim::cpus::for_thread(&cpus, group, groups)).expect("--rx-cpus: pinning a receive thread");
+            }
+            tids[group].store(lattice_sim::cpus::tid(), Relaxed);
+            rx.run(ingress)
+        })?);
     }
 
     let mut csv = csv_path.map(open_csv).transpose()?;
@@ -845,14 +876,14 @@ fn main() -> std::io::Result<()> {
         window.client_ticks += clients as u64;
         if warm.is_some() && cool.is_none() && clients < peak_clients * 9 / 10 {
             cool = Some(sim.counters().clone());
-            steady_state.net_end = Some(net_snapshot(&net, &receivers));
+            steady_state.net_end = Some(net_snapshot(&net, &receivers, &rx_tids));
         }
         let steady = |warm: &Option<Counters>, cool: &Option<Counters>| warm.is_some() && cool.is_none();
         if clients > 0 {
             let first = *first_client.get_or_insert(now);
             if now - first >= warmup && cool.is_none() {
                 warm.get_or_insert_with(|| sim.counters().clone());
-                steady_state.net_start.get_or_insert_with(|| net_snapshot(&net, &receivers));
+                steady_state.net_start.get_or_insert_with(|| net_snapshot(&net, &receivers, &rx_tids));
                 steady_state.first.get_or_insert(now);
                 steady_state.last = Some(done);
                 steady_state.client_ticks += clients as u64;
@@ -904,13 +935,15 @@ fn main() -> std::io::Result<()> {
         window.report(Instant::now() - start, &sim, &wait, &net, &thread_cpu(&receivers), csv.as_mut())?;
     }
     // Before the receive threads end: their CPU clocks go with them.
-    steady_state.net_end.get_or_insert_with(|| net_snapshot(&net, &receivers));
+    steady_state.net_end.get_or_insert_with(|| net_snapshot(&net, &receivers, &rx_tids));
     stop.store(true, Relaxed);
     for r in receivers {
         let _ = r.join();
     }
     if let Some(path) = summary_path {
-        let run = RunInfo { egress, keep_awake, send_early, ingress, gather, peak_clients, overruns: kept_overruns };
+        let cpus = |c: &Option<Vec<usize>>| c.as_ref().map_or("-".to_string(), |c| format!("{}-{}x{}", c[0], c[c.len() - 1], c.len()));
+        let (worker_cpus, rx_cpus) = (cpus(&worker_cpus), cpus(&rx_cpus));
+        let run = RunInfo { egress, keep_awake, send_early, worker_cpus, rx_cpus, ingress, gather, peak_clients, overruns: kept_overruns };
         let mut kv = summary_values(&kept, &run, &sim, warm.as_ref(), cool.as_ref(), &kept_wait, &net, &steady_state);
         for (tier, h) in ["near", "mid"].iter().zip(&kept_rewind) {
             let r = h.summary();
@@ -980,14 +1013,20 @@ struct NetSnap {
     counters: [u64; 5],
     /// CPU time of each receive thread.
     cpu: Vec<Duration>,
+    /// How long each receive thread has waited for a core (schedstats).
+    waited: Vec<Option<Duration>>,
+    /// CPU time of the kernel's softirq threads (ksoftirqd).
+    softirq: Option<Duration>,
 }
 
-fn net_snapshot(net: &NetCounters, receivers: &[std::thread::JoinHandle<()>]) -> NetSnap {
+fn net_snapshot(net: &NetCounters, receivers: &[std::thread::JoinHandle<()>], tids: &[std::sync::atomic::AtomicI32]) -> NetSnap {
     let [rcv, snd] = kernel_udp_drops();
     NetSnap {
         at: Instant::now(),
         counters: [net.in_pkts.load(Relaxed), net.in_bytes.load(Relaxed), net.recv_calls.load(Relaxed), rcv, snd],
         cpu: thread_cpu(receivers),
+        waited: tids.iter().map(|t| lattice_sim::cpus::runq_wait(t.load(Relaxed))).collect(),
+        softirq: lattice_sim::cpus::ksoftirqd_cpu(),
     }
 }
 
@@ -995,6 +1034,9 @@ struct RunInfo {
     egress: Egress,
     keep_awake: bool,
     send_early: bool,
+    /// Pinning (`--worker-cpus`, `--rx-cpus`): first-last x count, or "-".
+    worker_cpus: String,
+    rx_cpus: String,
     ingress: Ingress,
     gather: Duration,
     peak_clients: usize,
@@ -1023,6 +1065,8 @@ fn summary_values(
     kv.put("threads", rayon::current_num_threads());
     kv.put("keep_awake", if run.keep_awake { "on" } else { "off" });
     kv.put("send_during_assembly", if run.send_early { "on" } else { "off" });
+    kv.put("worker_cpus", &run.worker_cpus);
+    kv.put("rx_cpus", &run.rx_cpus);
     kv.put("shards", cfg.shards);
     kv.put("sockets", cfg.socket_groups);
     kv.put("peak_clients", run.peak_clients);
@@ -1070,9 +1114,24 @@ fn summary_values(
     // How much of a core each receive thread used: near 100% means one socket
     // can't keep up (more --sockets).
     if let (Some(a), Some(b)) = (&steady.net_start, &steady.net_end) {
-        if let Some((max, mean)) = busy_pct(&a.cpu, &b.cpu, (b.at - a.at).as_secs_f64()) {
+        let secs = (b.at - a.at).as_secs_f64();
+        if let Some((max, mean)) = busy_pct(&a.cpu, &b.cpu, secs) {
             kv.put("ingress_thread_busy_max_pct", format!("{max:.1}"));
             kv.put("ingress_thread_busy_mean_pct", format!("{mean:.1}"));
+        }
+        // How long a receive thread that had datagrams waited for a core:
+        // more than a little means the workers (or the NIC's softirq work)
+        // crowd it, and --rx-cpus with scripts/irq-affinity.sh is worth it.
+        let waited: Option<Vec<(Duration, Duration)>> = a.waited.iter().zip(&b.waited).map(|(x, y)| x.zip(*y)).collect();
+        if let Some((max, mean)) = waited.and_then(|w| {
+            let (x, y): (Vec<_>, Vec<_>) = w.into_iter().unzip();
+            busy_pct(&x, &y, secs)
+        }) {
+            kv.put("rx_runq_wait_max_pct", format!("{max:.2}"));
+            kv.put("rx_runq_wait_mean_pct", format!("{mean:.2}"));
+        }
+        if let (Some(x), Some(y)) = (a.softirq, b.softirq) {
+            kv.put("ksoftirqd_cpu_pct", format!("{:.1}", y.saturating_sub(x).as_secs_f64() / secs.max(1e-9) * 100.0));
         }
     }
     kv.put("kernel_rcvbuf_drops", rcv1.saturating_sub(rcv0));

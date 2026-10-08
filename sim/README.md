@@ -798,11 +798,53 @@ Movement grew 0.02–0.04 ms for the gathering. Hits, kills and trims (0) are al
 
 **Honest fighters** are never held: on clean links (`latency_classes_hit_alike_within_the_cap`) and on bad ones (`honest_fighters_on_bad_links_are_never_held_or_trimmed`: 5% loss, a fifth of uplink datagrams a step late, downlink up to a step late, at 0, 33 and 133 ms one-way; also tried with 8% loss, 40% late and two steps of jitter). On that bad link the backtrack bound (not the floor) still trims about 1 honest shot in 60,000, by under a step: a mid/far claim whose input arrived late, so its server wait collapsed while its claim didn't change. On WSL with the real binaries (1k blob fighting, uniform 5k with 20% firing), none of ~2.7 million shots over nine runs were trimmed. Before the stand-in allowance above, one run of seven held 4 shots by up to 0.9 steps (a step, less the slack, as a bumped input clock would); the two runs since held none. That cause is a fit, not a proof: the 4 didn't recur to be logged.
 
-**Two bugs found on the way:**
+**Three bugs found on the way:**
+- **Bots' shots on late slots.** A bot runs its input clock a step per call (`step_inputs`), but placed a trigger pull on it by the wall time since its last call. When a slot ran late, a pull landed two inputs ahead, and the input before it was made a call later, claiming a fresher view than the pull: the floor held such shots by a step (0.9, less the slack), 5–205 per run of ~440k–850k shots. A stepped caller's pull is now at most a step past its last call. The game client runs its clock by elapsed time and never did this.
 - **Kernel arrival stamps across a wall-clock step.** Stamps are wall-clock time, converted with a wall/monotonic pair read after each receive call; WSL steps its wall clock now and then, so a datagram stamped just before a step landed seconds off (one anchor 3.5 s early held a client's claims ~90 steps). Both the server's receive threads and the bots now clamp each arrival to no earlier than when the socket was last read empty (`udp::Clocks::arrival`). Input waits and RTTs had the same exposure.
 - **The swarm harness's late datagrams skipped the latency classes:** a datagram held back a step ignored the bot's lag, arriving early instead of late. It now arrives a step after its lag.
 
 **What it doesn't stop:** a cheat that fakes a jittery link (its RTTs' range comes from acks it reports) gets up to 100 ms of slack before the floor applies, and one that sends its inputs in bursts can claim copies up to 2 steps older; both are still within the backtrack bound. Neither can swing between fresh and stale shot by shot.
+
+### Sending during assembly (2026-10-08)
+
+**From a review:** egress waited for every shard's assembly, then sent the tick's ~12–14 MB (10k) in ~4 ms: ~25–28 Gbps for that moment, the burst AWS queued at the server's 25 Gbps allowance (11–14% of packets).
+
+**The change:** `SimServer::tick_sending` takes a per-shard sender. Each shard's task assembles its clients' messages, frames them (the transport's queue, ack and seal) and hands the datagrams to the sender at once, so packets leave while other shards still assemble, and two phase boundaries (assembly → transport → egress) go. The sim still never touches a socket; `tick` keeps the two passes (the in-process swarms use it).
+- `lattice-server --send-during-assembly on|off` (default on); the summary records `send_during_assembly`.
+- With it on, the assembly phase's time and task spans cover framing and sending; transport's spans are the framing alone, and egress has no time of its own (baseline.sh's overhead column then sums ingress and assembly only).
+- Swarm: `sending_during_assembly_fights_the_same`.
+
+**WSL A/B** (ladder off, 45 s, 8 server threads; two interleaved pairs uniform, one pair blob; ms):
+
+| | after the tick | during assembly |
+|---|---|---|
+| uniform 5k, 20% firing: tick p50 / p99 | 15.93–15.99 / 17.27–18.75 | 13.81–13.97 / 15.29–15.86 |
+| uniform 5k: assembly + transport + egress p50 | 4.79–4.82 + 3.12–3.21 + 2.97–3.00 | 8.88–8.89 (all three) |
+| uniform 5k: steady-state overruns | 1–2 | 0 |
+| 3k blob, all firing: tick p50 / p99 | 17.72 / 19.50 | 16.15 / 19.89 |
+| 3k blob: assembly + transport + egress p50 | 8.26 + 2.30 + 3.07 | 12.06 (all three) |
+
+- **Uniform 5k: ~2 ms off the tick at p50 and p99.** The three phases took 11.0 ms in a row and take 8.9 together. Each phase used to wait for its slowest thread before the next began; now each thread frames and sends its own shards as soon as their assembly is done.
+- **Less work, too:** the tasks' total time per tick fell from 79.8 ms (35.2 assembly + 23.5 transport + 21.1 egress) to 66.2 in uniform 5k, and from 99.8 to 90.3 in the blob. Most likely cache: a shard's messages are still warm when they're sealed and sent.
+- **Blob: 1.6 ms off at p50, p99 unchanged** (one pair).
+- Hits, kills and trims were alike; the held shots in these runs were the bots' late slots (below, under the render floor), fixed since.
+
+**If AWS still queues packets:** kernel pacing would need per-packet departure times (`SO_TXTIME`, which `fq` honors). `SO_MAX_PACING_RATE` on an unconnected UDP socket doesn't pace the socket's total: since Linux 4.16, `fq` makes each destination its own flow, so the rate caps each client's flow.
+
+### Where threads run (2026-10-08)
+
+**From a review:** with the workers kept awake through each tick (63 of them on the 64-core box), the receive threads and the network card's interrupt work compete with them for cores. Interrupts themselves preempt anything, but interrupt work that overflows into `ksoftirqd` threads is scheduled like any thread.
+
+**Pinning, to try on the rig:**
+- `lattice-server --worker-cpus LIST` pins the rayon workers (one CPU each when the list has one per thread; `--threads` defaults to its length), and `--rx-cpus LIST` pins the receive threads and the main thread (which runs no tick work).
+- `scripts/irq-affinity.sh <iface> <cpus>` steers the card's interrupts to the receive CPUs (it stops irqbalance; a VLAN's are its parent card's). `IRQ_CPUS=0-3 scripts/cloud-run.sh ...` runs it on the server box first; pair it with `SERVER_ARGS="--rx-cpus 0-3 --worker-cpus 4-63"`.
+- The layout costs the workers those cores (4 of 64 is ~6%), so it's an A/B, not a default.
+
+**Measured either way** (`lattice_sim::cpus`; in the summary): each receive thread's time waiting for a core over the steady state (`rx_runq_wait_max_pct`, `rx_runq_wait_mean_pct`, from schedstats) and the CPU the kernel's softirq threads used (`ksoftirqd_cpu_pct`, percent of one core, summed). High waits or busy ksoftirqd say pinning is worth it.
+
+**On WSL** (bots on the same box, so not a judgment of pinning): unpinned, the receive threads waited for a core 0.04% of the time in uniform 5k and in the 3k blob, and `ksoftirqd` used nothing (the bots' traffic doesn't touch a card). Pinned with `--worker-cpus 2-9 --rx-cpus 0-1 --sockets 2`, each receive thread ran on its own CPU, the main thread on 0–1, and the eight workers one each on 2–9 (read from `/proc`); the receive threads, then sharing their two CPUs with the unpinned bots, waited 0.78%.
+
+**Keeping workers awake assumes one server per machine:** two servers keeping their workers awake on the same cores would starve each other. The gate that fixed the hang depends on how rayon runs broadcast jobs (inside joins and `yield_now`); after upgrading rayon, run the full stress test: `cargo test --release -p lattice-sim pool -- --ignored` (150,000 ticks against competing load, ~30 s on WSL).
 
 ### Running it on bare metal (the desktop, dual-booted)
 

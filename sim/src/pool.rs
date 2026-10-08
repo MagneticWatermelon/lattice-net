@@ -33,7 +33,9 @@ const START_WAIT: Duration = Duration::from_millis(1);
 /// keeps looking for work (yielding to the OS when there's none), so `f`'s
 /// parallel passes start at once instead of waking sleeping workers. Call it
 /// from outside the pool, once per tick, with nothing else running on the
-/// pool: its threads are busy until `f` returns (or panics).
+/// pool: its threads are busy until `f` returns (or panics). It assumes the
+/// machine is the server's alone: two servers keeping their workers awake
+/// on the same cores would starve each other.
 pub fn awake<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     hold(f, None)
 }
@@ -154,5 +156,39 @@ mod tests {
             tx.send(()).unwrap();
         });
         rx.recv_timeout(Duration::from_secs(120)).expect("a tick hung");
+    }
+
+    /// The stress run that caught the hang, at full length and against
+    /// competing load. The gate depends on how rayon runs broadcast jobs
+    /// (inside joins and `yield_now`), so run it after upgrading rayon.
+    #[test]
+    #[ignore = "long (minutes): cargo test --release -p lattice-sim pool -- --ignored, after upgrading rayon"]
+    fn many_ticks_under_load_never_wait_on_a_held_worker() {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let load: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        spin(50);
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+            for i in 0..150_000 {
+                let tick = || (0..256usize).into_par_iter().with_max_len(4).map(|x| (spin(2), x).1).sum::<usize>();
+                assert_eq!(pool.install(|| awake(tick)), 255 * 256 / 2);
+                spin(i % 50);
+            }
+            tx.send(()).unwrap();
+        });
+        let done = rx.recv_timeout(Duration::from_secs(1800));
+        stop.store(true, Ordering::Relaxed);
+        load.into_iter().for_each(|t| t.join().unwrap());
+        done.expect("a tick hung");
     }
 }

@@ -9,6 +9,7 @@ pub mod activity;
 pub mod bot;
 pub mod debugmap;
 pub mod cli;
+pub mod cpus;
 pub mod grid;
 pub mod interest;
 pub mod ladder;

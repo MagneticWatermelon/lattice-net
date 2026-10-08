@@ -340,8 +340,9 @@ kilo() { awk -v v="$1" 'BEGIN {if (v == "-") print "-"; else printf "%.0f", v / 
   else
     where="on the same machine over loopback"
   fi
-  awake=$(for s in "$dir"/*/server.summary; do kv "$s" keep_awake; break; done)
-  echo "- **Runs:** ${#runs[@]} scenarios x $repeat, ${secs} s each, interleaved. Server $server_threads threads (kept awake through ticks: ${awake:-?}), bots $bot_threads threads, $where. Took $(( ($(date +%s) - started) / 60 )) min."
+  first=$(ls "$dir"/*/server.summary 2> /dev/null | head -1 || true)
+  setting() { [ -n "$first" ] && kv "$first" "$1" || echo '?'; }
+  echo "- **Runs:** ${#runs[@]} scenarios x $repeat, ${secs} s each, interleaved. Server $server_threads threads (kept awake through ticks: $(setting keep_awake); sending during assembly: $(setting send_during_assembly); worker CPUs $(setting worker_cpus), receive CPUs $(setting rx_cpus)), bots $bot_threads threads, $where. Took $(( ($(date +%s) - started) / 60 )) min."
   echo "- **Setup and checks:** \`env.txt\`. Raw logs, per-window CSVs and key=value summaries: one directory per run."
   echo
   echo "Steady state: from 3 s after the first client until clients start leaving. Times in ms."
