@@ -213,6 +213,9 @@ pub struct ClientCore {
     clock: f32,
     /// When `clock` was last advanced.
     clock_at: Option<Instant>,
+    /// The caller runs the clock a step per call (`step_inputs`), not by
+    /// elapsed time (`tick_inputs`).
+    stepped: bool,
     /// In 1/30 s.
     bump_cooldown: f32,
     buffer_avg: f32,
@@ -301,6 +304,7 @@ impl ClientCore {
             // adds or skips an input, instead of flipping at the edge every tick.
             clock: 0.5,
             clock_at: None,
+            stepped: false,
             bump_cooldown: 0.0,
             buffer_avg: TARGET_DEPTH,
             resyncing: false,
@@ -784,6 +788,12 @@ impl ClientCore {
     /// The shot time (`weapon::shot_time`) and seq of a trigger pull at `now`.
     fn shot_at(&self, now: Instant) -> (u64, u32, u8) {
         let since = self.clock_at.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32() * TICK_HZ as f32);
+        // A caller that runs the clock a step per call (a bot) advances it a
+        // step at its next call however late that is: a pull is at most a
+        // step past the last one, or it would ride an input two calls away
+        // while the one before it is made after it (claiming a fresher view
+        // than the pull's, which the server's render floor holds against it).
+        let since = if self.stepped { since.min(1.0) } else { since };
         let phase = (self.clock + self.rate * since).max(0.0);
         let ahead = phase.floor();
         let frac = (((phase - ahead) * 256.0) as u32).min(255) as u8;
@@ -862,6 +872,7 @@ impl ClientCore {
     /// and the early one waits a tick longer on the server (WSL blob: p99
     /// server wait 67-74 ms per call vs 80-102 ms by time).
     pub fn tick_inputs(&mut self, now: Instant, source: impl FnMut(&MoveState, &Welcome) -> Input) -> Vec<Vec<u8>> {
+        self.stepped = false;
         // In 1/30 s. A slow frame makes all its inputs, as several batches,
         // up to `MAX_CATCH_UP`; a longer stall is the server's to fill with
         // stand-ins, then a resync.
@@ -876,6 +887,7 @@ impl ClientCore {
     /// ticks at the input rate (the bots). Usually one input, occasionally
     /// two or none while it steers the server's queue depth into `DEPTH_BAND`.
     pub fn step_inputs(&mut self, now: Instant, source: impl FnMut(&MoveState, &Welcome) -> Input) -> Option<Vec<u8>> {
+        self.stepped = true;
         // At most a batch's worth, so at most one batch.
         self.run_inputs(now, 1.0, INPUT_REDUNDANCY, source).pop()
     }
