@@ -5,10 +5,11 @@
 //! Accuracy follows PlanetSide 2's model (an assault rifle's numbers): a
 //! shot leaves somewhere in a *cone of fire*, tight aiming down sights, wide
 //! from the hip, wider moving or in the air, and *bloom* widens it with each
-//! shot of a burst. The server decides where every shot goes (`spread`, from
-//! the shooter's id and the shot's seq, so the shooter's client predicts the
-//! same direction for its tracer). *Recoil* kicks the shooter's view; it's the
-//! client's, since shots go where the view points.
+//! shot of a burst. The server decides where every shot goes (`spread`, with
+//! a secret pick per shot, so no client can predict it and aim to cancel it;
+//! the shooter's own tracer leaves along a pick of its own, and everyone
+//! else's tracers show the real shot). *Recoil* kicks the shooter's view; it's
+//! the client's, since shots go where the view points.
 
 use crate::movement::{MoveState, TICK_HZ};
 
@@ -105,23 +106,17 @@ impl Bloom {
     }
 }
 
-fn mix(mut h: u64) -> u64 {
-    // splitmix64
-    h = h.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    h ^ (h >> 31)
-}
-
-/// Where a shot aimed at (`yaw`, `pitch`) with a `cone` (degrees) goes: a
-/// point of the cone picked by (`shooter`, `seq`), uniform over its disc.
-/// Unit vector.
-pub fn spread(yaw: u16, pitch: i16, cone: f32, shooter: u16, seq: u32) -> [f32; 3] {
+/// Where a shot aimed at (`yaw`, `pitch`) with a `cone` (degrees) goes: the
+/// point of the cone that `pick` (64 random bits) selects, uniform over its
+/// disc. Unit vector. The server's picks are secret (keyed by a secret the
+/// clients never see), so a client can't aim to cancel its spread or wait
+/// for a lucky shot; a client's own tracer uses a pick of its own.
+pub fn spread(yaw: u16, pitch: i16, cone: f32, pick: u64) -> [f32; 3] {
     let d = aim(yaw, pitch);
     if cone <= 0.0 {
         return d;
     }
-    let h = mix((shooter as u64) << 32 | seq as u64);
+    let h = pick;
     let (u1, u2) = ((h >> 40) as f32 / (1u64 << 24) as f32, (h & 0xFF_FFFF) as f32 / (1u64 << 24) as f32);
     let r = (cone.to_radians() * u1.sqrt()).tan();
     let (s, c) = (u2 * std::f32::consts::TAU).sin_cos();
@@ -247,20 +242,23 @@ mod tests {
     }
 
     #[test]
-    fn shots_spread_uniformly_over_the_cone_and_deterministically() {
+    fn shots_spread_uniformly_over_the_cone() {
         let (yaw, pitch) = (12000u16, 2000i16);
         let d = aim(yaw, pitch);
+        // Picks from a 64-bit LCG (any well-spread bits will do).
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
         let mut far = 0;
-        for seq in 0..2000 {
-            let s = spread(yaw, pitch, 2.0, 7, seq);
-            assert_eq!(s, spread(yaw, pitch, 2.0, 7, seq), "same shooter and seq: same shot");
+        for _ in 0..2000 {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let s = spread(yaw, pitch, 2.0, x);
+            assert_eq!(s, spread(yaw, pitch, 2.0, x), "the same pick: the same shot");
             let angle = (d[0] * s[0] + d[1] * s[1] + d[2] * s[2]).clamp(-1.0, 1.0).acos().to_degrees();
             assert!(angle <= 2.0 + 1e-3, "{angle}");
             far += (angle > 2.0 * std::f32::consts::FRAC_1_SQRT_2) as u32;
         }
         // Uniform over the disc: half the area is past radius / sqrt 2.
         assert!((900..1100).contains(&far), "{far} of 2000 in the outer half");
-        assert_ne!(spread(yaw, pitch, 2.0, 7, 1), spread(yaw, pitch, 2.0, 8, 1), "shooters differ");
+        assert_eq!(spread(yaw, pitch, 0.0, x), d, "no cone: straight down the aim");
         let (y, p) = angles(d);
         assert!((y as i32 - yaw as i32).abs() <= 1 && (p as i32 - pitch as i32).abs() <= 1);
     }

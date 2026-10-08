@@ -97,6 +97,7 @@ dependencies = [
  "lattice-net",
  "libc",
  "rayon",
+ "ring",
  "socket2",
 ]
 

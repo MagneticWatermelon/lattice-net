@@ -19,6 +19,8 @@ use lattice_game::movement::{TICK_HZ, WORLD_SIZE};
 use lattice_game::weapon::{Flight, SUBSTEPS};
 use lattice_game::world::World;
 
+use ring::hmac;
+
 use crate::grid::Grid;
 use crate::interest::NearState;
 
@@ -31,6 +33,41 @@ pub const MID_CAP: f64 = 11.0;
 pub const HISTORY_TICKS: usize = 16;
 /// Fastest a player moves (sprint), for padding candidate searches, m/s.
 const MAX_SPEED: f32 = 9.0;
+
+/// The secret that picks where in its cone of fire each shot goes
+/// (`weapon::spread`). It's never sent, and a pick is HMAC-SHA256 of the
+/// shooter's spawn and the shot's seq under it, so knowing a shot's id and
+/// seq (or seeing where earlier shots went: everyone near sees tracers) tells
+/// a client nothing about where the next shot will go.
+pub struct SpreadKey(hmac::Key);
+
+impl SpreadKey {
+    /// From `secret`, or 32 bytes from the OS when there's none.
+    pub fn new(secret: Option<[u8; 32]>) -> Self {
+        let bytes = secret.unwrap_or_else(|| {
+            let mut b = [0u8; 32];
+            ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b).expect("OS randomness");
+            b
+        });
+        Self(hmac::Key::new(hmac::HMAC_SHA256, &bytes))
+    }
+
+    /// The pick for shot `seq` of `spawn` (a number no other connection
+    /// shares while this key lives).
+    pub fn pick(&self, spawn: u64, seq: u32) -> u64 {
+        let mut msg = [0u8; 12];
+        msg[..8].copy_from_slice(&spawn.to_le_bytes());
+        msg[8..].copy_from_slice(&seq.to_le_bytes());
+        let tag = hmac::sign(&self.0, &msg);
+        u64::from_le_bytes(tag.as_ref()[..8].try_into().unwrap())
+    }
+}
+
+impl std::fmt::Debug for SpreadKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("SpreadKey(..)")
+    }
+}
 
 /// Where an entity was at the end of a tick.
 #[derive(Debug, Clone, Copy, Default)]
@@ -341,5 +378,19 @@ mod tests {
         assert_eq!((p.d, cut), ([4.0, 8.0], Cut::default()), "an honest claim stands");
         let (p, cut) = Projectile::new(4, &Fire { behind: [8.0 + 4.0, 10.5 + 4.0], ..f }, ok);
         assert_eq!((p.d, cut.trimmed), ([8.5, 10.5], true), "a backtrack claim is trimmed");
+    }
+
+    #[test]
+    fn spread_picks_depend_on_the_secret() {
+        let (a, b) = (SpreadKey::new(Some([1; 32])), SpreadKey::new(Some([2; 32])));
+        assert_eq!(a.pick(5, 9), SpreadKey::new(Some([1; 32])).pick(5, 9), "the same secret: the same picks");
+        assert_ne!(a.pick(5, 9), b.pick(5, 9), "another secret: other picks");
+        assert_ne!(a.pick(5, 9), a.pick(6, 9), "another spawn");
+        assert_ne!(a.pick(5, 9), a.pick(5, 10), "another shot");
+        let os = SpreadKey::new(None);
+        assert_ne!(os.pick(5, 9), SpreadKey::new(None).pick(5, 9), "a fresh secret from the OS each time");
+        // The picks' bits are spread evenly (the cone takes 48 of them).
+        let ones: u32 = (0..1000).map(|seq| a.pick(1, seq).count_ones()).sum();
+        assert!((31_000..33_000).contains(&ones), "{ones} of 64,000 bits set");
     }
 }

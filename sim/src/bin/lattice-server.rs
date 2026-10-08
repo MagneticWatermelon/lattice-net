@@ -580,6 +580,8 @@ fn main() -> std::io::Result<()> {
         deaths_per_sec: a.get("deaths-per-sec", 0.0),
         immortal: a.flag("immortal"),
         cone_of_fire: !a.flag("no-cone"),
+        // Where shots go in their cones: a fresh secret from the OS.
+        spread_secret: None,
         // Ticks take real time here: stamp sends when they're flushed.
         real_time: true,
         identity: lattice_net::ServerIdentity {

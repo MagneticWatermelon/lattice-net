@@ -69,10 +69,10 @@ struct Swarm {
     lag: Vec<u32>,
     /// Bot -> server datagrams held back by `lag`, with when they arrive.
     up_delayed: Vec<(Instant, SocketAddr, Vec<u8>)>,
-    /// A bot that aims at a target as it draws it, and fires; and where its
-    /// client said each shot went.
+    /// A bot that aims at a target as it draws it, and fires; and each shot's
+    /// aim and the direction its client drew the tracer along.
     gunner: Option<Gunner>,
-    gunner_dirs: Vec<[f32; 3]>,
+    gunner_dirs: Vec<([f32; 3], [f32; 3])>,
 }
 
 /// A test gunner: aims at `target` where its bot draws it, leading for the
@@ -92,14 +92,14 @@ struct Gunner {
 }
 
 /// Aims `brain` at `g.target` as drawn at `now`, and pulls the trigger.
-/// Returns where the client says the shot goes.
-fn aim_and_fire(brain: &mut BotBrain, g: &mut Gunner, now: Instant) -> Option<[f32; 3]> {
+/// Returns the aim and the direction the client drew its tracer along.
+fn aim_and_fire(brain: &mut BotBrain, g: &mut Gunner, now: Instant) -> Option<([f32; 3], [f32; 3])> {
     let core = brain.core_mut();
     let r = core.render_step(now)?;
     let (yaw, pitch) = lattice_sim::bot::aim_at(core, g.target, r - g.back as f64, g.head, g.extra_lead)?;
     let dir = core.fire_claiming(now, yaw, pitch, g.ads, g.back as f64)?;
     g.shots += 1;
-    Some(dir)
+    Some((lattice_game::weapon::aim(yaw, pitch), dir))
 }
 
 /// Where `entity` really was at (fractional) game step `r`: the server's
@@ -1393,7 +1393,8 @@ fn firing_line(dist: f32, lethal: bool) -> (Swarm, [u16; 3]) {
 fn firing_line_with(dist: f32, lethal: bool, cone_of_fire: bool) -> (Swarm, [u16; 3]) {
     use lattice_sim::bot::Moves;
     let interest = InterestConfig { squad_size: 0, ..Default::default() };
-    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, cone_of_fire, ..Default::default() };
+    // A fixed secret for where shots go in their cones, so runs repeat.
+    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, cone_of_fire, spread_secret: Some([7; 32]), ..Default::default() };
     let mut s = render_swarm(3, cfg, Duration::from_secs(3600));
     for _ in 0..TICK_HZ {
         s.step();
@@ -1705,12 +1706,13 @@ fn distant_fights_are_seen() {
 }
 
 #[test]
-fn aiming_down_sights_hits_and_shots_go_where_the_shooter_saw() {
+fn aiming_down_sights_hits_and_the_spread_is_the_servers_secret() {
     // A standing gunner 40 m from a standing target, with the cone of fire:
     // from the hip (2 degrees, blooming) most shots miss; down the sights
-    // (0.1, blooming to 0.6) nearly all hit. Every shot goes exactly where
-    // the shooter's client said it would (same cone, same pick), so its
-    // tracers show the real shots.
+    // (0.1, blooming to 0.6) nearly all hit. Every shot stays in its cone,
+    // but where in it is the server's secret: the shooter's client (which
+    // a cheat would run) draws its tracer in the same cone, never along the
+    // real shot, so it can't aim to cancel the spread.
     let mut rates = Vec::new();
     for ads in [false, true] {
         let (mut s, [shooter, target, _]) = firing_line_with(40.0, false, true);
@@ -1731,10 +1733,16 @@ fn aiming_down_sights_hits_and_shots_go_where_the_shooter_saw() {
         }
         let fired: Vec<[f32; 3]> = s.server.take_fired().into_iter().filter(|f| f.0 == shooter).map(|f| f.2).collect();
         assert_eq!(fired.len(), s.gunner_dirs.len(), "every shot the client fired, the server fired");
-        for (a, b) in fired.iter().zip(&s.gunner_dirs) {
-            let d = (0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0f32, f32::max);
-            assert!(d < 1e-6, "server {a:?} vs client {b:?}");
+        let degrees = |a: &[f32; 3], b: &[f32; 3]| (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0).acos().to_degrees();
+        use lattice_game::weapon::{BLOOM_MAX_ADS, BLOOM_MAX_HIP, CONE_ADS, CONE_HIP};
+        let widest = if ads { CONE_ADS + BLOOM_MAX_ADS } else { CONE_HIP + BLOOM_MAX_HIP } + 1e-3;
+        let mut predicted = 0;
+        for (shot, (aim, tracer)) in fired.iter().zip(&s.gunner_dirs) {
+            assert!(degrees(shot, aim) <= widest && degrees(tracer, aim) <= widest, "in the cone");
+            // Before the secret, client and server agreed to 1e-6.
+            predicted += ((0..3).map(|k| (shot[k] - tracer[k]).abs()).fold(0.0f32, f32::max) < 1e-6) as u32;
         }
+        assert_eq!(predicted, 0, "the client's tracer never knew where a shot would go");
         let hits = s.server.take_hits().len();
         eprintln!("{}: {hits} of {} hit", if ads { "down the sights" } else { "from the hip" }, fired.len());
         rates.push(hits as f64 / fired.len() as f64);

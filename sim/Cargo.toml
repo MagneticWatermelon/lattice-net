@@ -11,6 +11,8 @@ lattice-net = { path = ".." }
 lattice-game = { path = "../game" }
 lattice-client-core = { path = "../client-core" }
 rayon = "1"
+# HMAC-SHA256 for the secret cone-of-fire picks (the same ring as lattice-net's).
+ring = "0.17"
 socket2 = { version = "0.5", features = ["all"] } # all: SO_REUSEPORT
 
 [target.'cfg(target_os = "linux")'.dependencies]

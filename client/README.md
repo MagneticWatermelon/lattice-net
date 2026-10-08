@@ -106,7 +106,8 @@ Modeled on PlanetSide 2's assault rifles.
 - **Cone of fire:**
   - every shot leaves somewhere in a cone, uniform over its disc: 0.1° down the sights (0.4° moving), 2° from the hip (2.75° moving), 2.5× wider in the air;
   - bloom adds 0.04° (sights) or 0.1° (hip) per shot of a burst, up to +0.5° / +1.5°, and recovers 133 ms after the last shot at 12°/s;
-  - the server decides where each shot goes, from the shooter's id and the shot's input seq. The client runs the same rule (`weapon::Bloom`, `weapon::spread`), so your tracers show your real shots: at 40 m, hip fire hit 4 of 60 and the sights 59 of 60, every direction equal to 1e-6 (`aiming_down_sights_hits_and_shots_go_where_the_shooter_saw`);
+  - the server decides where in the cone each shot goes, with a secret pick per shot (HMAC-SHA256 under a key drawn at startup), so no client can predict it and aim to cancel the spread;
+  - the client keeps the same bloom (`weapon::Bloom`), so your tracer leaves within the real cone, but along a pick of its own: at long range your tracer can disagree with the hit marker. Hit markers and other players' tracers come from the server's real shots. At 40 m, hip fire hit 3 of 60 and the sights 60 of 60 (`aiming_down_sights_hits_and_the_spread_is_the_servers_secret`, which also checks the client never knew a shot's direction);
   - the hip reticle's four ticks sit at the cone's edge: they spread as you fire and move.
 - **Recoil:**
   - each shot kicks the view up 0.32° (the first of a burst 1.75× that) and 0.16° left to 0.22° right;

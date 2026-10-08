@@ -33,7 +33,7 @@ use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
-use crate::shots::{self, Cut, Fire, FlyStats, History, Outcome, Projectile, Sky};
+use crate::shots::{self, Cut, Fire, FlyStats, History, Outcome, Projectile, Sky, SpreadKey};
 use lattice_game::weapon::{self, shot_time, Bloom, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
 use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::events::{self, Event};
@@ -214,6 +214,10 @@ pub struct SimConfig {
     /// Shots leave within their cone of fire (`weapon::Bloom`, `spread`).
     /// Off only for tests that measure lag compensation's geometry.
     pub cone_of_fire: bool,
+    /// The secret that picks where in its cone each shot goes
+    /// (`shots::SpreadKey`). None draws one from the OS at startup; tests
+    /// fix it so their runs repeat.
+    pub spread_secret: Option<[u8; 32]>,
     /// Ticks take real time (the `lattice-server` binary): the transport
     /// stamps each shard's sends when it flushes them, so RTTs and the hold
     /// times acks report leave out the tick's processing (stamped at the
@@ -244,6 +248,7 @@ impl Default for SimConfig {
             deaths_per_sec: 0.0,
             immortal: false,
             cone_of_fire: true,
+            spread_secret: None,
             real_time: false,
             identity: ServerIdentity { server_id: 1, token_key: lattice_net::token::DEV_TOKEN_KEY },
         }
@@ -506,6 +511,9 @@ struct InputQueue {
     /// fire (`SimConfig::cone_of_fire`).
     bloom: Bloom,
     cone: bool,
+    /// The server's secret for where in the cone each shot goes, and this
+    /// spawn's number under it. None before the first spawn.
+    spread: Option<(Arc<SpreadKey>, u64)>,
 }
 
 impl Default for InputQueue {
@@ -525,6 +533,7 @@ impl Default for InputQueue {
             refused: 0,
             bloom: Bloom::default(),
             cone: true,
+            spread: None,
         }
     }
 }
@@ -610,7 +619,8 @@ impl InputQueue {
         };
         self.last_shot = Some(time);
         let cone = if self.cone { self.bloom.fire(time, ads, &before) } else { 0.0 };
-        let dir = weapon::spread(shot.yaw, shot.pitch, cone, e, seq);
+        let pick = self.spread.as_ref().map_or(0, |(key, spawn)| key.pick(*spawn, seq));
+        let dir = weapon::spread(shot.yaw, shot.pitch, cone, pick);
         let (yaw, pitch) = weapon::angles(dir);
         let tau0 = step_no as f64 - 1.0 + shot.frac as f64 / 256.0;
         let mid_lag = render.map_or(0.0, |r| r.mid_lag as f64 / MID_LAG_UNITS);
@@ -826,6 +836,8 @@ pub struct SimServer {
     debug: Option<DebugFrame>,
     /// The last tick's per-shard task spans (see `tasks`).
     spans: PhaseSpans,
+    /// Picks where in its cone each shot goes; shared with the input queues.
+    spread: Arc<SpreadKey>,
 }
 
 impl SimServer {
@@ -837,6 +849,7 @@ impl SimServer {
             net.preallocate(cfg.max_clients);
         }
         let (ladder, interest) = (Ladder::new(cfg.ladder.clone()), cfg.interest.clone());
+        let spread_secret = cfg.spread_secret;
         Self {
             world: World::shared(cfg.world_seed),
             pushes: Vec::new(),
@@ -888,6 +901,7 @@ impl SimServer {
             watch: None,
             debug: None,
             spans: [NO_SPAN; PHASES.len()],
+            spread: Arc::new(SpreadKey::new(spread_secret)),
         }
     }
 
@@ -1685,7 +1699,8 @@ impl SimServer {
             invulnerable: self.cfg.immortal,
             ..Body::default()
         };
-        self.inputs[i] = Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, ..InputQueue::default() });
+        let spread = Some((Arc::clone(&self.spread), self.counters.spawns));
+        self.inputs[i] = Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, spread, ..InputQueue::default() });
         if squad != NO_SQUAD {
             self.squads.entry(squad).or_default().push(e);
         }

@@ -248,9 +248,13 @@ pub struct ClientCore {
     pending_shot: Option<(u32, Shot)>,
     /// When the last shot fired (`weapon::shot_time`): the rifle's rate.
     last_shot: Option<u64>,
-    /// Our bloom, kept as the server keeps it, so our tracers go where the
-    /// server sends our shots.
+    /// Our bloom, kept as the server keeps it, so our tracers spread as wide
+    /// as the server spreads our shots.
     bloom: Bloom,
+    /// Picks where in the cone our own tracers go. The server's picks are
+    /// secret, so ours are our own: the tracer is cosmetic, and hits and
+    /// everyone else's tracers come from the server's.
+    tracer_picks: std::collections::hash_map::RandomState,
     /// The newest snapshot's own state and its step: the server's view of us.
     server_own: Option<(MoveState, u32)>,
     /// Own-player correction being smoothed away, as of `own_offset_at`.
@@ -317,6 +321,7 @@ impl ClientCore {
             pending_shot: None,
             last_shot: None,
             bloom: Bloom::default(),
+            tracer_picks: Default::default(),
             own_offset: [0.0; 3],
             own_offset_at: None,
             sink: false,
@@ -764,9 +769,10 @@ impl ClientCore {
     /// or not (`ads`: the inputs must say so too, with `BUTTON_ADS`). The
     /// shot rides the input whose step `now` falls in (`frac` from the input
     /// clock's phase), with the render step of `now`: what the player sees is
-    /// what the server tests it against. Returns where it goes (its cone of
-    /// fire, as the server will pick it), or nothing while dead, before the
-    /// render clock runs, or faster than the rifle fires (`FIRE_STEPS`).
+    /// what the server tests it against. Returns a direction for our own
+    /// tracer (in the cone of fire the server will use, but not its pick,
+    /// which is secret), or nothing while dead, before the render clock runs,
+    /// or faster than the rifle fires (`FIRE_STEPS`).
     pub fn fire(&mut self, now: Instant, yaw: u16, pitch: i16, ads: bool) -> Option<[f32; 3]> {
         self.fire_claiming(now, yaw, pitch, ads, 0.0)
     }
@@ -802,9 +808,11 @@ impl ClientCore {
         self.pending_shot = Some((seq, Shot { frac, yaw, pitch, render: msg::render_units(render - back) }));
         self.last_shot = Some(time);
         // As the server will: the cone from the state before the shot's step
-        // (ours now, unless the shot is for a later input this frame).
+        // (ours now, unless the shot is for a later input this frame). Where
+        // in it is our own pick.
         let cone = self.bloom.fire(time, ads, &self.state);
-        let dir = weapon::spread(yaw, pitch, cone, entity, seq);
+        let pick = std::hash::BuildHasher::hash_one(&self.tracer_picks, seq);
+        let dir = weapon::spread(yaw, pitch, cone, pick);
         // Our own tracer is drawn at once: not again as distant ambience. The
         // server counts it about a round trip after the newest step we heard.
         if let Some(newest) = self.render_clock.newest_at(now) {

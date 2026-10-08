@@ -514,9 +514,9 @@ Ticks were unchanged in the blob (p50 8.6 ms). Nothing was cut by the budget in 
 Worst case (every cell active): a 3.1 µs gather per client per window, and a 0.25 ms serial finish per window (`gather_cost`, ignored).
 
 **Cone of fire and aiming down sights** (PlanetSide 2's model; numbers and the client's side in client/README, The gun):
-- **Server-side spread:** every shot leaves within its cone of fire, picked by the server from the shooter's id and the shot's seq (`weapon::spread`).
+- **Server-side spread:** every shot leaves within its cone of fire, at a point the server picks (`weapon::spread`). Since 2026-10-08 the pick is secret: HMAC-SHA256 of the shooter's spawn number and the shot's seq, under a key drawn from the OS at startup (`shots::SpreadKey`; tests fix it with `SimConfig::spread_secret`). Before, it came from the shooter's id and the seq alone, so a modified client could predict every shot and aim to cancel the spread, or hold fire for a lucky one.
 - **Bloom:** the server keeps each player's bloom (`InputQueue::bloom`). The cone comes from the shooter's state before the shot's step and the input's `BUTTON_ADS`.
-- **The client agrees:** it computes the same direction, so its tracers are the real shots. Others' tracers carry the spread aim.
+- **The client's own tracer is cosmetic:** it keeps the same bloom, so its tracer stays in the real cone, but picks its own point in it. Others' tracers carry the real direction, and hits are the server's.
 - **`SimConfig::cone_of_fire` / `lattice-server --no-cone`:** turns the cone off. The lag-compensation tests (`what_you_see_is_what_you_hit`, the fairness test, walls, headshots) run without it, since they measure geometry.
 - **Fighting bots aim down sights while they have a target:** they move at half speed. `FightConfig::ads: false` turns it off, as the fairness test does: slower targets hide what lag costs.
 - **Old baselines:** fight baselines before this (`baselines/2026-10-05-wsl2-fight`) had no cone and no sights.
