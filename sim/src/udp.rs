@@ -157,6 +157,16 @@ impl Clocks {
     pub fn instant_of(&self, t: SystemTime) -> Instant {
         self.system.duration_since(t).map_or(self.instant, |ago| self.instant.checked_sub(ago).unwrap_or(self.instant))
     }
+
+    /// When a datagram arrived: its kernel `stamp` (or the reading, without
+    /// one), but never before its socket was last found empty (`drained`).
+    /// The stamp is wall-clock time, and the wall clock can step (WSL resyncs
+    /// it with the host): a datagram stamped just before a step would
+    /// otherwise land seconds off.
+    pub fn arrival(&self, stamp: Option<SystemTime>, drained: Option<Instant>) -> Instant {
+        let t = stamp.map_or(self.instant, |t| self.instant_of(t));
+        drained.map_or(t, |d| t.max(d).min(self.instant))
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +214,11 @@ mod tests {
         assert_eq!(c.instant_of(c.system - ago), c.instant - ago);
         // A stamp ahead of the reading (wall clock stepped) is taken as now.
         assert_eq!(c.instant_of(c.system + ago), c.instant);
+        // One far behind it (stepped the other way) is no earlier than when
+        // the socket was last empty.
+        let drained = c.instant - std::time::Duration::from_millis(2);
+        assert_eq!(c.arrival(Some(c.system - std::time::Duration::from_secs(3)), Some(drained)), drained);
+        assert_eq!(c.arrival(Some(c.system - ago), None), c.instant - ago);
+        assert_eq!(c.arrival(None, Some(drained)), c.instant);
     }
 }

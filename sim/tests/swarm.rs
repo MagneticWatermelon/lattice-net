@@ -89,17 +89,49 @@ struct Gunner {
     /// A cheat: aim where it drew the target this many steps earlier, and
     /// claim that render time ("backtrack").
     back: f32,
+    /// Holds its aim where it first drew the target (`fixed`, set by the
+    /// first shot) instead of tracking it.
+    hold: bool,
+    fixed: Option<(u16, i16)>,
+    /// With `hold`, a cheat: each shot claims whichever render step up to
+    /// this many steps back put the target on the held crosshair.
+    pick_back: f32,
 }
 
 /// Aims `brain` at `g.target` as drawn at `now`, and pulls the trigger.
 /// Returns the aim and the direction the client drew its tracer along.
 fn aim_and_fire(brain: &mut BotBrain, g: &mut Gunner, now: Instant) -> Option<([f32; 3], [f32; 3])> {
+    use lattice_game::weapon::aim;
+    use lattice_sim::bot::aim_at;
     let core = brain.core_mut();
     let r = core.render_step(now)?;
-    let (yaw, pitch) = lattice_sim::bot::aim_at(core, g.target, r - g.back as f64, g.head, g.extra_lead)?;
-    let dir = core.fire_claiming(now, yaw, pitch, g.ads, g.back as f64)?;
+    let (yaw, pitch, back) = if g.hold {
+        let (y, p) = match g.fixed {
+            Some(f) => f,
+            None => *g.fixed.insert(aim_at(core, g.target, r, g.head, g.extra_lead)?),
+        };
+        // The cheat: of the render steps it may claim, the one whose target
+        // lines up best with where it's aiming.
+        let want = aim(y, p);
+        let mut best = (f32::MAX, 0.0);
+        for k in 0..=(g.pick_back * 8.0) as u32 {
+            let b = k as f32 / 8.0;
+            if let Some((by, bp)) = aim_at(core, g.target, r - b as f64, g.head, g.extra_lead) {
+                let d = aim(by, bp);
+                let miss = 1.0 - (want[0] * d[0] + want[1] * d[1] + want[2] * d[2]);
+                if miss < best.0 {
+                    best = (miss, b);
+                }
+            }
+        }
+        (y, p, best.1)
+    } else {
+        let (y, p) = aim_at(core, g.target, r - g.back as f64, g.head, g.extra_lead)?;
+        (y, p, g.back)
+    };
+    let dir = core.fire_claiming(now, yaw, pitch, g.ads, back as f64)?;
     g.shots += 1;
-    Some((lattice_game::weapon::aim(yaw, pitch), dir))
+    Some((aim(yaw, pitch), dir))
 }
 
 /// Where `entity` really was at (fractional) game step `r`: the server's
@@ -219,11 +251,16 @@ impl Swarm {
             }
             client.flush(self.now);
             for pkt in client.drain_outgoing() {
+                let step = Duration::from_secs(1) / TICK_HZ;
                 match &mut self.hold_bot0 {
                     Some(held) if i == 0 => held.push((*addr, pkt)),
                     _ if self.rng.chance(self.loss) => {}
-                    _ if self.rng.chance(self.delay) => self.delayed.push((*addr, pkt)),
-                    _ if self.lag[i] > 0 => self.up_delayed.push((self.now + Duration::from_secs(1) / TICK_HZ * self.lag[i], *addr, pkt)),
+                    // Held back a step, on top of the bot's lag.
+                    _ if self.rng.chance(self.delay) => match self.lag[i] {
+                        0 => self.delayed.push((*addr, pkt)),
+                        lag => self.up_delayed.push((self.now + step * (lag + 1), *addr, pkt)),
+                    },
+                    _ if self.lag[i] > 0 => self.up_delayed.push((self.now + step * self.lag[i], *addr, pkt)),
                     _ => self.to_server.push((*addr, self.now, pkt)),
                 }
             }
@@ -1226,7 +1263,7 @@ fn shoot_at(lag: u32, strafe: u32, head: bool, extra_lead: f32, secs: u32, letha
         s.step();
     }
     s.server.take_rewind();
-    s.gunner = Some(Gunner { bot: 0, target, head, extra_lead, shots: 0, ads: false, back: 0.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head, extra_lead, shots: 0, ads: false, back: 0.0, hold: false, fixed: None, pick_back: 0.0 });
     for _ in 0..secs * TICK_HZ {
         s.step();
     }
@@ -1258,6 +1295,7 @@ fn what_you_see_is_what_you_hit() {
         assert_eq!((c.shots, c.shots_refused), (g.shots, 0), "every shot fired once, none refused");
         assert!(hits.iter().all(|h| h.rewind <= lattice_sim::shots::NEAR_CAP));
         assert_eq!(c.rewinds_trimmed, 0, "an honest shooter is never trimmed");
+        assert_eq!(c.renders_held, 0, "nor held to a floor");
         assert_eq!(s.corrections(), 0, "shooting doesn't disturb prediction");
     }
 }
@@ -1324,7 +1362,7 @@ fn walls_stop_shots() {
     for _ in 0..2 * TICK_HZ {
         s.step();
     }
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0, hold: false, fixed: None, pick_back: 0.0 });
     for _ in 0..5 * TICK_HZ {
         s.step();
     }
@@ -1428,7 +1466,7 @@ fn combat_news_reaches_the_right_players() {
     news(&mut s, 0);
     news(&mut s, 1);
     news(&mut s, 2);
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0, hold: false, fixed: None, pick_back: 0.0 });
     for _ in 0..10 * TICK_HZ {
         s.step();
     }
@@ -1478,7 +1516,7 @@ fn a_shooter_joins_its_targets_near_tier() {
     let (mut s, [shooter, target, _]) = firing_line(200.0, false);
     let tier = |s: &Swarm| s.bots[1].2.entities().and_then(|e| e.get(shooter)).map(|k| k.tier);
     assert_eq!(tier(&s), Some(Tier::Mid));
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0, hold: false, fixed: None, pick_back: 0.0 });
     for _ in 0..2 * TICK_HZ {
         s.step();
     }
@@ -1497,14 +1535,22 @@ fn a_shooter_joins_its_targets_near_tier() {
 /// then measure aim and lag compensation, not respawns). Returns per class
 /// (shots, hits, near rewind p50 ms) and the rewinds capped.
 /// Per class (shots, hits, hits' near rewind p50 in ms), then rewinds capped
-/// and rewinds trimmed during the fight.
-fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64, u64) {
+/// and shots trimmed (by the backtrack bound) and held (to their shooter's
+/// render clock) during the fight.
+fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64, u64, u64) {
+    fight_on(lags, secs, (0.0, 0.0, 0))
+}
+
+/// `fight` on links that lose `link.0` of datagrams, hold `link.1` of the
+/// bots' back a step, and hold the server's back up to `link.2` steps.
+fn fight_on(lags: &[u32], secs: u32, link: (f32, f32, u32)) -> (Vec<(u64, u64, f64)>, u64, u64, u64) {
     use lattice_sim::bot::FightConfig;
     let n = 9 * lags.len();
     let interest = InterestConfig { squad_size: 0, ..Default::default() };
     let cfg = SimConfig { spawn: SpawnMode::Disk(40.0), interest, cone_of_fire: false, ..Default::default() };
     let mut s = Swarm::with_config(n, cfg);
     s.render = true;
+    (s.loss, s.delay, s.down_jitter) = link;
     for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
         // Not down the sights: that slows them, which hides what lag costs.
         b.set_fight(Some(FightConfig { ads: false, ..FightConfig::default() }));
@@ -1518,7 +1564,8 @@ fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64, u64) {
         s.server.set_invulnerable(e, true);
     }
     s.server.take_hits();
-    let (capped0, trimmed0) = (s.server.counters().rewinds_capped, s.server.counters().rewinds_trimmed);
+    let c = s.server.counters();
+    let (capped0, trimmed0, held0) = (c.rewinds_capped, c.rewinds_trimmed, c.renders_held);
     let shots0: Vec<u64> = s.bots.iter().map(|(_, _, b)| b.stats().shots).collect();
     for _ in 0..secs * TICK_HZ {
         s.step();
@@ -1531,25 +1578,43 @@ fn fight(lags: &[u32], secs: u32) -> (Vec<(u64, u64, f64)>, u64, u64) {
         per[c].1 += hits.iter().filter(|h| h.shooter == ents[i]).count() as u64;
         per[c].2.extend(hits.iter().filter(|h| h.shooter == ents[i]).map(|h| h.rewind));
     }
-    assert_eq!(s.corrections(), 0);
+    if link == (0.0, 0.0, 0) {
+        assert_eq!(s.corrections(), 0);
+    }
     let out = per.into_iter().map(|(shots, hits, mut rw)| {
         let p50 = pct(&mut rw.iter().map(|&r| r as f32).collect::<Vec<_>>(), 0.5) as f64 * 1000.0 / 30.0;
         rw.clear();
         (shots, hits, p50)
     }).collect();
     let c = s.server.counters();
-    (out, c.rewinds_capped - capped0, c.rewinds_trimmed - trimmed0)
+    (out, c.rewinds_capped - capped0, c.rewinds_trimmed - trimmed0, c.renders_held - held0)
+}
+
+#[test]
+fn honest_fighters_on_bad_links_are_never_held_or_trimmed() {
+    // 5% loss both ways, a fifth of the bots' datagrams a step late, the
+    // server's up to a step late, at three latencies: what jitter and loss
+    // do to the render clock and to arrival times stays inside the render
+    // floor's allowance and the backtrack bound.
+    let (per, _, trimmed, held) = fight_on(&[0, 1, 4], 15, (0.05, 0.2, 1));
+    eprintln!("bad links: {per:?}, held {held}, trimmed {trimmed}");
+    assert!(per.iter().all(|p| p.0 > 300), "{per:?}");
+    assert_eq!(held, 0, "an honest fighter is never held to its render clock");
+    // The backtrack bound's slack is nearly used up here: a mid/far claim
+    // whose input came in late (its server wait gone) sometimes lands up to
+    // a step past it, about 1 shot in 60,000 (1 in 30 runs of ~2,000).
+    assert!(trimmed <= 2, "{trimmed} trimmed");
 }
 
 #[test]
 #[ignore = "measurement: cargo test --release --test swarm fight_classes_sweep -- --ignored --nocapture"]
 fn fight_classes_sweep() {
     let lags = [0, 1, 4, 6];
-    let (per, capped, trimmed) = fight(&lags, 30);
+    let (per, capped, trimmed, held) = fight(&lags, 30);
     for (lag, (shots, hits, rw)) in lags.iter().zip(&per) {
         eprintln!("one-way {} ms: {hits} of {shots} shots hit ({:.1}%), hits' near rewind p50 {rw:.0} ms", lag * 33, 100.0 * *hits as f64 / *shots as f64);
     }
-    eprintln!("rewinds capped: {capped}, trimmed: {trimmed}");
+    eprintln!("rewinds capped: {capped}, trimmed: {trimmed}, held: {held}");
 }
 
 #[test]
@@ -1558,13 +1623,13 @@ fn latency_classes_hit_alike_within_the_cap() {
     // compensated (rewinds under the 300 ms near cap) and must hit alike;
     // ~300 ms RTT is ~100 ms past the cap: aiming at what it draws (not
     // leading by the clipped time), it hits measurably less.
-    let (per, capped, trimmed) = fight(&[0, 1, 4], 20);
+    let (per, capped, trimmed, held) = fight(&[0, 1, 4], 20);
     let rate: Vec<f64> = per.iter().map(|&(shots, hits, _)| hits as f64 / shots as f64).collect();
-    eprintln!("hit rates by class: {rate:?}, rewinds capped {capped}, trimmed {trimmed}");
+    eprintln!("hit rates by class: {rate:?}, rewinds capped {capped}, trimmed {trimmed}, held {held}");
     // Honest shooters at every RTT: past the cap they lead, never trimmed
     // (the mid lag used to jump while the near clock slewed to a new delay,
     // claiming mid targets up to a step past their delay).
-    assert_eq!(trimmed, 0, "an honest fighter is never trimmed");
+    assert_eq!((trimmed, held), (0, 0), "an honest fighter is never trimmed or held");
     assert!(per.iter().all(|p| p.0 > 600), "{per:?}");
     assert!((rate[0] - rate[1]).abs() <= 0.1 * rate[0], "within the cap, alike: {rate:?}");
     assert!(rate[2] < 0.8 * rate[0], "past the cap, measurably less: {rate:?}");
@@ -1574,13 +1639,14 @@ fn latency_classes_hit_alike_within_the_cap() {
 #[test]
 fn backtrack_claims_are_trimmed() {
     // A cheat claims it was looking 10 steps further in the past than it
-    // was, and aims where the target was then. The server trims the claim to
+    // was, and aims where the target was then. The server holds the claim
+    // to its render clock (its inputs claimed fresher views) or trims it to
     // what an honest client could have seen (RTT + wait + the longest render
     // delays + slack), so against a runner it mostly misses.
     let (mut s, target, _, _) = shoot(0, 30, false, 0.0, 1);
     s.server.take_hits();
     let shots0 = s.server.counters().shots;
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 10.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 10.0, hold: false, fixed: None, pick_back: 0.0 });
     for _ in 0..10 * TICK_HZ {
         s.step();
     }
@@ -1591,9 +1657,79 @@ fn backtrack_claims_are_trimmed() {
     let c = s.server.counters().clone();
     let shots = c.shots - shots0;
     let hits = s.server.take_hits().len();
-    eprintln!("backtracking: {hits} of {shots} hit, {} trimmed", c.rewinds_trimmed);
-    assert!(c.rewinds_trimmed as f64 >= 0.95 * shots as f64, "{} of {shots} trimmed", c.rewinds_trimmed);
+    let cut = c.rewinds_trimmed + c.renders_held;
+    eprintln!("backtracking: {hits} of {shots} hit, {} held, {} trimmed", c.renders_held, c.rewinds_trimmed);
+    assert!(cut as f64 >= 0.95 * shots as f64, "{cut} of {shots} cut");
     assert!((hits as f64) < 0.3 * shots as f64, "the cheat mostly misses: {hits} of {shots}");
+}
+
+/// A gunner that holds its aim on a spot its strafing target runs through
+/// (50 m out, 6 m/s, turning every second) and fires as fast as the rifle
+/// allows, for `secs`. With `pick_back` it's a cheat: each shot claims
+/// whichever render step, up to that many steps back, lined the target up
+/// with its crosshair; with `stale_inputs` too, its inputs all claim to have
+/// drawn that many steps further back than they did. Returns hits, shots,
+/// and how many shots were held to its render clock (`floor`: the render
+/// floor on or off) or trimmed.
+fn held_aim(pick_back: f32, stale_inputs: f64, floor: bool, secs: u32) -> (usize, u64, u64, u64) {
+    use lattice_sim::bot::Moves;
+    let interest = InterestConfig { squad_size: 0, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, cone_of_fire: false, render_floor: floor, ..Default::default() };
+    let mut s = render_swarm(2, cfg, Duration::from_secs(3600));
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let (a, b) = range(s.server.world());
+    let (shooter, target) = (s.bots[0].2.welcome().unwrap().entity, s.bots[1].2.welcome().unwrap().entity);
+    s.server.teleport(shooter, a);
+    s.server.teleport(target, b);
+    s.server.set_invulnerable(target, true);
+    s.bots[0].2.set_moves(Moves::Hold);
+    s.bots[0].2.core_mut().claim_stale_inputs(stale_inputs);
+    s.bots[1].2.set_moves(Moves::Strafe { period: 30 });
+    // Half a strafe in, so the held aim is mid-run: the target crosses it
+    // once a second.
+    for _ in 0..2 * TICK_HZ + 15 {
+        s.step();
+    }
+    let c0 = s.server.counters().clone();
+    s.server.take_hits();
+    let hold = true;
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0, hold, fixed: None, pick_back });
+    for _ in 0..secs * TICK_HZ {
+        s.step();
+    }
+    let g = s.gunner.take().unwrap();
+    for _ in 0..TICK_HZ / 3 {
+        s.step();
+    }
+    let hits = s.server.take_hits().into_iter().filter(|h| h.shooter == shooter && h.target == target).count();
+    let c = s.server.counters();
+    (hits, g.shots, c.renders_held - c0.renders_held, c.rewinds_trimmed - c0.rewinds_trimmed)
+}
+
+#[test]
+fn picking_the_best_render_step_for_each_shot_is_floored() {
+    // The backtrack bound allows claims up to the longest render delay
+    // anyone may use, plus slack. A cheat that draws near players 2 steps
+    // behind can claim up to ~4 more, and pick, shot by shot, whichever
+    // moment of a runner's past lined up with a crosshair it doesn't move.
+    // The render floor holds its claims to its own render clock: it can't
+    // claim older than its inputs said it drew, and getting stale again
+    // after a fresh claim takes time. So it hits about as an honest gunner
+    // holding the same aim does, even when every input lies too.
+    let (honest, shots_h, floored_h, _) = held_aim(0.0, 0.0, true, 20);
+    let (free, shots_f, _, trimmed_f) = held_aim(4.0, 0.0, false, 20);
+    let (cheat, shots_c, floored_c, trimmed_c) = held_aim(4.0, 0.0, true, 20);
+    let (stale, shots_s, floored_s, trimmed_s) = held_aim(4.0, 4.0, true, 20);
+    eprintln!("held aim: honest {honest} of {shots_h} hit; picking its render step, {free} of {shots_f} without the floor ({trimmed_f} trimmed), {cheat} of {shots_c} with it ({floored_c} held, {trimmed_c} trimmed), {stale} of {shots_s} with stale inputs too ({floored_s} held, {trimmed_s} trimmed)");
+    assert_eq!(floored_h, 0, "an honest gunner is never held");
+    assert!(shots_h > 150 && shots_f > 150 && shots_c > 150 && shots_s > 150);
+    assert!(free as f64 > 1.5 * honest as f64, "without the floor the cheat works: {free} vs {honest}");
+    for (name, hits) in [("picking", cheat), ("with stale inputs", stale)] {
+        assert!((hits as f64) < 1.3 * honest as f64 + 3.0, "{name}: about as an honest gunner: {hits} vs {honest}");
+    }
+    assert!(floored_c > 0);
 }
 
 #[test]
@@ -1602,7 +1738,7 @@ fn hits_from_an_earlier_life_deal_nothing() {
     // is a life change, like a respawn): every hit lands on a life the
     // shooter saw that has since ended, so none deals damage.
     let (mut s, [_, target, _]) = firing_line(100.0, true);
-    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0 });
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0, hold: false, fixed: None, pick_back: 0.0 });
     for k in 0..4 * TICK_HZ {
         if k % 2 == 0 {
             let p = s.server.entity_state(target).unwrap().pos;
@@ -1723,7 +1859,7 @@ fn aiming_down_sights_hits_and_the_spread_is_the_servers_secret() {
         s.server.take_hits();
         s.server.take_fired();
         s.gunner_dirs.clear();
-        s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads, back: 0.0 });
+        s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads, back: 0.0, hold: false, fixed: None, pick_back: 0.0 });
         for _ in 0..6 * TICK_HZ {
             s.step();
         }

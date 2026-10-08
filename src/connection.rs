@@ -102,6 +102,11 @@ pub struct Stats {
     /// between a datagram arriving and the `now` passed to `receive`, so pass
     /// arrival timestamps where you have them.
     pub rtt_ms: f32,
+    /// The lowest and highest RTT samples of the last one to two seconds, in
+    /// ms (0 before the first): what a single packet just saw, where the
+    /// average lags a rise, and how much the delay varies (jitter).
+    pub rtt_min_ms: f32,
+    pub rtt_max_ms: f32,
     /// Smoothed packet loss 0..1 (EWMA, alpha 0.05).
     pub loss: f32,
 }
@@ -200,7 +205,37 @@ pub struct Connection {
     last_recv: Instant,
     last_send: Option<Instant>,
     rtt_samples: u64,
+    rtt_window: RttWindow,
     stats: Stats,
+}
+
+/// RTT samples' range over the last 1-2 s: the current second's and the one
+/// before it.
+#[derive(Debug, Clone, Copy, Default)]
+struct RttWindow {
+    start: Option<Instant>,
+    cur: (f32, f32),
+    prev: Option<(f32, f32)>,
+}
+
+impl RttWindow {
+    const SPAN: Duration = Duration::from_secs(1);
+
+    /// Adds a sample; returns the range (min, max) over this second and the last.
+    fn sample(&mut self, ms: f32, now: Instant) -> (f32, f32) {
+        match self.start {
+            Some(t) if now.saturating_duration_since(t) < Self::SPAN => self.cur = (self.cur.0.min(ms), self.cur.1.max(ms)),
+            started => {
+                self.prev = started.filter(|&t| now.saturating_duration_since(t) < 2 * Self::SPAN).map(|_| self.cur);
+                self.cur = (ms, ms);
+                self.start = Some(now);
+            }
+        }
+        match self.prev {
+            Some(p) => (p.0.min(self.cur.0), p.1.max(self.cur.1)),
+            None => self.cur,
+        }
+    }
 }
 
 impl Connection {
@@ -222,6 +257,7 @@ impl Connection {
             last_recv: now,
             last_send: None,
             rtt_samples: 0,
+            rtt_window: RttWindow::default(),
             stats: Stats::default(),
         }
     }
@@ -247,6 +283,7 @@ impl Connection {
             last_recv,
             last_send,
             rtt_samples,
+            rtt_window,
             stats,
         } = self;
         *send_cipher = Cipher::new(send_key);
@@ -263,6 +300,7 @@ impl Connection {
         *last_recv = now;
         *last_send = None;
         *rtt_samples = 0;
+        *rtt_window = RttWindow::default();
         *stats = Stats::default();
     }
 
@@ -432,6 +470,7 @@ impl Connection {
                 } else {
                     self.stats.rtt_ms + (sample - self.stats.rtt_ms) * 0.1
                 };
+                (self.stats.rtt_min_ms, self.stats.rtt_max_ms) = self.rtt_window.sample(sample, now);
             }
             if !ids.is_empty() {
                 self.reliable_tx.on_acked(ids.as_slice());
@@ -679,5 +718,17 @@ mod tests {
         assert_eq!(header(&B_TO_A, &reply).ack_delay, 3000, "30 ms in 10 us units");
         a.receive_sealed(&reply, ms(50)).unwrap();
         assert!((a.stats().rtt_ms - 20.0).abs() < 0.01, "rtt {}", a.stats().rtt_ms);
+    }
+
+    #[test]
+    fn the_rtt_range_covers_the_last_second_or_two() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut w = RttWindow::default();
+        assert_eq!(w.sample(20.0, at(0)), (20.0, 20.0));
+        assert_eq!(w.sample(50.0, at(400)), (20.0, 50.0), "a spike counts at once");
+        assert_eq!(w.sample(30.0, at(1100)), (20.0, 50.0), "and through the next second");
+        assert_eq!(w.sample(25.0, at(2200)), (25.0, 30.0), "then it ages out");
+        assert_eq!(w.sample(40.0, at(5000)), (40.0, 40.0), "a silence forgets everything");
     }
 }

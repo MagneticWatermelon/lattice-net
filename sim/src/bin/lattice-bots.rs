@@ -270,6 +270,8 @@ struct Bot {
     /// inside the first tick overran the swarm and delivered its inputs late.
     sock: Option<UdpSocket>,
     net: Option<(UdpSocket, Client)>,
+    /// When its socket was last read empty: nothing after arrived before it.
+    drained: Option<Instant>,
     brain: Option<BotBrain>,
     joined_ms: Option<u32>,
     failed: bool,
@@ -303,6 +305,7 @@ impl Bot {
         }
         let (sock, client) = self.net.as_mut().unwrap();
         let brain = self.brain.as_mut().unwrap();
+        let drained = self.drained;
         loop {
             match rx.recv(sock, false) {
                 Ok(n) => {
@@ -311,7 +314,7 @@ impl Bot {
                         // (and the input -> applied estimate built on it) must not
                         // include the up-to-a-tick wait for our own tick.
                         let (data, _, stamp) = rx.get(i);
-                        client.receive(server, data, stamp.map_or(now, |t| clocks.instant_of(t)));
+                        client.receive(server, data, clocks.arrival(stamp, drained));
                     }
                     if n < RX_BATCH {
                         break;
@@ -323,6 +326,8 @@ impl Bot {
                 Err(e) => return Err(e),
             }
         }
+        // Read empty by now (the reading is from before the reads: a bound).
+        self.drained = Some(now);
         client.update(now);
 
         let mut joined = None;
@@ -521,6 +526,7 @@ fn main() -> std::io::Result<()> {
                 port: port_of(i),
                 sock: sockets[i].take(),
                 net: None,
+                drained: None,
                 brain: None,
                 joined_ms: None,
                 failed: false,

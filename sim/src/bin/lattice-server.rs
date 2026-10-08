@@ -86,7 +86,9 @@ lattice-server: M1 movement-only authoritative server
   --immortal           hits land (and are confirmed) but deal no damage: hit rates then
                        measure aim and lag compensation, not who died first
   --no-cone            shots go exactly where aimed: no cone of fire or bloom (to compare
-                       with fight baselines from before it)";
+                       with fight baselines from before it)
+  --no-render-floor    don't hold shots' claimed render steps to each client's render clock
+                       (only the backtrack bound applies): to measure what it stops";
 
 /// Columns of per-tick timing samples: the sim phases, then egress and total.
 const COLS: usize = PHASES.len() + 2;
@@ -245,6 +247,8 @@ impl Receiver {
     fn batched(&self) {
         let mut rx = RecvBatch::new(RX_BATCH);
         let mut routed: Vec<(usize, InDatagram)> = Vec::with_capacity(RX_BATCH);
+        // When a call last left the socket empty: nothing after it arrived before.
+        let mut drained = None;
         while !self.stop.load(Relaxed) {
             let n = match rx.recv(&self.sock, true) {
                 Ok(n) => n,
@@ -262,7 +266,7 @@ impl Receiver {
                 bytes += data.len();
                 // The kernel's arrival time: the input's server-side wait and the
                 // transport's ack_delay include time queued in the socket.
-                let arrived = stamp.map_or(clocks.instant, |t| clocks.instant_of(t));
+                let arrived = clocks.arrival(stamp, drained);
                 let shard = self.router.shard_in(self.group, &from) - self.group * self.per_group;
                 routed.push((shard, (from, arrived, data.to_vec())));
             }
@@ -276,6 +280,7 @@ impl Receiver {
                 }
             }
             if n < RX_BATCH {
+                drained = Some(clocks.instant);
                 let wait = self.tick.gather_for(clocks.instant, self.gather);
                 if !wait.is_zero() {
                     std::thread::sleep(wait);
@@ -582,6 +587,7 @@ fn main() -> std::io::Result<()> {
         cone_of_fire: !a.flag("no-cone"),
         // Where shots go in their cones: a fresh secret from the OS.
         spread_secret: None,
+        render_floor: !a.flag("no-render-floor"),
         // Ticks take real time here: stamp sends when they're flushed.
         real_time: true,
         identity: lattice_net::ServerIdentity {
@@ -1066,6 +1072,7 @@ fn summary_values(
         ("rewinds_capped", c.rewinds_capped),
         ("rewinds_trimmed", c.rewinds_trimmed),
         ("rewinds_trimmed_mid", c.rewinds_trimmed_mid),
+        ("renders_held", c.renders_held),
         ("hits_head", c.hits_head),
         ("hits_body", c.hits_body),
         ("hits_ground", c.hits_ground),
@@ -1089,6 +1096,10 @@ fn summary_values(
     kv.put("trim_excess_p50_steps", format!("{:.1}", te.quantile(0.5) as f64 / 10.0));
     kv.put("trim_excess_p99_steps", format!("{:.1}", te.quantile(0.99) as f64 / 10.0));
     kv.put("trim_excess_max_steps", format!("{:.1}", te.summary().max as f64 / 10.0));
+    let hb = sim.held_by();
+    kv.put("held_by_p50_steps", format!("{:.1}", hb.quantile(0.5) as f64 / 10.0));
+    kv.put("held_by_p99_steps", format!("{:.1}", hb.quantile(0.99) as f64 / 10.0));
+    kv.put("held_by_max_steps", format!("{:.1}", hb.summary().max as f64 / 10.0));
     kv.put("joins_deferred", sim.net().deferred_accepts());
     kv.put("bad_messages", c.bad_messages);
     kv.put("recv_errors", net.recv_errors.load(Relaxed));

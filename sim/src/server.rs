@@ -33,7 +33,7 @@ use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
-use crate::shots::{self, Cut, Fire, FlyStats, History, Outcome, Projectile, Sky, SpreadKey};
+use crate::shots::{self, ClockRate, Cut, Fire, FlyStats, History, Outcome, Projectile, RenderFloor, Sky, SpreadKey};
 use lattice_game::weapon::{self, shot_time, Bloom, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
 use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::events::{self, Event};
@@ -218,6 +218,9 @@ pub struct SimConfig {
     /// (`shots::SpreadKey`). None draws one from the OS at startup; tests
     /// fix it so their runs repeat.
     pub spread_secret: Option<[u8; 32]>,
+    /// Hold each shooter's claimed render steps to its render clock
+    /// (`shots::RenderFloor`). Off only to measure what it stops.
+    pub render_floor: bool,
     /// Ticks take real time (the `lattice-server` binary): the transport
     /// stamps each shard's sends when it flushes them, so RTTs and the hold
     /// times acks report leave out the tick's processing (stamped at the
@@ -249,6 +252,7 @@ impl Default for SimConfig {
             immortal: false,
             cone_of_fire: true,
             spread_secret: None,
+            render_floor: true,
             real_time: false,
             identity: ServerIdentity { server_id: 1, token_key: lattice_net::token::DEV_TOKEN_KEY },
         }
@@ -296,6 +300,10 @@ pub struct Counters {
     pub rewinds_trimmed: u64,
     /// Of those, the ones whose larger excess was the mid/far claim.
     pub rewinds_trimmed_mid: u64,
+    /// Shots whose claimed view didn't fit the shooter's render clock (older
+    /// than its inputs said it drew, or newer than its own input): held to
+    /// it (`shots::RenderFloor`).
+    pub renders_held: u64,
     /// Projectile segments flown and player candidates tested.
     pub segments: u64,
     pub candidates: u64,
@@ -475,8 +483,23 @@ struct Tally {
 
 /// Per-entity input stream. Every tick consumes exactly one input seq, so each
 /// server step matches exactly one client step and replays stay consistent.
-/// A queued input: seq, input, render time, shot, first arrival.
-type Queued = (u32, Input, Option<RenderTime>, Option<Shot>, Instant);
+/// A queued input: seq, input, render time, shot (with its claim as the
+/// render floor held it: near and mid render steps, and how far it moved),
+/// first arrival.
+type Queued = (u32, Input, Option<RenderTime>, Option<(Shot, Option<Held>)>, Instant);
+/// A shot's claimed render steps (near, mid/far; absolute) as the render
+/// floor held them, and how far that moved them, in steps.
+type Held = ([f64; 2], f64);
+
+/// What a message's inputs are judged by: the server's step (to place
+/// render steps), and for the render floor (when it's on) the client's
+/// clock rate and link jitter.
+#[derive(Debug, Clone, Copy)]
+struct Judge {
+    step: u32,
+    clock: ClockRate,
+    floor: bool,
+}
 
 struct InputQueue {
     /// Newest seq consumed, by a real input or a stand-in. 0 = none yet.
@@ -514,7 +537,19 @@ struct InputQueue {
     /// The server's secret for where in the cone each shot goes, and this
     /// spawn's number under it. None before the first spawn.
     spread: Option<(Arc<SpreadKey>, u64)>,
+    /// The render steps this client has claimed, for the render floor.
+    claims: RenderFloor,
+    /// A message's inputs while it's judged, oldest first.
+    batch: Vec<(u32, Input, Option<RenderTime>, Option<Shot>)>,
+    /// Inputs received (first arrivals): the first `SETTLE_INPUTS` are the
+    /// client's first seconds, while its clocks settle.
+    inputs_seen: u32,
 }
+
+/// A client's first two seconds of inputs (at 30 Hz): its RTT isn't
+/// measured yet and its render clock is still catching its target, so the
+/// backtrack bound allows it more (`shots::plausible`).
+const SETTLE_INPUTS: u32 = 60;
 
 impl Default for InputQueue {
     fn default() -> Self {
@@ -534,6 +569,9 @@ impl Default for InputQueue {
             bloom: Bloom::default(),
             cone: true,
             spread: None,
+            claims: RenderFloor::default(),
+            batch: Vec::new(),
+            inputs_seen: 0,
         }
     }
 }
@@ -561,26 +599,89 @@ enum Step {
 impl InputQueue {
     /// Queues the inputs of one message. Counts into `n`: inputs late (a
     /// stand-in took their seq) and discarded (queue full), and bad messages.
-    fn receive(&mut self, e: u16, data: &[u8], arrived: Instant, dead: bool, n: &mut [u64; 3]) {
-        let ok = msg::decode_inputs(data, |seq, input, render, shot| match self.push(e, seq, input, render, shot, arrived, dead) {
-            Push::Late => n[0] += 1,
-            Push::Discarded => n[1] += 1,
-            Push::Queued | Push::Duplicate => {}
-        });
+    ///
+    /// Each input's claimed render step is held to the client's render clock
+    /// as it arrives, and each shot's to the inputs around it
+    /// (`shots::RenderFloor`), so a shot carries the view it's allowed.
+    fn receive(&mut self, e: u16, data: &[u8], arrived: Instant, dead: bool, judge: Judge, n: &mut [u64; 3]) {
+        let mut batch = std::mem::take(&mut self.batch);
+        batch.clear();
+        let ok = msg::decode_inputs(data, |seq, input, render, shot| batch.push((seq, input, render, shot)));
+        let newest = batch.first().map_or(0, |b| b.0);
+        // Oldest first: a shot is held between the input before it and its own.
+        for &(seq, input, render, mut shot) in batch.iter().rev() {
+            let new = self.is_new(seq);
+            self.inputs_seen += new as u32;
+            let settling = self.inputs_seen < SETTLE_INPUTS;
+            // How far a shot may claim older than the input before it: a
+            // client's input clock runs ahead of what it has made in its
+            // first seconds, and by a step after a stand-in filled a gap.
+            let before = match (settling, self.stand_ins != 0) {
+                (true, _) => None,
+                (false, true) => Some(1.1),
+                (false, false) => Some(0.0),
+            };
+            let place = |units| judge.step as f64 - msg::render_age(judge.step, units);
+            let held = match (judge.floor && new, render, shot) {
+                (true, Some(r), _) => {
+                    let lag = r.mid_lag as f64 / MID_LAG_UNITS;
+                    let near = place(r.near);
+                    self.claims.input(seq, [near, near - lag], newest, arrived, judge.clock);
+                    shot.map(|s| {
+                        let near = place(s.render);
+                        let h = self.claims.shot(seq, [near, near - lag], before);
+                        (h, (near - h[0]).abs().max((near - lag - h[1]).abs()))
+                    })
+                }
+                // No render steps in the message: held to the earlier claims
+                // alone; with none at all past its first seconds, a client
+                // that never says what it drew doesn't get lag compensation.
+                (true, None, Some(s)) => {
+                    let near = place(s.render);
+                    match self.claims.bare_shot(seq, [near, near], newest, arrived, judge.clock) {
+                        Some(h) => Some((h, (near - h[0]).abs().max((near - h[1]).abs()))),
+                        None if settling => None,
+                        None => {
+                            shot = None;
+                            self.refused += 1;
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            match self.push(e, seq, input, render, shot.map(|s| (s, held)), arrived, dead) {
+                Push::Late => n[0] += 1,
+                Push::Discarded => n[1] += 1,
+                Push::Queued | Push::Duplicate => {}
+            }
+        }
+        self.batch = batch;
         n[2] += ok.is_err() as u64;
     }
 
+    /// Whether input `seq` hasn't arrived before: queued or applied, or late
+    /// (a stand-in took its seq; still unseen).
+    fn is_new(&self, seq: u32) -> bool {
+        if seq <= self.last_seq {
+            let age = self.last_seq - seq;
+            age < 32 && self.stand_ins & (1 << age) != 0
+        } else {
+            self.pending.binary_search_by_key(&seq, |q| q.0).is_err()
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn push(&mut self, e: u16, seq: u32, input: Input, render: Option<RenderTime>, shot: Option<Shot>, arrived: Instant, dead: bool) -> Push {
+    fn push(&mut self, e: u16, seq: u32, input: Input, render: Option<RenderTime>, shot: Option<(Shot, Option<Held>)>, arrived: Instant, dead: bool) -> Push {
         if seq <= self.last_seq {
             let age = self.last_seq - seq;
             if age < 32 && self.stand_ins & (1 << age) != 0 {
                 self.stand_ins &= !(1 << age); // count each late seq once
                 // Its movement is gone (a stand-in moved instead), but a shot
                 // in it still fires, from where the stand-in put the shooter.
-                if let Some(shot) = shot {
+                if let Some((shot, held)) = shot {
                     if age < LATE_SHOT_STEPS && !dead {
-                        self.fire(e, seq, shot, render, true, input.buttons & BUTTON_ADS != 0);
+                        self.fire(e, seq, shot, held, render, true, input.buttons & BUTTON_ADS != 0);
                     } else {
                         self.refused += 1;
                     }
@@ -606,8 +707,10 @@ impl InputQueue {
     /// eye between its states before and after that seq, unless it comes too
     /// soon after the last shot (or is a copy of one). It leaves somewhere in
     /// its cone of fire: aiming down sights (`ads`) or not, from the state
-    /// before the seq, with the shooter's bloom.
-    fn fire(&mut self, e: u16, seq: u32, shot: Shot, render: Option<RenderTime>, late: bool, ads: bool) {
+    /// before the seq, with the shooter's bloom. Its claimed view is the one
+    /// the render floor `held` it to, if it did.
+    #[allow(clippy::too_many_arguments)]
+    fn fire(&mut self, e: u16, seq: u32, shot: Shot, held: Option<Held>, render: Option<RenderTime>, late: bool, ads: bool) {
         let time = shot_time(seq, shot.frac);
         if self.last_shot.is_some_and(|last| time < last + FIRE_STEPS as u64 * 256) {
             self.refused += 1;
@@ -625,6 +728,10 @@ impl InputQueue {
         let tau0 = step_no as f64 - 1.0 + shot.frac as f64 / 256.0;
         let mid_lag = render.map_or(0.0, |r| r.mid_lag as f64 / MID_LAG_UNITS);
         let near = msg::render_age(step_no, shot.render) - (1.0 - shot.frac as f64 / 256.0);
+        let (behind, held) = match held {
+            Some((h, moved)) => ([tau0 - h[0], tau0 - h[1]], moved),
+            None => ([near, near + mid_lag], 0.0),
+        };
         self.fires.push(Fire {
             shooter: e,
             seq,
@@ -634,10 +741,12 @@ impl InputQueue {
             yaw,
             pitch,
             tau0,
-            behind: [near, near + mid_lag],
+            behind,
             late,
             // This input's server wait (just set by `advance`); none if late.
             wait: if late { 0.0 } else { self.wait as f64 / 10.0 / 1000.0 * TICK_HZ as f64 },
+            held,
+            settling: self.inputs_seen < SETTLE_INPUTS,
         });
     }
 
@@ -690,11 +799,11 @@ impl InputQueue {
         body.ads = !body.dead() && input.buttons & BUTTON_ADS != 0;
         self.consume(next, kind != Step::Applied);
         // Only real inputs fire: a stand-in repeats movement, never a shot.
-        if let Some((shot, render)) = fired {
+        if let Some(((shot, held), render)) = fired {
             if body.dead() {
                 self.refused += 1;
             } else {
-                self.fire(e, next, shot, render, false, input.buttons & BUTTON_ADS != 0);
+                self.fire(e, next, shot, held, render, false, input.buttons & BUTTON_ADS != 0);
             }
         }
         kind
@@ -838,7 +947,14 @@ pub struct SimServer {
     spans: PhaseSpans,
     /// Picks where in its cone each shot goes; shared with the input queues.
     spread: Arc<SpreadKey>,
+    /// The pace advertised in each of the last `PACE_TICKS` ticks.
+    paces: [f32; PACE_TICKS],
+    /// How far the render floor moved shots' claimed views (0.1 steps).
+    held_by: Histogram,
 }
+
+/// Ticks of advertised pace the render floor looks back over (2 s at 30 Hz).
+const PACE_TICKS: usize = 60;
 
 impl SimServer {
     pub fn new(cfg: SimConfig, now: Instant) -> Self {
@@ -902,6 +1018,8 @@ impl SimServer {
             debug: None,
             spans: [NO_SPAN; PHASES.len()],
             spread: Arc::new(SpreadKey::new(spread_secret)),
+            paces: [1.0; PACE_TICKS],
+            held_by: Histogram::new(200),
         }
     }
 
@@ -1000,6 +1118,12 @@ impl SimServer {
         &self.trim_excess
     }
 
+    /// How far the render floor moved shots' claimed views, in 0.1 steps
+    /// (`Counters::renders_held`).
+    pub fn held_by(&self) -> &Histogram {
+        &self.held_by
+    }
+
     pub fn take_rewind(&mut self) -> [Histogram; 2] {
         std::mem::replace(&mut self.rewind, [Histogram::new(REWIND_CAP_MS), Histogram::new(REWIND_CAP_MS)])
     }
@@ -1042,6 +1166,7 @@ impl SimServer {
         let rung = *self.ladder.rung();
         self.pace.record(now, rung.period());
         self.pace_now = ladder::advertised_pace(rung.dilation, self.pace.stretch());
+        self.paces[self.tick as usize % PACE_TICKS] = self.pace_now;
         self.step_acc += rung.steps_per_tick();
         let steps = self.step_acc.floor() as u32;
         self.step_acc -= steps as f64;
@@ -1055,6 +1180,12 @@ impl SimServer {
         let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         self.spans = [NO_SPAN; PHASES.len()];
         let (by_client, bodies, inputs) = (&self.by_client, &self.bodies, &self.inputs);
+        // Clients' render clocks run at the pace they were told (30 × pace
+        // steps a second), which reaches them a round trip late: the render
+        // floor goes by the lowest of the last two seconds'.
+        let pace = self.paces.iter().copied().fold(f32::MAX, f32::min);
+        let clock = ClockRate { rate: TICK_HZ as f64 * pace as f64, jitter: 0.0 };
+        let judge = Judge { step: self.step, clock, floor: self.cfg.render_floor };
         let (ingress, [late, discarded, bad]) = self
             .net
             .shards_mut()
@@ -1064,26 +1195,37 @@ impl SimServer {
             .map(|((shard, bucket), lifecycle)| {
                 let t0 = Instant::now();
                 let mut n = [0u64; 3];
-                let mut handle = |ev, arrived| match ev {
+                let mut handle = |ev, arrived, jitter| match ev {
                     ServerEvent::Message { client, channel: Channel::Unreliable, data } => {
                         if let Some(&e) = by_client.get(&client) {
                             let dead = bodies[e as usize].dead();
-                            inputs[e as usize].lock().unwrap().receive(e, &data, arrived, dead, &mut n);
+                            let judge = Judge { clock: ClockRate { jitter, ..judge.clock }, ..judge };
+                            inputs[e as usize].lock().unwrap().receive(e, &data, arrived, dead, judge, &mut n);
                         }
                     }
                     ServerEvent::Message { .. } => n[2] += 1,
                     ServerEvent::Connected { client, .. } => lifecycle.push((client, true)),
                     ServerEvent::Disconnected { client, .. } => lifecycle.push((client, false)),
                 };
+                // How much the sender's link delay varies (its RTTs' range
+                // of late), in seconds: the render floor's allowance.
+                let jitter = |shard: &lattice_net::Shard, ev: &ServerEvent| match ev {
+                    ServerEvent::Message { client, .. } => {
+                        shard.client_stats(*client).map_or(0.0, |s| (s.rtt_max_ms - s.rtt_min_ms) as f64 / 1000.0)
+                    }
+                    _ => 0.0,
+                };
                 for (from, arrived, data) in bucket.drain(..) {
                     shard.receive(from, &data, arrived);
                     while let Some(ev) = shard.poll_event() {
-                        handle(ev, arrived);
+                        let j = jitter(shard, &ev);
+                        handle(ev, arrived, j);
                     }
                 }
                 shard.update(now, unix_now);
                 while let Some(ev) = shard.poll_event() {
-                    handle(ev, now);
+                    let j = jitter(shard, &ev);
+                    handle(ev, now, j);
                 }
                 (span(t0.elapsed()), n)
             })
@@ -1399,8 +1541,10 @@ impl SimServer {
         // that much older than its RTT alone says.
         let send = self.send_delays.iter().copied().fold(0.0, f64::max);
         // What each shooter could plausibly have seen: from its RTT (once
-        // measured) and its input's wait. Older claims are trimmed. In
-        // parallel: the RTT lookups are the work.
+        // measured; the highest of the last second or two, since each shot
+        // saw the RTT of its moment and an average lags a rise) and its
+        // input's wait. Older claims are trimmed. In parallel: the RTT
+        // lookups are the work.
         let (net, client_of, first) = (&self.net, &self.client_of, self.next_projectile);
         let made: Vec<(Projectile, Cut)> = fires
             .par_iter()
@@ -1411,9 +1555,9 @@ impl SimServer {
                     .copied()
                     .flatten()
                     .and_then(|c| net.client_stats(c))
-                    .map(|s| s.rtt_ms as f64 / 1000.0 * TICK_HZ as f64)
+                    .map(|s| s.rtt_max_ms as f64 / 1000.0 * TICK_HZ as f64)
                     .filter(|&r| r > 0.0);
-                Projectile::new(first + i as u64, f, shots::plausible(rtt, f.wait, send))
+                Projectile::new(first + i as u64, f, shots::plausible(rtt, f.wait, send, f.settling))
             })
             .collect();
         self.next_projectile += fires.len() as u64;
@@ -1431,6 +1575,11 @@ impl SimServer {
             if cut.trimmed {
                 self.counters.rewinds_trimmed_mid += cut.mid as u64;
                 self.trim_excess.record((cut.excess * 10.0).round() as u32);
+            }
+            // Past a hundredth of a step: rounding isn't a claim.
+            if f.held > 0.01 {
+                self.counters.renders_held += 1;
+                self.held_by.record((f.held * 10.0).round() as u32);
             }
         }
         if self.projectiles.is_empty() {
@@ -2265,7 +2414,7 @@ mod tests {
         let t = Instant::now();
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
-        let shot = |frac| Some(Shot { frac, yaw: 0, pitch: 0, render: 0 });
+        let shot = |frac| Some((Shot { frac, yaw: 0, pitch: 0, render: 0 }, None));
         let w = tw();
         // seq 1 fires; its redundant copy doesn't fire again.
         q.push(0, 1, fwd(), None, shot(128), t, false);

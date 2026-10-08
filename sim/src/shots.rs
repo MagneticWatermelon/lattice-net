@@ -19,6 +19,9 @@ use lattice_game::movement::{TICK_HZ, WORLD_SIZE};
 use lattice_game::weapon::{Flight, SUBSTEPS};
 use lattice_game::world::World;
 
+use std::collections::VecDeque;
+use std::time::Instant;
+
 use ring::hmac;
 
 use crate::grid::Grid;
@@ -177,19 +180,170 @@ pub struct Fire {
     pub late: bool,
     /// How long its input waited on the server, in steps (0 if late).
     pub wait: f64,
+    /// How far its claimed view was moved to fit the client's render clock
+    /// (`RenderFloor`), in steps (0: it fit); `behind` is already moved.
+    pub held: f64,
+    /// From the client's first seconds, while its clocks settle.
+    pub settling: bool,
 }
 
 /// Slack on top of the plausible rewind, in steps: jitter and frame timing.
 pub const TRIM_SLACK: f64 = 2.0;
+/// More slack in a client's first seconds: its RTT isn't measured yet, and
+/// its render clock is still catching up to its target (a step behind it
+/// after an early snapshot came late).
+pub const SETTLE_SLACK: f64 = 2.0;
+
+/// The render floor's rates: an honest near render clock runs at least 90%
+/// of real time (it slews at most 10% to change its delay; clock.rs), and
+/// mid and far lag it by a lag that slews 10% too, so they run at least 80%.
+pub const FLOOR_RATE_NEAR: f64 = 0.9;
+pub const FLOOR_RATE_MID: f64 = 0.8;
+/// Slack under the render floor, in steps: rounding (near render steps are
+/// in 1/64 steps, the mid lag in 1/8) and when a client sends what it made.
+pub const FLOOR_SLACK_NEAR: f64 = 0.1;
+pub const FLOOR_SLACK_MID: f64 = 0.25;
+/// The most delay variation (jitter) the floor allows for, in seconds: a
+/// link that varies more (or a client pretending to) gets no more slack
+/// than this.
+pub const FLOOR_JITTER_MAX: f64 = 0.1;
+/// A client's first seconds of claims get all of it: its RTTs haven't been
+/// measured long enough to show how its link varies.
+const FLOOR_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Fresh claims remembered per client: about a second and a half.
+const ANCHORS: usize = 48;
+/// Inputs whose claims are kept for bracketing shots.
+const RECENT: usize = 8;
+
+/// What a client's render clock is judged by: the game's steps per wall
+/// second (30 × the lowest recent pace) and how much its link's delay
+/// varies (jitter), in seconds.
+#[derive(Debug, Clone, Copy)]
+pub struct ClockRate {
+    pub rate: f64,
+    pub jitter: f64,
+}
+
+/// Holds a client's claimed render steps to its render clock.
+///
+/// The backtrack bound (`plausible`) caps how old a claim can be, but that
+/// cap is the longest render delay a client may use: one that draws near
+/// players 2 steps behind could claim 4, plus slack, and pick for each shot
+/// whichever moment of a target's past lined up with its crosshair. Every
+/// input carries the render step it was made at, and an honest render clock
+/// never runs backwards and keeps to at least 90% of real time. So:
+///
+/// - **Inputs:** each input's claim is held to the client's earlier fresh
+///   claims (a message's newest input, made just before it was sent),
+///   carried forward at that rate over the time between their arrivals, less
+///   the link's measured jitter. An input that came in a later message than
+///   the newest (a copy, after a loss) is judged as of when it was made.
+/// - **Shots:** a shot fires between two inputs being made: it rides the
+///   next input made after it. So its claim is held between the claims of
+///   the input before it and its own: it can neither claim an older view
+///   than the client said it had, nor a fresher one than its own input.
+///
+/// A cheat that varies its claims shot by shot gets held to its inputs, and
+/// one that makes its inputs stale too can only drift staler at 10% of real
+/// time (plus the jitter allowance): it can't swing back and forth.
+#[derive(Debug, Clone, Default)]
+pub struct RenderFloor {
+    /// Recent fresh claims, held: (seq, near, mid, arrival).
+    anchors: VecDeque<(u32, f64, f64, Instant)>,
+    /// The last inputs' held claims, by seq: (seq, near, mid).
+    recent: [(u32, f64, f64); RECENT],
+    /// When the first claim arrived.
+    first: Option<Instant>,
+}
+
+impl RenderFloor {
+    /// The oldest near and mid claims the client's fresh claims before input
+    /// `seq` allow for something made at `made`.
+    fn floor(&self, seq: u32, made: Instant, clock: ClockRate) -> [f64; 2] {
+        let settled = self.first.is_some_and(|t| made.saturating_duration_since(t) >= FLOOR_SETTLE);
+        let (rate, jitter) = (clock.rate, if settled { clock.jitter.clamp(0.0, FLOOR_JITTER_MAX) } else { FLOOR_JITTER_MAX });
+        let mut f = [f64::MIN; 2];
+        for &(s, near, mid, at) in &self.anchors {
+            if s < seq {
+                // Real time from this claim's arrival to `made`, at least:
+                // less how much the link's delay varies, never back in time.
+                let run = (made.saturating_duration_since(at).as_secs_f64() - jitter).max(0.0) * rate;
+                f[0] = f[0].max(near + run * FLOOR_RATE_NEAR);
+                f[1] = f[1].max(mid + run * FLOOR_RATE_MID);
+            }
+        }
+        [f[0] - FLOOR_SLACK_NEAR, f[1] - FLOOR_SLACK_MID]
+    }
+
+    /// Input `seq` arrived (for the first time) claiming it was made at
+    /// render steps `claim` (near, mid; absolute), in a message that arrived
+    /// at `at` and whose newest input was `newest`. Returns the claim held
+    /// to the floor.
+    pub fn input(&mut self, seq: u32, claim: [f64; 2], newest: u32, at: Instant, clock: ClockRate) -> [f64; 2] {
+        self.first.get_or_insert(at);
+        let f = self.floor(seq, Self::made(seq, newest, at, clock), clock);
+        let held = [claim[0].max(f[0]), claim[1].max(f[1])];
+        self.recent[seq as usize % RECENT] = (seq, held[0], held[1]);
+        if seq == newest {
+            if self.anchors.len() == ANCHORS {
+                self.anchors.pop_front();
+            }
+            self.anchors.push_back((seq, held[0], held[1], at));
+        }
+        held
+    }
+
+    /// When input `seq` was made, in a message whose newest input was
+    /// `newest` that arrived at `at`: a copy, (newest - seq) steps before.
+    fn made(seq: u32, newest: u32, at: Instant, clock: ClockRate) -> Instant {
+        let behind = std::time::Duration::from_secs_f64((newest - seq) as f64 / clock.rate.max(1.0));
+        at.checked_sub(behind).unwrap_or(at)
+    }
+
+    /// A shot in input `seq` whose message carried no render steps for its
+    /// inputs (a client's first inputs, or a couple of messages after a
+    /// resync), claiming `claim`: held to the floor of the client's earlier
+    /// claims alone. `None` if it has made none.
+    pub fn bare_shot(&self, seq: u32, claim: [f64; 2], newest: u32, at: Instant, clock: ClockRate) -> Option<[f64; 2]> {
+        if self.anchors.is_empty() {
+            return None;
+        }
+        let f = self.floor(seq, Self::made(seq, newest, at, clock), clock);
+        Some([claim[0].max(f[0]), claim[1].max(f[1])])
+    }
+
+    /// A shot riding input `seq` (already given to `input`) claims render
+    /// steps `claim` (near, mid): held between the claims of the input before
+    /// it (less `before` steps of slack) and its own. Returns the held claim.
+    /// The slack is for an input clock running ahead of what the client has
+    /// made: the inputs between are made after the shot, and claim fresher
+    /// views. That happens in a client's first seconds (`before` = None:
+    /// only its own input bounds the shot) and for a step after the server
+    /// fills in a missing input (the client then runs its clock a step ahead).
+    pub fn shot(&self, seq: u32, claim: [f64; 2], before: Option<f64>) -> [f64; 2] {
+        let known = |s: u32| self.recent[s as usize % RECENT].0 == s;
+        let mut held = claim;
+        if known(seq) {
+            let (_, n, m) = self.recent[seq as usize % RECENT];
+            held = [held[0].min(n + FLOOR_SLACK_NEAR), held[1].min(m + FLOOR_SLACK_MID)];
+        }
+        if let (Some(slack), true) = (before, seq > 1 && known(seq - 1)) {
+            let (_, n, m) = self.recent[(seq - 1) as usize % RECENT];
+            held = [held[0].max(n - slack - FLOOR_SLACK_NEAR), held[1].max(m - slack - FLOOR_SLACK_MID)];
+        }
+        held
+    }
+}
 
 /// The most rewind (near, mid/far) an honest client can need for a shot:
-/// its RTT and its input's wait on the server, plus how late in its tick
-/// the server sent the snapshots the client drew from (`send`; RTTs leave
-/// it out, since sends are stamped when they go, but what the client saw was
-/// that much older), all in steps, plus the longest render delays the
-/// protocol allows, plus slack. `None`: no RTT yet.
-pub fn plausible(rtt: Option<f64>, wait: f64, send: f64) -> Option<[f64; 2]> {
-    let base = rtt? + wait + send + TRIM_SLACK;
+/// its RTT (the highest of the last second or two) and its input's wait on
+/// the server, plus how late in its tick the server sent the snapshots the
+/// client drew from (`send`; RTTs leave it out, since sends are stamped when
+/// they go, but what the client saw was that much older), all in steps,
+/// plus the longest render delays the protocol allows, plus slack (more
+/// while the client's clocks are `settling`). `None`: no RTT yet.
+pub fn plausible(rtt: Option<f64>, wait: f64, send: f64, settling: bool) -> Option<[f64; 2]> {
+    let base = rtt? + wait + send + TRIM_SLACK + if settling { SETTLE_SLACK } else { 0.0 };
     Some([base + lattice_game::msg::MAX_NEAR_DELAY, base + lattice_game::msg::MAX_MID_DELAY])
 }
 
@@ -366,18 +520,153 @@ mod tests {
 
     #[test]
     fn rewinds_are_capped() {
-        let f = Fire { shooter: 1, seq: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false, wait: 1.5 };
+        let f = Fire { shooter: 1, seq: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false, wait: 1.5, held: 0.0, settling: false };
         let (p, cut) = Projectile::new(1, &f, None);
         assert_eq!((p.d, cut), ([4.0, 8.0], Cut::default()));
         let (p, cut) = Projectile::new(2, &Fire { behind: [12.0, 16.0], ..f }, None);
         assert_eq!((p.d, cut.capped, cut.trimmed), ([NEAR_CAP, MID_CAP], true, false));
         // RTT 1 step + wait 1.5: honest near rewinds are at most 1 + 1.5 + 4 + 2.
-        assert_eq!(plausible(Some(1.0), 1.5, 0.5), plausible(Some(1.5), 1.5, 0.0), "a late send counts like RTT");
-        let ok = plausible(Some(1.0), 1.5, 0.0);
+        assert_eq!(plausible(Some(1.0), 1.5, 0.5, false), plausible(Some(1.5), 1.5, 0.0, false), "a late send counts like RTT");
+        assert_eq!(plausible(Some(1.0), 1.5, 0.0, true), plausible(Some(3.0), 1.5, 0.0, false), "settling: two more steps");
+        let ok = plausible(Some(1.0), 1.5, 0.0, false);
         let (p, cut) = Projectile::new(3, &f, ok);
         assert_eq!((p.d, cut), ([4.0, 8.0], Cut::default()), "an honest claim stands");
         let (p, cut) = Projectile::new(4, &Fire { behind: [8.0 + 4.0, 10.5 + 4.0], ..f }, ok);
         assert_eq!((p.d, cut.trimmed), ([8.5, 10.5], true), "a backtrack claim is trimmed");
+    }
+
+    /// A client as `RenderFloor` sees it: messages of inputs (each made at
+    /// a render step), the newest of which may carry a shot.
+    struct Client {
+        floor: RenderFloor,
+        t0: Instant,
+        seq: u32,
+        /// Inputs made but not yet in a message that arrived.
+        unsent: Vec<f64>,
+    }
+
+    const STEP: f64 = 1.0 / TICK_HZ as f64;
+    const RATE: f64 = TICK_HZ as f64;
+
+    impl Client {
+        fn new() -> Self {
+            Self { floor: RenderFloor::default(), t0: Instant::now(), seq: 0, unsent: Vec::new() }
+        }
+
+        /// Makes an input drawn at render step `r` (not sent yet).
+        fn make(&mut self, r: f64) {
+            self.seq += 1;
+            self.unsent.push(r);
+        }
+
+        /// A message carrying the unsent inputs arrives at `secs` (with
+        /// `jitter` allowed); the newest carries a shot claiming `shot`.
+        /// Returns how far the shot was held (near), if it had one.
+        fn arrive(&mut self, secs: f64, jitter: f64, shot: Option<f64>) -> Option<f64> {
+            let at = self.t0 + std::time::Duration::from_secs_f64(secs);
+            let first = self.seq + 1 - self.unsent.len() as u32;
+            for (k, r) in std::mem::take(&mut self.unsent).into_iter().enumerate() {
+                self.floor.input(first + k as u32, [r, r - 3.0], self.seq, at, ClockRate { rate: RATE, jitter });
+            }
+            shot.map(|r| {
+                let h = self.floor.shot(self.seq, [r, r - 3.0], Some(0.0));
+                (h[0] - r).abs().max((h[1] - (r - 3.0)).abs())
+            })
+        }
+
+        /// One input a step, drawn at `r(k)`, arriving 40 ms after it's made
+        /// (± `wobble`); a shot rides every third, claiming `shot(k)`.
+        /// Returns the most any shot was held.
+        fn run(&mut self, steps: u32, from: f64, r: impl Fn(f64) -> f64, wobble: f64, jitter: f64, shot: impl Fn(f64) -> f64) -> f64 {
+            let mut most: f64 = 0.0;
+            for k in 0..steps {
+                let t = from + k as f64 * STEP;
+                self.make(r(t));
+                let late = if k % 2 == 0 { wobble } else { -wobble };
+                let held = self.arrive(t + 0.040 + late, jitter, (k % 3 == 0).then(|| shot(t)));
+                most = most.max(held.unwrap_or(0.0));
+            }
+            most
+        }
+    }
+
+    #[test]
+    fn honest_render_clocks_are_never_held() {
+        // A shot drawn as its input was made (a bot), or up to a step before
+        // (a frame loop that fired early in the step).
+        let mut c = Client::new();
+        assert_eq!(c.run(300, 0.0, |t| t * 30.0, 0.0, 0.0, |t| t * 30.0), 0.0, "steady");
+        assert_eq!(c.run(60, 10.0, |t| t * 30.0, 0.0, 0.0, |t| t * 30.0 - 0.9), 0.0, "fired early in the step");
+        // Slowing 10% for a second to take a longer delay.
+        assert_eq!(c.run(30, 12.0, |t| 360.0 + (t - 12.0) * 27.0, 0.0, 0.0, |t| 360.0 + (t - 12.0) * 27.0), 0.0, "slewing");
+        // ±20 ms of delay variation, allowed for.
+        let mut c = Client::new();
+        assert_eq!(c.run(300, 0.0, |t| t * 30.0, 0.020, 0.045, |t| t * 30.0), 0.0, "jitter");
+    }
+
+    #[test]
+    fn hitches_and_losses_are_never_held() {
+        let mut c = Client::new();
+        c.run(30, 0.0, |t| t * 30.0, 0.0, 0.0, |t| t * 30.0);
+        // A 200 ms hitch: six inputs made at once at the frame's render
+        // step, in two messages arriving together; a shot rides the last.
+        let (t, r) = (1.2, 36.0);
+        for _ in 0..3 {
+            c.make(r);
+        }
+        assert_eq!(c.arrive(t + 0.040, 0.0, None), None);
+        for _ in 0..3 {
+            c.make(r);
+        }
+        assert_eq!(c.arrive(t + 0.040, 0.0, Some(r)), Some(0.0), "a catch-up");
+        // A lost message: its input (and shot) arrive a step later as a copy.
+        c.make(r + 1.0);
+        c.make(r + 2.0);
+        let (seq, at) = (c.seq, c.t0 + std::time::Duration::from_secs_f64(t + 2.0 * STEP + 0.040));
+        let first = seq - 1;
+        let clock = ClockRate { rate: RATE, jitter: 0.0 };
+        c.floor.input(first, [r + 1.0, r - 2.0], seq, at, clock);
+        let h = c.floor.shot(first, [r + 1.0, r - 2.0], Some(0.0));
+        assert_eq!(h, [r + 1.0, r - 2.0], "a shot in a copy");
+        c.floor.input(seq, [r + 2.0, r - 1.0], seq, at, clock);
+        c.unsent.clear();
+    }
+
+    #[test]
+    fn shots_are_held_to_the_inputs_around_them() {
+        // Honest inputs, a shot claiming 3 steps further back than it drew:
+        // held to the input made before it (a step back), less the slack.
+        let mut c = Client::new();
+        c.run(60, 0.0, |t| t * 30.0, 0.0, 0.0, |t| t * 30.0);
+        c.make(60.0);
+        let held = c.arrive(2.0 + 0.040, 0.0, Some(57.0)).unwrap();
+        assert!((1.85..=1.95).contains(&held), "{held}");
+        // Inputs all claiming 4 steps stale, a shot claiming what it really
+        // saw: held to its own input's stale claim, so it can't pick fresh
+        // and stale shot by shot.
+        let mut c = Client::new();
+        c.run(60, 0.0, |t| t * 30.0 - 4.0, 0.0, 0.0, |t| t * 30.0 - 4.0);
+        c.make(56.0);
+        let held = c.arrive(2.0 + 0.040, 0.0, Some(60.0)).unwrap();
+        assert!((3.85..=3.95).contains(&held), "{held}");
+        // Inputs that freeze their render step to grow stale: held to 90% of
+        // real time, so the shot after a second of it is held ~27 steps.
+        let mut c = Client::new();
+        c.run(60, 0.0, |t| t * 30.0, 0.0, 0.0, |t| t * 30.0);
+        let held = c.run(30, 2.0, |_| 59.0, 0.0, 0.0, |_| 59.0);
+        assert!(held > 20.0, "{held}");
+        // A message without render steps can't dodge the floor.
+        let at = c.t0 + std::time::Duration::from_secs_f64(3.0 + 0.040);
+        let bare = c.floor.bare_shot(c.seq + 1, [59.0, 56.0], c.seq + 1, at, ClockRate { rate: RATE, jitter: 0.0 }).unwrap();
+        assert!(bare[0] > 85.0, "{bare:?}");
+        assert_eq!(RenderFloor::default().bare_shot(1, [5.0, 2.0], 1, at, ClockRate { rate: RATE, jitter: 0.0 }), None);
+        // Jitter buys slack, but only up to FLOOR_JITTER_MAX.
+        let (mut a, mut b) = (Client::new(), Client::new());
+        let freeze = |c: &mut Client, jitter| {
+            c.run(60, 0.0, |t| t * 30.0, 0.0, jitter, |t| t * 30.0);
+            c.run(30, 2.0, |_| 59.0, 0.0, jitter, |_| 59.0)
+        };
+        assert_eq!(freeze(&mut a, 1.0), freeze(&mut b, FLOOR_JITTER_MAX));
     }
 
     #[test]

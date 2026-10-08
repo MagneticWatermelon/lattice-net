@@ -255,6 +255,9 @@ pub struct ClientCore {
     /// secret, so ours are our own: the tracer is cosmetic, and hits and
     /// everyone else's tracers come from the server's.
     tracer_picks: std::collections::hash_map::RandomState,
+    /// Steps our inputs claim to have drawn further in the past than we did:
+    /// a cheat's way to keep the server's render floor low (tests only).
+    stale_inputs: f64,
     /// The newest snapshot's own state and its step: the server's view of us.
     server_own: Option<(MoveState, u32)>,
     /// Own-player correction being smoothed away, as of `own_offset_at`.
@@ -322,6 +325,7 @@ impl ClientCore {
             last_shot: None,
             bloom: Bloom::default(),
             tracer_picks: Default::default(),
+            stale_inputs: 0.0,
             own_offset: [0.0; 3],
             own_offset_at: None,
             sink: false,
@@ -792,6 +796,13 @@ impl ClientCore {
         self.bloom.cone(self.shot_at(now).0, ads, &self.state)
     }
 
+    /// Every input claims a render time `steps` older than the real one: a
+    /// backtrack cheat keeping the server's render floor low, for tests.
+    #[doc(hidden)]
+    pub fn claim_stale_inputs(&mut self, steps: f64) {
+        self.stale_inputs = steps;
+    }
+
     /// `fire`, claiming a render time `back` steps older than the real one:
     /// the "backtrack" cheat, for testing that the server trims it.
     #[doc(hidden)]
@@ -876,7 +887,7 @@ impl ClientCore {
         self.clock_at = Some(now);
         self.clock += self.rate * elapsed;
         self.bump_cooldown -= elapsed;
-        let render = self.render_clock.render_at(now).map(msg::render_units);
+        let render = self.render_clock.render_at(now).map(|r| msg::render_units(r - self.stale_inputs));
         self.slew_mid_lag(now);
         let mut made = 0;
         while self.clock >= 1.0 && made < max {

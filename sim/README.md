@@ -472,8 +472,9 @@ One 100 ms timeline was too long for near players (it added 33 ms to every rewin
 - **Kills land exactly at 100 HP.** Hits on a target that died since the shooter saw it deal nothing (`hits_too_late`).
 - **Hits are keyed to the life the shooter saw.** History keeps each entity's life counter. A hit deals damage only while the target is still on that life, so a shot at a corpse can't hurt its respawned body, even when the rewound position is right.
 - **Render-step claims are trimmed (the backtrack cheat).** A client could claim it drew a target earlier than it did, to shoot where the target used to be. The server bounds each shot's rewind by what an honest client could need: RTT + the input's wait on the server + the protocol's longest render delay (4 steps near, 6 mid/far) + 2 steps of slack. Anything beyond is trimmed and counted (`rewinds_trimmed`). There's no trim until the connection has an RTT.
-  - `backtrack_claims_are_trimmed`: a cheat claiming 10 steps further back has every shot trimmed and hits 10 of 100.
+  - `backtrack_claims_are_trimmed`: a cheat claiming 10 steps further back has every shot trimmed (since 2026-10-08, held to its render clock first) and hits 10 of 100.
   - Honest gunners are never trimmed (`what_you_see_is_what_you_hit` checks this).
+  - Since 2026-10-08 the bound uses the highest RTT of the last second or two, not the average, and a client's first 2 s get 2 more steps; and every shot is also held to its shooter's render clock (below, "Shots held to the shooter's render clock").
 - **The input queue's rules are unit-tested:** shots fire once, at the rifle's rate, never from stand-ins; late ones still fire within 8 steps; shots from the dead are refused.
 
 **Firing load on WSL** (`lattice-bots --fire-share F`: bots hold the trigger, level along their heading; 8 server threads sharing the box):
@@ -773,6 +774,35 @@ With 8 busy threads competing for the 16 hardware threads (like bots on the same
 | 3k blob, all firing: tick p50 / p99 | 24.45 / 28.01 | 20.10 / 22.40 |
 
 Movement grew 0.02–0.04 ms for the gathering. Hits, kills and trims (0) are alike before and after.
+
+### Shots held to the shooter's render clock (2026-10-08)
+
+**The gap, from a review:** the backtrack bound allows the longest render delay a client may use, plus slack, not the delay it actually uses. A quiet client on a clean link draws near players 2 steps behind but may claim 4, plus 2 of slack: about 133 ms of free backtrack against near targets (mid/far are drawn at a fixed 200 ms, so only the slack is free there). Within that window a cheat can pick, shot by shot, whichever moment of a target's past lined up with its crosshair.
+
+**The rule** (`shots::RenderFloor`, on by default; `SimConfig::render_floor`, `lattice-server --no-render-floor`). Every input carries the render step it was made at, and an honest render clock never runs backwards and keeps to at least 90% of real time (mid/far 80%: their lag slews too).
+- **Inputs:** each input's claim is held to the client's earlier fresh claims (each message's newest input, made just before it was sent), carried forward at that rate over the time between their arrivals, less the link's jitter (its RTTs' range over the last 1–2 s, at most 100 ms). An input that first arrives as a copy (after a loss) is judged as of when it was made.
+- **Shots:** a shot rides the input made after it fired, so its claim is held between the input before it and its own: no older than what the client said it drew, no fresher than its own input. A cheat that varies its claims shot by shot gets held to its inputs; one that makes its inputs stale too can only drift staler at 10% of real time.
+- **Settling:** for a client's first 2 seconds (60 inputs), only its own input bounds a shot (its input clock can still run a few inputs ahead of what it has made), the jitter allowance is the whole 100 ms (its RTTs aren't measured yet), and the backtrack bound allows 2 more steps (its render clock may still be a step behind its target).
+- **After a stand-in:** a client told the server filled in its input runs its input clock a step ahead, so for the 32 steps after one, a shot may claim a step older than the input before it.
+- **Messages without render steps** (the format drops them for a whole batch when any input lacks one: a client's first inputs, a couple of messages after a resync): their shots are held to the floor of the client's earlier claims alone; past its first seconds, a client that has never claimed a render step gets its shots refused rather than unchecked.
+- **Counted:** `renders_held` (shots moved), `held_by_*` (how far, in steps).
+
+**Swarm test** (`picking_the_best_render_step_for_each_shot_is_floored`): a gunner holds its aim on a spot a target strafes through, 50 m out, 20 s at 10 shots/s.
+
+| gunner | hits of 200 |
+|---|---|
+| honest | 20 |
+| cheat picking its best render step up to 4 steps back, render floor off | 40 (100 trimmed by the bound) |
+| the same cheat, render floor on | 20 (100 held) |
+| the same, with every input also claiming 4 steps stale | 20 (100 held, all trimmed) |
+
+**Honest fighters** are never held: on clean links (`latency_classes_hit_alike_within_the_cap`) and on bad ones (`honest_fighters_on_bad_links_are_never_held_or_trimmed`: 5% loss, a fifth of uplink datagrams a step late, downlink up to a step late, at 0, 33 and 133 ms one-way; also tried with 8% loss, 40% late and two steps of jitter). On that bad link the backtrack bound (not the floor) still trims about 1 honest shot in 60,000, by under a step: a mid/far claim whose input arrived late, so its server wait collapsed while its claim didn't change. On WSL with the real binaries (1k blob fighting, uniform 5k with 20% firing), none of ~2.7 million shots over nine runs were trimmed. Before the stand-in allowance above, one run of seven held 4 shots by up to 0.9 steps (a step, less the slack, as a bumped input clock would); the two runs since held none. That cause is a fit, not a proof: the 4 didn't recur to be logged.
+
+**Two bugs found on the way:**
+- **Kernel arrival stamps across a wall-clock step.** Stamps are wall-clock time, converted with a wall/monotonic pair read after each receive call; WSL steps its wall clock now and then, so a datagram stamped just before a step landed seconds off (one anchor 3.5 s early held a client's claims ~90 steps). Both the server's receive threads and the bots now clamp each arrival to no earlier than when the socket was last read empty (`udp::Clocks::arrival`). Input waits and RTTs had the same exposure.
+- **The swarm harness's late datagrams skipped the latency classes:** a datagram held back a step ignored the bot's lag, arriving early instead of late. It now arrives a step after its lag.
+
+**What it doesn't stop:** a cheat that fakes a jittery link (its RTTs' range comes from acks it reports) gets up to 100 ms of slack before the floor applies, and one that sends its inputs in bursts can claim copies up to 2 steps older; both are still within the backtrack bound. Neither can swing between fresh and stale shot by shot.
 
 ### Running it on bare metal (the desktop, dual-booted)
 
