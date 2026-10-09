@@ -2188,3 +2188,42 @@ fn aiming_down_sights_hits_and_the_spread_is_the_servers_secret() {
     assert!(rates[0] < 0.4, "from the hip at 40 m, most miss: {rates:?}");
     assert!(rates[1] > 0.85, "down the sights, nearly all hit: {rates:?}");
 }
+
+#[test]
+fn a_slow_game_client_keeps_its_inputs_coming() {
+    // A game client at 7 to 15 fps makes its inputs in bursts, a frame
+    // (2-4 steps) apart: each burst has to last until the next arrives.
+    // Its input clock learns the gap between its frames. A resync makes a
+    // gap's worth of inputs plus the spare (two left a 7 fps client
+    // starving again every frame), its reports aren't excused (a slow frame
+    // makes several inputs every call; excused, a 15 fps client 100 ms away
+    // sent every input late), and it steers the depth its bursts average.
+    // A trigger pull's input is made in its frame, not the next: a frame
+    // later, every shot claimed a frame more rewind than the backtrack bound
+    // allows (all trimmed at 5-15 fps on a fast link), and the rifle fired
+    // every other frame.
+    for fps in [7u32, 10, 15] {
+        for lag in [0u32, 3] {
+            let (mut s, [_, target, _]) = firing_line(40.0, false);
+            s.lag[0] = lag;
+            s.frames_bot0 = Some(fps);
+            s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0, hold: false, fixed: None, pick_back: 0.0 });
+            for _ in 0..3 * TICK_HZ {
+                s.step();
+            }
+            let (c0, st0) = (s.server.counters().clone(), s.bots[0].2.stats().clone());
+            for _ in 0..10 * TICK_HZ {
+                s.step();
+            }
+            let (c, st) = (s.server.counters(), s.bots[0].2.stats());
+            let stand_ins = (c.repeated + c.frozen) - (c0.repeated + c0.frozen);
+            let got = (stand_ins, c.late_inputs - c0.late_inputs, st.resyncs - st0.resyncs, st.corrections - st0.corrections);
+            assert_eq!(got, (0, 0, 0, 0), "{fps} fps, lag {lag}: stand-ins, late inputs, resyncs, corrections");
+            assert_eq!((c.rewinds_trimmed - c0.rewinds_trimmed, c.renders_held - c0.renders_held), (0, 0), "{fps} fps, lag {lag}: trimmed, held");
+            // The rifle every 3 steps, a pull per frame: 7 or 10 a second.
+            let rate = (fps as f64).min(TICK_HZ as f64 / 3.0) * 0.75;
+            assert!((c.shots - c0.shots) as f64 >= 10.0 * rate * 0.95, "{fps} fps: {} shots", c.shots - c0.shots);
+        }
+    }
+}
+

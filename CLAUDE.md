@@ -179,7 +179,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
       - **Built with `scripts/client-windows.sh`:** WSL → `x86_64-pc-windows-gnullvm` with a user-space llvm-mingw, into `C:\lattice`. WSL interop can launch it for self-checks (`--screenshot`, `--exit-after`).
       - **Found and fixed:** a frame slower than 100 ms made only one batch of inputs and starved the server (42 resyncs at 9 fps). `tick_inputs` now makes up to 300 ms of inputs per call, as several batches.
       - **Judged by eye (the user, 2026-10-05):** "all movement seems very smooth". M3c's last pass bar is met.
-      - **Open:** below ~10 fps the server still starves between frames (a net thread would decouple input from rendering).
+      - **Low frame rates** (2026-10-09): the input clock learns its frame gap: a resync makes a gap's worth of inputs, the depth target rises for bursts, and a trigger pull's input is made in its own frame. At 7–15 fps a client has no stand-ins, resyncs or trimmed shots (every shot was trimmed at 5–15 fps on a fast link before; sim/README, input policy). At 5 fps with 100 ms of lag it still loses a few inputs; a net thread would decouple input from rendering.
       - **Its own Cargo workspace** (the root `exclude`s it), so `cargo test` and `clippy` at the root never build Bevy. It uses Bevy 0.19.1 without audio or gamepads, which need ALSA and libudev headers on Linux.
       - **Networking in the frame loop.** `client/src/net.rs` (`Session`) is plain Rust, no Bevy: a non-blocking UDP socket, a `lattice_net::Client` and a `ClientCore`.
         - Each frame: receive and deliver, then `tick_inputs` with the frame's keyboard and mouse, then flush.

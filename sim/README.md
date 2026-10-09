@@ -82,7 +82,13 @@ Movement is deterministic f32 code shared by both sides, so prediction matches t
 - The spare is there from the start: the first tick after Welcome sends 2 inputs. Starting at depth 1 left every input arriving just in time, and jitter kept bots one tick late.
 - When a snapshot reports a stand-in (depth 0), the bot sends one extra input at once, at most once per 10 ticks. The nudge handles slow drift.
 - A client that stalls past the server's seq resyncs (`resyncs`) instead of staying late forever. It adopts the server's state at the newest seq it heard of and leaves the server the stand-ins a round trip covers (its usual lead over the acks, less one), predicting them with the server's own rule (`movement::stand_in`) rather than making inputs that would arrive too late and be dropped. Then it makes the next input and its spare at once. The time it stalled isn't made up: the stand-ins filled it.
-- Snapshots about seqs the server consumed before such a burst reached it (a resync's stand-ins, or a slow frame's catch-up, all made at once) don't steer the clock: their stand-ins and empty queues are already answered.
+- Snapshots about seqs the server consumed before such a burst reached it (a resync's stand-ins, or a hitch's catch-up, all made at once) don't steer the clock: their stand-ins and empty queues are already answered.
+- **Slow frame loops.** The clock learns the gap between its caller's calls (`gap`: under a step for a fast frame loop, 1 for the bots, 2–4 steps at 15–7 fps), and a slow caller's inputs come in bursts a gap apart, each of which must last until the next arrives:
+  - a resync makes a gap's worth of inputs as well as the spare;
+  - a hitch is a call far later than the usual gap (only its reports are excused: a slow frame loop makes several inputs every call);
+  - the depth target rises by half the gap beyond a step, since the server's queue then swings from the spare's 2 right before a burst to gap + 1 right after one;
+  - a trigger pull's input is made in its own frame, borrowed from the clock, instead of at the next frame.
+  At 7, 10 and 15 fps, with or without 100 ms of lag each way, a client then has no stand-ins, late inputs, resyncs, corrections, holds or trims (`a_slow_game_client_keeps_its_inputs_coming`).
 - At most 3 inputs go out per tick, the most one redundant batch carries.
 
 Stand-ins can exceed bot corrections: a stand-in whose input matches what the bot sent (for example, a repeat of an unchanged input) costs no correction.
@@ -822,6 +828,8 @@ With those, the game client is never held or trimmed through the three stalls, a
 | after, 100 ms each way | 19 / 19 / 19 | 2 / 0 / 0 | 1 tick |
 
 (100, 300 and 1,000 ms freezes. With lag, one shot of the 20 is still in flight at the window's end; the 100 ms freeze's 2 late inputs are the freeze itself, longer than the spare. A bot that misses calls without a resync, which real bots don't, stays behind until its clock catches up.)
+
+**Slow frame loops** (found by running the game client under WSLg's software rendering, ~6.5 fps). The first version of the resync made just the next input and its spare. A client slower than ~10 fps then starved again before its next frame, so it resynced every frame (90 times in 15 s). Excusing every multi-input call's reports hid a 15 fps client's late inputs at 100 ms of lag (every input late). Both are fixed by the frame gap rules in the input policy. Measuring it turned up an older problem: at 5–15 fps on a fast link, every shot was trimmed, because its input left a frame after the pull and the bound doesn't allow for a frame. Also, the rifle fired every other frame. With the pull's input made in its frame: no trims, and 70 shots in 10 s at 7 fps instead of 35. The WSLg client at ~6.5 fps: 5 resyncs in 20 s (was 90), 2 corrections of at most 7 cm.
 
 With the real binaries (`baselines/2026-10-09-wsl2-input-clock`, against the old client core in `…-before`, WSL fight mode): the immortal blob hit 99.3 / 99.3 / 97.3% (old: 99.4 / 99.4 / 98.0), with nothing held, trimmed or corrected in either. No bot resynced in either run, so the resync path didn't run. The new run's lethal blob had 950 late inputs and 221 corrections, all in one 5 s window where the bot swarm stalled (156 thread overruns; the server's tick spiked to 30 ms in it). The old core's run had no such stall.
 

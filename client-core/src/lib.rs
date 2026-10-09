@@ -65,9 +65,8 @@ const MAX_CATCH_UP: usize = 3 * INPUT_REDUNDANCY;
 /// How fast `lead` follows its samples (one per input call after a
 /// snapshot): ~1 s.
 const LEAD_GAIN: f32 = 0.03;
-/// An input call this many steps after the last follows a hitch: the lead
-/// read before it is short by the inputs the hitch held back.
-const HITCH: f32 = 4.0;
+/// How fast `gap` follows the steps between input calls.
+const GAP_GAIN: f32 = 0.1;
 /// Most stand-ins a resync leaves the server (2 s of round trip).
 const MAX_STAND_INS: u32 = 60;
 /// Own-player corrections are smoothed with this time constant.
@@ -248,6 +247,12 @@ pub struct ClientCore {
     /// The newest snapshot's lead, folded in at the next input call, so of
     /// snapshots read at once only the newest counts.
     lead_sample: Option<u32>,
+    /// Steps between input calls (real time, up to `MAX_CATCH_UP`),
+    /// smoothed: under 1 for a frame loop faster than 30 Hz, 1 for a caller
+    /// at the input rate, more for a slow frame loop, whose inputs then
+    /// come in bursts a gap apart. And when the last call was.
+    gap: f32,
+    last_call: Option<Instant>,
     last_server_tick: Option<u32>,
     last_acked: u32,
     /// Timings not yet taken by `drain_latency`.
@@ -352,6 +357,8 @@ impl ClientCore {
             // At no latency: one step until the server reads our input.
             lead: TARGET_DEPTH - 1.0,
             lead_sample: None,
+            gap: 1.0,
+            last_call: None,
             last_server_tick: None,
             last_acked: 0,
             latency: Vec::new(),
@@ -776,14 +783,19 @@ impl ClientCore {
     /// queued (`buffered`) when it consumed one: toward `TARGET_DEPTH`.
     fn steer(&mut self, buffered: u8) {
         self.buffer_avg += (buffered as f32 - self.buffer_avg) * 0.1;
-        let (lo, hi) = DEPTH_BAND;
-        let error = if self.buffer_avg < lo || self.buffer_avg > hi { TARGET_DEPTH - self.buffer_avg } else { 0.0 };
+        // Inputs a gap of g steps apart arrive in bursts: the server holds
+        // g + 1 right after one and the spare's 2 just before the next, so
+        // the depth it reports averages (g - 1) / 2 above a steady stream's.
+        let burst = (self.gap - 1.0).max(0.0) / 2.0;
+        let (lo, hi) = (DEPTH_BAND.0 + burst, DEPTH_BAND.1 + burst);
+        let target = TARGET_DEPTH + burst;
+        let error = if self.buffer_avg < lo || self.buffer_avg > hi { target - self.buffer_avg } else { 0.0 };
         self.rate = self.pace * (1.0 + (CLOCK_GAIN * error).clamp(-MAX_CLOCK_ADJUST, MAX_CLOCK_ADJUST));
         if self.bump_cooldown <= 0.0 {
             if buffered == 0 {
                 self.clock += 1.0;
                 self.bump_cooldown = BUMP_COOLDOWN;
-            } else if buffered as f32 >= TARGET_DEPTH + BACKLOG {
+            } else if buffered as f32 >= target + burst + BACKLOG {
                 self.clock -= 1.0;
                 self.bump_cooldown = BUMP_COOLDOWN;
                 self.stats.backlog_skips += 1;
@@ -826,8 +838,10 @@ impl ClientCore {
         if self.pending_shot.take_if(|(seq, _)| *seq <= to).is_some() {
             self.stats.shots_dropped += 1;
         }
-        // As at the start: a step's input plus the spare at the next call.
-        self.clock = 0.5 + TARGET_DEPTH - 1.0;
+        // As at the start: a step's input plus the spare at the next call,
+        // and for a slow frame loop, enough to last until its next frame
+        // (it starves again otherwise).
+        self.clock = 0.5 + TARGET_DEPTH - 1.0 + (self.gap - 1.0).max(0.0);
         self.clock_at = None;
         self.lead_sample = None;
     }
@@ -1009,10 +1023,17 @@ impl ClientCore {
     /// Makes at most `max` inputs; returns their batches, oldest first.
     fn run_inputs(&mut self, now: Instant, elapsed: f32, max: usize, mut source: impl FnMut(&MoveState, &Welcome) -> Input) -> Vec<Vec<u8>> {
         let Some(w) = self.welcome else { return Vec::new() };
+        // A hitch: far longer since the last call than this caller's usual
+        // gap (a frame loop at 144 Hz: over ~80 ms; at 15 Hz: over 200 ms).
+        let since = self.last_call.map(|t| now.saturating_duration_since(t).as_secs_f32() * TICK_HZ as f32);
+        self.last_call = Some(now);
+        let hitch = since.is_none_or(|s| s > 2.0 * self.gap + 2.0);
+        if let Some(s) = since {
+            self.gap += (s.min(MAX_CATCH_UP as f32) - self.gap) * GAP_GAIN;
+        }
         // How far ahead we ran when the last snapshot came, unless a hitch
         // held our inputs back since.
-        let steady = self.clock_at.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() * TICK_HZ as f32 <= HITCH);
-        if let (Some(lead), true) = (self.lead_sample.take(), steady) {
+        if let (Some(lead), false) = (self.lead_sample.take(), hitch) {
             self.lead += (lead as f32 - self.lead) * LEAD_GAIN;
         }
         self.clock_at = Some(now);
@@ -1021,7 +1042,14 @@ impl ClientCore {
         let render_step = self.render_clock.render_at(now);
         self.slew_mid_lag(now);
         let (mut made, mut withhold) = (0, false);
-        while self.clock >= 1.0 && made < max {
+        // A trigger pulled in a frame rides the input for the step it was
+        // pulled in, the one after the frame's catch-up. A frame loop slower
+        // than 30 Hz would make that input only at its next frame: the shot
+        // would wait a frame for nothing, and claim a frame more rewind than
+        // the backtrack bound allows (every shot trimmed at 15 fps). So it's
+        // made now, borrowed from the clock (the next frame makes one less).
+        let pulled = |c: &Self| !c.stepped && c.gap > 1.0 && c.pending_shot.is_some_and(|(seq, _)| seq == c.seq + 1);
+        while (self.clock >= 1.0 || pulled(self)) && made < max {
             self.clock -= 1.0;
             let input = source(&self.state, &w);
             self.seq += 1;
@@ -1051,10 +1079,13 @@ impl ClientCore {
             1 => {}
             _ => {
                 self.stats.clock_extra += 1;
-                // Made at once, the older ones late (or spare): the server
-                // stood in or ran short before the newest reached it, and
-                // its reports on that are already answered.
-                self.excused_to = self.excused_to.max(self.seq - 1);
+                // Made at once after a hitch, the older ones late: the
+                // server stood in or ran short before the newest reached
+                // it, and its reports on that are already answered. (A slow
+                // frame loop makes several every call: its reports count.)
+                if hitch {
+                    self.excused_to = self.excused_to.max(self.seq - 1);
+                }
             }
         }
         if withhold {
