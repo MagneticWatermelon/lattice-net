@@ -293,6 +293,10 @@ pub struct ClientCore {
     /// drawn further back: a cheat spending the floor's jitter allowance
     /// on stale shots only (tests only).
     stale_shots: f64,
+    /// Holds back a batch whose newest input is the one before a shot, so it
+    /// reaches the server only as a copy in the shot's batch: a cheat's way
+    /// to spend the floor's allowance for copies on stale shots (tests only).
+    withhold_pre_shot: bool,
     /// The newest snapshot's own state and its step: the server's view of us.
     server_own: Option<(MoveState, u32)>,
     /// The server's step minus our input seq: each step consumes a seq, so
@@ -372,6 +376,7 @@ impl ClientCore {
             tracer_picks: Default::default(),
             stale_inputs: 0.0,
             stale_shots: 0.0,
+            withhold_pre_shot: false,
             own_offset: [0.0; 3],
             own_offset_at: None,
             sink: false,
@@ -912,6 +917,14 @@ impl ClientCore {
         self.stale_shots = steps;
     }
 
+    /// Sends the input made just before each shot only as a copy, in the
+    /// shot's batch: a cheat getting the render floor's copy allowance for
+    /// its stale shots, for tests.
+    #[doc(hidden)]
+    pub fn withhold_pre_shot_inputs(&mut self, on: bool) {
+        self.withhold_pre_shot = on;
+    }
+
     /// `fire`, claiming a render time `back` steps older than the real one:
     /// the "backtrack" cheat, for testing that the server trims it.
     #[doc(hidden)]
@@ -1007,7 +1020,7 @@ impl ClientCore {
         self.bump_cooldown -= elapsed;
         let render_step = self.render_clock.render_at(now);
         self.slew_mid_lag(now);
-        let mut made = 0;
+        let (mut made, mut withhold) = (0, false);
         while self.clock >= 1.0 && made < max {
             self.clock -= 1.0;
             let input = source(&self.state, &w);
@@ -1015,6 +1028,7 @@ impl ClientCore {
             self.made = self.seq;
             // The input right before a pending shot (the cheats' hooks).
             let before_shot = self.pending_shot.is_some_and(|(seq, _)| seq == self.seq + 1);
+            withhold = self.withhold_pre_shot && before_shot;
             let stale = self.stale_inputs + if before_shot { self.stale_shots } else { 0.0 };
             let render = render_step.map(|r| msg::render_units(r - stale));
             let applied = if self.is_dead() { dead_input(input) } else { input };
@@ -1042,6 +1056,9 @@ impl ClientCore {
                 // its reports on that are already answered.
                 self.excused_to = self.excused_to.max(self.seq - 1);
             }
+        }
+        if withhold {
+            return Vec::new(); // (the cheat's hook)
         }
         // One batch per INPUT_REDUNDANCY new inputs, ending at the newest:
         // each new input is in at least one batch, with older ones behind it.

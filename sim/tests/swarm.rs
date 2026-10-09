@@ -1662,14 +1662,19 @@ fn honest_fighters_on_bad_links_are_never_held_or_trimmed() {
 }
 
 #[test]
-fn spending_the_jitter_allowance_on_stale_shots_is_flagged() {
-    // On a bad link the render floor allows for jitter, so in any one claim
-    // a step of jitter and a step of lying look alike. Half these fighters
-    // cheat: each shot, and the input made just before it (which bounds the
-    // shot's view), claims to have drawn a step further back than it did.
-    // An honest client's dips into the allowance come from its link,
-    // whenever it shoots; the cheats' come right before shots.
+fn allowances_spent_on_stale_shots_are_flagged() {
+    // On a bad link the render floor allows for jitter and for inputs that
+    // first arrive as copies, so in any one claim a step of jitter or loss
+    // and a step of lying look alike. Two thirds of these fighters cheat,
+    // within those allowances: each shot, and the input made just before it
+    // (which bounds the shot's view), claims to have drawn further back than
+    // it did; the second kind also sends that input only as a copy, in the
+    // shot's batch, which the floor judges as made a step earlier. An honest
+    // client's dips under the floor come from its link, whenever it shoots;
+    // the cheats' come at their shots. Every 100 shots each client is judged
+    // (and on leaving), and the first flag is a line in the session log.
     use lattice_sim::bot::FightConfig;
+    use lattice_sim::server::SessionEvent;
     use lattice_sim::shots::DIP_MIN_SHOTS;
     let interest = InterestConfig { squad_size: 0, ..Default::default() };
     let cfg = SimConfig { spawn: SpawnMode::Disk(40.0), interest, cone_of_fire: false, ..Default::default() };
@@ -1678,8 +1683,13 @@ fn spending_the_jitter_allowance_on_stale_shots_is_flagged() {
     (s.loss, s.delay, s.down_jitter) = (0.05, 0.2, 1);
     for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
         b.set_fight(Some(FightConfig { ads: false, ..FightConfig::default() }));
-        if i % 2 == 1 {
-            b.core_mut().claim_stale_shots(1.0);
+        match i % 3 {
+            1 => b.core_mut().claim_stale_shots(1.0),
+            2 => {
+                b.core_mut().claim_stale_shots(0.8);
+                b.core_mut().withhold_pre_shot_inputs(true);
+            }
+            _ => {}
         }
     }
     for _ in 0..3 * TICK_HZ {
@@ -1689,21 +1699,43 @@ fn spending_the_jitter_allowance_on_stale_shots_is_flagged() {
     for &e in &ents {
         s.server.set_invulnerable(e, true);
     }
-    for _ in 0..25 * TICK_HZ {
+    for _ in 0..30 * TICK_HZ {
         s.step();
     }
     let dips = s.server.shot_dips();
-    let (mut honest, mut cheats) = (Vec::new(), Vec::new());
+    let mut by_kind = [Vec::new(), Vec::new(), Vec::new()];
     for (i, e) in ents.iter().enumerate() {
         if let Some(&(_, d)) = dips.iter().find(|d| d.0 == *e).filter(|d| d.1.judged()) {
-            if i % 2 == 1 { &mut cheats } else { &mut honest }.push(d);
+            by_kind[i % 3].push(d);
         }
     }
     let show = |v: &[lattice_sim::shots::Dips]| v.iter().map(|d| format!("{:.2} ({:.1} se)", d.excess, d.z)).collect::<Vec<_>>();
-    eprintln!("pre-shot dip excess, steps: honest {:?}, cheats {:?}", show(&honest), show(&cheats));
-    assert!(honest.len() >= 6 && cheats.len() >= 6, "enough of each fired {DIP_MIN_SHOTS}+ shots");
-    assert!(honest.iter().all(|d| !d.flagged()), "no honest fighter flagged");
-    assert!(cheats.iter().all(|d| d.flagged()), "every cheat flagged");
+    eprintln!("shot dip excess, steps: honest {:?}", show(&by_kind[0]));
+    eprintln!("  stale shots {:?}", show(&by_kind[1]));
+    eprintln!("  stale shots after copies {:?}", show(&by_kind[2]));
+    assert!(by_kind.iter().all(|k| k.len() >= 5), "enough of each fired {DIP_MIN_SHOTS}+ shots");
+    assert!(by_kind[0].iter().all(|d| !d.flagged()), "no honest fighter flagged");
+    assert!(by_kind[1..].iter().flatten().all(|d| d.flagged()), "every cheat flagged");
+    // The session log: each cheat flagged during the session (most in its
+    // first window), nobody else; then a line for everyone still connected,
+    // with the user id from its connect token (here, the bot's index).
+    let mut records = s.server.take_session_records();
+    let flagged: Vec<u16> = records.iter().filter(|r| r.event == SessionEvent::Flagged).map(|r| r.entity).collect();
+    let cheats: Vec<u16> = ents.iter().enumerate().filter(|(i, _)| i % 3 != 0).map(|(_, &e)| e).collect();
+    let mut sorted = flagged.clone();
+    sorted.sort_unstable();
+    let mut expected = cheats.clone();
+    expected.sort_unstable();
+    assert_eq!(sorted, expected, "flagged during the session: the cheats, once each");
+    s.server.close_sessions(s.now);
+    records.extend(s.server.take_session_records());
+    for (i, &e) in ents.iter().enumerate() {
+        let r = records.iter().find(|r| r.event == SessionEvent::Open && r.entity == e).expect("a line for each");
+        assert_eq!(r.session.user, i as u64);
+        assert!(r.session.shots > 100 && r.session.windows >= 1, "{:?}", r.session);
+        assert_eq!(r.session.windows_flagged > 0, i % 3 != 0, "{}", r.to_json());
+    }
+    eprintln!("a cheat's line: {}", records.iter().find(|r| r.entity == cheats[0] && r.event == SessionEvent::Open).unwrap().to_json());
 }
 
 #[test]

@@ -39,9 +39,11 @@ const MAX_SPEED: f32 = 9.0;
 
 /// The secret that picks where in its cone of fire each shot goes
 /// (`weapon::spread`). It's never sent, and a pick is HMAC-SHA256 of the
-/// shooter's spawn and the shot's seq under it, so knowing a shot's id and
-/// seq (or seeing where earlier shots went: everyone near sees tracers) tells
-/// a client nothing about where the next shot will go.
+/// shooter's spawn (a 64-bit count) and the shot's input seq (the full
+/// 32-bit seq inputs carry, which wraps only after 4.5 years of one
+/// connection) under it, so knowing a shot's id and seq (or seeing where
+/// earlier shots went: everyone near sees tracers) tells a client nothing
+/// about where the next shot will go.
 pub struct SpreadKey(hmac::Key);
 
 impl SpreadKey {
@@ -264,23 +266,69 @@ pub struct ClockRate {
 pub struct RenderFloor {
     /// Recent fresh claims, held: (seq, near, mid, arrival).
     anchors: VecDeque<(u32, f64, f64, Instant)>,
-    /// The last inputs' held claims, by seq: (seq, near, mid, dip).
-    recent: [(u32, f64, f64, f64); RECENT],
+    /// The last inputs as judged, by seq.
+    recent: [Judged; RECENT],
     /// When the first claim arrived.
     first: Option<Instant>,
-    /// How far near claims dipped under the floor the jitter allowance
-    /// lowers (`dips`), after the client's first seconds: every input's
-    /// (sum, sum of squares, count), and the inputs' right before shots
-    /// (sum, count).
-    dips_all: (f64, f64, u32),
-    dips_shots: (f64, u32),
+    /// How far claims dipped under the floor without allowances, after the
+    /// client's first seconds (`judge`): this window of shots, and the
+    /// whole session.
+    window: DipSums,
+    total: DipSums,
 }
 
-/// A client's pre-shot dips into the render floor's jitter allowance
-/// (`RenderFloor::dips`).
+/// An input's claims as the floor judged them, kept for the shots after it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Judged {
+    seq: u32,
+    /// Held to the floor (near, mid).
+    held: [f64; 2],
+    /// The strictest view it could be held to: the floor without allowances
+    /// where it claimed older than that, else its claim.
+    strict: [f64; 2],
+    /// How far it dipped under that, if counted (past the first seconds).
+    dip: Option<f64>,
+}
+
+/// Dips under the floor without allowances, summed: every input's (sum,
+/// sum of squares, count), the inputs' right before shots (sum, sum of
+/// squares), and the shots' (sum, count).
+#[derive(Debug, Clone, Copy, Default)]
+struct DipSums {
+    inputs: (f64, f64, u32),
+    before_shots: (f64, f64),
+    shots: (f64, u32),
+}
+
+impl DipSums {
+    fn input(&mut self, dip: f64) {
+        let (sum, sq, n) = self.inputs;
+        self.inputs = (sum + dip, sq + dip * dip, n + 1);
+    }
+
+    /// A shot that dipped `dip`, after an input that dipped `before`.
+    fn shot(&mut self, dip: f64, before: f64) {
+        self.before_shots = (self.before_shots.0 + before, self.before_shots.1 + before * before);
+        self.shots = (self.shots.0 + dip, self.shots.1 + 1);
+    }
+
+    /// The shots' dips against the other inputs' (the ones before shots
+    /// are what a cheat makes stale).
+    fn dips(&self) -> Option<Dips> {
+        let ((sum, sq, n), (bsum, bsq), (shots, k)) = (self.inputs, self.before_shots, self.shots);
+        let others = n.checked_sub(k).filter(|&m| m > 0 && k > 0)? as f64;
+        let mean = (sum - bsum) / others;
+        let sd = ((sq - bsq) / others - mean * mean).max(0.0).sqrt().max(0.01);
+        let excess = shots / k as f64 - mean;
+        Some(Dips { excess, shots: k, z: excess / (sd / (k as f64).sqrt()) })
+    }
+}
+
+/// How far a client's shots dipped under the render floor without its
+/// allowances, against how far its inputs did (`RenderFloor::judge`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Dips {
-    /// Beyond its other inputs' dips, on average, in steps.
+    /// Beyond its inputs' dips, on average, in steps.
     pub excess: f64,
     pub shots: u32,
     /// The excess in standard errors.
@@ -288,7 +336,7 @@ pub struct Dips {
 }
 
 impl Dips {
-    /// Judged (enough shots), and spending the allowance on stale shots.
+    /// Judged (enough shots), and spending allowances on stale shots.
     pub fn judged(&self) -> bool {
         self.shots >= DIP_MIN_SHOTS
     }
@@ -297,22 +345,40 @@ impl Dips {
     }
 }
 
-/// Shots a client must have fired before its dips are judged (`dips`); how
-/// far (steps) its pre-shot dips must exceed its others' to be flagged as
-/// spending the jitter allowance on stale shots, and by how many standard
-/// errors (its dips vary with its link: an honest client's excess is noise).
+/// A client's dips judged after a window of `JUDGE_SHOTS` shots: the
+/// window's, and its session's so far (a cheat that starts late shows in
+/// its windows before its session).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Judgment {
+    pub window: Dips,
+    pub total: Dips,
+}
+
+impl Judgment {
+    pub fn flagged(&self) -> bool {
+        self.window.flagged() || self.total.flagged()
+    }
+}
+
+/// Shots a client must have fired before its dips are judged; how far
+/// (steps) its shots' dips must exceed its inputs' to be flagged as spending
+/// the floor's allowances on stale shots, and by how many standard errors
+/// (its dips vary with its link: an honest client's excess is noise).
 pub const DIP_MIN_SHOTS: u32 = 30;
 pub const DIP_FLAG: f64 = 0.3;
 pub const DIP_Z: f64 = 4.0;
+/// Shots in each window judged during a session (`RenderFloor::judge`):
+/// about ten seconds of a rifle's fire.
+pub const JUDGE_SHOTS: u32 = 100;
 
 impl RenderFloor {
     /// The oldest near and mid claims the client's fresh claims before input
-    /// `seq` allow for something made at `made`; and the near one without
-    /// the jitter allowance. Whether the client is past its first seconds.
-    fn floor(&self, seq: u32, made: Instant, clock: ClockRate) -> ([f64; 2], f64, bool) {
+    /// `seq` allow for something made at `made`; and the same without the
+    /// jitter allowance. Whether the client is past its first seconds.
+    fn floor(&self, seq: u32, made: Instant, clock: ClockRate) -> ([f64; 2], [f64; 2], bool) {
         let settled = self.first.is_some_and(|t| made.saturating_duration_since(t) >= FLOOR_SETTLE);
         let (rate, jitter) = (clock.rate, if settled { clock.jitter.clamp(0.0, FLOOR_JITTER_MAX) } else { FLOOR_JITTER_MAX });
-        let (mut f, mut strict) = ([f64::MIN; 2], f64::MIN);
+        let (mut f, mut strict) = ([f64::MIN; 2], [f64::MIN; 2]);
         for &(s, near, mid, at) in &self.anchors {
             if s < seq && made.saturating_duration_since(at) <= ANCHOR_AGE {
                 // Real time from this claim's arrival to `made`, at least:
@@ -321,10 +387,12 @@ impl RenderFloor {
                 let run = (since - jitter).max(0.0) * rate;
                 f[0] = f[0].max(near + run * FLOOR_RATE_NEAR);
                 f[1] = f[1].max(mid + run * FLOOR_RATE_MID);
-                strict = strict.max(near + since * rate * FLOOR_RATE_NEAR);
+                strict[0] = strict[0].max(near + since * rate * FLOOR_RATE_NEAR);
+                strict[1] = strict[1].max(mid + since * rate * FLOOR_RATE_MID);
             }
         }
-        ([f[0] - FLOOR_SLACK_NEAR, f[1] - FLOOR_SLACK_MID], strict - FLOOR_SLACK_NEAR, settled)
+        let slack = |v: [f64; 2]| [v[0] - FLOOR_SLACK_NEAR, v[1] - FLOOR_SLACK_MID];
+        (slack(f), slack(strict), settled)
     }
 
     /// Input `seq` arrived (for the first time) claiming it was made at
@@ -335,13 +403,17 @@ impl RenderFloor {
         self.first.get_or_insert(at);
         let (f, strict, settled) = self.floor(seq, Self::made(seq, newest, at, clock), clock);
         let held = [claim[0].max(f[0]), claim[1].max(f[1])];
-        // How much of the jitter allowance this claim used.
-        let dip = (strict - claim[0]).max(0.0);
-        if settled {
-            let (sum, sq, n) = self.dips_all;
-            self.dips_all = (sum + dip, sq + dip * dip, n + 1);
+        // The floor without allowances: no jitter, and judged as made when
+        // its message arrived (a copy's credit is one too). How far under
+        // it the claim dipped is what the allowances bought.
+        let strict = if seq == newest { strict } else { self.floor(seq, at, clock).1 };
+        let strict = [claim[0].max(strict[0]), claim[1].max(strict[1])];
+        let dip = settled.then(|| (strict[0] - claim[0]).max(strict[1] - claim[1]));
+        if let Some(d) = dip {
+            self.window.input(d);
+            self.total.input(d);
         }
-        self.recent[seq as usize % RECENT] = (seq, held[0], held[1], dip);
+        self.recent[seq as usize % RECENT] = Judged { seq, held, strict, dip };
         if seq == newest {
             if self.anchors.len() == ANCHORS {
                 self.anchors.pop_front();
@@ -385,35 +457,51 @@ impl RenderFloor {
     /// only its own input bounds the shot) and for a step after the server
     /// fills in a missing input (the client then runs its clock a step ahead).
     pub fn shot(&mut self, seq: u32, claim: [f64; 2], before: Option<f64>) -> [f64; 2] {
-        let known = |s: u32| self.recent[s as usize % RECENT].0 == s;
+        let known = |s: u32| self.recent[s as usize % RECENT].seq == s;
         let mut held = claim;
         if known(seq) {
-            let (_, n, m, _) = self.recent[seq as usize % RECENT];
-            held = [held[0].min(n + FLOOR_SLACK_NEAR), held[1].min(m + FLOOR_SLACK_MID)];
+            let own = self.recent[seq as usize % RECENT].held;
+            held = [held[0].min(own[0] + FLOOR_SLACK_NEAR), held[1].min(own[1] + FLOOR_SLACK_MID)];
         }
         if let (Some(slack), true) = (before, seq > 1 && known(seq - 1)) {
-            let (_, n, m, dip) = self.recent[(seq - 1) as usize % RECENT];
-            held = [held[0].max(n - slack - FLOOR_SLACK_NEAR), held[1].max(m - slack - FLOOR_SLACK_MID)];
-            // The input before a shot bounds how old its view can be.
-            self.dips_shots = (self.dips_shots.0 + dip, self.dips_shots.1 + 1);
+            let prev = self.recent[(seq - 1) as usize % RECENT];
+            held = [held[0].max(prev.held[0] - slack - FLOOR_SLACK_NEAR), held[1].max(prev.held[1] - slack - FLOOR_SLACK_MID)];
+            // How far the shot's view dipped under the strictest it could
+            // have: the input before it's, without allowances. An honest shot
+            // fires once that input is made, so it dips no more than the
+            // input did.
+            if let Some(before) = prev.dip {
+                let dip = (prev.strict[0] - FLOOR_SLACK_NEAR - claim[0]).max(prev.strict[1] - FLOOR_SLACK_MID - claim[1]).max(0.0);
+                self.window.shot(dip, before);
+                self.total.shot(dip, before);
+            }
         }
         held
     }
 
-    /// How far, on average, the client's claims dipped into the jitter
-    /// allowance right before its shots, beyond how far they dipped at all,
-    /// in steps; over how many shots; and how many standard errors that is.
-    /// An honest client's dips come from its link, whenever it shoots; a
-    /// cheat spending the allowance on stale views dips before shots. `None`
-    /// before it has made a claim.
+    /// Every `JUDGE_SHOTS` shots: how far this window's shots dipped under
+    /// the floor without allowances, beyond how far its inputs did (`Dips`),
+    /// and the same over the session; then a new window. An honest client's
+    /// dips come from its link, whenever it shoots. A cheat spending an
+    /// allowance on stale views (claiming staler inputs within the jitter
+    /// allowance, sending them only as copies, claiming shots older than the
+    /// input before them after a stand-in) dips at its shots.
+    pub fn judge(&mut self) -> Option<Judgment> {
+        if self.window.shots.1 < JUDGE_SHOTS {
+            return None;
+        }
+        let window = std::mem::take(&mut self.window).dips()?;
+        Some(Judgment { window, total: self.total.dips()? })
+    }
+
+    /// The session's dips so far (`judge`); `None` before a shot. And the
+    /// window not judged yet, as a client leaves.
     pub fn dips(&self) -> Option<Dips> {
-        let ((sum, sq, n), (shots, k)) = (self.dips_all, self.dips_shots);
-        (n > 0 && k > 0).then(|| {
-            let mean = sum / n as f64;
-            let sd = (sq / n as f64 - mean * mean).max(0.0).sqrt().max(0.01);
-            let excess = shots / k as f64 - mean;
-            Dips { excess, shots: k, z: excess / (sd / (k as f64).sqrt()) }
-        })
+        self.total.dips()
+    }
+
+    pub fn window_dips(&self) -> Option<Dips> {
+        self.window.dips()
     }
 }
 
@@ -626,6 +714,9 @@ mod tests {
         seq: u32,
         /// Inputs made but not yet in a message that arrived.
         unsent: Vec<f64>,
+        /// How far a shot may claim older than the input before it (the
+        /// stand-in allowance).
+        before: f64,
     }
 
     const STEP: f64 = 1.0 / TICK_HZ as f64;
@@ -633,7 +724,7 @@ mod tests {
 
     impl Client {
         fn new() -> Self {
-            Self { floor: RenderFloor::default(), t0: Instant::now(), seq: 0, unsent: Vec::new() }
+            Self { floor: RenderFloor::default(), t0: Instant::now(), seq: 0, unsent: Vec::new(), before: 0.0 }
         }
 
         /// Makes an input drawn at render step `r` (not sent yet).
@@ -652,7 +743,7 @@ mod tests {
                 self.floor.input(first + k as u32, [r, r - 3.0], self.seq, at, ClockRate { rate: RATE, jitter });
             }
             shot.map(|r| {
-                let h = self.floor.shot(self.seq, [r, r - 3.0], Some(0.0));
+                let h = self.floor.shot(self.seq, [r, r - 3.0], Some(self.before));
                 (h[0] - r).abs().max((h[1] - (r - 3.0)).abs())
             })
         }
@@ -781,6 +872,65 @@ mod tests {
             c.run(30, 2.0, |_| 59.0, 0.0, jitter, |_| 59.0)
         };
         assert_eq!(freeze(&mut a, 1.0), freeze(&mut b, FLOOR_JITTER_MAX));
+    }
+
+    /// A client making an input a step for 100 s with a shot riding every
+    /// third, its messages 40 ± 10 ms on the way and 5% of them lost (their
+    /// inputs come as copies in the next). Each input before a shot claims
+    /// `stale` steps older than it drew, and goes only as a copy if
+    /// `withhold`. Each shot claims `back` steps older than that input
+    /// (`None`: honest, as drawn when its own input was made, a step
+    /// later). Allowances: `before` after the input before (a stand-in's),
+    /// and the link's jitter. Returns the judgments and the most any shot
+    /// was held.
+    fn spend(stale: f64, withhold: bool, back: Option<f64>, before: f64, jitter: f64) -> (Vec<Judgment>, f64) {
+        let mut c = Client::new();
+        c.before = before;
+        let mut rng = crate::rng::Rng::new(11);
+        let (mut judged, mut most) = (Vec::new(), 0.0f64);
+        for k in 1..=3000u32 {
+            let t = k as f64 * STEP;
+            let r = t * 30.0;
+            let before_shot = k % 3 == 2;
+            c.make(if before_shot { r - stale } else { r });
+            if rng.chance(0.05) || (withhold && before_shot) {
+                continue; // in the next message
+            }
+            let shot = (k % 3 == 0).then(|| back.map_or(r, |b| r - 1.0 - stale - b));
+            let delay = 0.040 + (rng.unit() as f64 - 0.5) * 0.020;
+            if let Some(held) = c.arrive(t + delay, jitter, shot) {
+                most = most.max(held);
+                judged.extend(c.floor.judge());
+            }
+        }
+        (judged, most)
+    }
+
+    #[test]
+    fn allowances_spent_on_shots_alone_are_flagged() {
+        let flagged = |j: &[Judgment]| j.iter().filter(|j| j.flagged()).count();
+        // Honest, with or without a stand-in allowance it doesn't use: its
+        // shots dip no more than the inputs before them, which dip like any.
+        for before in [0.0, 1.1] {
+            let (j, held) = spend(0.0, false, None, before, 0.02);
+            assert!(j.len() >= 8, "{} judgments", j.len());
+            assert_eq!((flagged(&j), held), (0, 0.0), "{j:?}");
+            assert!(j.iter().all(|j| j.window.excess < 0.1), "{j:?}");
+        }
+        // Three cheats, each within an allowance (never held), each spending
+        // it on its shots alone:
+        // - a faked jittery link: the input before each shot claims the view
+        //   of the input before it (a step stale), and so does the shot;
+        // - that input held back to come as a copy, which is judged as made
+        //   a step earlier, so it claims ~a step staler;
+        // - after a stand-in: each shot a step older than the input before.
+        for (name, stale, withhold, back, before, jitter) in
+            [("jitter", 1.0, false, 0.0, 0.0, 0.1), ("copy", 0.8, true, 0.0, 0.0, 0.02), ("stand-in", 0.0, false, 1.0, 1.1, 0.02)]
+        {
+            let (j, held) = spend(stale, withhold, Some(back), before, jitter);
+            assert_eq!(held, 0.0, "{name}: within its allowance");
+            assert!(flagged(&j) == j.len() && j.len() >= 8, "{name}: {j:?}");
+        }
     }
 
     #[test]

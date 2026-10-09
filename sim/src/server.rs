@@ -33,7 +33,7 @@ use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, GRACE_TICKS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
-use crate::shots::{self, ClockRate, Cut, Fire, FlyStats, History, Outcome, Projectile, RenderFloor, Sky, SpreadKey};
+use crate::shots::{self, ClockRate, Cut, Dips, Fire, FlyStats, History, Judgment, Outcome, Projectile, RenderFloor, Sky, SpreadKey};
 use lattice_game::weapon::{self, shot_time, Bloom, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
 use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::events::{self, Event};
@@ -306,12 +306,16 @@ pub struct Counters {
     /// than its inputs said it drew, or newer than its own input): held to
     /// it (`shots::RenderFloor`).
     pub renders_held: u64,
-    /// Clients judged, as they left, by whether their claims dipped into the
-    /// jitter allowance more right before shots than otherwise
-    /// (`RenderFloor::dips`, at least `DIP_MIN_SHOTS` shots), and of those,
-    /// the ones flagged (`Dips::flagged`): spending it on stale shots.
+    /// Clients judged, as they left, by whether their shots dipped under the
+    /// render floor without its allowances more than their inputs did
+    /// (`RenderFloor::judge`, at least `DIP_MIN_SHOTS` shots), and of those,
+    /// the ones flagged in any window or over the session: spending the
+    /// allowances on stale shots.
     pub dip_clients: u64,
     pub dip_flagged: u64,
+    /// Windows of `JUDGE_SHOTS` shots judged during sessions, and flagged.
+    pub dip_windows: u64,
+    pub dip_windows_flagged: u64,
     /// Projectile segments flown and player candidates tested.
     pub segments: u64,
     pub candidates: u64,
@@ -507,6 +511,99 @@ struct Judge {
     step: u32,
     clock: ClockRate,
     floor: bool,
+    /// The sender's RTT now, in ms (0 before it's measured).
+    rtt: f32,
+}
+
+/// One client's time on the server, for the session log
+/// (`SimServer::take_session_records`): who it is (the connect token's user
+/// id) and what it did.
+#[derive(Debug, Clone, Default)]
+pub struct Session {
+    pub user: u64,
+    /// When it connected: unix seconds, and here.
+    pub joined_unix: u64,
+    joined: Option<Instant>,
+    /// Seconds connected, as of the record.
+    pub secs: f64,
+    /// Inputs applied; seqs a stand-in took (its input was late or lost);
+    /// inputs that came after a stand-in took their seq.
+    pub inputs: u64,
+    pub stand_ins: u64,
+    pub late: u64,
+    /// Shots fired; of those, held to its render clock (`RenderFloor`) or
+    /// trimmed (`shots::plausible`); and shots refused (too fast, from the
+    /// dead, too late).
+    pub shots: u64,
+    pub held: u64,
+    pub trimmed: u64,
+    pub refused: u64,
+    /// Its shots that hit a player, its kills, its deaths.
+    pub hits: u64,
+    pub kills: u64,
+    pub deaths: u64,
+    /// The transport's RTT: summed over its messages, and the highest, in ms.
+    pub rtt_sum_ms: f64,
+    pub rtt_samples: u64,
+    pub rtt_max_ms: f32,
+    /// Windows of its shots judged (`RenderFloor::judge`), and flagged; the
+    /// first judgment that flagged it.
+    pub windows: u32,
+    pub windows_flagged: u32,
+    pub first_flag: Option<Judgment>,
+}
+
+impl Session {
+    /// A copy with `secs` as of `now`.
+    fn as_of(&self, now: Instant) -> Session {
+        let secs = self.joined.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
+        Session { secs, ..self.clone() }
+    }
+}
+
+/// What a session record is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// A judgment of its shots flagged it, the first time this session.
+    Flagged,
+    /// It left (disconnected or timed out).
+    Left,
+    /// Still connected when the server stopped (`SimServer::close_sessions`).
+    Open,
+}
+
+/// A line of the session log.
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub event: SessionEvent,
+    pub entity: u16,
+    pub session: Session,
+    /// Flagged: the judgment's window and session dips. Left and Open: the
+    /// window not judged yet, and the whole session's.
+    pub window: Option<Dips>,
+    pub total: Option<Dips>,
+}
+
+impl SessionRecord {
+    /// One JSON object, no newline.
+    pub fn to_json(&self) -> String {
+        let s = &self.session;
+        let dips = |d: Option<Dips>| match d {
+            Some(d) => format!("{{\"shots\":{},\"excess\":{:.3},\"z\":{:.2},\"flagged\":{}}}", d.shots, d.excess, d.z, d.flagged()),
+            None => "null".to_string(),
+        };
+        let event = match self.event {
+            SessionEvent::Flagged => "flagged",
+            SessionEvent::Left => "left",
+            SessionEvent::Open => "open",
+        };
+        let rtt_mean = if s.rtt_samples > 0 { s.rtt_sum_ms / s.rtt_samples as f64 } else { 0.0 };
+        format!(
+            "{{\"event\":\"{event}\",\"user\":{},\"entity\":{},\"joined_unix\":{},\"secs\":{:.1},\"inputs\":{},\"stand_ins\":{},\"late\":{},\"shots\":{},\"held\":{},\"trimmed\":{},\"refused\":{},\"hits\":{},\"kills\":{},\"deaths\":{},\"rtt_mean_ms\":{:.1},\"rtt_max_ms\":{:.1},\"windows\":{},\"windows_flagged\":{},\"window\":{},\"total\":{}}}",
+            s.user, self.entity, s.joined_unix, s.secs, s.inputs, s.stand_ins, s.late, s.shots, s.held, s.trimmed, s.refused, s.hits, s.kills, s.deaths,
+            rtt_mean, s.rtt_max_ms, s.windows, s.windows_flagged, dips(self.window), dips(self.total)
+        )
+    }
 }
 
 struct InputQueue {
@@ -552,6 +649,9 @@ struct InputQueue {
     /// Inputs received (first arrivals): the first `SETTLE_INPUTS` are the
     /// client's first seconds, while its clocks settle.
     inputs_seen: u32,
+    session: Session,
+    /// A judgment flagged it for the first time since the last tick.
+    flagged_now: bool,
 }
 
 /// A client's first two seconds of inputs (at 30 Hz): its RTT isn't
@@ -580,6 +680,8 @@ impl Default for InputQueue {
             claims: RenderFloor::default(),
             batch: Vec::new(),
             inputs_seen: 0,
+            session: Session::default(),
+            flagged_now: false,
         }
     }
 }
@@ -612,6 +714,10 @@ impl InputQueue {
     /// as it arrives, and each shot's to the inputs around it
     /// (`shots::RenderFloor`), so a shot carries the view it's allowed.
     fn receive(&mut self, e: u16, data: &[u8], arrived: Instant, dead: bool, judge: Judge, n: &mut [u64; 3]) {
+        if judge.rtt > 0.0 {
+            let s = &mut self.session;
+            (s.rtt_sum_ms, s.rtt_samples, s.rtt_max_ms) = (s.rtt_sum_ms + judge.rtt as f64, s.rtt_samples + 1, s.rtt_max_ms.max(judge.rtt));
+        }
         let mut batch = std::mem::take(&mut self.batch);
         batch.clear();
         let ok = msg::decode_inputs(data, |seq, input, render, shot| batch.push((seq, input, render, shot)));
@@ -635,12 +741,16 @@ impl InputQueue {
                     let lag = r.mid_lag as f64 / MID_LAG_UNITS;
                     let near = place(r.near);
                     self.claims.input(seq, [near, near - lag], newest, arrived, judge.clock);
-                    shot.map(|s| {
+                    let held = shot.map(|s| {
                         let near = place(s.render);
                         let h = self.claims.shot(seq, [near, near - lag], before);
                         let m = (near - h[0]).abs().max((near - lag - h[1]).abs());
                         (h, m)
-                    })
+                    });
+                    if let Some(j) = self.claims.judge() {
+                        self.judged(j);
+                    }
+                    held
                 }
                 // No render steps in the message: held to the earlier claims
                 // alone; with none at all past its first seconds, a client
@@ -660,13 +770,29 @@ impl InputQueue {
                 _ => None,
             };
             match self.push(e, seq, input, render, shot.map(|s| (s, held)), arrived, dead) {
-                Push::Late => n[0] += 1,
+                Push::Late => {
+                    n[0] += 1;
+                    self.session.late += 1;
+                }
                 Push::Discarded => n[1] += 1,
                 Push::Queued | Push::Duplicate => {}
             }
         }
         self.batch = batch;
         n[2] += ok.is_err() as u64;
+    }
+
+    /// A window of the client's shots was judged (`RenderFloor::judge`).
+    fn judged(&mut self, j: Judgment) {
+        let s = &mut self.session;
+        s.windows += 1;
+        if j.flagged() {
+            s.windows_flagged += 1;
+            if s.first_flag.is_none() {
+                s.first_flag = Some(j);
+                self.flagged_now = true;
+            }
+        }
     }
 
     /// Whether input `seq` hasn't arrived before: queued or applied, or late
@@ -811,6 +937,11 @@ impl InputQueue {
         }
         body.ads = !body.dead() && input.buttons & BUTTON_ADS != 0;
         self.consume(next, kind != Step::Applied);
+        if kind == Step::Applied {
+            self.session.inputs += 1;
+        } else {
+            self.session.stand_ins += 1;
+        }
         // Only real inputs fire: a stand-in repeats movement, never a shot.
         if let Some(((shot, held), render)) = fired {
             if body.dead() {
@@ -939,9 +1070,11 @@ pub struct SimServer {
     squad_anchor: HashMap<u32, [f32; 2]>,
     /// Per-shard snapshot buffers, reused every tick.
     snapshots: Vec<Vec<Snap>>,
-    /// Per shard: connects (true) and disconnects (false), in the order the
-    /// transport reported them.
-    lifecycle: Vec<Vec<(ClientId, bool)>>,
+    /// Per shard: connects (with the connect token's user id) and
+    /// disconnects (`None`), in the order the transport reported them.
+    lifecycle: Vec<Vec<(ClientId, Option<u64>)>>,
+    /// Session log lines since the last `take_session_records`.
+    session_records: Vec<SessionRecord>,
     /// Input waits (arrival -> applied) since the last `take_input_wait`, in 0.1 ms.
     input_wait: Histogram,
     /// Rewinds (see `InputQueue::rewind`) for near and for mid/far targets
@@ -1008,6 +1141,7 @@ impl SimServer {
             squad_anchor: HashMap::new(),
             snapshots: vec![Vec::new(); cfg.shards],
             lifecycle: vec![Vec::new(); cfg.shards],
+            session_records: Vec::new(),
             input_wait: Histogram::new(INPUT_WAIT_CAP),
             rewind: [Histogram::new(REWIND_CAP_MS), Histogram::new(REWIND_CAP_MS)],
             trim_excess: Histogram::new(200),
@@ -1163,9 +1297,35 @@ impl SimServer {
         &self.dip_excess
     }
 
-    /// Each connected client's pre-shot dips so far (`RenderFloor::dips`).
+    /// Each connected client's shot dips so far, over its session
+    /// (`RenderFloor::dips`).
     pub fn shot_dips(&self) -> Vec<(u16, shots::Dips)> {
         self.by_client.values().filter_map(|&e| self.inputs[e as usize].lock().unwrap().claims.dips().map(|d| (e, d))).collect()
+    }
+
+    /// The session log since the last call: a line when a client is first
+    /// flagged (`RenderFloor::judge`), and one when it leaves. The server
+    /// binary appends them to its `--session-log`.
+    pub fn take_session_records(&mut self) -> Vec<SessionRecord> {
+        std::mem::take(&mut self.session_records)
+    }
+
+    /// A last line for every client still connected (the server is
+    /// stopping), for `take_session_records`.
+    pub fn close_sessions(&mut self, now: Instant) {
+        let mut open: Vec<u16> = self.by_client.values().copied().collect();
+        open.sort_unstable();
+        for e in open {
+            let record = self.session_record(e, SessionEvent::Open, now);
+            self.session_records.push(record);
+        }
+    }
+
+    /// Entity `e`'s session as of `now`, with its shots' dips: the window
+    /// not judged yet and the whole session.
+    fn session_record(&mut self, e: u16, event: SessionEvent, now: Instant) -> SessionRecord {
+        let q = self.inputs[e as usize].get_mut().unwrap();
+        SessionRecord { event, entity: e, session: q.session.as_of(now), window: q.claims.window_dips(), total: q.claims.dips() }
     }
 
     pub fn take_rewind(&mut self) -> [Histogram; 2] {
@@ -1239,7 +1399,7 @@ impl SimServer {
         // floor goes by the lowest of the last two seconds'.
         let pace = self.paces.iter().copied().fold(f32::MAX, f32::min);
         let clock = ClockRate { rate: TICK_HZ as f64 * pace as f64, jitter: 0.0 };
-        let judge = Judge { step: self.step, clock, floor: self.cfg.render_floor };
+        let judge = Judge { step: self.step, clock, floor: self.cfg.render_floor, rtt: 0.0 };
         let (ingress, [late, discarded, bad]) = self
             .net
             .shards_mut()
@@ -1249,25 +1409,26 @@ impl SimServer {
             .map(|((shard, bucket), lifecycle)| {
                 let t0 = Instant::now();
                 let mut n = [0u64; 3];
-                let mut handle = |ev, arrived, jitter| match ev {
+                let mut handle = |ev, arrived, (jitter, rtt)| match ev {
                     ServerEvent::Message { client, channel: Channel::Unreliable, data } => {
                         if let Some(&e) = by_client.get(&client) {
                             let dead = bodies[e as usize].dead();
-                            let judge = Judge { clock: ClockRate { jitter, ..judge.clock }, ..judge };
+                            let judge = Judge { clock: ClockRate { jitter, ..judge.clock }, rtt, ..judge };
                             inputs[e as usize].lock().unwrap().receive(e, &data, arrived, dead, judge, &mut n);
                         }
                     }
                     ServerEvent::Message { .. } => n[2] += 1,
-                    ServerEvent::Connected { client, .. } => lifecycle.push((client, true)),
-                    ServerEvent::Disconnected { client, .. } => lifecycle.push((client, false)),
+                    ServerEvent::Connected { client, user_id, .. } => lifecycle.push((client, Some(user_id))),
+                    ServerEvent::Disconnected { client, .. } => lifecycle.push((client, None)),
                 };
                 // How much the sender's link delay varies (its RTTs' range
-                // of late), in seconds: the render floor's allowance.
+                // of late), in seconds: the render floor's allowance; and its
+                // RTT, in ms.
                 let jitter = |shard: &lattice_net::Shard, ev: &ServerEvent| match ev {
-                    ServerEvent::Message { client, .. } => {
-                        shard.client_stats(*client).map_or(0.0, |s| (s.rtt_max_ms - s.rtt_min_ms) as f64 / 1000.0)
-                    }
-                    _ => 0.0,
+                    ServerEvent::Message { client, .. } => shard
+                        .client_stats(*client)
+                        .map_or((0.0, 0.0), |s| ((s.rtt_max_ms - s.rtt_min_ms) as f64 / 1000.0, s.rtt_ms)),
+                    _ => (0.0, 0.0),
                 };
                 for (from, arrived, data) in bucket.drain(..) {
                     shard.receive(from, &data, arrived);
@@ -1294,11 +1455,10 @@ impl SimServer {
         // applied on one thread, in shard order
         for k in 0..self.shard_count() {
             let mut events = std::mem::take(&mut self.lifecycle[k]);
-            for &(client, joined) in &events {
-                if joined {
-                    self.spawn(client);
-                } else {
-                    self.despawn(client);
+            for &(client, user) in &events {
+                match user {
+                    Some(user) => self.spawn(client, user, now, unix_now),
+                    None => self.despawn(client, now),
                 }
             }
             events.clear();
@@ -1313,15 +1473,15 @@ impl SimServer {
         let base_step = self.step;
         // Movement also gathers the shots fired (here, or by late inputs at
         // ingress) for the shots phase, in entity order.
-        let ([applied, repeated, frozen], fires, refused) = self
+        let ([applied, repeated, frozen], fires, refused, flagged) = self
             .bodies
             .par_iter_mut()
             .zip(self.inputs.par_iter_mut())
             .enumerate()
             .with_min_len(256)
             .fold(
-                || ([0u64; 3], Vec::new(), 0u64),
-                |(mut n, mut fires, refused), (e, (b, q))| {
+                || ([0u64; 3], Vec::new(), 0u64, Vec::new()),
+                |(mut n, mut fires, refused, mut flagged), (e, (b, q))| {
                     let q = q.get_mut().unwrap();
                     if b.alive {
                         // A tick consumes `steps` 1/30 s movement steps (1 or 2 at 20 Hz).
@@ -1338,17 +1498,33 @@ impl SimServer {
                         q.depth = (queued + 1).saturating_sub(steps as usize).min(u8::MAX as usize) as u8;
                     }
                     fires.append(&mut q.fires);
-                    (n, fires, refused + std::mem::take(&mut q.refused) as u64)
+                    if std::mem::take(&mut q.flagged_now) {
+                        flagged.push(e as u16);
+                    }
+                    q.session.refused += q.refused as u64;
+                    (n, fires, refused + std::mem::take(&mut q.refused) as u64, flagged)
                 },
             )
             .reduce(
-                || ([0; 3], Vec::new(), 0),
-                |(a, mut fa, ra), (b, mut fb, rb)| {
+                || ([0; 3], Vec::new(), 0, Vec::new()),
+                |(a, mut fa, ra, mut ga), (b, mut fb, rb, mut gb)| {
                     fa.append(&mut fb);
-                    ([a[0] + b[0], a[1] + b[1], a[2] + b[2]], fa, ra + rb)
+                    ga.append(&mut gb);
+                    ([a[0] + b[0], a[1] + b[1], a[2] + b[2]], fa, ra + rb, ga)
                 },
             );
         self.fires = fires;
+        for e in flagged {
+            let q = self.inputs[e as usize].get_mut().unwrap();
+            let j = q.session.first_flag.expect("flagged");
+            self.session_records.push(SessionRecord {
+                event: SessionEvent::Flagged,
+                entity: e,
+                session: q.session.as_of(now),
+                window: Some(j.window),
+                total: Some(j.total),
+            });
+        }
         self.step = base_step + steps;
         self.counters.inputs_applied += applied;
         self.counters.repeated += repeated;
@@ -1632,6 +1808,9 @@ impl SimServer {
             self.counters.shots_late += f.late as u64;
             self.counters.rewinds_capped += cut.capped as u64;
             self.counters.rewinds_trimmed += cut.trimmed as u64;
+            let session = &mut self.inputs[f.shooter as usize].get_mut().unwrap().session;
+            (session.shots, session.trimmed) = (session.shots + 1, session.trimmed + cut.trimmed as u64);
+            session.held += (f.held > 0.01) as u64;
             if cut.trimmed {
                 self.counters.rewinds_trimmed_mid += cut.mid as u64;
                 self.trim_excess.record((cut.excess * 10.0).round() as u32);
@@ -1708,6 +1887,8 @@ impl SimServer {
                     let c = &mut self.counters;
                     (c.hits_head, c.hits_body) = (c.hits_head + head as u64, c.hits_body + !head as u64);
                     c.kills += killed as u64;
+                    let session = &mut self.inputs[shooter as usize].get_mut().unwrap().session;
+                    (session.hits, session.kills) = (session.hits + 1, session.kills + killed as u64);
                     c.hits_after_cover += after_cover as u64;
                     c.hits_too_late += (damage == 0) as u64;
                     self.hits.push(HitRecord { shooter, target, head, damage, killed, rewind, after_cover, at, tick: self.tick });
@@ -1779,6 +1960,7 @@ impl SimServer {
         b.respawn_at = Some(step_no + RESPAWN_STEPS);
         b.life = b.life.wrapping_add(1);
         self.counters.deaths += 1;
+        self.inputs[e as usize].get_mut().unwrap().session.deaths += 1;
         Some(true)
     }
 
@@ -1874,7 +2056,7 @@ impl SimServer {
         }
     }
 
-    fn spawn(&mut self, client: ClientId) {
+    fn spawn(&mut self, client: ClientId, user: u64, now: Instant, unix_now: u64) {
         let squad = match self.cfg.interest.squad_size {
             0 => NO_SQUAD,
             n => (self.counters.spawns / n as u64) as u32,
@@ -1909,7 +2091,8 @@ impl SimServer {
             ..Body::default()
         };
         let spread = Some((Arc::clone(&self.spread), self.counters.spawns));
-        self.inputs[i] = Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, spread, ..InputQueue::default() });
+        let session = Session { user, joined_unix: unix_now, joined: Some(now), ..Session::default() };
+        self.inputs[i] = Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, spread, session, ..InputQueue::default() });
         if squad != NO_SQUAD {
             self.squads.entry(squad).or_default().push(e);
         }
@@ -1937,7 +2120,7 @@ impl SimServer {
         let _ = self.net.send(client, Channel::Reliable, welcome);
     }
 
-    fn despawn(&mut self, client: ClientId) {
+    fn despawn(&mut self, client: ClientId, now: Instant) {
         if let Some(e) = self.by_client.remove(&client) {
             let k = self.net.shard_of_client(client);
             let list = &mut self.shard_clients[k];
@@ -1950,12 +2133,17 @@ impl SimServer {
                 }
             }
             self.client_of[e as usize] = None;
-            // Did it spend the jitter allowance on stale shots?
-            if let Some(d) = self.inputs[e as usize].get_mut().unwrap().claims.dips().filter(|d| d.judged()) {
-                self.counters.dip_clients += 1;
-                self.counters.dip_flagged += d.flagged() as u64;
+            // Did it spend the render floor's allowances on stale shots?
+            let record = self.session_record(e, SessionEvent::Left, now);
+            let c = &mut self.counters;
+            let s = &record.session;
+            (c.dip_windows, c.dip_windows_flagged) = (c.dip_windows + s.windows as u64, c.dip_windows_flagged + s.windows_flagged as u64);
+            if let Some(d) = record.total.filter(|d| d.judged()) {
+                c.dip_clients += 1;
+                c.dip_flagged += (s.first_flag.is_some() || d.flagged() || record.window.is_some_and(|w| w.flagged())) as u64;
                 self.dip_excess.record((d.excess.max(0.0) * 10.0).round() as u32);
             }
+            self.session_records.push(record);
             let body = &mut self.bodies[e as usize];
             body.alive = false;
             if let Some(members) = self.squads.get_mut(&body.squad) {

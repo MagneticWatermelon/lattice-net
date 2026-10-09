@@ -87,6 +87,11 @@ lattice-server: M1 movement-only authoritative server
                        the summary also stops once clients drain below 90% of peak
   --csv PATH           append one row per report window
   --summary PATH       write the end-of-run results as key=value lines (scripts/baseline.sh)
+  --session-log PATH   append a JSON line per client session: when a judgment of its shots
+                       first flags it, when it leaves, and for those still here at stop.
+                       Keyed by the connect token's user id; its inputs, stand-ins, shots,
+                       holds, trims, hits, deaths, RTT, and how its shots dipped under the
+                       render floor without its allowances (judged every 100 shots)
   --debug-http ADDR    serve the debug map (what one client receives) on ADDR, e.g. 0.0.0.0:8080
   --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
                        connect tokens, standing in for a login service) [the public dev key]
@@ -632,8 +637,13 @@ fn main() -> std::io::Result<()> {
     let warmup = Duration::from_secs_f64(a.get("warmup", 3.0));
     let csv_path: Option<String> = a.opt("csv");
     let summary_path: Option<String> = a.opt("summary");
+    let session_path: Option<String> = a.opt("session-log");
     let debug_http: Option<SocketAddr> = a.opt("debug-http");
     a.finish();
+    let mut session_log = match &session_path {
+        Some(path) => Some(BufWriter::new(std::fs::OpenOptions::new().create(true).append(true).open(path)?)),
+        None => None,
+    };
 
     let mut pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
     if let Some(cpus) = worker_cpus.clone() {
@@ -858,6 +868,7 @@ fn main() -> std::io::Result<()> {
         // The ladder judges this tick against the period it ran at.
         let period = sim.tick_period();
         sim.observe_tick(done - now);
+        write_sessions(&mut sim, session_log.as_mut())?;
         window.level_min = window.level_min.min(sim.level());
         window.level_max = window.level_max.max(sim.level());
         let mut row = [0u32; COLS];
@@ -936,6 +947,8 @@ fn main() -> std::io::Result<()> {
     }
     // Before the receive threads end: their CPU clocks go with them.
     steady_state.net_end.get_or_insert_with(|| net_snapshot(&net, &receivers, &rx_tids));
+    sim.close_sessions(Instant::now());
+    write_sessions(&mut sim, session_log.as_mut())?;
     stop.store(true, Relaxed);
     for r in receivers {
         let _ = r.join();
@@ -986,6 +999,19 @@ fn main() -> std::io::Result<()> {
         "  shots {} (late {}, refused {}, rewinds capped {}) | hits head {} body {} (after cover {}, too late {}), kills {} | ground {} cover {} expired {} | segments {} candidates {}",
         c.shots, c.shots_late, c.shots_refused, c.rewinds_capped, c.hits_head, c.hits_body, c.hits_after_cover, c.hits_too_late, c.kills, c.hits_ground, c.hits_cover, c.expired, c.segments, c.candidates
     );
+    Ok(())
+}
+
+/// Appends the session log's new lines (`SimServer::take_session_records`)
+/// to `--session-log`, if there is one; without it they're dropped.
+fn write_sessions(sim: &mut SimServer, log: Option<&mut BufWriter<std::fs::File>>) -> std::io::Result<()> {
+    let records = sim.take_session_records();
+    if let (Some(log), false) = (log, records.is_empty()) {
+        for r in records {
+            writeln!(log, "{}", r.to_json())?;
+        }
+        log.flush()?;
+    }
     Ok(())
 }
 
@@ -1179,6 +1205,8 @@ fn summary_values(
         ("renders_held", c.renders_held),
         ("shot_dip_clients", c.dip_clients),
         ("shot_dip_flagged", c.dip_flagged),
+        ("shot_dip_windows", c.dip_windows),
+        ("shot_dip_windows_flagged", c.dip_windows_flagged),
         ("hits_head", c.hits_head),
         ("hits_body", c.hits_body),
         ("hits_ground", c.hits_ground),
