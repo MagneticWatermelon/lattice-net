@@ -267,6 +267,9 @@ pub struct ClientCore {
     stale_inputs: f64,
     /// The newest snapshot's own state and its step: the server's view of us.
     server_own: Option<(MoveState, u32)>,
+    /// The server's step minus our input seq: each step consumes a seq, so
+    /// it's fixed for the connection (stand-ins and resyncs included).
+    step_offset: Option<i64>,
     /// Own-player correction being smoothed away, as of `own_offset_at`.
     own_offset: [f32; 3],
     own_offset_at: Option<Instant>,
@@ -325,6 +328,7 @@ impl ClientCore {
             near_bounds: (steps(cfg.near_delay), steps(cfg.near_delay_max.max(cfg.near_delay))),
             mid_delay: steps(cfg.mid_delay),
             server_own: None,
+            step_offset: None,
             keep_news: false,
             news: Vec::new(),
             seen_shots: Vec::new(),
@@ -656,6 +660,9 @@ impl ClientCore {
         self.pace = (h.pace as f32 / 1000.0).clamp(0.1, 1.0);
         self.tick_steps.put(h.server_tick, h.step);
         self.server_own = Some((h.own, h.step));
+        if h.ack_seq > 0 {
+            self.step_offset = Some(h.step as i64 - h.ack_seq as i64);
+        }
         let life_changed = h.life != self.last_life;
         (self.last_life, self.health) = (h.life, h.health);
         self.render_clock.on_snapshot(h.step, self.pace, now);
@@ -809,6 +816,14 @@ impl ClientCore {
         let frac = (((phase - ahead) * 256.0) as u32).min(255) as u8;
         let seq = self.seq + 1 + ahead as u32;
         (shot_time(seq, frac), seq, frac)
+    }
+
+    /// When our last shot fired, in the server's game steps: the step the
+    /// server's tracer message gives for it, with where it really went (the
+    /// cone of fire's pick is the server's). `None` before the server has
+    /// applied any of our inputs.
+    pub fn last_shot_step(&self) -> Option<f64> {
+        Some(self.last_shot? as f64 / 256.0 + self.step_offset? as f64)
     }
 
     /// The cone of fire (degrees) a shot at `now` would have: the crosshair.

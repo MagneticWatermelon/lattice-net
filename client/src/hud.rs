@@ -165,11 +165,20 @@ pub fn combat(
     let (mut events, mut shots) = (Vec::new(), Vec::new());
     net.0.core.drain_news(&mut events, &mut shots);
     let now = frame.secs;
-    tracers.pending.extend(shots.into_iter().map(|s| (s, now)));
+    // Our own shots come back with where they really went (the tracers
+    // re-aim ours); others' wait for their shooter to be drawn firing.
+    let own = net.0.core.welcome().map(|w| w.entity);
+    for s in shots {
+        if Some(s.shooter) == own {
+            tracers.real.push(s);
+        } else {
+            tracers.pending.push((s, now));
+        }
+    }
     // Distant fights: ambient shots from players drawn there (or the spot).
     let mut ambient = Vec::new();
     net.0.core.drain_ambient(frame.now, &mut ambient);
-    tracers.flying.extend(ambient.iter().map(|a| crate::controls::Tracer::new(a.origin, a.dir, false)));
+    tracers.flying.extend(ambient.iter().map(|a| crate::controls::Tracer::new(a.origin, a.dir)));
     for ev in events {
         match ev {
             Event::Hit { head, killed, .. } => combat.mark = Some((now, head, killed)),

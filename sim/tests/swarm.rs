@@ -1978,6 +1978,48 @@ fn distant_fights_are_seen() {
 }
 
 #[test]
+fn the_shooter_learns_where_its_shots_went() {
+    // Its tracers are drawn along picks of its own (the server's are
+    // secret), so the server sends the shooter each of its shots back the
+    // next tick with where it really went: its tracer can be re-aimed, and
+    // land where the shot did. Revealed after the fact, a pick predicts
+    // nothing about the next.
+    let (mut s, [shooter, target, _]) = firing_line_with(40.0, false, true);
+    news(&mut s, 0);
+    s.server.take_fired();
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0, hold: false, fixed: None, pick_back: 0.0 });
+    let mut steps = Vec::new();
+    for _ in 0..3 * TICK_HZ {
+        let before = s.bots[0].2.core().last_shot_step();
+        s.step();
+        let after = s.bots[0].2.core().last_shot_step();
+        if after != before {
+            steps.extend(after);
+        }
+    }
+    s.gunner = None;
+    for _ in 0..TICK_HZ / 3 {
+        s.step();
+    }
+    let fired: Vec<[f32; 3]> = s.server.take_fired().into_iter().filter(|f| f.0 == shooter).map(|f| f.2).collect();
+    let (_, shots) = news(&mut s, 0);
+    let own: Vec<_> = shots.iter().filter(|sh| sh.shooter == shooter).collect();
+    eprintln!("{} shots fired, {} came back", fired.len(), own.len());
+    assert!(fired.len() > 20);
+    assert_eq!(own.len(), fired.len(), "every shot comes back once");
+    for ((real, back), step) in fired.iter().zip(&own).zip(&steps) {
+        // The angle between them, in f64 (acos near 1 in f32 is mostly noise).
+        let (a, b) = (lattice_game::weapon::aim(back.yaw, back.pitch).map(f64::from), real.map(f64::from));
+        let cross = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        let sin = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+        let deg = sin.atan2(a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).to_degrees();
+        // The wire's 16-bit yaw and pitch: under a hundredth of a degree.
+        assert!(deg < 0.01, "the real direction: {deg} degrees off");
+        assert!((back.step - step).abs() <= 1.0 / 16.0, "the step it fired at: {} vs {step}", back.step);
+    }
+}
+
+#[test]
 fn aiming_down_sights_hits_and_the_spread_is_the_servers_secret() {
     // A standing gunner 40 m from a standing target, with the cone of fire:
     // from the hip (2 degrees, blooming) most shots miss; down the sights

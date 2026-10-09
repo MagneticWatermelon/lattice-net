@@ -2149,12 +2149,13 @@ impl View<'_> {
             w.into_inner()
         });
         let near_bytes = near_msg.as_ref().map_or(0, |m| m.len());
-        // Tracers: this tick's shots by its near-tier players.
+        // Tracers: this tick's shots by its near-tier players, and its own
+        // (the cone of fire's pick is the server's: this is where they went).
         let shots_msg = (!self.shots.is_empty()).then(|| {
             let mut seen: Vec<(u16, u16, i16, f64)> = Vec::new();
-            for c in &sc.near {
-                let at = self.shots.partition_point(|s| s.0 < c.entity);
-                seen.extend(self.shots[at..].iter().take_while(|s| s.0 == c.entity));
+            for e in sc.near.iter().map(|c| c.entity).chain([slot.entity]) {
+                let at = self.shots.partition_point(|s| s.0 < e);
+                seen.extend(self.shots[at..].iter().take_while(|s| s.0 == e));
             }
             (!seen.is_empty()).then(|| events::encode_shots(self.step, seen.into_iter()))
         });
