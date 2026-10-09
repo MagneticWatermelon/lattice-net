@@ -27,7 +27,20 @@ In WSL itself, `cargo run` in `client/` opens a window under WSLg, but it render
 
 ## A playtest with other people (`scripts/playtest.sh`)
 
-For a handful of invited players on a rented Linux VM with a public address (any provider; root or a user with passwordless sudo). Each step runs from WSL:
+For a handful of invited players. The easy way is an hourly AWS instance, made and deleted per session:
+
+```sh
+scripts/playtest-aws.sh up 40        # a c7a.large in Frankfurt, deployed, 40 bots; prints its address
+ADDR=<address> scripts/playtest.sh invites lattice-vm alice bob carol
+scripts/playtest-aws.sh down         # session summary, then deletes everything it made
+```
+
+- **Checked on 2026-10-09:** tick p99 0.7 ms with 40 bots, and the guest's sleeps exact to 0.15 ms. The Windows game from home had RTT 49 ms, no loss, no corrections, and near and mid over 99.9% interpolated. About $0.12 an hour.
+- **Nothing stays between sessions:** there's no fixed address, so invites are minted per session.
+- **A forgotten instance terminates itself** 3 hours after boot. Still, always run `down` and check with `status`.
+- **Not a VM on the dev box:** with WSL2 installed, VirtualBox runs on top of Windows' hypervisor, and its guests' timers stall (20 ms sleeps up to 380 ms), which players would feel. A Hyper-V VM (`scripts/playtest-hyperv.sh`) needs a bridged switch on the Wi-Fi adapter for players to reach it, and making one took the network down once. `scripts/netstate.sh` snapshots and undoes the host's network configuration.
+
+Any other Linux VM with a public address works the same way (root or a user with passwordless sudo). Each step runs from WSL:
 
 ```sh
 scripts/playtest.sh deploy root@203.0.113.7     # repo, build, system user, token key, services

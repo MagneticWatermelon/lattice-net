@@ -76,7 +76,7 @@ After=network-online.target
 [Service]
 User=lattice
 WorkingDirectory=$data
-ExecStart=/usr/local/bin/lattice-server --bind 0.0.0.0:$port --token-key @$data/token.key --session-log $data/sessions.jsonl --spawn disk:250 --max-clients 500 --report 60
+ExecStart=/usr/local/bin/lattice-server --bind 0.0.0.0:$port --token-key @$data/token.key --session-log $data/sessions.jsonl --spawn disk:250 --max-clients 500 --report 60 --keep-awake off
 Restart=on-failure
 StandardOutput=append:$data/server.log
 StandardError=append:$data/server.log
