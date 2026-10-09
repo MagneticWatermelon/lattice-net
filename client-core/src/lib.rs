@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use lattice_game::activity;
 use lattice_game::delta;
 use lattice_game::events::{self, Event, SeenShot};
-use lattice_game::movement::{dead_input, step, Input, MoveState, TICK_HZ};
+use lattice_game::movement::{dead_input, stand_in, step, Input, MoveState, TICK_HZ};
 use lattice_game::msg::{self, InputEntry, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
 use lattice_game::weapon::{self, shot_time, Bloom, Shot, FIRE_STEPS};
 use lattice_game::tier::Tier;
@@ -62,6 +62,14 @@ const BUMP_COOLDOWN: f32 = 10.0;
 const BACKLOG: f32 = 3.0;
 /// Most inputs one `tick_inputs` call makes (300 ms): a slow frame catches up.
 const MAX_CATCH_UP: usize = 3 * INPUT_REDUNDANCY;
+/// How fast `lead` follows its samples (one per input call after a
+/// snapshot): ~1 s.
+const LEAD_GAIN: f32 = 0.03;
+/// An input call this many steps after the last follows a hitch: the lead
+/// read before it is short by the inputs the hitch held back.
+const HITCH: f32 = 4.0;
+/// Most stand-ins a resync leaves the server (2 s of round trip).
+const MAX_STAND_INS: u32 = 60;
 /// Own-player corrections are smoothed with this time constant.
 const OWN_SMOOTH: Duration = Duration::from_millis(100);
 
@@ -187,7 +195,8 @@ struct Predicted {
     input: Input,
     /// State after applying `input`.
     state: MoveState,
-    /// When the input was generated (and sent).
+    /// When the input was generated (and sent). None for a seq we didn't
+    /// make: the server's state at a resync, the stand-ins we left it.
     sent_at: Option<Instant>,
     /// The render step then, as sent (`msg::render_units`).
     render: Option<u16>,
@@ -224,6 +233,21 @@ pub struct ClientCore {
     bump_cooldown: f32,
     buffer_avg: f32,
     resyncing: bool,
+    /// The newest seq we made an input for. After a resync `seq` runs
+    /// further, over the stand-ins we leave the server.
+    made: u32,
+    /// Snapshots for seqs up to here don't steer the input clock: the
+    /// server consumed them before what we did about it reached it (the
+    /// stand-ins a resync leaves it, or inputs a slow frame made late, at
+    /// once), so its queue then says nothing about our clock.
+    excused_to: u32,
+    /// How far our newest seq runs ahead of the newest the server has
+    /// consumed when a snapshot says so: a round trip and the spare, in
+    /// steps, smoothed. A resync rebuilds it at once (`resync`).
+    lead: f32,
+    /// The newest snapshot's lead, folded in at the next input call, so of
+    /// snapshots read at once only the newest counts.
+    lead_sample: Option<u32>,
     last_server_tick: Option<u32>,
     last_acked: u32,
     /// Timings not yet taken by `drain_latency`.
@@ -319,6 +343,11 @@ impl ClientCore {
             bump_cooldown: 0.0,
             buffer_avg: TARGET_DEPTH,
             resyncing: false,
+            made: 0,
+            excused_to: 0,
+            // At no latency: one step until the server reads our input.
+            lead: TARGET_DEPTH - 1.0,
+            lead_sample: None,
             last_server_tick: None,
             last_acked: 0,
             latency: Vec::new(),
@@ -675,43 +704,15 @@ impl ClientCore {
         if h.ack_seq == 0 {
             return; // server hasn't consumed any of our inputs yet
         }
-        self.buffer_avg += (h.buffered as f32 - self.buffer_avg) * 0.1;
-        let (lo, hi) = DEPTH_BAND;
-        let error = if self.buffer_avg < lo || self.buffer_avg > hi { TARGET_DEPTH - self.buffer_avg } else { 0.0 };
-        self.rate = self.pace * (1.0 + (CLOCK_GAIN * error).clamp(-MAX_CLOCK_ADJUST, MAX_CLOCK_ADJUST));
-        if self.bump_cooldown <= 0.0 {
-            if h.buffered == 0 {
-                self.clock += 1.0;
-                self.bump_cooldown = BUMP_COOLDOWN;
-            } else if h.buffered as f32 >= TARGET_DEPTH + BACKLOG {
-                self.clock -= 1.0;
-                self.bump_cooldown = BUMP_COOLDOWN;
-                self.stats.backlog_skips += 1;
-            }
-        }
-
-        if h.ack_seq > self.seq {
-            // We fell behind (stalled) and the server filled our seqs with
-            // stand-ins. Adopt its state and continue after its newest seq;
-            // otherwise every input we send would arrive late and be dropped.
-            self.stats.resyncs += !self.resyncing as u64;
-            if !self.resyncing {
-                // Landing exactly on the server's seq leaves no lead: the next
-                // input would be late too. Rebuild the spare right away.
-                self.clock += TARGET_DEPTH;
-            }
-            self.resyncing = true;
-            self.seq = h.ack_seq;
-            if self.pending_shot.take_if(|(seq, _)| *seq <= self.seq).is_some() {
-                self.stats.shots_dropped += 1;
-            }
-            self.state = h.own;
-            self.history[self.seq as usize % HISTORY] =
-                Predicted { seq: self.seq, input: Input::default(), state: h.own, sent_at: None, render: None, shot: None };
-            self.last_acked = h.ack_seq;
+        if h.ack_seq > self.made {
+            self.resync(h);
             return;
         }
         self.resyncing = false;
+        if h.ack_seq > self.excused_to {
+            self.steer(h.buffered);
+            self.lead_sample = Some(self.seq - h.ack_seq);
+        }
         let slot = self.history[h.ack_seq as usize % HISTORY];
         if slot.seq != h.ack_seq {
             self.stats.unmatched_acks += 1;
@@ -764,6 +765,66 @@ impl ClientCore {
         }
 
         self.rebase(h.ack_seq, h.own, now, false);
+    }
+
+    /// Steers the input clock by how many of our inputs the server had
+    /// queued (`buffered`) when it consumed one: toward `TARGET_DEPTH`.
+    fn steer(&mut self, buffered: u8) {
+        self.buffer_avg += (buffered as f32 - self.buffer_avg) * 0.1;
+        let (lo, hi) = DEPTH_BAND;
+        let error = if self.buffer_avg < lo || self.buffer_avg > hi { TARGET_DEPTH - self.buffer_avg } else { 0.0 };
+        self.rate = self.pace * (1.0 + (CLOCK_GAIN * error).clamp(-MAX_CLOCK_ADJUST, MAX_CLOCK_ADJUST));
+        if self.bump_cooldown <= 0.0 {
+            if buffered == 0 {
+                self.clock += 1.0;
+                self.bump_cooldown = BUMP_COOLDOWN;
+            } else if buffered as f32 >= TARGET_DEPTH + BACKLOG {
+                self.clock -= 1.0;
+                self.bump_cooldown = BUMP_COOLDOWN;
+                self.stats.backlog_skips += 1;
+            }
+        }
+    }
+
+    /// The server ran out of our inputs (we stalled, or they were all lost)
+    /// and stood in past the newest we made, `h` says. Adopt its state
+    /// there. It keeps standing in until our inputs reach it again, so we
+    /// leave it the seqs a round trip covers (`lead` - 1): predicted as its
+    /// stand-ins, not made as inputs that would come too late and be
+    /// dropped. The next input call then makes a step's input and the spare
+    /// at once, and not the time we stalled: stand-ins filled that.
+    /// Snapshots queued up in a stall all come here, each from its own seq:
+    /// the newest wins.
+    fn resync(&mut self, h: &SnapshotHeader) {
+        self.stats.resyncs += !self.resyncing as u64;
+        self.resyncing = true;
+        let world = Arc::clone(self.world.as_ref().expect("welcomed"));
+        // The server stands in from the last input it applied: ours, unless
+        // that one was lost too (then the repeats may differ; frozen ones never).
+        let p = self.history[self.made as usize % HISTORY];
+        let last = if p.seq == self.made && p.sent_at.is_some() { p.input } else { Input::default() };
+        let dead = self.is_dead();
+        let to = h.ack_seq + (self.lead.round().max(1.0) as u32 - 1).min(MAX_STAND_INS);
+        let (mut seq, mut s) = (h.ack_seq, h.own);
+        loop {
+            let input = stand_in(last, seq - self.made);
+            if seq > h.ack_seq {
+                s = step(&world, s, if dead { dead_input(input) } else { input });
+            }
+            self.history[seq as usize % HISTORY] = Predicted { seq, input, state: s, sent_at: None, render: None, shot: None };
+            if seq == to {
+                break;
+            }
+            seq += 1;
+        }
+        (self.seq, self.state, self.excused_to, self.last_acked) = (to, s, to, h.ack_seq);
+        if self.pending_shot.take_if(|(seq, _)| *seq <= to).is_some() {
+            self.stats.shots_dropped += 1;
+        }
+        // As at the start: a step's input plus the spare at the next call.
+        self.clock = 0.5 + TARGET_DEPTH - 1.0;
+        self.clock_at = None;
+        self.lead_sample = None;
     }
 
     /// Rebases on the server's state `own` for input `ack` and replays
@@ -914,7 +975,7 @@ impl ClientCore {
         self.stepped = false;
         // In 1/30 s. A slow frame makes all its inputs, as several batches,
         // up to `MAX_CATCH_UP`; a longer stall is the server's to fill with
-        // stand-ins, then a resync.
+        // stand-ins, then a resync (which makes none of it up).
         let elapsed = match self.clock_at {
             None => 1.0,
             Some(t) => (now.saturating_duration_since(t).as_secs_f32() * TICK_HZ as f32).min(MAX_CATCH_UP as f32),
@@ -935,6 +996,12 @@ impl ClientCore {
     /// Makes at most `max` inputs; returns their batches, oldest first.
     fn run_inputs(&mut self, now: Instant, elapsed: f32, max: usize, mut source: impl FnMut(&MoveState, &Welcome) -> Input) -> Vec<Vec<u8>> {
         let Some(w) = self.welcome else { return Vec::new() };
+        // How far ahead we ran when the last snapshot came, unless a hitch
+        // held our inputs back since.
+        let steady = self.clock_at.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() * TICK_HZ as f32 <= HITCH);
+        if let (Some(lead), true) = (self.lead_sample.take(), steady) {
+            self.lead += (lead as f32 - self.lead) * LEAD_GAIN;
+        }
         self.clock_at = Some(now);
         self.clock += self.rate * elapsed;
         self.bump_cooldown -= elapsed;
@@ -945,6 +1012,7 @@ impl ClientCore {
             self.clock -= 1.0;
             let input = source(&self.state, &w);
             self.seq += 1;
+            self.made = self.seq;
             // The input right before a pending shot (the cheats' hooks).
             let before_shot = self.pending_shot.is_some_and(|(seq, _)| seq == self.seq + 1);
             let stale = self.stale_inputs + if before_shot { self.stale_shots } else { 0.0 };
@@ -967,7 +1035,13 @@ impl ClientCore {
                 return Vec::new();
             }
             1 => {}
-            _ => self.stats.clock_extra += 1,
+            _ => {
+                self.stats.clock_extra += 1;
+                // Made at once, the older ones late (or spare): the server
+                // stood in or ran short before the newest reached it, and
+                // its reports on that are already answered.
+                self.excused_to = self.excused_to.max(self.seq - 1);
+            }
         }
         // One batch per INPUT_REDUNDANCY new inputs, ending at the newest:
         // each new input is in at least one batch, with older ones behind it.
@@ -979,14 +1053,14 @@ impl ClientCore {
         ends.into_iter().map(|end| self.batch(end, lag)).collect()
     }
 
-    /// The batch whose newest input is `end`: newest first, stopping at a gap
-    /// (a resync skips seqs we never generated).
+    /// The batch whose newest input is `end`: newest first, stopping at a
+    /// seq we didn't make (a resync leaves the server stand-ins).
     fn batch(&self, end: u32, mid_lag: u8) -> Vec<u8> {
         let mut batch = [InputEntry::default(); INPUT_REDUNDANCY];
         let mut n = 0;
         while n < INPUT_REDUNDANCY && (n as u32) < end {
             let p = self.history[(end as usize - n) % HISTORY];
-            if p.seq != end - n as u32 {
+            if p.seq != end - n as u32 || p.sent_at.is_none() {
                 break;
             }
             batch[n] = InputEntry { input: p.input, render: p.render, shot: p.shot };

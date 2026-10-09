@@ -1,0 +1,47 @@
+== uniform, 5000 bots, 60s -> baselines/2026-10-09-wsl2-input-clock/fight-uniform-5k-1
+== summary: 1405 steady-state ticks (after warmup, before clients drain), peak 5000 clients ==
+  phase        p50 ms   p99 ms   max ms
+  ingress        2.78     4.11     7.43
+  events         0.00     0.00     0.94
+  movement       0.58     0.85     2.81
+  grid           0.37     0.44     0.57
+  separate       0.04     0.08     0.41
+  history        0.01     0.02     0.09
+  shots          1.11     2.03     5.52
+  serialize      0.05     0.12     1.73
+  assembly      20.38    30.79    72.70
+  transport      0.00     0.00     0.01
+  egress         0.04     0.10     1.38
+  tick          25.79    37.28    79.25
+  overruns 18 | spawns 5000 despawns 5000 (8989 joins deferred) | deaths 3912 respawns 3664 | stand-ins: repeated 3542 frozen 0 | late inputs 3135 discarded 0 | bad messages 0 | recv errors 0 send errors 0
+  egress (whole run): 7445527 datagrams in 7445527 sends (1.00 per send), 95815 syscalls
+  ingress (whole run): 8911241 datagrams in 166473 receive calls (53.53 per call)
+  ticks per ladder level (whole run): L0: 56, L1: 31, L2: 31, L3: 178, L4: 31, L5: 573, L6: 608
+  input wait on the server (datagram arrival -> applied): p50 51.3 p99 82.7 max 118.4 mean 51.0 ms
+  steady state: stand-ins repeated 3458 frozen 0 | late inputs 3135 discarded 0
+  rewind of near targets (applied step - the input's render step for that tier): p50 234 p99 333 max 397 mean 232.0 ms (n=7361847)
+  rewind of mid/far targets (applied step - the input's render step for that tier): p50 367 p99 436 max 484 mean 362.6 ms (n=7361847)
+  render times ahead of the server (bogus) 0
+  shots 585135 (late 220, refused 1432, rewinds capped 380613) | hits head 1284 body 21720 (after cover 462, too late 2328), kills 3912 | ground 360449 cover 41126 expired 154584 | segments 25642104 candidates 541111
+== bots summary ==
+  started 5000 welcomed 5000 failed 0
+  join latency ms: p50 548 p99 1001 max 1172 (n=5000)
+  corrections 115 (0.02/bot-minute), mean error 0.085 m, max 0.177 m
+  push corrections (the server pushed us apart from a crowd) 1089 (0.22/bot-minute), max 0.101 m
+  snapshots 7391044 (entities per snapshot: near 9.2 mid 6.7 far 4.5), stale 0, unmatched acks 0, resyncs 0
+  input -> applied on server (est. RTT/2 + server wait): p50 101.0 p99 155.0 max 195.0 mean 97.2 ms (n=7372640)
+    of which server wait (arrival -> applied): p50 51.3 p99 82.7 max 118.4 mean 51.0 ms (n=7372640)
+  input -> seen acked (round trip): p50 169.0 p99 267.0 max 338.0 mean 173.2 ms (n=7375775)
+  near entity update interval (tracked bots): p50 33.0 p99 50.0 max 1500.0 mean 39.8 ms (n=5868232)
+  mid entity update interval (tracked bots): p50 166.0 p99 250.0 max 2250.0 mean 175.5 ms (n=4973950)
+  far entity update interval (tracked bots): p50 1000.0 p99 1500.0 max 3000.0 mean 929.1 ms (n=3043632)
+  near drawn (tracked bots): 99.53% interpolated, 0.24% extrapolated, 0.09% held, 0.15% new | pops p50 0 p99 0 max 12646 mm
+  mid drawn (tracked bots): 89.62% interpolated, 9.30% extrapolated, 0.33% held, 0.75% new | pops p50 0 p99 580 max 41241 mm
+  far drawn (tracked bots): 19.29% interpolated, 71.31% extrapolated, 7.58% held, 1.81% new | pops p50 1523 p99 14263 max 65535 mm
+  render delay (near) 95.7 ms behind the newest step, clock snaps 0 (backwards 0), slewing 34.40% of frames, near delay changes 2394 | streak entity-frames (drawn > 20 m/s) 3597126
+  fighters, class 0: 167 at rtt 22.7 ms | 37405 shots, 6616 hits (17.7%), 1295 kills
+  fighters, class 1: 167 at rtt 102.7 ms | 38367 shots, 7009 hits (18.3%), 1346 kills
+  fighters, class 2: 166 at rtt 152.8 ms | 37483 shots, 6304 hits (16.8%), 1221 kills
+  others' shots (tracked bots): 548185 as tracers | distant fights: 1769777 cell entries counting 9427363 shots, 8737045 ambient shots made
+  input clock: 38732 extra inputs, 42886 skipped ticks, 0 backlog skips | near decode errors (tracked bots) 0
+  bytes down 2319.7 MB up 570.9 MB | swarm busy 57% of its threads' time, tick overruns 2487

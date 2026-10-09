@@ -1,0 +1,47 @@
+== uniform, 5000 bots, 60s -> baselines/2026-10-09-wsl2-input-clock-before/fight-uniform-5k-1
+== summary: 1498 steady-state ticks (after warmup, before clients drain), peak 5000 clients ==
+  phase        p50 ms   p99 ms   max ms
+  ingress        2.41     3.80     7.02
+  events         0.00     0.00     0.01
+  movement       0.54     0.90     3.32
+  grid           0.36     0.43     0.55
+  separate       0.04     0.08     1.09
+  history        0.01     0.02     0.04
+  shots          1.03     2.11     2.53
+  serialize      0.05     0.10     0.20
+  assembly      20.26    28.81    65.06
+  transport      0.00     0.00     0.01
+  egress         0.03     0.32     1.80
+  tick          25.18    34.77    69.40
+  overruns 11 | spawns 5000 despawns 5000 (7634 joins deferred) | deaths 4159 respawns 3862 | stand-ins: repeated 1776 frozen 19856 | late inputs 1433 discarded 0 | bad messages 0 | recv errors 0 send errors 0
+  egress (whole run): 7945436 datagrams in 7945436 sends (1.00 per send), 110505 syscalls
+  ingress (whole run): 8923228 datagrams in 165876 receive calls (53.79 per call)
+  ticks per ladder level (whole run): L0: 58, L1: 31, L2: 31, L3: 447, L4: 101, L5: 668, L6: 416
+  input wait on the server (datagram arrival -> applied): p50 51.3 p99 82.0 max 147.5 mean 51.2 ms
+  steady state: stand-ins repeated 1433 frozen 0 | late inputs 1433 discarded 0
+  rewind of near targets (applied step - the input's render step for that tier): p50 233 p99 320 max 383 mean 232.1 ms (n=7837955)
+  rewind of mid/far targets (applied step - the input's render step for that tier): p50 367 p99 435 max 468 mean 363.4 ms (n=7837955)
+  render times ahead of the server (bogus) 0
+  shots 588888 (late 96, refused 1431, rewinds capped 382879) | hits head 1428 body 22924 (after cover 401, too late 2537), kills 4159 | ground 362968 cover 40910 expired 160658 | segments 26281980 candidates 548806
+== bots summary ==
+  started 5000 welcomed 5000 failed 0
+  join latency ms: p50 542 p99 1027 max 1287 (n=5000)
+  corrections 30 (0.01/bot-minute), mean error 0.079 m, max 0.139 m
+  push corrections (the server pushed us apart from a crowd) 1237 (0.25/bot-minute), max 0.101 m
+  snapshots 7863577 (entities per snapshot: near 9.2 mid 7.3 far 5.0), stale 0, unmatched acks 0, resyncs 0
+  input -> applied on server (est. RTT/2 + server wait): p50 102.0 p99 154.0 max 224.0 mean 97.4 ms (n=7846993)
+    of which server wait (arrival -> applied): p50 51.3 p99 82.0 max 147.5 mean 51.2 ms (n=7846993)
+  input -> seen acked (round trip): p50 168.0 p99 267.0 max 336.0 mean 172.9 ms (n=7848426)
+  near entity update interval (tracked bots): p50 33.0 p99 50.0 max 1500.0 mean 37.5 ms (n=6336234)
+  mid entity update interval (tracked bots): p50 166.0 p99 250.0 max 2500.0 mean 151.4 ms (n=5909256)
+  far entity update interval (tracked bots): p50 500.0 p99 1500.0 max 3000.0 mean 787.9 ms (n=3706640)
+  near drawn (tracked bots): 99.56% interpolated, 0.22% extrapolated, 0.06% held, 0.15% new | pops p50 0 p99 0 max 16111 mm
+  mid drawn (tracked bots): 92.54% interpolated, 6.45% extrapolated, 0.27% held, 0.75% new | pops p50 0 p99 482 max 65535 mm
+  far drawn (tracked bots): 22.92% interpolated, 68.85% extrapolated, 6.45% held, 1.78% new | pops p50 947 p99 13254 max 65535 mm
+  render delay (near) 88.4 ms behind the newest step, clock snaps 0 (backwards 0), slewing 30.49% of frames, near delay changes 2099 | streak entity-frames (drawn > 20 m/s) 3353641
+  fighters, class 0: 167 at rtt 22.7 ms | 40176 shots, 7540 hits (18.8%), 1480 kills
+  fighters, class 1: 167 at rtt 102.8 ms | 38637 shots, 6881 hits (17.8%), 1340 kills
+  fighters, class 2: 166 at rtt 152.8 ms | 38743 shots, 6631 hits (17.1%), 1299 kills
+  others' shots (tracked bots): 537898 as tracers | distant fights: 1909620 cell entries counting 9694417 shots, 8996216 ambient shots made
+  input clock: 30549 extra inputs, 35522 skipped ticks, 0 backlog skips | near decode errors (tracked bots) 0
+  bytes down 2555.1 MB up 572.0 MB | swarm busy 59% of its threads' time, tick overruns 2208

@@ -1848,69 +1848,116 @@ fn picking_the_best_render_step_for_each_shot_is_floored() {
     assert!(floored_c > 0);
 }
 
+/// What a gunner did around its freezes (`stalled_gunner`).
+#[derive(Debug, Default)]
+struct Stalls {
+    shots: u64,
+    hits: u64,
+    /// Shots held to its render clock, trimmed, refused, and dropped (a
+    /// resync left their input to a stand-in).
+    held: u64,
+    trimmed: u64,
+    refused: u64,
+    dropped: u64,
+    /// Times its render step went backwards.
+    backwards: u64,
+    /// After each freeze, over the next 2 s: shots fired, inputs that came
+    /// too late for their seq, and the longest an input waited on the
+    /// server, in ticks.
+    after: Vec<(u64, u64, f64)>,
+}
+
 /// A gunner (bot 0) firing at a standing target 40 m away as fast as the
 /// rifle allows, run like the game client (`frames`: frames a second, its
-/// input clock by elapsed time) or like a bot (a step per tick); three
-/// times it freezes completely (a shader compile, an alt-tab) for 100, 300
-/// and 1,000 ms. Returns shots, hits, and shots held to its render clock,
-/// trimmed, refused and dropped (a resync skipped their input), and how
-/// often its render step went backwards.
-fn stalled_gunner(frames: Option<u32>) -> [u64; 7] {
+/// input clock by elapsed time) or like a bot (a step per tick), `lag`
+/// steps from the server each way; three times it freezes completely (a
+/// shader compile, an alt-tab) for 100, 300 and 1,000 ms.
+fn stalled_gunner(frames: Option<u32>, lag: u32) -> Stalls {
     let (mut s, [shooter, target, _]) = firing_line(40.0, false);
     s.frames_bot0 = frames;
+    s.lag[0] = lag;
     let hold = false;
     s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0, hold, fixed: None, pick_back: 0.0 });
-    for _ in 0..TICK_HZ {
+    // Settled at its lag: its render clock, and the RTT range the render
+    // floor allows for (a link whose delay just changed is another test).
+    for _ in 0..3 * TICK_HZ {
         s.step();
     }
     let c0 = s.server.counters().clone();
     let (backwards0, dropped0) = (s.render_backwards, s.bots[0].2.stats().shots_dropped);
     s.server.take_hits();
+    let mut after = Vec::new();
     for stall_ms in [100u32, 300, 1000] {
         s.stall_bot0 = true;
         for _ in 0..(stall_ms * TICK_HZ).div_ceil(1000) {
             s.step();
         }
         s.stall_bot0 = false;
+        let (shots, late) = (s.server.counters().shots, s.server.counters().late_inputs);
+        let mut timings = Vec::new();
         for _ in 0..2 * TICK_HZ {
             s.step();
+            s.bots[0].2.drain_latency(&mut timings);
         }
+        let wait = timings.iter().filter_map(|t| t.server_wait).map(|w| w as f64 / 10.0 / 1000.0 * TICK_HZ as f64).fold(0.0, f64::max);
+        let c = s.server.counters();
+        after.push((c.shots - shots, c.late_inputs - late, wait));
     }
     let hits = s.server.take_hits().iter().filter(|h| h.shooter == shooter && h.target == target).count() as u64;
     let c = s.server.counters();
-    [
-        c.shots - c0.shots,
+    Stalls {
+        shots: c.shots - c0.shots,
         hits,
-        c.renders_held - c0.renders_held,
-        c.rewinds_trimmed - c0.rewinds_trimmed,
-        c.shots_refused - c0.shots_refused,
-        s.bots[0].2.stats().shots_dropped - dropped0,
-        s.render_backwards - backwards0,
-    ]
+        held: c.renders_held - c0.renders_held,
+        trimmed: c.rewinds_trimmed - c0.rewinds_trimmed,
+        refused: c.shots_refused - c0.shots_refused,
+        dropped: s.bots[0].2.stats().shots_dropped - dropped0,
+        backwards: s.render_backwards - backwards0,
+        after,
+    }
 }
 
 #[test]
 fn a_game_client_that_stalls_is_never_held() {
     // After a stall the client reads the snapshots that queued up all at
-    // once, makes the inputs it missed at once (up to 300 ms of them; the
-    // server fills the rest with stand-ins, and it resyncs), and fires
-    // again. None of its shots may be held to its render clock or trimmed,
-    // and its render step mustn't jump back. (Each stall also costs ~4 shots
-    // of the 20 in the next 2 s: after a resync the input clock over-builds
-    // its spare and drains it at 5%.)
-    let [shots, hits, held, trimmed, refused, dropped, backwards] = stalled_gunner(Some(60));
-    eprintln!("game client: {hits} hits of {shots} shots; held {held}, trimmed {trimmed}, refused {refused}, dropped {dropped}; render back {backwards}x");
-    assert!(shots > 40, "it kept firing: {shots}");
-    assert_eq!((held, trimmed), (0, 0), "never held or trimmed");
-    assert_eq!(backwards, 0, "the render step never went back");
+    // once. A short one it makes up (the inputs it missed, at once); after
+    // a long one the server has stood in for it, so it resyncs: it adopts
+    // the server's state, leaves it the stand-ins a round trip needs, and
+    // makes the next input and its spare. Either way it fires on at the
+    // rifle's rate, none of its shots may be held to its render clock or
+    // trimmed, and its render step mustn't jump back.
+    for lag in [0, 3] {
+        let r = stalled_gunner(Some(60), lag);
+        eprintln!("game client, lag {lag}: {r:?}");
+        assert!(r.shots > 50, "it kept firing: {}", r.shots);
+        assert_eq!(r.hits, r.shots, "every shot hits the standing target");
+        assert_eq!((r.held, r.trimmed, r.refused), (0, 0, 0), "never held, trimmed or refused");
+        assert!(r.dropped <= 3, "at most a shot a freeze is lost: {}", r.dropped);
+        assert_eq!(r.backwards, 0, "the render step never went back");
+        for (k, &(shots, late, wait)) in r.after.iter().enumerate() {
+            // The rifle fires 20 times in 2 s; a stall's shot may be lost.
+            assert!(shots >= 19, "freeze {k}: {shots} shots in the next 2 s");
+            // The spare covers one step: a 100 ms freeze makes two inputs
+            // late when they take 100 ms to get there. After a resync none
+            // are: the stand-ins were left to the server.
+            assert!(late <= if k == 0 { 2 } else { 0 }, "freeze {k}: {late} inputs late");
+            // The spare is rebuilt at once, not over-built: an input waits a
+            // tick, as before the freeze (it was 12 when a resync added to
+            // the catch-up). The first one back can wait up to two.
+            assert!(wait <= 2.0, "freeze {k}: inputs waited up to {wait:.1} ticks");
+        }
+    }
     // A bot (a step per tick) stalls the same way: never held either. Its
     // links here have no RTT at all, so the backtrack bound has no margin
     // while its near delay sits at the most after a stall: a shot can land
-    // a hair past it (0.02 steps, 33 steps after a 1 s stall).
-    let [shots, hits, held, trimmed, ..] = stalled_gunner(None);
-    eprintln!("bot: {hits} hits of {shots} shots; held {held}, trimmed {trimmed}");
-    assert_eq!(held, 0);
-    assert!(trimmed <= 1, "{trimmed}");
+    // a hair past it (0.02 steps, 33 steps after a 1 s stall). (A bot that
+    // misses calls without a resync stays that many inputs behind until its
+    // clock catches up; real bots run a missed tick's call late instead.)
+    let r = stalled_gunner(None, 0);
+    eprintln!("bot: {r:?}");
+    assert_eq!((r.held, r.hits), (0, r.shots));
+    assert!(r.trimmed <= 1 && r.dropped <= 3, "{r:?}");
+    assert!(r.after.iter().all(|&(shots, late, wait)| shots >= 19 && late == 0 && wait <= 2.0), "{:?}", r.after);
 }
 
 #[test]

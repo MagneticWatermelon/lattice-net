@@ -81,6 +81,24 @@ pub fn dead_input(i: Input) -> Input {
     Input { yaw: i.yaw, pitch: i.pitch, ..Input::default() }
 }
 
+/// Starved steps whose stand-in repeats the last input before movement
+/// freezes (`stand_in`).
+pub const GRACE_TICKS: u32 = 2;
+
+/// What the server applies for a seq whose input came too late or never,
+/// the `run`th such seq in a row (from 1), given the last real input it
+/// applied: that input again for `GRACE_TICKS` (a lost packet costs nothing),
+/// then a frozen one, no movement with the facing kept (holding packets back
+/// buys no movement). A client predicts the same for the seqs it leaves to
+/// stand-ins after a resync.
+pub fn stand_in(last: Input, run: u32) -> Input {
+    if run <= GRACE_TICKS {
+        last
+    } else {
+        Input { yaw: last.yaw, ..Input::default() }
+    }
+}
+
 pub fn step(world: &World, s: MoveState, input: Input) -> MoveState {
     let mut wish = [input.move_x as f32 / 127.0, input.move_y as f32 / 127.0];
     let len = (wish[0] * wish[0] + wish[1] * wish[1]).sqrt();

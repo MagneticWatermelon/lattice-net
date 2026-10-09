@@ -32,7 +32,7 @@ use crate::grid::{Grid, Knn};
 use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
-use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
+use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, GRACE_TICKS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
 use crate::shots::{self, ClockRate, Cut, Fire, FlyStats, History, Outcome, Projectile, RenderFloor, Sky, SpreadKey};
 use lattice_game::weapon::{self, shot_time, Bloom, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
 use lattice_game::msg::MID_LAG_UNITS;
@@ -75,8 +75,6 @@ const LATE_SHOT_STEPS: u32 = 8;
 const SEND_DELAY_TICKS: usize = 16;
 /// Consumed steps an input queue remembers (for late shots' origins).
 const STEP_RING: usize = 16;
-/// Starved ticks that repeat the last input before movement freezes.
-pub const GRACE_TICKS: u32 = 2;
 /// A client can't queue more inputs than this (~0.5 s); beyond it the oldest
 /// are discarded unapplied rather than letting latency grow.
 const MAX_QUEUED_INPUTS: usize = 16;
@@ -796,13 +794,11 @@ impl InputQueue {
             // The input for `next` is late or lost: a stand-in takes its seq, and
             // the real one is dropped if it shows up. Freezing after the grace
             // means holding packets back (a lag switch) buys no movement.
+            // (The rule is shared: a resyncing client predicts it.)
             self.starved_run += 1;
             self.wait = WAIT_STAND_IN;
-            if self.starved_run <= GRACE_TICKS {
-                (self.last, Step::Repeated)
-            } else {
-                (Input { yaw: self.last.yaw, ..Default::default() }, Step::Frozen)
-            }
+            let kind = if self.starved_run <= GRACE_TICKS { Step::Repeated } else { Step::Frozen };
+            (movement::stand_in(self.last, self.starved_run), kind)
         };
         let before = body.state;
         body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input });

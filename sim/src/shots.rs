@@ -216,8 +216,16 @@ pub const FLOOR_JITTER_MAX: f64 = 0.1;
 /// A client's first seconds of claims get all of it: its RTTs haven't been
 /// measured long enough to show how its link varies.
 const FLOOR_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-/// Fresh claims remembered per client: about a second and a half.
+/// Fresh claims kept per client: more than `ANCHOR_AGE` of them.
 const ANCHORS: usize = 48;
+/// The oldest fresh claim the floor goes by, before the input it judges was
+/// made. The link's jitter comes from its RTT range, which keeps only the
+/// last second or so: an older claim could carry a delay the range no
+/// longer shows. (A link whose delay stepped up 100 ms was held to its
+/// claims from before the step a second later, once its range had forgotten
+/// them.) RTT samples ride the same packets as the inputs, so the range
+/// shows an input's delay from when it arrives.
+const ANCHOR_AGE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Inputs whose claims are kept for bracketing shots.
 const RECENT: usize = 8;
 
@@ -306,7 +314,7 @@ impl RenderFloor {
         let (rate, jitter) = (clock.rate, if settled { clock.jitter.clamp(0.0, FLOOR_JITTER_MAX) } else { FLOOR_JITTER_MAX });
         let (mut f, mut strict) = ([f64::MIN; 2], f64::MIN);
         for &(s, near, mid, at) in &self.anchors {
-            if s < seq {
+            if s < seq && made.saturating_duration_since(at) <= ANCHOR_AGE {
                 // Real time from this claim's arrival to `made`, at least:
                 // less how much the link's delay varies, never back in time.
                 let since = made.saturating_duration_since(at).as_secs_f64();
@@ -677,6 +685,37 @@ mod tests {
         // ±20 ms of delay variation, allowed for.
         let mut c = Client::new();
         assert_eq!(c.run(300, 0.0, |t| t * 30.0, 0.020, 0.045, |t| t * 30.0), 0.0, "jitter");
+    }
+
+    #[test]
+    fn a_link_whose_delay_steps_up_is_never_held() {
+        // A route change: both ways get 100 ms slower. Inputs take 140 ms
+        // to arrive instead of 40, and the render clock takes the later
+        // snapshots by slewing 10% slow for a second (3 steps). The RTT
+        // range shows the step from the first late packet on (acks ride the
+        // inputs) and keeps it a second, the least its window does; claims
+        // from before the step must not outlive it (they held this client's
+        // shots up to 1.5 steps once the range forgot).
+        let mut c = Client::new();
+        let mut delays = VecDeque::new();
+        let mut most: f64 = 0.0;
+        for k in 0..200u32 {
+            let t = k as f64 * STEP;
+            let (delay, r) = match t {
+                t if t < 3.0 => (0.040, t * 30.0),
+                t if t < 4.0 => (0.140, 90.0 + (t - 3.0) * 27.0),
+                t => (0.140, 117.0 + (t - 4.0) * 30.0),
+            };
+            delays.push_back((t + delay, delay));
+            while delays.front().is_some_and(|&(at, _)| at < t + delay - 1.0) {
+                delays.pop_front();
+            }
+            let (lo, hi) = delays.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &(_, d)| (lo.min(d), hi.max(d)));
+            c.make(r);
+            let held = c.arrive(t + delay, hi - lo, (k % 3 == 0).then_some(r));
+            most = most.max(held.unwrap_or(0.0));
+        }
+        assert_eq!(most, 0.0);
     }
 
     #[test]
