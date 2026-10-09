@@ -75,6 +75,12 @@ struct Swarm {
     gunner_dirs: Vec<([f32; 3], [f32; 3])>,
     /// Tick with `tick_sending`: each shard sends from its own task.
     send_early: bool,
+    /// Bot 0 runs like the game client: frames at this rate, each firing
+    /// (if it's the gunner) and running the input clock by elapsed time
+    /// (`tick_inputs`), instead of a step per tick (`step_inputs`). Its last
+    /// frame's time.
+    frames_bot0: Option<u32>,
+    last_frame: Option<Instant>,
 }
 
 /// A test gunner: aims at `target` where its bot draws it, leading for the
@@ -188,6 +194,8 @@ impl Swarm {
             gunner: None,
             gunner_dirs: Vec::new(),
             send_early: false,
+            frames_bot0: None,
+            last_frame: None,
         }
     }
 
@@ -243,13 +251,39 @@ impl Swarm {
                         });
                     }
                 }
-                if let Some(g) = self.gunner.as_mut().filter(|g| g.bot == i) {
-                    if let Some(d) = aim_and_fire(brain, g, now) {
-                        self.gunner_dirs.push(d);
+                match self.frames_bot0.filter(|_| i == 0) {
+                    // The game client's loop: each frame fires, then runs the
+                    // input clock by the time since the last frame.
+                    Some(fps) => {
+                        let frame = Duration::from_secs(1) / fps;
+                        // After a stall (or at first), the next frame is now.
+                        let mut t = match self.last_frame {
+                            Some(l) if now.saturating_duration_since(l) <= 3 * frame => l + frame,
+                            _ => now,
+                        };
+                        while t <= now {
+                            if let Some(g) = self.gunner.as_mut().filter(|g| g.bot == i) {
+                                if let Some(d) = aim_and_fire(brain, g, t) {
+                                    self.gunner_dirs.push(d);
+                                }
+                            }
+                            for batch in brain.core_mut().tick_inputs(t, |_, _| Default::default()) {
+                                client.send(Channel::Unreliable, batch).unwrap();
+                            }
+                            self.last_frame = Some(t);
+                            t += frame;
+                        }
                     }
-                }
-                if let Some(batch) = brain.tick_inputs(self.now) {
-                    client.send(Channel::Unreliable, batch).unwrap();
+                    None => {
+                        if let Some(g) = self.gunner.as_mut().filter(|g| g.bot == i) {
+                            if let Some(d) = aim_and_fire(brain, g, now) {
+                                self.gunner_dirs.push(d);
+                            }
+                        }
+                        if let Some(batch) = brain.tick_inputs(self.now) {
+                            client.send(Channel::Unreliable, batch).unwrap();
+                        }
+                    }
                 }
             }
             client.flush(self.now);
@@ -1767,6 +1801,71 @@ fn picking_the_best_render_step_for_each_shot_is_floored() {
         assert!((hits as f64) < 1.3 * honest as f64 + 3.0, "{name}: about as an honest gunner: {hits} vs {honest}");
     }
     assert!(floored_c > 0);
+}
+
+/// A gunner (bot 0) firing at a standing target 40 m away as fast as the
+/// rifle allows, run like the game client (`frames`: frames a second, its
+/// input clock by elapsed time) or like a bot (a step per tick); three
+/// times it freezes completely (a shader compile, an alt-tab) for 100, 300
+/// and 1,000 ms. Returns shots, hits, and shots held to its render clock,
+/// trimmed, refused and dropped (a resync skipped their input), and how
+/// often its render step went backwards.
+fn stalled_gunner(frames: Option<u32>) -> [u64; 7] {
+    let (mut s, [shooter, target, _]) = firing_line(40.0, false);
+    s.frames_bot0 = frames;
+    let hold = false;
+    s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: false, back: 0.0, hold, fixed: None, pick_back: 0.0 });
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let c0 = s.server.counters().clone();
+    let (backwards0, dropped0) = (s.render_backwards, s.bots[0].2.stats().shots_dropped);
+    s.server.take_hits();
+    for stall_ms in [100u32, 300, 1000] {
+        s.stall_bot0 = true;
+        for _ in 0..(stall_ms * TICK_HZ).div_ceil(1000) {
+            s.step();
+        }
+        s.stall_bot0 = false;
+        for _ in 0..2 * TICK_HZ {
+            s.step();
+        }
+    }
+    let hits = s.server.take_hits().iter().filter(|h| h.shooter == shooter && h.target == target).count() as u64;
+    let c = s.server.counters();
+    [
+        c.shots - c0.shots,
+        hits,
+        c.renders_held - c0.renders_held,
+        c.rewinds_trimmed - c0.rewinds_trimmed,
+        c.shots_refused - c0.shots_refused,
+        s.bots[0].2.stats().shots_dropped - dropped0,
+        s.render_backwards - backwards0,
+    ]
+}
+
+#[test]
+fn a_game_client_that_stalls_is_never_held() {
+    // After a stall the client reads the snapshots that queued up all at
+    // once, makes the inputs it missed at once (up to 300 ms of them; the
+    // server fills the rest with stand-ins, and it resyncs), and fires
+    // again. None of its shots may be held to its render clock or trimmed,
+    // and its render step mustn't jump back. (Each stall also costs ~4 shots
+    // of the 20 in the next 2 s: after a resync the input clock over-builds
+    // its spare and drains it at 5%.)
+    let [shots, hits, held, trimmed, refused, dropped, backwards] = stalled_gunner(Some(60));
+    eprintln!("game client: {hits} hits of {shots} shots; held {held}, trimmed {trimmed}, refused {refused}, dropped {dropped}; render back {backwards}x");
+    assert!(shots > 40, "it kept firing: {shots}");
+    assert_eq!((held, trimmed), (0, 0), "never held or trimmed");
+    assert_eq!(backwards, 0, "the render step never went back");
+    // A bot (a step per tick) stalls the same way: never held either. Its
+    // links here have no RTT at all, so the backtrack bound has no margin
+    // while its near delay sits at the most after a stall: a shot can land
+    // a hair past it (0.02 steps, 33 steps after a 1 s stall).
+    let [shots, hits, held, trimmed, ..] = stalled_gunner(None);
+    eprintln!("bot: {hits} hits of {shots} shots; held {held}, trimmed {trimmed}");
+    assert_eq!(held, 0);
+    assert!(trimmed <= 1, "{trimmed}");
 }
 
 #[test]

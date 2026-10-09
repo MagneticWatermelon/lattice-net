@@ -183,8 +183,10 @@ pub struct Fire {
     /// How far its claimed view was moved to fit the client's render clock
     /// (`RenderFloor`), in steps (0: it fit); `behind` is already moved.
     pub held: f64,
-    /// From the client's first seconds, while its clocks settle.
-    pub settling: bool,
+    /// Slack the backtrack bound adds while the client's clocks settle, in
+    /// steps: its first seconds (`SETTLE_SLACK`), or after the server filled
+    /// in a missing input (`STAND_IN_SLACK`).
+    pub settling: f64,
 }
 
 /// Slack on top of the plausible rewind, in steps: jitter and frame timing.
@@ -193,6 +195,10 @@ pub const TRIM_SLACK: f64 = 2.0;
 /// its render clock is still catching up to its target (a step behind it
 /// after an early snapshot came late).
 pub const SETTLE_SLACK: f64 = 2.0;
+/// And for a while after the server filled in a missing input (the client
+/// stalled): its input clock runs a step ahead to rebuild its spare, and its
+/// render clock catches up from the backlog it read late.
+pub const STAND_IN_SLACK: f64 = 1.0;
 
 /// The render floor's rates: an honest near render clock runs at least 90%
 /// of real time (it slews at most 10% to change its delay; clock.rs), and
@@ -293,10 +299,16 @@ impl RenderFloor {
         held
     }
 
-    /// When input `seq` was made, in a message whose newest input was
-    /// `newest` that arrived at `at`: a copy, (newest - seq) steps before.
+    /// When input `seq` was made, at the latest, in a message whose newest
+    /// input was `newest` that arrived at `at`: a copy was made (newest -
+    /// seq) steps before it, and a step more if the client's input clock
+    /// skipped a call in between (it does, now and then, to steer its spare).
     fn made(seq: u32, newest: u32, at: Instant, clock: ClockRate) -> Instant {
-        let behind = std::time::Duration::from_secs_f64((newest - seq) as f64 / clock.rate.max(1.0));
+        let steps = match newest - seq {
+            0 => 0,
+            n => n + 1,
+        };
+        let behind = std::time::Duration::from_secs_f64(steps as f64 / clock.rate.max(1.0));
         at.checked_sub(behind).unwrap_or(at)
     }
 
@@ -340,10 +352,11 @@ impl RenderFloor {
 /// the server, plus how late in its tick the server sent the snapshots the
 /// client drew from (`send`; RTTs leave it out, since sends are stamped when
 /// they go, but what the client saw was that much older), all in steps,
-/// plus the longest render delays the protocol allows, plus slack (more
-/// while the client's clocks are `settling`). `None`: no RTT yet.
-pub fn plausible(rtt: Option<f64>, wait: f64, send: f64, settling: bool) -> Option<[f64; 2]> {
-    let base = rtt? + wait + send + TRIM_SLACK + if settling { SETTLE_SLACK } else { 0.0 };
+/// plus the longest render delays the protocol allows, plus slack (and
+/// `settling` steps more while the client's clocks settle). `None`: no RTT
+/// yet.
+pub fn plausible(rtt: Option<f64>, wait: f64, send: f64, settling: f64) -> Option<[f64; 2]> {
+    let base = rtt? + wait + send + TRIM_SLACK + settling;
     Some([base + lattice_game::msg::MAX_NEAR_DELAY, base + lattice_game::msg::MAX_MID_DELAY])
 }
 
@@ -520,15 +533,15 @@ mod tests {
 
     #[test]
     fn rewinds_are_capped() {
-        let f = Fire { shooter: 1, seq: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false, wait: 1.5, held: 0.0, settling: false };
+        let f = Fire { shooter: 1, seq: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false, wait: 1.5, held: 0.0, settling: 0.0 };
         let (p, cut) = Projectile::new(1, &f, None);
         assert_eq!((p.d, cut), ([4.0, 8.0], Cut::default()));
         let (p, cut) = Projectile::new(2, &Fire { behind: [12.0, 16.0], ..f }, None);
         assert_eq!((p.d, cut.capped, cut.trimmed), ([NEAR_CAP, MID_CAP], true, false));
         // RTT 1 step + wait 1.5: honest near rewinds are at most 1 + 1.5 + 4 + 2.
-        assert_eq!(plausible(Some(1.0), 1.5, 0.5, false), plausible(Some(1.5), 1.5, 0.0, false), "a late send counts like RTT");
-        assert_eq!(plausible(Some(1.0), 1.5, 0.0, true), plausible(Some(3.0), 1.5, 0.0, false), "settling: two more steps");
-        let ok = plausible(Some(1.0), 1.5, 0.0, false);
+        assert_eq!(plausible(Some(1.0), 1.5, 0.5, 0.0), plausible(Some(1.5), 1.5, 0.0, 0.0), "a late send counts like RTT");
+        assert_eq!(plausible(Some(1.0), 1.5, 0.0, SETTLE_SLACK), plausible(Some(3.0), 1.5, 0.0, 0.0), "settling: two more steps");
+        let ok = plausible(Some(1.0), 1.5, 0.0, 0.0);
         let (p, cut) = Projectile::new(3, &f, ok);
         assert_eq!((p.d, cut), ([4.0, 8.0], Cut::default()), "an honest claim stands");
         let (p, cut) = Projectile::new(4, &Fire { behind: [8.0 + 4.0, 10.5 + 4.0], ..f }, ok);

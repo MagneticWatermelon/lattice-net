@@ -634,7 +634,8 @@ impl InputQueue {
                     shot.map(|s| {
                         let near = place(s.render);
                         let h = self.claims.shot(seq, [near, near - lag], before);
-                        (h, (near - h[0]).abs().max((near - lag - h[1]).abs()))
+                        let m = (near - h[0]).abs().max((near - lag - h[1]).abs());
+                        (h, m)
                     })
                 }
                 // No render steps in the message: held to the earlier claims
@@ -750,7 +751,13 @@ impl InputQueue {
             // This input's server wait (just set by `advance`); none if late.
             wait: if late { 0.0 } else { self.wait as f64 / 10.0 / 1000.0 * TICK_HZ as f64 },
             held,
-            settling: self.inputs_seen < SETTLE_INPUTS,
+            settling: if self.inputs_seen < SETTLE_INPUTS {
+                shots::SETTLE_SLACK
+            } else if self.stand_ins != 0 {
+                shots::STAND_IN_SLACK // a stand-in in the last 32 steps
+            } else {
+                0.0
+            },
         });
     }
 

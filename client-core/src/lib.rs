@@ -116,6 +116,10 @@ pub struct ClientStats {
     /// Times the server had consumed seqs we hadn't generated yet (we stalled)
     /// and we jumped ahead. Snapshots queued up during one stall count once.
     pub resyncs: u64,
+    /// Shots dropped because a resync skipped the input they were to ride:
+    /// its moment was gone, and firing it later with the view from before
+    /// the stall would claim a view far older than its new input's.
+    pub shots_dropped: u64,
     /// Calls where the input clock produced two or more inputs / none.
     pub clock_extra: u64,
     pub clock_skipped: u64,
@@ -686,6 +690,9 @@ impl ClientCore {
             }
             self.resyncing = true;
             self.seq = h.ack_seq;
+            if self.pending_shot.take_if(|(seq, _)| *seq <= self.seq).is_some() {
+                self.stats.shots_dropped += 1;
+            }
             self.state = h.own;
             self.history[self.seq as usize % HISTORY] =
                 Predicted { seq: self.seq, input: Input::default(), state: h.own, sent_at: None, render: None, shot: None };
@@ -788,12 +795,15 @@ impl ClientCore {
     /// The shot time (`weapon::shot_time`) and seq of a trigger pull at `now`.
     fn shot_at(&self, now: Instant) -> (u64, u32, u8) {
         let since = self.clock_at.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32() * TICK_HZ as f32);
-        // A caller that runs the clock a step per call (a bot) advances it a
-        // step at its next call however late that is: a pull is at most a
-        // step past the last one, or it would ride an input two calls away
-        // while the one before it is made after it (claiming a fresher view
-        // than the pull's, which the server's render floor holds against it).
-        let since = if self.stepped { since.min(1.0) } else { since };
+        // The clock advances no further at the next call than the caller's
+        // limit: a step for a caller that runs it a step per call (a bot,
+        // however late that call is), `MAX_CATCH_UP` by elapsed time (after a
+        // stall, the rest is the server's to fill with stand-ins). Past that,
+        // a pull would ride an input whose predecessors are made after it
+        // (claiming fresher views than the pull's, which the server's render
+        // floor holds against it), claim a rewind of the whole stall, and
+        // set the rifle's next shot that far ahead.
+        let since = since.min(if self.stepped { 1.0 } else { MAX_CATCH_UP as f32 });
         let phase = (self.clock + self.rate * since).max(0.0);
         let ahead = phase.floor();
         let frac = (((phase - ahead) * 256.0) as u32).min(255) as u8;
@@ -908,7 +918,7 @@ impl ClientCore {
             self.seq += 1;
             let applied = if self.is_dead() { dead_input(input) } else { input };
             self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied);
-            // A shot fired during this step (or one a resync skipped past).
+            // A shot fired during this step (a resync drops one it skips).
             let shot = self.pending_shot.filter(|&(seq, _)| seq <= self.seq).map(|(_, shot)| shot);
             if shot.is_some() {
                 self.pending_shot = None;

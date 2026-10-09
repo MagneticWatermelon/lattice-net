@@ -344,6 +344,7 @@ The client every player runs, bots and humans alike, is now `lattice-client-core
 **Render clock** (`client-core/src/clock.rs`):
 - other entities are drawn at the newest step minus 100 ms (`--interp-ms` on the bots);
 - the newest step tracks the earliest snapshot arrivals: it moves up at once, and down by 2% per late snapshot, so jitter doesn't move it;
+- snapshots read at one instant (a backlog, after the client froze) don't move it down, and one more than 0.5 s late but newer than anything heard keeps it where it is: only steps going back past what was heard are a new timeline (since 2026-10-09; before, a backlog after a stall over 0.5 s snapped the render step back a second, then forward);
 - the render step slews at most ±10% to follow and never runs backwards; it snaps only past 0.5 s of error;
 - under dilation it runs at pace × 30 steps/s.
 
@@ -803,7 +804,16 @@ Movement grew 0.02–0.04 ms for the gathering. Hits, kills and trims (0) are al
 - **Kernel arrival stamps across a wall-clock step.** Stamps are wall-clock time, converted with a wall/monotonic pair read after each receive call; WSL steps its wall clock now and then, so a datagram stamped just before a step landed seconds off (one anchor 3.5 s early held a client's claims ~90 steps). Both the server's receive threads and the bots now clamp each arrival to no earlier than when the socket was last read empty (`udp::Clocks::arrival`). Input waits and RTTs had the same exposure.
 - **The swarm harness's late datagrams skipped the latency classes:** a datagram held back a step ignored the bot's lag, arriving early instead of late. It now arrives a step after its lag.
 
-**What it doesn't stop:** a cheat that fakes a jittery link (its RTTs' range comes from acks it reports) gets up to 100 ms of slack before the floor applies, and one that sends its inputs in bursts can claim copies up to 2 steps older; both are still within the backtrack bound. Neither can swing between fresh and stale shot by shot.
+**Stalls** (2026-10-09, from a review: the floor was tuned on bots, which don't freeze the way a game client does). The swarm test `a_game_client_that_stalls_is_never_held` runs a gunner like the game client (frames at 60 Hz, its input clock by elapsed time) and freezes it for 100, 300 and 1,000 ms. It found three bugs in the client core, all fixed:
+- **Shots placed past the catch-up.** A pull's place on the input timeline came from the whole time since the last frame, but the catch-up makes at most 300 ms of inputs: after a 1 s freeze the first shot claimed a 35-step rewind (trimmed) and pushed the rifle's next shot most of a second away. A pull is now placed no further than the catch-up reaches.
+- **A shot across a resync.** One fired just before a long freeze rode an input made after the resync, with the view from before the freeze (held by the floor). A resync now drops a shot whose input it skipped (`ClientStats::shots_dropped`).
+- **The render clock read a backlog as a new timeline.** After a freeze over 0.5 s, the oldest queued snapshot reset the newest-step estimate a second back, and the near and entity messages read the render step in between: it snapped back a second, then forward. Visible to a player as everything jumping back in time after a hitch, and the first shot claimed the stale view. See "Render clock" above.
+
+With those, the game client is never held or trimmed through the three stalls, and its render step never goes back. Each stall still costs ~4 of the 20 shots in the next 2 s: after a resync the input clock rebuilds its spare twice (the catch-up and the resync's own +2), so the server holds ~4.8 inputs instead of 2 and drains them at 5%, while inputs run ~2 steps late. A fix for later: skip the resync's bump when the catch-up covers the gap.
+
+Two more allowances came out of it: a copy (an input first arriving in a later message) is judged as made one step earlier than its place in the message says, since the client's input clock skips a call now and then (`honest_fighters_on_bad_links_are_never_held_or_trimmed` held a shot in 3 of 30 runs without it), and for 32 steps after a stand-in the backtrack bound allows a step more (`STAND_IN_SLACK`).
+
+**What it doesn't stop:** a cheat that fakes a jittery link (its RTTs' range comes from acks it reports) gets up to 100 ms of slack before the floor applies, and one that sends its inputs in bursts can claim copies up to 3 steps older; both are still within the backtrack bound. Neither can swing between fresh and stale shot by shot.
 
 ### Sending during assembly (2026-10-08)
 

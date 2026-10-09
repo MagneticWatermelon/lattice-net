@@ -10,7 +10,11 @@
 //! earlier than expected moves it up at once (it can't have arrived before it
 //! was sent), and one that arrives later pulls it down by a small share, so a
 //! lasting change in delay is adopted over a second or two while jitter is
-//! not. The render step follows `newest - delay`, speeding up or slowing down
+//! not. Snapshots read at one instant (a backlog read after a stall) were
+//! read late: only the first can pull it down, and one far later than
+//! expected (past `SNAP`) but newer than anything heard says nothing about
+//! the link at all; only steps going back past what was heard mean a new
+//! timeline (the server restarted). The render step follows `newest - delay`, speeding up or slowing down
 //! by at most `SLEW` to catch it, so it never stalls or runs backwards; only
 //! an error past `SNAP` (a long hitch, a server restart) makes it jump.
 //!
@@ -45,6 +49,9 @@ pub struct RenderClock {
     rate: f64,
     /// The newest step estimated to have arrived by a time: (time, step).
     newest: Option<(Instant, f64)>,
+    /// The newest step heard, and when the last snapshot arrived.
+    heard: Option<f64>,
+    heard_at: Option<Instant>,
     /// The last render step handed out, and when.
     render: Option<(Instant, f64)>,
     /// Times the render step jumped instead of slewing (backwards jumps included).
@@ -63,6 +70,8 @@ impl RenderClock {
             delay: delay.as_secs_f64() * TICK_HZ as f64,
             rate: TICK_HZ as f64,
             newest: None,
+            heard: None,
+            heard_at: None,
             render: None,
             snaps: 0,
             backwards: 0,
@@ -96,17 +105,28 @@ impl RenderClock {
     /// `pace` game seconds per wall second.
     pub fn on_snapshot(&mut self, step: u32, pace: f32, at: Instant) {
         let s = step as f64;
+        // The server's steps went back: another timeline (a restart).
+        let restarted = self.heard.is_some_and(|h| s < h - SNAP);
+        // Read at the same instant as the last: part of a backlog.
+        let backlog = self.heard_at == Some(at);
+        self.heard_at = Some(at);
         let newest = match self.newest_at(at) {
             None => s,
             Some(est) => {
                 let e = s - est;
-                if e > 0.0 || e < -SNAP {
+                if e > 0.0 || restarted {
                     s // earlier than expected (or a different timeline): adopt it
+                } else if e < -SNAP || backlog {
+                    est // read late, after a stall: keep the estimate
                 } else {
                     est + e * DRIFT_DOWN
                 }
             }
         };
+        self.heard = Some(match self.heard {
+            Some(h) if !restarted => h.max(s),
+            _ => s,
+        });
         self.newest = Some((at, newest));
         self.rate = TICK_HZ as f64 * pace.clamp(0.1, 1.0) as f64;
     }
@@ -259,6 +279,36 @@ mod tests {
         c.on_snapshot(5, 1.0, t1);
         assert_eq!(c.render_at(t1), Some(2.0));
         assert_eq!((c.snaps, c.backwards), (1, 1));
+    }
+
+    #[test]
+    fn a_backlog_read_after_a_stall_never_takes_the_clock_back() {
+        // A second's snapshots queue up while the client is frozen; it reads
+        // them all at once (each seen at the same instant, with other
+        // messages reading the render step in between). The oldest are a
+        // second late: read late, not a new timeline.
+        let t0 = Instant::now();
+        let mut c = RenderClock::new(Duration::from_millis(67));
+        for i in 0..60u32 {
+            c.on_snapshot(i, 1.0, t0 + TICK * i);
+            c.render_at(t0 + TICK * i);
+        }
+        let before = c.render_at(t0 + TICK * 59).unwrap();
+        let after_stall = t0 + TICK * 90;
+        for i in 60..=90u32 {
+            c.on_snapshot(i, 1.0, after_stall);
+            let r = c.render_at(after_stall).unwrap();
+            assert!(r >= before, "never back: {r} < {before}");
+        }
+        let r = c.render_at(after_stall).unwrap();
+        assert!((r - 88.0).abs() < 1.0, "caught up: {r}");
+        assert_eq!(c.backwards, 0);
+        // The backlog's late snapshots didn't pull the estimate down, so the
+        // next on time one doesn't jump it back up: the clock runs on evenly.
+        let next = after_stall + TICK;
+        c.on_snapshot(91, 1.0, next);
+        let r2 = c.render_at(next).unwrap();
+        assert!((r2 - r - 1.0).abs() < 0.05, "a step a step: {r} -> {r2}");
     }
 
     #[test]
