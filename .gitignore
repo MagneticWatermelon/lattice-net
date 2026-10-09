@@ -5,3 +5,8 @@ results/
 # Meshy's raw output (152 MB): client/assets/models is made from it (import-assets).
 /client/assets/meshy_output/
 /tools/*/target
+# Playtest invites (each holds a player's connect tokens), session logs and
+# the Windows zip: scripts/playtest.sh.
+/playtest/
+# The game client's session summaries (lattice-client), when run from here.
+lattice-report.txt

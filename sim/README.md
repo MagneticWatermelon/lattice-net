@@ -1003,7 +1003,7 @@ Findings:
 
 ## Encryption on the WSL2 dev box
 
-Every packet after the handshake is sealed with ChaCha20-Poly1305 (`ring`), and clients connect with tokens. The bots mint their own tokens with `--token-key` (default: the public dev key, and the server warns about it), standing in for a login service. `lattice-server` takes the same `--token-key` and `--server-id`.
+Every packet after the handshake is sealed with ChaCha20-Poly1305 (`ring`), and clients connect with tokens. The bots mint their own tokens with `--token-key` (default: the public dev key, and the server warns about it), standing in for a login service. `lattice-server` takes the same `--token-key` and `--server-id`. Both take the key as 64 hex digits or `@FILE` (read from a file, so it isn't in the process list). For people rather than bots, `lattice-invite` mints playtest invites: a user id and a batch of tokens per player (client/README, "A playtest with other people").
 
 **Before and after** (GSO egress in the blob; "before" is `4ad39ca`, with the CRC):
 

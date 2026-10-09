@@ -25,6 +25,26 @@ A native build on Windows works too, with Rust + MSVC: `cargo build --release` i
 
 In WSL itself, `cargo run` in `client/` opens a window under WSLg, but it renders on the CPU (llvmpipe, 5–10 fps). That's good for checking what's drawn, not for playing. Run the built binary directly with `BEVY_ASSET_ROOT=$PWD` (in `client/`), or Bevy looks for `assets/` beside the executable.
 
+## A playtest with other people (`scripts/playtest.sh`)
+
+For a handful of invited players on a rented Linux VM with a public address (any provider; root or a user with passwordless sudo). Each step runs from WSL:
+
+```sh
+scripts/playtest.sh deploy root@203.0.113.7     # repo, build, system user, token key, services
+scripts/playtest.sh start root@203.0.113.7 40   # the server, and 40 bots to fight
+scripts/playtest.sh invites root@203.0.113.7 alice bob carol   # playtest/invites/*.txt
+scripts/playtest.sh pack                         # playtest/lattice-playtest.zip (~42 MB)
+scripts/playtest.sh status root@203.0.113.7
+scripts/playtest.sh sessions root@203.0.113.7    # who played, how it went, anyone flagged
+scripts/playtest.sh stop root@203.0.113.7
+```
+
+- **Players:** each gets the zip and their own invite, privately. They unzip it, save the invite beside the exe as `invite.txt` and start `play.bat`. Open UDP 40000 (`PORT`) in the provider's firewall.
+- **Invites** (`lattice-invite`, format in `client-core/src/invite.rs`): the server's address, a user id and 100 connect tokens, valid for 14 days. Each token connects once (the server remembers them), so the game spends one per launch and counts them in `invite.used` beside the invite. Whoever has an invite can play as its player. Deleting the token key on the VM and deploying again revokes them all.
+- **The server** runs as the system user `lattice`, sandboxed by systemd, with its token key and logs in `/var/lib/lattice-playtest`. The key never leaves the VM. Everyone spawns within 250 m, so players meet each other and the bots.
+- **What comes back:** the server's session log (`--session-log`: a JSON line per session, keyed by user id, with stand-ins, shots, holds, trims, hits, RTT and the render floor's judgments), summed up per player by `sessions`; and each player's `lattice-report.txt` (frame times, RTT and loss, corrections, smoothness per tier, combat), which the game appends to every time it quits.
+- **Checked here:** the whole flow on WSL (a server with a real key, an invite, the game under WSLg playing with it twice, the session log and the report). The packaged exe read its invite on Windows but couldn't open a window while the desktop was locked (Vulkan offered the window no present modes). Nothing has run on a real VM yet.
+
 ## Models
 
 Everything visible beyond the terrain is a model in `assets/models/` (~25 MB), made with Meshy and imported by `tools/import-assets`. The soldier and the rifle are the user's own Meshy models (image-to-3d from concept art); the rest came from text prompts.
@@ -144,6 +164,7 @@ Modeled on PlanetSide 2's assault rifles.
 
 | flag | what it does |
 |---|---|
+| `--invite FILE` | play with a playtest invite (`lattice-invite`): the server, who you are, and the next of its connect tokens; replaces the four below |
 | `--server` | the server's address |
 | `--user` | the user id |
 | `--token-key`, `--server-id` | for the dev connect token, which the client mints itself like the bots do |
@@ -152,6 +173,8 @@ Modeled on PlanetSide 2's assault rifles.
 | `--no-vsync`, `--no-shadows`, `--ghosts` | rendering options |
 | `--autoplay`, `--autofire` | wander instead of reading the keyboard; hold the trigger |
 | `--screenshot PATH --after S` and `--exit-after S` | self-checks: save a frame, then quit with a summary (frame times, corrections, smoothness per tier) |
+
+However the game ends, it disconnects at once (so the server's session log closes the session) and appends the summary to `lattice-report.txt` in the folder it was started in, with the time, the player and the server.
 
 ## Layout
 

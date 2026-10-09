@@ -47,8 +47,9 @@ lattice-bots: M1 bot swarm
                        so tc can shape each class (scripts/baseline.sh fight) [none]
   --full-every K       only every Kth bot measures (prediction, latency, tracking); the
                        rest are sink bots that play but only count what they're sent [1]
-  --token-key HEX      64 hex digits shared by server and bots (the bots mint their own
-                       connect tokens, standing in for a login service) [the public dev key]
+  --token-key KEY      64 hex digits shared by server and bots, or @FILE to read them from
+                       a file (the bots mint their own connect tokens, standing in for a
+                       login service) [the public dev key]
   --server-id N        the server id tokens are minted for [1]
   --seed N             [1]
   --summary PATH       write the end-of-run results as key=value lines (scripts/baseline.sh)";

@@ -19,6 +19,7 @@
 pub mod clock;
 pub mod distant;
 pub mod entities;
+pub mod invite;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

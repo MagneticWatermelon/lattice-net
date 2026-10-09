@@ -10,13 +10,16 @@ mod net;
 mod scene;
 mod terrain;
 
-use std::net::SocketAddr;
+use std::io::Write;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::window::PresentMode;
+use lattice_client_core::invite::Invite;
 use lattice_client_core::ClientConfig;
+use lattice_net::ConnectToken;
 
 use crate::controls::{Mode, View};
 use crate::net::Session;
@@ -24,6 +27,8 @@ use crate::net::Session;
 const USAGE: &str = "\
 lattice-client: play on a lattice-server
 
+  --invite FILE        play with a playtest invite (lattice-invite): the server, who you
+                       are, and a connect token for each launch, instead of the four below
   --server ADDR        the server [127.0.0.1:40000]; from Windows, a WSL server is at
                        the WSL IP (`hostname -I` in WSL) and binds 0.0.0.0 by default
   --user N             user id for the dev connect token [random]
@@ -44,11 +49,25 @@ lattice-client: play on a lattice-server
   --viewer             no game: a row of soldiers (bind pose, then each animation) beside
                        their collision capsules, to look at the models
   --screenshot PATH    save a frame to PATH after --after seconds [5], then
-  --exit-after S       quit after S seconds, printing a summary";
+  --exit-after S       quit after S seconds, printing a summary
+
+However it ends, the game appends that summary (frame times, connection, corrections,
+smoothness, combat) to lattice-report.txt in the folder it was started in.";
+
+/// Where the summary goes on exit, for playtesters to send back.
+const REPORT: &str = "lattice-report.txt";
 
 /// The connection, as a Bevy resource.
 #[derive(Resource)]
 pub struct Net(pub Session);
+
+/// Who's playing, and where: for the report.
+#[derive(Resource)]
+pub struct Player {
+    pub server: String,
+    pub user: u64,
+    pub name: String,
+}
 
 /// This frame's clock: one `Instant` for every system.
 #[derive(Resource)]
@@ -85,6 +104,7 @@ pub struct FrameTimes {
 }
 
 struct Args {
+    invite: Option<String>,
     server: SocketAddr,
     user: u64,
     key: [u8; 32],
@@ -111,6 +131,7 @@ fn die(msg: &str) -> ! {
 
 fn parse_args() -> Args {
     let mut a = Args {
+        invite: None,
         server: "127.0.0.1:40000".parse().unwrap(),
         user: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |d| d.as_nanos() as u64) | 1 << 40,
         key: lattice_net::token::DEV_TOKEN_KEY,
@@ -133,6 +154,7 @@ fn parse_args() -> Args {
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
         match flag.as_str() {
+            "--invite" => a.invite = Some(val()),
             "--server" => a.server = val().parse().unwrap_or_else(|e| die(&format!("--server: {e}"))),
             "--user" => a.user = val().parse().unwrap_or_else(|e| die(&format!("--user: {e}"))),
             "--server-id" => a.server_id = val().parse().unwrap_or_else(|e| die(&format!("--server-id: {e}"))),
@@ -180,14 +202,39 @@ fn parse_args() -> Args {
     a
 }
 
+/// The server, a token and who we are, from a playtest invite: the next of
+/// its tokens (each connects once).
+fn from_invite(path: &str) -> (SocketAddr, ConnectToken, Player) {
+    let fail = |e: &dyn std::fmt::Display| -> ! {
+        eprintln!("error: --invite {path}: {e}");
+        std::process::exit(2);
+    };
+    let invite = std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| Invite::parse(&t)).unwrap_or_else(|e| fail(&e));
+    let server = invite.server.to_socket_addrs().ok().and_then(|mut a| a.next()).unwrap_or_else(|| fail(&format!("can't find {}", invite.server)));
+    let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (i, token) = match invite.next_token(std::path::Path::new(path), unix) {
+        Ok(Some(t)) => t,
+        Ok(None) => fail(&"no tokens left (each connects once, and they expire): ask for a new invite"),
+        Err(e) => fail(&format!("counting its used tokens: {e}")),
+    };
+    println!("token {} of {} from {path}", i + 1, invite.tokens.len());
+    (server, token, Player { server: invite.server, user: invite.user, name: invite.name })
+}
+
 fn main() {
     let args = parse_args();
     let now = Instant::now();
-    let token = net::dev_token(&args.key, args.server_id, args.user);
+    let (server, token, player) = match &args.invite {
+        Some(path) => from_invite(path),
+        None => {
+            let player = Player { server: args.server.to_string(), user: args.user, name: String::new() };
+            (args.server, net::dev_token(&args.key, args.server_id, args.user), player)
+        }
+    };
     let cfg = ClientConfig { near_delay: args.delays.0, near_delay_max: args.delays.1, mid_delay: args.delays.2, track_entities: true };
-    let mut session = Session::connect(args.server, token, cfg, now).unwrap_or_else(|e| die(&format!("socket: {e}")));
+    let mut session = Session::connect(server, token, cfg, now).unwrap_or_else(|e| die(&format!("socket: {e}")));
     session.core.keep_news(true);
-    println!("connecting to {} as user {}", args.server, args.user);
+    println!("connecting to {server} as {} (user {})", if player.name.is_empty() { "-" } else { &player.name }, player.user);
     let mut view = View::new(args.mode);
     if let Some((eye, yaw, pitch)) = args.spectate {
         view.spectate(eye, yaw, pitch);
@@ -209,6 +256,7 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.62, 0.74, 0.86)))
         .insert_resource(GlobalAmbientLight { color: Color::WHITE, brightness: 250.0, ..default() })
         .insert_resource(Net(session))
+        .insert_resource(player)
         .insert_resource(Frame { now, start: now, secs: 0.0, dt: 0.0 })
         .insert_resource(Settings {
             ghosts: args.ghosts,
@@ -265,6 +313,7 @@ fn main() {
                 .chain(),
         )
         .add_systems(PostUpdate, flush)
+        .add_systems(Last, report_on_exit)
         // Rifles go to their hands once the skeletons are posed.
         .add_systems(
             PostUpdate,
@@ -335,7 +384,7 @@ fn flush(frame: Res<Frame>, mut net: ResMut<Net>) {
 }
 
 /// `--screenshot` and `--exit-after`.
-fn shots(mut commands: Commands, frame: Res<Frame>, mut settings: ResMut<Settings>, mut net: ResMut<Net>, times: Res<FrameTimes>, mut exit: MessageWriter<AppExit>) {
+fn shots(mut commands: Commands, frame: Res<Frame>, mut settings: ResMut<Settings>, net: Res<Net>, times: Res<FrameTimes>, mut exit: MessageWriter<AppExit>) {
     if let Some((path, at)) = settings.screenshot.clone() {
         if frame.secs >= at {
             commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
@@ -344,20 +393,69 @@ fn shots(mut commands: Commands, frame: Res<Frame>, mut settings: ResMut<Setting
     }
     if settings.exit_after.is_some_and(|t| frame.secs >= t) {
         settings.exit_after = None;
-        summary(&net.0, &times);
-        net.0.disconnect(frame.now);
-        exit.write(AppExit::Success);
+        print!("{}", summary(&net.0, &times));
+        exit.write(AppExit::Success); // (`report_on_exit` disconnects)
     }
 }
 
-fn summary(s: &Session, times: &FrameTimes) {
+/// However the game ends (the window closed, `--exit-after`): tells the
+/// server at once, so its session log closes the session, and appends the
+/// summary to `REPORT`.
+fn report_on_exit(mut exits: MessageReader<AppExit>, frame: Res<Frame>, mut net: ResMut<Net>, times: Res<FrameTimes>, player: Res<Player>, mut done: Local<bool>) {
+    if exits.read().next().is_none() || std::mem::replace(&mut *done, true) {
+        return;
+    }
+    let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let who = if player.name.is_empty() { format!("user {}", player.user) } else { format!("{} (user {})", player.name, player.user) };
+    // Before disconnecting: the transport's numbers go with the connection.
+    let text = format!("== {} | {who} on {} | played {:.0} s ==\n{}\n", utc(unix), player.server, frame.secs, summary(&net.0, &times));
+    if net.0.state() == lattice_net::ClientState::Connected {
+        net.0.disconnect(frame.now);
+    }
+    match std::fs::OpenOptions::new().create(true).append(true).open(REPORT).and_then(|mut f| f.write_all(text.as_bytes())) {
+        Ok(()) => println!("summary appended to {REPORT}"),
+        Err(e) => eprintln!("couldn't write {REPORT}: {e}"),
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS UTC` for unix seconds (Howard Hinnant's
+/// civil_from_days; no time zone data).
+fn utc(unix: u64) -> String {
+    let (days, secs) = ((unix / 86_400) as i64, unix % 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", secs / 3600, secs / 60 % 60, secs % 60)
+}
+
+fn summary(s: &Session, times: &FrameTimes) -> String {
+    use std::fmt::Write;
     let st = &s.core.stats;
     let mut all = times.all.clone();
     all.sort_by(f32::total_cmp);
     let at = |p: f32| all.get(((all.len() as f32 * p) as usize).min(all.len().saturating_sub(1))).copied().unwrap_or(0.0);
-    println!("== client summary ==");
-    println!("  frames {} | frame time p50 {:.1} p99 {:.1} max {:.1} ms", all.len(), at(0.5), at(0.99), at(1.0));
-    println!(
+    let mut out = String::from("== client summary ==\n");
+    let _ = writeln!(out, "  frames {} | frame time p50 {:.1} p99 {:.1} max {:.1} ms", all.len(), at(0.5), at(0.99), at(1.0));
+    if let Some(t) = s.transport().stats() {
+        let _ = writeln!(
+            out,
+            "  rtt {:.1} ms (last seconds {:.1}-{:.1}) | loss {:.2}% | packets sent {} received {} lost {}",
+            t.rtt_ms,
+            t.rtt_min_ms,
+            t.rtt_max_ms,
+            t.loss * 100.0,
+            t.packets_sent,
+            t.packets_received,
+            t.packets_lost
+        );
+    }
+    let _ = writeln!(
+        out,
         "  snapshots {} | corrections {} (largest {:.3} m) | push corrections {} | resyncs {} | own correction offset largest {:.3} m | shots {} | deaths/respawns {}",
         st.snapshots, st.corrections, st.correction_error_max, st.push_corrections, st.resyncs, st.own_offset_max, st.shots, st.life_events
     );
@@ -365,7 +463,8 @@ fn summary(s: &Session, times: &FrameTimes) {
         for (t, name) in ["near", "mid", "far"].iter().enumerate() {
             let f = e.smooth.frames[t];
             let n = f.iter().sum::<u64>().max(1) as f64;
-            println!(
+            let _ = writeln!(
+                out,
                 "  {name}: {} entity-frames, {:.2}% interpolated, {:.2}% extrapolated, {:.2}% held, {:.2}% new",
                 f.iter().sum::<u64>(),
                 100.0 * f[0] as f64 / n,
@@ -375,11 +474,24 @@ fn summary(s: &Session, times: &FrameTimes) {
             );
         }
     }
-    println!(
+    let _ = writeln!(
+        out,
         "  hits confirmed {} (kills {}) | hit {} times for {} damage | kills heard {} | others' shots seen {} | distant fights: {} cells, {} shots, {} ambient",
         st.hits_confirmed, st.kills_confirmed, st.hurts, st.damage_taken, st.kills_heard, st.shots_seen, st.activity_cells, st.activity_shots, st.ambient
     );
     let delay = st.render_delay_sum / st.render_frames.max(1) as f64 * 1000.0 / 30.0;
     let mid = s.core.entities().map_or(0.0, |e| e.mid_lag()) * 1000.0 / 30.0;
-    println!("  render delay near {delay:.1} ms, mid/far +{mid:.0} ms, clock snaps {}", s.core.render_clock().snaps);
+    let _ = writeln!(out, "  render delay near {delay:.1} ms, mid/far +{mid:.0} ms, clock snaps {}", s.core.render_clock().snaps);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn utc_dates() {
+        assert_eq!(super::utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(super::utc(951_782_400), "2000-02-29 00:00:00 UTC");
+        assert_eq!(super::utc(1_791_552_658), "2026-10-09 13:30:58 UTC");
+        assert_eq!(super::utc(4_102_444_800), "2100-01-01 00:00:00 UTC");
+    }
 }

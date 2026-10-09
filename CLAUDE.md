@@ -401,6 +401,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - 20 ms and 100 ms RTT bots hit at the same rate (±10%) for the same aim error; 150 ms bots measurably less (they lead ~50 ms);
     - no hit lands with a rewind beyond its cap (300 / 367 ms); post-cover hits are measured; honest bots are never trimmed (`rewinds_trimmed` 0);
     - corrections only from separation pushes and respawns, both flagged.
+- **Playtest tooling** (2026-10-09, before M4; client/README "A playtest with other people"): `scripts/playtest.sh` deploys the server and bots to one rented VM as systemd services (system user `lattice`, key and logs in `/var/lib/lattice-playtest`), mints invites (`lattice-invite`: a user id and 100 connect tokens, one per launch), sums up the session log per player, and packs the Windows game with a launcher. The game takes `--invite FILE` and appends a summary to `lattice-report.txt` on every exit. Key flags take `@FILE`. Checked end to end on WSL; no VM yet (needs a provider account: the user's choice, e.g. Hetzner Cloud).
 - **M4:** vehicles. Their physics goes in `lattice-game`, deterministic across platforms (see Conventions: `libm`, `scripts/determinism.sh`).
 - **M5:** minimal playable client.
 
