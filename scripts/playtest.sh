@@ -40,9 +40,11 @@ dir=playtest
 data=/var/lib/lattice-playtest
 say() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
 need_host() { [ -n "$host" ] || { echo "usage: $0 $cmd user@address ..." >&2; exit 2; }; }
-on() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" "$@"; }
+# A new host's key is taken on first contact; a changed one is refused.
+ssh_opts="-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+on() { ssh $ssh_opts "$host" "$@"; }
 # Files only the lattice user may read, copied back.
-fetch() { rsync -a --rsync-path="sudo rsync" -e "ssh -o BatchMode=yes" "$host:$1" "$2"; }
+fetch() { rsync -a --rsync-path="sudo rsync" -e "ssh $ssh_opts" "$host:$1" "$2"; }
 
 # The setup on HOST: a system user, the binaries, a token key, the services.
 # Takes the port; runs as the ssh user, with sudo.
@@ -177,11 +179,13 @@ back, shots that should have hit or should not have, anything that felt off.'
 case $cmd in
 deploy)
   need_host
+  say "packages (once a new VM's first-boot setup is done)"
+  apt="sudo DEBIAN_FRONTEND=noninteractive apt-get -qq -o DPkg::Lock::Timeout=600"
+  on "if command -v cloud-init > /dev/null; then sudo cloud-init status --wait > /dev/null || true; fi; $apt update && $apt install -y build-essential rsync > /dev/null"
   say "copying the repo to $host"
-  rsync -a --delete -e "ssh -o BatchMode=yes" --exclude target --exclude results --exclude .cloud \
+  rsync -a --delete -e "ssh $ssh_opts" --exclude target --exclude results --exclude .cloud --exclude /.claude \
     --exclude client/assets --exclude /meshy_output --exclude /playtest --exclude client/target ./ "$host:lattice-net/"
   say "toolchain and build (a few minutes the first time)"
-  on "sudo DEBIAN_FRONTEND=noninteractive apt-get -qq update && sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y build-essential rsync > /dev/null"
   on "command -v cargo > /dev/null || [ -x ~/.cargo/bin/cargo ] || curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal > /dev/null"
   on "source ~/.cargo/env && cd lattice-net && cargo build --release -q -p lattice-sim --bin lattice-server --bin lattice-bots --bin lattice-invite"
   say "a system user, the token key and the services"
@@ -215,7 +219,7 @@ invites)
   need_host
   shift 2
   [ $# -gt 0 ] || { echo "usage: $0 invites HOST NAME..." >&2; exit 2; }
-  on "cd $data && sudo -u lattice /usr/local/bin/lattice-invite --token-key @token.key --server $addr:$port --out invites $*"
+  on "sudo -u lattice /usr/local/bin/lattice-invite --token-key @$data/token.key --server $addr:$port --out $data/invites $*"
   mkdir -p "$dir/invites"
   fetch "$data/invites/" "$dir/invites/"
   chmod 600 "$dir"/invites/*.txt
