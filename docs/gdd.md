@@ -111,7 +111,7 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 
 - **A continent is one map on one server process** (decided): an 8,192 m square (exists: `WORLD_SIZE`), with up to 10,000 players (decided ceiling).
 - **The wire formats bound the map:** 8,192 m across (512 m cells, 4 bits per axis) and heights of 0–655.35 m (exists). A bigger map or higher ground needs a protocol change.
-- **Launch with one continent, Harrow (proposed).** It's the temperate hills of the procedural world that exists: ~160 m of relief, 16 walled bases, ~35 outposts.
+- **Launch with one continent, Harrow (proposed).** It's the temperate hills of the procedural world that exists (world seed 1): about 90 m of relief, 16 walled bases and 35 outposts.
 - **Plan for four:** Harrow, Kiln (desert canyons), Rime (arctic) and Mire (marsh and jungle), with 2–3 open at a time.
 - **Design for 2,000–6,000 players per continent as the usual case, and 10,000 as the peak (proposed).** A continent with 300 players must still be fun: open fewer continents (§3.6), don't spread players thin.
 
@@ -126,10 +126,10 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 - **Supply.** A region cut off from its faction's Landing loses its benefits (vehicle terminals, capture bonuses) until it's reconnected.
 - **Region shapes** are the sites' Voronoi cells, clipped by authored borders where needed. Holding the site holds the region.
 - **Harrow v0's lattice (proposed):**
-  - its sites are `world.rs`'s 16 bases and ~35 outposts;
+  - its sites are `world.rs`'s 16 bases and 35 outposts;
   - three of the bases, near the map's edge and roughly 120° apart around its center, become Landings;
   - each site links to its 2–4 nearest neighbors, as a planar graph built deterministically from the seed;
-  - neighbors are 600–1,500 m apart: 70–170 s of sprinting, so vehicles matter.
+  - most lanes run 600–1,700 m (median about 1 km): one to three minutes of sprinting, so vehicles matter.
 
 ### 3.3 Capturing
 
@@ -657,7 +657,7 @@ PostLateUpdate (inserted,      lt_flush
 
 ### 14.3 Props and buildings
 
-- **v0:** one prefab per cover kind, fitted exactly to its box (as the Bevy client does: each model is normalized to a unit box). The GPU Resident Drawer instances them; Harrow has 10–25k boxes.
+- **v0:** one prefab per cover kind, fitted exactly to its box (as the Bevy client does: each model is normalized to a unit box). The GPU Resident Drawer instances them; Harrow v0 has about 17,000.
 - **The rule, from the Bevy client: what you see is what blocks you.** Within a player's reach, no art geometry may look solid and not be, or be solid and not look it.
 
 ### 14.4 The crowd
