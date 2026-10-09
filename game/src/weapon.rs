@@ -118,8 +118,8 @@ pub fn spread(yaw: u16, pitch: i16, cone: f32, pick: u64) -> [f32; 3] {
     }
     let h = pick;
     let (u1, u2) = ((h >> 40) as f32 / (1u64 << 24) as f32, (h & 0xFF_FFFF) as f32 / (1u64 << 24) as f32);
-    let r = (cone.to_radians() * u1.sqrt()).tan();
-    let (s, c) = (u2 * std::f32::consts::TAU).sin_cos();
+    let r = libm::tanf(cone.to_radians() * u1.sqrt());
+    let (s, c) = libm::sincosf(u2 * std::f32::consts::TAU);
     // Right and up around the aim (straight up or down: any right will do).
     let flat = (d[0] * d[0] + d[1] * d[1]).sqrt();
     let right = if flat > 1e-4 { [d[1] / flat, -d[0] / flat, 0.0] } else { [1.0, 0.0, 0.0] };
@@ -131,8 +131,8 @@ pub fn spread(yaw: u16, pitch: i16, cone: f32, pick: u64) -> [f32; 3] {
 
 /// The aim (`yaw`, `pitch` in wire units) of a unit direction.
 pub fn angles(d: [f32; 3]) -> (u16, i16) {
-    let yaw = d[1].atan2(d[0]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0;
-    let pitch = d[2].clamp(-1.0, 1.0).asin() / std::f32::consts::FRAC_PI_2 * 32767.0;
+    let yaw = libm::atan2f(d[1], d[0]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0;
+    let pitch = libm::asinf(d[2].clamp(-1.0, 1.0)) / std::f32::consts::FRAC_PI_2 * 32767.0;
     (yaw as u32 as u16, pitch.clamp(-32767.0, 32767.0) as i16)
 }
 
@@ -158,8 +158,8 @@ pub fn shot_time(seq: u32, frac: u8) -> u64 {
 pub fn aim(yaw: u16, pitch: i16) -> [f32; 3] {
     let y = yaw as f32 / 65536.0 * std::f32::consts::TAU;
     let p = pitch as f32 / 32767.0 * std::f32::consts::FRAC_PI_2;
-    let (sy, cy) = y.sin_cos();
-    let (sp, cp) = p.sin_cos();
+    let (sy, cy) = libm::sincosf(y);
+    let (sp, cp) = libm::sincosf(p);
     [cp * cy, cp * sy, sp]
 }
 
@@ -252,7 +252,7 @@ mod tests {
             x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
             let s = spread(yaw, pitch, 2.0, x);
             assert_eq!(s, spread(yaw, pitch, 2.0, x), "the same pick: the same shot");
-            let angle = (d[0] * s[0] + d[1] * s[1] + d[2] * s[2]).clamp(-1.0, 1.0).acos().to_degrees();
+            let angle = libm::acosf((d[0] * s[0] + d[1] * s[1] + d[2] * s[2]).clamp(-1.0, 1.0)).to_degrees();
             assert!(angle <= 2.0 + 1e-3, "{angle}");
             far += (angle > 2.0 * std::f32::consts::FRAC_1_SQRT_2) as u32;
         }

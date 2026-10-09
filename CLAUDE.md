@@ -397,7 +397,7 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
     - 20 ms and 100 ms RTT bots hit at the same rate (±10%) for the same aim error; 150 ms bots measurably less (they lead ~50 ms);
     - no hit lands with a rewind beyond its cap (300 / 367 ms); post-cover hits are measured; honest bots are never trimmed (`rewinds_trimmed` 0);
     - corrections only from separation pushes and respawns, both flagged.
-- **M4:** vehicles.
+- **M4:** vehicles. Their physics goes in `lattice-game`, deterministic across platforms (see Conventions: `libm`, `scripts/determinism.sh`).
 - **M5:** minimal playable client.
 
 ## Dev environment
@@ -430,4 +430,5 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 ## Conventions
 
 - `cargo test --release` (runs the whole workspace) and `cargo clippy --workspace --all-targets` must stay clean. The client is its own workspace: `cargo test` and `cargo clippy --all-targets` inside `client/` too.
+- **`lattice-game` gives the same bits on every platform:** the Linux server and the Windows client run its movement, and prediction is checked bit for bit. Use basic arithmetic and `sqrt` (exact under IEEE 754), or the `libm` crate's functions; `game/clippy.toml` disallows std's `sin`, `cos`, `powf` and the rest, whose results differ between Linux and Windows (in a 14 M-value sample, 6.5% of Linux's and 8.4% of Windows' differed from `libm`, which agreed on both). After touching `lattice-game`, run `scripts/determinism.sh`: a long replay (`game/examples/determinism`: the world, 192k movement steps, the weapon math, the codecs) on Linux and on Windows, compared by hash. Today movement uses no transcendental math at all (inputs carry a quantized direction); M4's vehicles will.
 - Zero dependencies in the core crate unless there's a strong reason. Crypto uses audited, widely used crates, never hand-rolled. The one dependency is `ring` (BoringSSL-derived ChaCha20-Poly1305 and OS randomness); it builds C/asm, so a C toolchain is needed (MSVC on Windows).

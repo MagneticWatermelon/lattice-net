@@ -138,7 +138,8 @@ pub fn line_clear(world: &World, p0: V, p1: V) -> bool {
         return false;
     }
     let mid = [(p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0];
-    let half = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt() / 2.0;
+    let (dx, dy) = (p1[0] - p0[0], p1[1] - p0[1]);
+    let half = (dx * dx + dy * dy).sqrt() / 2.0;
     let mut clear = true;
     world.boxes_near(mid[0], mid[1], half + 1.0, |c| {
         clear &= aabb(p0, p1, [c.min[0], c.min[1], c.bottom], [c.max[0], c.max[1], c.top]).is_none();

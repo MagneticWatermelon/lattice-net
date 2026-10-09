@@ -540,7 +540,7 @@ mod tests {
             for k in 0..200 {
                 let a = k as f32 / 200.0 * std::f32::consts::TAU;
                 let r = s.half + SITE_BLEND / 2.0;
-                let (x, y) = (s.center[0] + a.cos() * r, s.center[1] + a.sin() * r);
+                let (x, y) = (s.center[0] + libm::cosf(a) * r, s.center[1] + libm::sinf(a) * r);
                 let slope = (w.terrain(x + 0.5, y) - w.terrain(x - 0.5, y)).abs().max((w.terrain(x, y + 0.5) - w.terrain(x, y - 0.5)).abs());
                 assert!(slope < 1.0, "walkable blend: slope {slope}");
             }
@@ -580,7 +580,7 @@ mod tests {
                 let d = (to[0] * to[0] + to[1] * to[1]).sqrt();
                 // Steer around what's in the way: aim a little off-center now and then.
                 let wobble = if (i / 30) % 2 == 0 { 0.6 } else { -0.6 };
-                let (c, sn) = (wobble as f32).sin_cos();
+                let (c, sn) = libm::sincosf(wobble as f32); // as before: (sin, cos)
                 let dir = [(to[0] * sn - to[1] * c) / d, (to[0] * c + to[1] * sn) / d];
                 p = step(&w, p, Input { move_x: (dir[0] * 127.0) as i8, move_y: (dir[1] * 127.0) as i8, ..Default::default() });
                 inside |= (p.pos[0] - s.center[0]).abs() < 40.0 && (p.pos[1] - s.center[1]).abs() < 40.0;

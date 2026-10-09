@@ -62,7 +62,7 @@ pub fn shots_code(n: u32) -> u8 {
     if n <= 32 {
         n as u8
     } else {
-        (32.0 + (6.0 * (n as f32 / 32.0).log2()).round()).min(63.0) as u8
+        (32.0 + (6.0 * libm::log2f(n as f32 / 32.0)).round()).min(63.0) as u8
     }
 }
 
@@ -70,7 +70,7 @@ pub fn shots_from_code(c: u8) -> u32 {
     if c <= 32 {
         c as u32
     } else {
-        (32.0 * 2f32.powf((c - 32) as f32 / 6.0)).round() as u32
+        (32.0 * libm::exp2f((c - 32) as f32 / 6.0)).round() as u32
     }
 }
 

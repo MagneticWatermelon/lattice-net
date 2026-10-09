@@ -8,3 +8,5 @@ publish = false
 
 [dependencies]
 lattice-net = { path = ".." }
+# Math functions that give the same bits on every platform (clippy.toml).
+libm = "0.2"

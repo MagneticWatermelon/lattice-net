@@ -138,7 +138,7 @@ pub fn decode_shots(data: &[u8]) -> Result<Vec<SeenShot>, DecodeError> {
 
 /// The yaw from `from` to `to`, in 1/256 turns.
 pub fn direction(from: [f32; 2], to: [f32; 2]) -> u8 {
-    let a = (to[1] - from[1]).atan2(to[0] - from[0]);
+    let a = libm::atan2f(to[1] - from[1], to[0] - from[0]);
     (a.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 256.0).round() as u32 as u8
 }
 
