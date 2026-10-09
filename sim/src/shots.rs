@@ -256,29 +256,67 @@ pub struct ClockRate {
 pub struct RenderFloor {
     /// Recent fresh claims, held: (seq, near, mid, arrival).
     anchors: VecDeque<(u32, f64, f64, Instant)>,
-    /// The last inputs' held claims, by seq: (seq, near, mid).
-    recent: [(u32, f64, f64); RECENT],
+    /// The last inputs' held claims, by seq: (seq, near, mid, dip).
+    recent: [(u32, f64, f64, f64); RECENT],
     /// When the first claim arrived.
     first: Option<Instant>,
+    /// How far near claims dipped under the floor the jitter allowance
+    /// lowers (`dips`), after the client's first seconds: every input's
+    /// (sum, sum of squares, count), and the inputs' right before shots
+    /// (sum, count).
+    dips_all: (f64, f64, u32),
+    dips_shots: (f64, u32),
 }
+
+/// A client's pre-shot dips into the render floor's jitter allowance
+/// (`RenderFloor::dips`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Dips {
+    /// Beyond its other inputs' dips, on average, in steps.
+    pub excess: f64,
+    pub shots: u32,
+    /// The excess in standard errors.
+    pub z: f64,
+}
+
+impl Dips {
+    /// Judged (enough shots), and spending the allowance on stale shots.
+    pub fn judged(&self) -> bool {
+        self.shots >= DIP_MIN_SHOTS
+    }
+    pub fn flagged(&self) -> bool {
+        self.judged() && self.excess > DIP_FLAG && self.z > DIP_Z
+    }
+}
+
+/// Shots a client must have fired before its dips are judged (`dips`); how
+/// far (steps) its pre-shot dips must exceed its others' to be flagged as
+/// spending the jitter allowance on stale shots, and by how many standard
+/// errors (its dips vary with its link: an honest client's excess is noise).
+pub const DIP_MIN_SHOTS: u32 = 30;
+pub const DIP_FLAG: f64 = 0.3;
+pub const DIP_Z: f64 = 4.0;
 
 impl RenderFloor {
     /// The oldest near and mid claims the client's fresh claims before input
-    /// `seq` allow for something made at `made`.
-    fn floor(&self, seq: u32, made: Instant, clock: ClockRate) -> [f64; 2] {
+    /// `seq` allow for something made at `made`; and the near one without
+    /// the jitter allowance. Whether the client is past its first seconds.
+    fn floor(&self, seq: u32, made: Instant, clock: ClockRate) -> ([f64; 2], f64, bool) {
         let settled = self.first.is_some_and(|t| made.saturating_duration_since(t) >= FLOOR_SETTLE);
         let (rate, jitter) = (clock.rate, if settled { clock.jitter.clamp(0.0, FLOOR_JITTER_MAX) } else { FLOOR_JITTER_MAX });
-        let mut f = [f64::MIN; 2];
+        let (mut f, mut strict) = ([f64::MIN; 2], f64::MIN);
         for &(s, near, mid, at) in &self.anchors {
             if s < seq {
                 // Real time from this claim's arrival to `made`, at least:
                 // less how much the link's delay varies, never back in time.
-                let run = (made.saturating_duration_since(at).as_secs_f64() - jitter).max(0.0) * rate;
+                let since = made.saturating_duration_since(at).as_secs_f64();
+                let run = (since - jitter).max(0.0) * rate;
                 f[0] = f[0].max(near + run * FLOOR_RATE_NEAR);
                 f[1] = f[1].max(mid + run * FLOOR_RATE_MID);
+                strict = strict.max(near + since * rate * FLOOR_RATE_NEAR);
             }
         }
-        [f[0] - FLOOR_SLACK_NEAR, f[1] - FLOOR_SLACK_MID]
+        ([f[0] - FLOOR_SLACK_NEAR, f[1] - FLOOR_SLACK_MID], strict - FLOOR_SLACK_NEAR, settled)
     }
 
     /// Input `seq` arrived (for the first time) claiming it was made at
@@ -287,9 +325,15 @@ impl RenderFloor {
     /// to the floor.
     pub fn input(&mut self, seq: u32, claim: [f64; 2], newest: u32, at: Instant, clock: ClockRate) -> [f64; 2] {
         self.first.get_or_insert(at);
-        let f = self.floor(seq, Self::made(seq, newest, at, clock), clock);
+        let (f, strict, settled) = self.floor(seq, Self::made(seq, newest, at, clock), clock);
         let held = [claim[0].max(f[0]), claim[1].max(f[1])];
-        self.recent[seq as usize % RECENT] = (seq, held[0], held[1]);
+        // How much of the jitter allowance this claim used.
+        let dip = (strict - claim[0]).max(0.0);
+        if settled {
+            let (sum, sq, n) = self.dips_all;
+            self.dips_all = (sum + dip, sq + dip * dip, n + 1);
+        }
+        self.recent[seq as usize % RECENT] = (seq, held[0], held[1], dip);
         if seq == newest {
             if self.anchors.len() == ANCHORS {
                 self.anchors.pop_front();
@@ -320,7 +364,7 @@ impl RenderFloor {
         if self.anchors.is_empty() {
             return None;
         }
-        let f = self.floor(seq, Self::made(seq, newest, at, clock), clock);
+        let (f, ..) = self.floor(seq, Self::made(seq, newest, at, clock), clock);
         Some([claim[0].max(f[0]), claim[1].max(f[1])])
     }
 
@@ -332,18 +376,36 @@ impl RenderFloor {
     /// views. That happens in a client's first seconds (`before` = None:
     /// only its own input bounds the shot) and for a step after the server
     /// fills in a missing input (the client then runs its clock a step ahead).
-    pub fn shot(&self, seq: u32, claim: [f64; 2], before: Option<f64>) -> [f64; 2] {
+    pub fn shot(&mut self, seq: u32, claim: [f64; 2], before: Option<f64>) -> [f64; 2] {
         let known = |s: u32| self.recent[s as usize % RECENT].0 == s;
         let mut held = claim;
         if known(seq) {
-            let (_, n, m) = self.recent[seq as usize % RECENT];
+            let (_, n, m, _) = self.recent[seq as usize % RECENT];
             held = [held[0].min(n + FLOOR_SLACK_NEAR), held[1].min(m + FLOOR_SLACK_MID)];
         }
         if let (Some(slack), true) = (before, seq > 1 && known(seq - 1)) {
-            let (_, n, m) = self.recent[(seq - 1) as usize % RECENT];
+            let (_, n, m, dip) = self.recent[(seq - 1) as usize % RECENT];
             held = [held[0].max(n - slack - FLOOR_SLACK_NEAR), held[1].max(m - slack - FLOOR_SLACK_MID)];
+            // The input before a shot bounds how old its view can be.
+            self.dips_shots = (self.dips_shots.0 + dip, self.dips_shots.1 + 1);
         }
         held
+    }
+
+    /// How far, on average, the client's claims dipped into the jitter
+    /// allowance right before its shots, beyond how far they dipped at all,
+    /// in steps; over how many shots; and how many standard errors that is.
+    /// An honest client's dips come from its link, whenever it shoots; a
+    /// cheat spending the allowance on stale views dips before shots. `None`
+    /// before it has made a claim.
+    pub fn dips(&self) -> Option<Dips> {
+        let ((sum, sq, n), (shots, k)) = (self.dips_all, self.dips_shots);
+        (n > 0 && k > 0).then(|| {
+            let mean = sum / n as f64;
+            let sd = (sq / n as f64 - mean * mean).max(0.0).sqrt().max(0.01);
+            let excess = shots / k as f64 - mean;
+            Dips { excess, shots: k, z: excess / (sd / (k as f64).sqrt()) }
+        })
     }
 }
 

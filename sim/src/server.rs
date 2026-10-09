@@ -308,6 +308,12 @@ pub struct Counters {
     /// than its inputs said it drew, or newer than its own input): held to
     /// it (`shots::RenderFloor`).
     pub renders_held: u64,
+    /// Clients judged, as they left, by whether their claims dipped into the
+    /// jitter allowance more right before shots than otherwise
+    /// (`RenderFloor::dips`, at least `DIP_MIN_SHOTS` shots), and of those,
+    /// the ones flagged (`Dips::flagged`): spending it on stale shots.
+    pub dip_clients: u64,
+    pub dip_flagged: u64,
     /// Projectile segments flown and player candidates tested.
     pub segments: u64,
     pub candidates: u64,
@@ -979,6 +985,8 @@ pub struct SimServer {
     paces: [f32; PACE_TICKS],
     /// How far the render floor moved shots' claimed views (0.1 steps).
     held_by: Histogram,
+    /// Clients' pre-shot dip excess as they left (0.1 steps, from 0).
+    dip_excess: Histogram,
 }
 
 /// Ticks of advertised pace the render floor looks back over (2 s at 30 Hz).
@@ -1048,6 +1056,7 @@ impl SimServer {
             spread: Arc::new(SpreadKey::new(spread_secret)),
             paces: [1.0; PACE_TICKS],
             held_by: Histogram::new(200),
+            dip_excess: Histogram::new(200),
         }
     }
 
@@ -1150,6 +1159,17 @@ impl SimServer {
     /// (`Counters::renders_held`).
     pub fn held_by(&self) -> &Histogram {
         &self.held_by
+    }
+
+    /// Clients' pre-shot dip excess (`RenderFloor::dips`) as they left, in
+    /// 0.1 steps (`Counters::dip_clients`).
+    pub fn dip_excess(&self) -> &Histogram {
+        &self.dip_excess
+    }
+
+    /// Each connected client's pre-shot dips so far (`RenderFloor::dips`).
+    pub fn shot_dips(&self) -> Vec<(u16, shots::Dips)> {
+        self.by_client.values().filter_map(|&e| self.inputs[e as usize].lock().unwrap().claims.dips().map(|d| (e, d))).collect()
     }
 
     pub fn take_rewind(&mut self) -> [Histogram; 2] {
@@ -1934,6 +1954,12 @@ impl SimServer {
                 }
             }
             self.client_of[e as usize] = None;
+            // Did it spend the jitter allowance on stale shots?
+            if let Some(d) = self.inputs[e as usize].get_mut().unwrap().claims.dips().filter(|d| d.judged()) {
+                self.counters.dip_clients += 1;
+                self.counters.dip_flagged += d.flagged() as u64;
+                self.dip_excess.record((d.excess.max(0.0) * 10.0).round() as u32);
+            }
             let body = &mut self.bodies[e as usize];
             body.alive = false;
             if let Some(members) = self.squads.get_mut(&body.squad) {

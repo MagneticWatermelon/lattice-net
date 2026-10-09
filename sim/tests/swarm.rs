@@ -1662,6 +1662,51 @@ fn honest_fighters_on_bad_links_are_never_held_or_trimmed() {
 }
 
 #[test]
+fn spending_the_jitter_allowance_on_stale_shots_is_flagged() {
+    // On a bad link the render floor allows for jitter, so in any one claim
+    // a step of jitter and a step of lying look alike. Half these fighters
+    // cheat: each shot, and the input made just before it (which bounds the
+    // shot's view), claims to have drawn a step further back than it did.
+    // An honest client's dips into the allowance come from its link,
+    // whenever it shoots; the cheats' come right before shots.
+    use lattice_sim::bot::FightConfig;
+    use lattice_sim::shots::DIP_MIN_SHOTS;
+    let interest = InterestConfig { squad_size: 0, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Disk(40.0), interest, cone_of_fire: false, ..Default::default() };
+    let mut s = Swarm::with_config(18, cfg);
+    s.render = true;
+    (s.loss, s.delay, s.down_jitter) = (0.05, 0.2, 1);
+    for (i, (_, _, b)) in s.bots.iter_mut().enumerate() {
+        b.set_fight(Some(FightConfig { ads: false, ..FightConfig::default() }));
+        if i % 2 == 1 {
+            b.core_mut().claim_stale_shots(1.0);
+        }
+    }
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    let ents: Vec<u16> = s.bots.iter().map(|(_, _, b)| b.welcome().unwrap().entity).collect();
+    for &e in &ents {
+        s.server.set_invulnerable(e, true);
+    }
+    for _ in 0..25 * TICK_HZ {
+        s.step();
+    }
+    let dips = s.server.shot_dips();
+    let (mut honest, mut cheats) = (Vec::new(), Vec::new());
+    for (i, e) in ents.iter().enumerate() {
+        if let Some(&(_, d)) = dips.iter().find(|d| d.0 == *e).filter(|d| d.1.judged()) {
+            if i % 2 == 1 { &mut cheats } else { &mut honest }.push(d);
+        }
+    }
+    let show = |v: &[lattice_sim::shots::Dips]| v.iter().map(|d| format!("{:.2} ({:.1} se)", d.excess, d.z)).collect::<Vec<_>>();
+    eprintln!("pre-shot dip excess, steps: honest {:?}, cheats {:?}", show(&honest), show(&cheats));
+    assert!(honest.len() >= 6 && cheats.len() >= 6, "enough of each fired {DIP_MIN_SHOTS}+ shots");
+    assert!(honest.iter().all(|d| !d.flagged()), "no honest fighter flagged");
+    assert!(cheats.iter().all(|d| d.flagged()), "every cheat flagged");
+}
+
+#[test]
 fn sending_during_assembly_fights_the_same() {
     // The server hands each shard's datagrams over from the shard's own task
     // (`tick_sending`, lattice-server's default) instead of after the tick:

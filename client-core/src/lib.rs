@@ -265,6 +265,10 @@ pub struct ClientCore {
     /// Steps our inputs claim to have drawn further in the past than we did:
     /// a cheat's way to keep the server's render floor low (tests only).
     stale_inputs: f64,
+    /// Steps our shots, and the input made just before each, claim to have
+    /// drawn further back: a cheat spending the floor's jitter allowance
+    /// on stale shots only (tests only).
+    stale_shots: f64,
     /// The newest snapshot's own state and its step: the server's view of us.
     server_own: Option<(MoveState, u32)>,
     /// The server's step minus our input seq: each step consumes a seq, so
@@ -338,6 +342,7 @@ impl ClientCore {
             bloom: Bloom::default(),
             tracer_picks: Default::default(),
             stale_inputs: 0.0,
+            stale_shots: 0.0,
             own_offset: [0.0; 3],
             own_offset_at: None,
             sink: false,
@@ -838,6 +843,14 @@ impl ClientCore {
         self.stale_inputs = steps;
     }
 
+    /// Each shot, and the input made just before it, claims a render time
+    /// `steps` older than the real one: a cheat spending the render floor's
+    /// jitter allowance on stale shots, for tests.
+    #[doc(hidden)]
+    pub fn claim_stale_shots(&mut self, steps: f64) {
+        self.stale_shots = steps;
+    }
+
     /// `fire`, claiming a render time `back` steps older than the real one:
     /// the "backtrack" cheat, for testing that the server trims it.
     #[doc(hidden)]
@@ -851,6 +864,7 @@ impl ClientCore {
             return None;
         }
         let render = self.render_clock.render_at(now)?;
+        let back = back + self.stale_shots;
         self.pending_shot = Some((seq, Shot { frac, yaw, pitch, render: msg::render_units(render - back) }));
         self.last_shot = Some(time);
         // As the server will: the cone from the state before the shot's step
@@ -924,13 +938,17 @@ impl ClientCore {
         self.clock_at = Some(now);
         self.clock += self.rate * elapsed;
         self.bump_cooldown -= elapsed;
-        let render = self.render_clock.render_at(now).map(|r| msg::render_units(r - self.stale_inputs));
+        let render_step = self.render_clock.render_at(now);
         self.slew_mid_lag(now);
         let mut made = 0;
         while self.clock >= 1.0 && made < max {
             self.clock -= 1.0;
             let input = source(&self.state, &w);
             self.seq += 1;
+            // The input right before a pending shot (the cheats' hooks).
+            let before_shot = self.pending_shot.is_some_and(|(seq, _)| seq == self.seq + 1);
+            let stale = self.stale_inputs + if before_shot { self.stale_shots } else { 0.0 };
+            let render = render_step.map(|r| msg::render_units(r - stale));
             let applied = if self.is_dead() { dead_input(input) } else { input };
             self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied);
             // A shot fired during this step (a resync drops one it skips).

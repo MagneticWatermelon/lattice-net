@@ -815,6 +815,12 @@ Two more allowances came out of it: a copy (an input first arriving in a later m
 
 **What it doesn't stop:** a cheat that fakes a jittery link (its RTTs' range comes from acks it reports) gets up to 100 ms of slack before the floor applies, and one that sends its inputs in bursts can claim copies up to 3 steps older; both are still within the backtrack bound. Neither can swing between fresh and stale shot by shot.
 
+**Spending the jitter allowance on stale shots is flagged** (2026-10-09, from the same review). In any one claim a step of jitter and a step of lying look alike, but an honest client's dips into the allowance come from its link, whenever it shoots. So the floor keeps, per client, how far each claim dipped under the line it would have without the allowance: over all inputs, and over the inputs made right before shots (they bound how old a shot's view can be). A client is judged as it leaves, after at least 30 shots, and flagged when its pre-shot dips exceed its others' by over 0.3 steps and over 4 standard errors (its own dips' spread: a jittery link's noise).
+- **Counted:** `shot_dip_clients`, `shot_dip_flagged`, `shot_dip_excess_*` in the summary; `SimServer::shot_dips` for a connected client.
+- **Swarm** (`spending_the_jitter_allowance_on_stale_shots_is_flagged`): on the bad link, honest fighters' excess was -0.06 to +0.05 steps (within 2.7 standard errors), and fighters claiming a step staler in each shot and the input before it 0.57 to 0.71 (~18): all 9 cheats flagged, no honest fighter, in three runs.
+- **WSL, real binaries:** 2,020 honest clients judged (uniform 5k firing, 1k blob fighting), none flagged.
+- It flags, nothing more: there's no reporting of suspicious players yet.
+
 ### Sending during assembly (2026-10-08)
 
 **From a review:** egress waited for every shard's assembly, then sent the tick's ~12–14 MB (10k) in ~4 ms: ~25–28 Gbps for that moment, the burst AWS queued at the server's 25 Gbps allowance (11–14% of packets).

@@ -1177,6 +1177,8 @@ fn summary_values(
         ("rewinds_trimmed", c.rewinds_trimmed),
         ("rewinds_trimmed_mid", c.rewinds_trimmed_mid),
         ("renders_held", c.renders_held),
+        ("shot_dip_clients", c.dip_clients),
+        ("shot_dip_flagged", c.dip_flagged),
         ("hits_head", c.hits_head),
         ("hits_body", c.hits_body),
         ("hits_ground", c.hits_ground),
@@ -1200,6 +1202,10 @@ fn summary_values(
     kv.put("trim_excess_p50_steps", format!("{:.1}", te.quantile(0.5) as f64 / 10.0));
     kv.put("trim_excess_p99_steps", format!("{:.1}", te.quantile(0.99) as f64 / 10.0));
     kv.put("trim_excess_max_steps", format!("{:.1}", te.summary().max as f64 / 10.0));
+    let de = sim.dip_excess();
+    kv.put("shot_dip_excess_p50_steps", format!("{:.1}", de.quantile(0.5) as f64 / 10.0));
+    kv.put("shot_dip_excess_p99_steps", format!("{:.1}", de.quantile(0.99) as f64 / 10.0));
+    kv.put("shot_dip_excess_max_steps", format!("{:.1}", de.summary().max as f64 / 10.0));
     let hb = sim.held_by();
     kv.put("held_by_p50_steps", format!("{:.1}", hb.quantile(0.5) as f64 / 10.0));
     kv.put("held_by_p99_steps", format!("{:.1}", hb.quantile(0.99) as f64 / 10.0));
