@@ -193,14 +193,14 @@ However the game ends, it disconnects at once (so the server's session log close
 
 | file | what's in it |
 |---|---|
-| `net.rs` | `Session`: UDP socket + transport + client core, polled and flushed each frame. No Bevy; tested against an in-process `SimServer` over loopback. |
-| `coords.rs` | Game (x, y, z up) → Bevy (x, z, −y); yaw/pitch encodings; movement stick from WASD and view yaw. |
+| `net.rs` | `Session` (UDP socket + transport + client core, polled and flushed each frame) from `client-ffi`, shared with the Unity plugin and tested there against an in-process `SimServer`. |
+| `coords.rs` | Game (x, y, z up) → Bevy (x, z, −y). The input encoding (yaw/pitch, the movement stick) is `client-core`'s `aim`. |
 | `terrain.rs` | 64 × 64 chunks of 128 m: every 4 m sample within ~1 km of the camera, every 32 m beyond, skirts on every edge. Vertex colors by height and slope, ±8% noise per sample. |
 | `scene.rs` | The world on Welcome (terrain, cover, rocks, sun), terrain streaming, players (a root at the feet: capsule, or soldier when near) and ghosts. |
 | `models.rs` | The models: loading, cover fitted to its boxes, rocks, soldiers (spawn, tint, animation, rifle in hand, its kick and flash), the first-person rifle. |
 | `gun.rs` | Aiming down sights, recoil, the first-person rifle's motion and flash, the reticle. |
 | `../tools/import-assets` | Meshy's output → `assets/models` (see Models). |
-| `controls.rs` | Mouse look, the frame's input to `tick_inputs`, cameras, toggles, autoplay. |
+| `controls.rs` | Mouse look, the frame's input to `tick_inputs`, cameras, toggles, autoplay; draws the tracers `client-core`'s `tracers` flies. |
 | `hud.rs` | The net graph, the crosshair and the help line. |
 
 ## Measured (2026-10-05)

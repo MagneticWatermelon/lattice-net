@@ -16,10 +16,12 @@
 //!   as a lag behind near), so the server knows what the player saw: lag
 //!   compensation rewinds each target by its own tier's delay.
 
+pub mod aim;
 pub mod clock;
 pub mod distant;
 pub mod entities;
 pub mod invite;
+pub mod tracers;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -978,6 +980,12 @@ impl ClientCore {
     /// Own health from the newest snapshot.
     pub fn health(&self) -> u8 {
         self.health
+    }
+
+    /// The life counter in the newest snapshot: it changes with every death
+    /// and respawn (a respawn moves us without a correction).
+    pub fn life(&self) -> u8 {
+        self.last_life
     }
 
     /// Dead: waiting to respawn, inputs move nothing.

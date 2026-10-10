@@ -75,6 +75,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-client-ffi"
+version = "0.1.0"
+dependencies = [
+ "lattice-client-core",
+ "lattice-game",
+ "lattice-net",
+ "lattice-sim",
+]
+
+[[package]]
 name = "lattice-game"
 version = "0.1.0"
 dependencies = [

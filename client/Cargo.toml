@@ -13,6 +13,8 @@ publish = false
 lattice-net = { path = ".." }
 lattice-game = { path = "../game" }
 lattice-client-core = { path = "../client-core" }
+# The connection (Session), shared with the Unity plugin.
+lattice-ffi = { package = "lattice-client-ffi", path = "../client-ffi" }
 # No audio, gamepads or Wayland: on Linux they need ALSA, libudev and Wayland
 # headers (WSLg serves X11 too), and the client has no use for them yet.
 bevy = { version = "0.19.1", default-features = false, features = [

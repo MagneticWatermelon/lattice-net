@@ -408,7 +408,7 @@ fn report_on_exit(mut exits: MessageReader<AppExit>, frame: Res<Frame>, mut net:
     let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let who = if player.name.is_empty() { format!("user {}", player.user) } else { format!("{} (user {})", player.name, player.user) };
     // Before disconnecting: the transport's numbers go with the connection.
-    let text = format!("== {} | {who} on {} | played {:.0} s ==\n{}\n", utc(unix), player.server, frame.secs, summary(&net.0, &times));
+    let text = format!("== {} | {who} on {} | played {:.0} s ==\n{}\n", net::utc(unix), player.server, frame.secs, summary(&net.0, &times));
     if net.0.state() == lattice_net::ClientState::Connected {
         net.0.disconnect(frame.now);
     }
@@ -418,80 +418,13 @@ fn report_on_exit(mut exits: MessageReader<AppExit>, frame: Res<Frame>, mut net:
     }
 }
 
-/// `YYYY-MM-DD HH:MM:SS UTC` for unix seconds (Howard Hinnant's
-/// civil_from_days; no time zone data).
-fn utc(unix: u64) -> String {
-    let (days, secs) = ((unix / 86_400) as i64, unix % 86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
-    let y = yoe + era * 400 + (m <= 2) as i64;
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", secs / 3600, secs / 60 % 60, secs % 60)
-}
-
 fn summary(s: &Session, times: &FrameTimes) -> String {
     use std::fmt::Write;
-    let st = &s.core.stats;
     let mut all = times.all.clone();
     all.sort_by(f32::total_cmp);
     let at = |p: f32| all.get(((all.len() as f32 * p) as usize).min(all.len().saturating_sub(1))).copied().unwrap_or(0.0);
     let mut out = String::from("== client summary ==\n");
     let _ = writeln!(out, "  frames {} | frame time p50 {:.1} p99 {:.1} max {:.1} ms", all.len(), at(0.5), at(0.99), at(1.0));
-    if let Some(t) = s.transport().stats() {
-        let _ = writeln!(
-            out,
-            "  rtt {:.1} ms (last seconds {:.1}-{:.1}) | loss {:.2}% | packets sent {} received {} lost {}",
-            t.rtt_ms,
-            t.rtt_min_ms,
-            t.rtt_max_ms,
-            t.loss * 100.0,
-            t.packets_sent,
-            t.packets_received,
-            t.packets_lost
-        );
-    }
-    let _ = writeln!(
-        out,
-        "  snapshots {} | corrections {} (largest {:.3} m) | push corrections {} | resyncs {} | own correction offset largest {:.3} m | shots {} | deaths/respawns {}",
-        st.snapshots, st.corrections, st.correction_error_max, st.push_corrections, st.resyncs, st.own_offset_max, st.shots, st.life_events
-    );
-    if let Some(e) = s.core.entities() {
-        for (t, name) in ["near", "mid", "far"].iter().enumerate() {
-            let f = e.smooth.frames[t];
-            let n = f.iter().sum::<u64>().max(1) as f64;
-            let _ = writeln!(
-                out,
-                "  {name}: {} entity-frames, {:.2}% interpolated, {:.2}% extrapolated, {:.2}% held, {:.2}% new",
-                f.iter().sum::<u64>(),
-                100.0 * f[0] as f64 / n,
-                100.0 * f[1] as f64 / n,
-                100.0 * f[2] as f64 / n,
-                100.0 * f[3] as f64 / n
-            );
-        }
-    }
-    let _ = writeln!(
-        out,
-        "  hits confirmed {} (kills {}) | hit {} times for {} damage | kills heard {} | others' shots seen {} | distant fights: {} cells, {} shots, {} ambient",
-        st.hits_confirmed, st.kills_confirmed, st.hurts, st.damage_taken, st.kills_heard, st.shots_seen, st.activity_cells, st.activity_shots, st.ambient
-    );
-    let delay = st.render_delay_sum / st.render_frames.max(1) as f64 * 1000.0 / 30.0;
-    let mid = s.core.entities().map_or(0.0, |e| e.mid_lag()) * 1000.0 / 30.0;
-    let _ = writeln!(out, "  render delay near {delay:.1} ms, mid/far +{mid:.0} ms, clock snaps {}", s.core.render_clock().snaps);
+    out.push_str(&s.summary());
     out
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn utc_dates() {
-        assert_eq!(super::utc(0), "1970-01-01 00:00:00 UTC");
-        assert_eq!(super::utc(951_782_400), "2000-02-29 00:00:00 UTC");
-        assert_eq!(super::utc(1_791_552_658), "2026-10-09 13:30:58 UTC");
-        assert_eq!(super::utc(4_102_444_800), "2100-01-01 00:00:00 UTC");
-    }
 }

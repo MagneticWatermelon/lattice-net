@@ -6,8 +6,8 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+use lattice_client_core::tracers::Kind;
 use lattice_game::movement::{Input, BUTTON_ADS, BUTTON_JUMP, BUTTON_SPRINT};
-use lattice_game::weapon::{aim, Flight, RANGE_STEPS, SUBSTEPS};
 
 use crate::coords::{look_rotation, pitch_i16, stick, to_bevy, yaw_u16};
 use crate::{Frame, Net, Settings};
@@ -135,121 +135,27 @@ pub fn toggles(
 #[derive(Default, Reflect, GizmoConfigGroup)]
 pub struct TracerGizmos;
 
-/// Tracer lines' width, in pixels, and how much of the path behind a
-/// projectile shows (a fading trail), in meters.
+/// Tracer lines' width, in pixels.
 pub const TRACER_WIDTH: f32 = 4.0;
-const TRAIL: f32 = 20.0;
-/// Our tracers leave from a muzzle below and right of the eye, aimed to
-/// converge on the line of sight this far out (from the eye itself they'd
-/// be a dot under the crosshair).
-const CONVERGE: f32 = 120.0;
+/// Others' tracers leave from the shooter's drawn eye (no offset), as before
+/// the bookkeeping moved to client-core.
+const OTHERS_MUZZLE: [f32; 3] = [0.0; 3];
 
 pub fn setup_tracer_gizmos(mut store: ResMut<GizmoConfigStore>) {
     let (cfg, _) = store.config_mut::<TracerGizmos>();
     cfg.line.width = TRACER_WIDTH;
 }
 
-/// One tracer: its flight, where it started, seconds flown and not yet
-/// flown, and, for one of our own shots, how to re-aim it.
-pub struct Tracer {
-    flight: Flight,
-    start: [f32; 3],
-    age: f32,
-    owed: f32,
-    ours: bool,
-    own: Option<OwnShot>,
+/// Where our tracers leave from, from the eye (right, up, forward): low right
+/// from the hip, under the eye down the sights (`hip` 1 to 0).
+pub fn own_muzzle(hip: f32) -> [f32; 3] {
+    [0.25 * hip, -(0.12 + 0.08 * hip), 0.6]
 }
 
-/// One of our shots: when it fired (the server's step) and the view it left
-/// from. Its tracer leaves along a pick of our own in the cone of fire (the
-/// server's is secret) until the server says where the shot really went.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OwnShot {
-    step: f64,
-    eye: [f32; 3],
-    yaw: f32,
-    hip: f32,
-    /// Re-aimed along the real shot already.
-    real: bool,
-}
-
-/// Seconds per flight segment.
-const SEG: f32 = 1.0 / (SUBSTEPS * 30) as f32;
-
-/// Whether a segment from `a` to `b` hits the ground or cover.
-fn segment_hits(world: &lattice_game::world::World, a: [f32; 3], b: [f32; 3]) -> bool {
-    let mut hit = lattice_game::hit::terrain(world, a, b).is_some();
-    let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
-    world.boxes_near(mid[0], mid[1], 6.0, |c| {
-        hit |= lattice_game::hit::aabb(a, b, [c.min[0], c.min[1], c.bottom], [c.max[0], c.max[1], c.top]).is_some();
-    });
-    hit
-}
-
-impl Tracer {
-    pub fn new(origin: [f32; 3], dir: [f32; 3]) -> Self {
-        Self { flight: Flight::new(origin, dir), start: origin, age: 0.0, owed: 0.0, ours: false, own: None }
-    }
-
-    /// Ours: from the muzzle (low right from the hip, under the eye down the
-    /// sights: `hip` 1 to 0), converging on what the eye at `eye` aims at
-    /// along `aim_dir` (a direction in the cone of fire). `step`: when it
-    /// fired, in the server's steps, to re-aim it along the real shot.
-    pub fn ours(eye: [f32; 3], yaw: f32, aim_dir: [f32; 3], hip: f32, step: Option<f64>) -> Self {
-        let (s, c) = yaw.sin_cos();
-        let right = [s, -c, 0.0];
-        let down = 0.12 + 0.08 * hip;
-        let muzzle = [0, 1, 2].map(|k| eye[k] + right[k] * 0.25 * hip + aim_dir[k] * 0.6 - if k == 2 { down } else { 0.0 });
-        let target = [0, 1, 2].map(|k| eye[k] + aim_dir[k] * CONVERGE);
-        let d = [0, 1, 2].map(|k| target[k] - muzzle[k]);
-        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let own = step.map(|step| OwnShot { step, eye, yaw, hip, real: false });
-        Self { ours: true, own, ..Self::new(muzzle, d.map(|v| v / len)) }
-    }
-}
-
-/// Cosmetic tracers (ours and others'), flown with the server's kinematics.
+/// Cosmetic tracers (ours and others'), flown with the server's kinematics
+/// by `lattice_client_core::tracers`, which decides what to draw and when.
 #[derive(Resource, Default)]
-pub struct Tracers {
-    pub flying: Vec<Tracer>,
-    /// Others' shots waiting for their shooter to be drawn firing:
-    /// (shot, when it arrived).
-    pub pending: Vec<(lattice_game::events::SeenShot, f32)>,
-    /// Our own shots as the server says they went, to re-aim their tracers.
-    pub real: Vec<lattice_game::events::SeenShot>,
-}
-
-impl Tracers {
-    /// Our shot `shot` really went along its direction: re-aim its tracer,
-    /// still in flight, from the same muzzle and as far along, so it lands
-    /// where the shot did; if the real path already hit something by then,
-    /// it ends. One that already landed (close in, before the server's word
-    /// came, about a round trip) keeps its own path.
-    pub fn correct(&mut self, shot: &lattice_game::events::SeenShot, world: &lattice_game::world::World) {
-        let close = |t: &&mut Tracer| t.own.is_some_and(|o| !o.real && (o.step - shot.step).abs() < 0.5);
-        let Some((i, t)) = self.flying.iter_mut().enumerate().filter(|(_, t)| close(t)).min_by(|a, b| {
-            let d = |t: &Tracer| t.own.map_or(f64::MAX, |o| (o.step - shot.step).abs());
-            d(a.1).total_cmp(&d(b.1))
-        }) else {
-            return;
-        };
-        let o = t.own.expect("matched an own shot");
-        let mut real = Tracer::ours(o.eye, o.yaw, aim(shot.yaw, shot.pitch), o.hip, Some(o.step));
-        let mut flown = 0.0;
-        while flown + SEG <= t.age + 1e-6 {
-            let next = real.flight.advance();
-            if segment_hits(world, real.flight.pos, next.pos) {
-                self.flying.swap_remove(i);
-                return;
-            }
-            real.flight = next;
-            flown += SEG;
-        }
-        (real.age, real.owed) = (t.age, t.owed);
-        real.own = Some(OwnShot { real: true, ..o });
-        *t = real;
-    }
-}
+pub struct Tracers(pub lattice_client_core::tracers::Tracers);
 
 /// Mouse look, then this frame's input (and shot) to the input clock.
 #[allow(clippy::too_many_arguments)]
@@ -323,7 +229,8 @@ pub fn play(
         if let Some(dir) = net.0.core.fire(frame.now, yaw, pitch, gun.ads) {
             let f = view.feet;
             let step = net.0.core.last_shot_step();
-            tracers.flying.push(Tracer::ours([f[0], f[1], f[2] + EYE], view.yaw, dir, 1.0 - gun.blend, step));
+            let faction = net.0.core.welcome().map_or(0, |w| lattice_game::faction::faction(w.entity));
+            tracers.0.fire_own([f[0], f[1], f[2] + EYE], view.yaw, view.pitch, dir, own_muzzle(1.0 - gun.blend), step, faction);
             gun.shot(view, frame.secs);
             fire_times.0.insert(crate::scene::OWN, frame.secs);
         }
@@ -354,50 +261,21 @@ pub fn tracers(
     let Some(w) = net.0.core.welcome() else { return };
     let world = lattice_game::world::World::shared(w.world_seed);
     let core = &net.0.core;
-    if let (Some(r), Some(ents)) = (core.render_clock().last_render(), core.entities()) {
-        let tracers = &mut *tracers;
-        tracers.pending.retain(|(shot, at)| {
-            match ents.render_one(shot.shooter, r) {
-                Some(st) if st.at >= shot.step => {
-                    let o = [st.pos[0], st.pos[1], st.pos[2] + EYE];
-                    tracers.flying.push(Tracer::new(o, aim(shot.yaw, shot.pitch)));
-                    // Its rifle kicks and flashes as it's drawn firing.
-                    fire_times.0.insert(shot.shooter, frame.secs);
-                    false
-                }
-                // Not drawn (yet): wait up to a second.
-                _ => frame.secs - *at < 1.0,
-            }
-        });
-    }
-    // Our shots as they really went: their tracers follow.
-    for shot in std::mem::take(&mut tracers.real) {
-        tracers.correct(&shot, &world);
-    }
-    let range = RANGE_STEPS as f32 / 30.0;
-    tracers.flying.retain_mut(|t| {
-        let Tracer { flight: f, start, age, owed, ours, .. } = t;
-        *owed += frame.dt;
-        while *owed >= SEG {
-            let next = f.advance();
-            let hit = segment_hits(&world, f.pos, next.pos);
-            *owed -= SEG;
-            *age += SEG;
-            if hit || *age > range {
-                return false;
-            }
-            *f = next;
+    // Others' shots start as their shooters are drawn firing (their rifles
+    // kick and flash then); ours re-aim along the server's word.
+    let secs = frame.secs;
+    tracers.0.update(core.entities(), core.render_clock().last_render(), secs, &world, OTHERS_MUZZLE, |f| {
+        if let Some(shooter) = f.shooter {
+            fire_times.0.insert(shooter, secs);
         }
-        // A trail behind the head, no longer than the path flown, fading out.
-        let p = f.pos;
-        let flown = ((p[0] - start[0]).powi(2) + (p[1] - start[1]).powi(2) + (p[2] - start[2]).powi(2)).sqrt();
-        let speed = (f.vel[0] * f.vel[0] + f.vel[1] * f.vel[1] + f.vel[2] * f.vel[2]).sqrt().max(1.0);
-        let back = TRAIL.min(flown) / speed;
-        let tail = [p[0] - f.vel[0] * back, p[1] - f.vel[1] * back, p[2] - f.vel[2] * back];
-        let head = if *ours { Color::srgb(1.0, 0.95, 0.55) } else { Color::srgb(1.0, 0.55, 0.15) };
-        gizmos.line_gradient(to_bevy(tail[0], tail[1], tail[2]), to_bevy(p[0], p[1], p[2]), head.with_alpha(0.0), head);
-        true
     });
+    tracers.0.fly(frame.dt, &world, |_, _| {});
+    // A trail behind each head, no longer than the path flown, fading out.
+    for t in &tracers.0.flying {
+        let (tail, p) = t.streak();
+        let head = if t.kind == Kind::Own { Color::srgb(1.0, 0.95, 0.55) } else { Color::srgb(1.0, 0.55, 0.15) };
+        gizmos.line_gradient(to_bevy(tail[0], tail[1], tail[2]), to_bevy(p[0], p[1], p[2]), head.with_alpha(0.0), head);
+    }
 }
 
 /// The first-person rifle.
@@ -464,63 +342,5 @@ impl View {
         self.eye = eye;
         self.spec_placed = true;
         (self.spec_yaw, self.spec_pitch) = (yaw, pitch);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lattice_game::events::SeenShot;
-    use lattice_game::weapon::angles;
-
-    /// One of our tracers 40 m above the ground at (2000, 2000), fired
-    /// east at step 100 and flown `segments` segments.
-    fn flying(world: &lattice_game::world::World, segments: u32) -> Tracers {
-        let eye = [2000.0, 2000.0, world.terrain(2000.0, 2000.0) + 40.0];
-        let mut t = Tracer::ours(eye, 0.0, aim(0, 0), 1.0, Some(100.0));
-        for _ in 0..segments {
-            t.flight = t.flight.advance();
-        }
-        t.age = segments as f32 * SEG;
-        Tracers { flying: vec![t], ..Default::default() }
-    }
-
-    fn shot(step: f64, dir: [f32; 3]) -> SeenShot {
-        let (yaw, pitch) = angles(dir);
-        SeenShot { shooter: 7, step, yaw, pitch }
-    }
-
-    #[test]
-    fn our_tracer_follows_the_real_shot() {
-        let world = lattice_game::world::World::shared(1);
-        let real = aim(300, 120); // ~1.6 degrees right and ~0.3 up of the aim
-        let mut tracers = flying(&world, 6);
-        // Another shot's word (3 steps later) leaves it alone.
-        tracers.correct(&shot(103.0, real), &world);
-        assert!(tracers.flying[0].own.is_some_and(|o| !o.real));
-        tracers.correct(&shot(100.0, real), &world);
-        let t = &tracers.flying[0];
-        assert!(t.own.is_some_and(|o| o.real), "re-aimed");
-        // Exactly where the real shot's tracer is after as many segments.
-        let mut want = Tracer::ours(t.own.unwrap().eye, 0.0, aim(shot(0.0, real).yaw, shot(0.0, real).pitch), 1.0, None);
-        for _ in 0..6 {
-            want.flight = want.flight.advance();
-        }
-        assert_eq!(t.flight, want.flight);
-        assert_eq!(t.age, 6.0 * SEG);
-        // A second word for the same shot changes nothing.
-        let before = t.flight;
-        tracers.correct(&shot(100.0, aim(0, -200)), &world);
-        assert_eq!(tracers.flying[0].flight, before);
-    }
-
-    #[test]
-    fn a_real_shot_that_already_landed_ends_its_tracer() {
-        let world = lattice_game::world::World::shared(1);
-        // Flown 30 segments (300 m): straight down, the real shot hit the
-        // ground 40 m below long before.
-        let mut tracers = flying(&world, 30);
-        tracers.correct(&shot(100.0, aim(0, -32000)), &world);
-        assert!(tracers.flying.is_empty());
     }
 }

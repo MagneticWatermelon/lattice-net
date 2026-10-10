@@ -1,0 +1,19 @@
+[package]
+name = "lattice-client-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "The client stack as a native plugin: a C ABI (lt_*) over a Session (UDP socket + transport + ClientCore), for the Unity client, with generated C# bindings (gen-cs). Also an rlib, so the Bevy client shares its Session."
+license = "MIT"
+publish = false
+
+[lib]
+name = "lattice_client"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lattice-net = { path = ".." }
+lattice-game = { path = "../game" }
+lattice-client-core = { path = "../client-core" }
+
+[dev-dependencies]
+lattice-sim = { path = "../sim" }

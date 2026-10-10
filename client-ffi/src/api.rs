@@ -1,0 +1,533 @@
+//! The C API: `lt_*` functions over a `Handle` (an `LtSession*` to the
+//! caller) and a shared `World` (an `LtWorld*`). Declared through `ffi_fns!`,
+//! which also records each signature (`FNS`) for the C# generator.
+//!
+//! **The rules for callers:**
+//! - One thread at a time per session (pump mode: the engine's main thread).
+//! - Buffers belong to the caller: functions fill `out` arrays of `cap`
+//!   items and return how many there are (which can be more than `cap`: grow
+//!   the buffer). Nothing they return points into the plugin.
+//! - Strings are NUL-terminated UTF-8.
+//! - Nothing panics across the boundary: a panic inside a call is caught,
+//!   its message kept for `lt_last_error`, and a session it happened in is
+//!   closed (its calls do nothing and its state reads `LT_STATE_ERROR`).
+//!
+//! A frame, in order (GDD §13): `lt_begin_frame`, `lt_poll`; then `lt_fire`
+//! (if the trigger is held) and `lt_inputs`; then `lt_own`, `lt_render` and
+//! `lt_combat`, with the drains (`lt_events`, `lt_fx`, `lt_tracers`); last,
+//! `lt_flush`.
+
+#![allow(clippy::missing_safety_doc)]
+
+use std::cell::RefCell;
+use std::ffi::CStr;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use lattice_client_core::invite::Invite;
+use lattice_client_core::tracers::segment_hit;
+use lattice_client_core::ClientConfig;
+use lattice_game::world::{World, TERRAIN_N, TERRAIN_RES};
+
+use crate::abi::*;
+use crate::handle::{Handle, Player};
+use crate::session::dev_token;
+
+/// The API's version: bump it with any change a caller must follow.
+pub const VERSION: u32 = 1;
+
+/// A function's signature, as the C# generator sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct FnInfo {
+    pub name: &'static str,
+    pub doc: &'static str,
+    pub args: &'static [(&'static str, &'static str)],
+    pub ret: &'static str,
+}
+
+/// An open session (opaque to callers).
+pub struct LtSession {
+    handle: Option<Handle>,
+}
+
+/// A world, shared (opaque to callers).
+pub struct LtWorld {
+    world: Arc<World>,
+}
+
+thread_local! {
+    static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn set_error(msg: impl Into<String>) {
+    LAST_ERROR.with(|e| *e.borrow_mut() = msg.into());
+}
+
+#[cfg(test)]
+pub(crate) fn tests_set_error(msg: &str) {
+    set_error(msg);
+}
+
+/// What a call returns when it can't run (a panic, a null session).
+pub trait Fallback {
+    fn fallback() -> Self;
+}
+
+macro_rules! fallback {
+    ($($t:ty = $v:expr),*) => { $(impl Fallback for $t { fn fallback() -> Self { $v } })* };
+}
+fallback!(() = (), u8 = 0, u16 = 0, u32 = 0, u64 = 0, i32 = -1, f32 = 0.0, f64 = 0.0);
+
+impl<T> Fallback for *mut T {
+    fn fallback() -> Self {
+        std::ptr::null_mut()
+    }
+}
+
+fn panic_text(e: &(dyn std::any::Any + Send)) -> String {
+    e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_else(|| "a panic".into())
+}
+
+/// Runs a call, catching any panic.
+fn guard<R: Fallback>(name: &str, f: impl FnOnce() -> R) -> R {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(e) => {
+            set_error(format!("{name}: {}", panic_text(&*e)));
+            R::fallback()
+        }
+    }
+}
+
+/// Runs a call on an open session; a panic closes it.
+unsafe fn with<R: Fallback>(s: *mut LtSession, f: impl FnOnce(&mut Handle) -> R) -> R {
+    let Some(s) = s.as_mut() else {
+        set_error("null session");
+        return R::fallback();
+    };
+    let Some(h) = s.handle.as_mut() else {
+        return R::fallback();
+    };
+    match catch_unwind(AssertUnwindSafe(|| f(h))) {
+        Ok(r) => r,
+        Err(e) => {
+            set_error(format!("session closed after a panic: {}", panic_text(&*e)));
+            s.handle = None;
+            R::fallback()
+        }
+    }
+}
+
+unsafe fn world<'a>(w: *const LtWorld) -> Option<&'a World> {
+    w.as_ref().map(|w| &*w.world)
+}
+
+unsafe fn text<'a>(p: *const u8) -> Result<&'a str, String> {
+    if p.is_null() {
+        return Err("null string".into());
+    }
+    CStr::from_ptr(p.cast()).to_str().map_err(|e| format!("not UTF-8: {e}"))
+}
+
+/// Copies `s` into `buf` (`cap` bytes, NUL-terminated, cut at a character
+/// boundary); returns the bytes it needs, without the NUL.
+unsafe fn put_text(s: &str, buf: *mut u8, cap: i32) -> i32 {
+    if !buf.is_null() && cap > 0 {
+        let mut n = s.len().min(cap as usize - 1);
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
+        std::ptr::copy_nonoverlapping(s.as_ptr(), buf, n);
+        *buf.add(n) = 0;
+    }
+    s.len() as i32
+}
+
+unsafe fn slice<'a, T>(out: *mut T, cap: i32) -> &'a mut [T] {
+    if out.is_null() || cap <= 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(out, cap as usize)
+    }
+}
+
+fn config(cfg: Option<&LtConfig>) -> ClientConfig {
+    let mut c = ClientConfig::default();
+    if let Some(cfg) = cfg {
+        let ms = |v: f32| (v > 0.0 && v.is_finite()).then(|| Duration::from_secs_f64(v as f64 / 1000.0));
+        if let Some(d) = ms(cfg.near_delay_ms) {
+            c.near_delay = d;
+        }
+        if let Some(d) = ms(cfg.near_delay_max_ms) {
+            c.near_delay_max = d;
+        }
+        if let Some(d) = ms(cfg.mid_delay_ms) {
+            c.mid_delay = d;
+        }
+    }
+    c
+}
+
+fn resolve(addr: &str) -> Result<SocketAddr, String> {
+    addr.to_socket_addrs().map_err(|e| format!("{addr}: {e}"))?.next().ok_or_else(|| format!("{addr}: no address"))
+}
+
+fn open(h: std::io::Result<Handle>) -> *mut LtSession {
+    match h {
+        Ok(h) => Box::into_raw(Box::new(LtSession { handle: Some(h) })),
+        Err(e) => {
+            set_error(format!("socket: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+macro_rules! ffi_fns {
+    ($( $(#[doc = $doc:literal])* fn $name:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> $ret:ty $body:block )*) => {
+        $(
+            $(#[doc = $doc])*
+            #[no_mangle]
+            #[allow(clippy::unused_unit)]
+            pub unsafe extern "C" fn $name($($arg: $ty),*) -> $ret {
+                guard(stringify!($name), move || -> $ret { $body })
+            }
+        )*
+        /// Every exported function's signature, in declaration order.
+        pub const FNS: &[FnInfo] = &[ $( FnInfo {
+            name: stringify!($name),
+            doc: concat!($($doc, "\n"),*),
+            args: &[$((stringify!($arg), stringify!($ty))),*],
+            ret: stringify!($ret),
+        } ),* ];
+    };
+}
+
+ffi_fns! {
+    /// The API's version (`VERSION`): the C# side checks it, and the layout
+    /// hash, when it loads the plugin.
+    fn lt_version() -> u32 {
+        VERSION
+    }
+
+    /// A hash of every exported struct's layout and function's signature.
+    fn lt_layout_hash() -> u64 {
+        layout_hash(FNS)
+    }
+
+    /// The last error on this thread (a failed connect, a caught panic):
+    /// copied into `buf`; returns its length in bytes.
+    fn lt_last_error(buf: *mut u8, cap: i32) -> i32 {
+        LAST_ERROR.with(|e| put_text(&e.borrow(), buf, cap))
+    }
+
+    /// Connects to `addr` ("host:port") with a dev connect token for `user`,
+    /// minted with the server's `--token-key` (`key_hex`: 64 hex digits, or
+    /// null for the public dev key) and `--server-id`. `cfg` may be null.
+    /// Null on failure (`lt_last_error`).
+    fn lt_connect_dev(addr: *const u8, user: u64, key_hex: *const u8, server_id: u64, cfg: *const LtConfig) -> *mut LtSession {
+        let run = || -> Result<*mut LtSession, String> {
+            let addr_text = text(addr)?;
+            let server = resolve(addr_text)?;
+            let mut key = lattice_net::token::DEV_TOKEN_KEY;
+            if !key_hex.is_null() {
+                let hex = text(key_hex)?;
+                if hex.len() != 64 {
+                    return Err("token key: expected 64 hex digits".into());
+                }
+                for (i, k) in key.iter_mut().enumerate() {
+                    *k = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|e| format!("token key: {e}"))?;
+                }
+            }
+            let token = dev_token(&key, server_id, user);
+            let player = Player { server: addr_text.to_string(), user, name: String::new() };
+            Ok(open(Handle::connect(server, token, config(cfg.as_ref()), player)))
+        };
+        run().unwrap_or_else(|e| {
+            set_error(e);
+            std::ptr::null_mut()
+        })
+    }
+
+    /// Connects with a playtest invite (`lattice-invite`): the server, who we
+    /// are, and the next of its connect tokens (each connects once; the
+    /// invite's `.used` file beside it counts them). Null on failure.
+    fn lt_connect_invite(path: *const u8, cfg: *const LtConfig) -> *mut LtSession {
+        let run = || -> Result<*mut LtSession, String> {
+            let path = text(path)?;
+            let invite = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}")).and_then(|t| Invite::parse(&t))?;
+            let server = resolve(&invite.server)?;
+            let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let token = match invite.next_token(std::path::Path::new(path), unix) {
+                Ok(Some((_, t))) => t,
+                Ok(None) => return Err("no tokens left in the invite (each connects once, and they expire)".into()),
+                Err(e) => return Err(format!("counting the invite's used tokens: {e}")),
+            };
+            let player = Player { server: invite.server.clone(), user: invite.user, name: invite.name.clone() };
+            Ok(open(Handle::connect(server, token, config(cfg.as_ref()), player)))
+        };
+        run().unwrap_or_else(|e| {
+            set_error(e);
+            std::ptr::null_mut()
+        })
+    }
+
+    /// Disconnects (the server hears at once) and frees the session.
+    fn lt_close(s: *mut LtSession) -> () {
+        if !s.is_null() {
+            let mut s = Box::from_raw(s);
+            if let Some(h) = s.handle.as_mut() {
+                h.close();
+            }
+        }
+    }
+
+    /// Starts a frame: reads the plugin's clock once; every call until the
+    /// next frame uses it. Returns seconds since connecting.
+    fn lt_begin_frame(s: *mut LtSession) -> f64 {
+        with(s, |h| h.begin_frame(Instant::now()))
+    }
+
+    /// Starts a frame `secs` after connecting (for tests that drive time).
+    fn lt_begin_frame_at(s: *mut LtSession, secs: f64) -> f64 {
+        with(s, |h| h.begin_frame_at(secs))
+    }
+
+    /// Receives and delivers everything that arrived; returns the state
+    /// (`LT_STATE_*`).
+    fn lt_poll(s: *mut LtSession) -> i32 {
+        with(s, |h| match h.poll() {
+            Ok(state) => state,
+            Err(e) => {
+                set_error(format!("receive: {e}"));
+                h.state()
+            }
+        })
+    }
+
+    /// The connection's state (`LT_STATE_*`).
+    fn lt_state(s: *mut LtSession) -> i32 {
+        with(s, |h| h.state())
+    }
+
+    /// Pulls the trigger. Returns 1 if a shot fired (the rifle was ready, we
+    /// are alive), with its direction and tracer origin in `out` (may be
+    /// null); its tracer flies at once. Call before `lt_inputs`: the shot
+    /// rides this frame's input.
+    fn lt_fire(s: *mut LtSession, fire: *const LtFire, out: *mut LtShot) -> i32 {
+        let Some(f) = fire.as_ref() else { return 0 };
+        with(s, |h| match h.fire(f) {
+            Some(shot) => {
+                if let Some(o) = out.as_mut() {
+                    *o = shot;
+                }
+                1
+            }
+            None => 0,
+        })
+    }
+
+    /// This frame's intent to the input clock: inputs (with any shot) go out
+    /// at the server's pace.
+    fn lt_inputs(s: *mut LtSession, intent: *const LtIntent) -> () {
+        if let Some(i) = intent.as_ref() {
+            with(s, |h| h.inputs(i))
+        }
+    }
+
+    /// Our own player: where to draw it, its vitals, the server ghost and
+    /// the reticle's cone (`ads`: down the sights).
+    fn lt_own(s: *mut LtSession, ads: u8, out: *mut LtOwn) -> () {
+        if let Some(o) = out.as_mut() {
+            *o = with(s, |h| Wrapped(h.own(ads != 0))).0;
+        }
+    }
+
+    /// Draws every other player at this frame's render step: fills `out` (up
+    /// to `cap`) and returns how many there are. Exactly once per frame.
+    fn lt_render(s: *mut LtSession, out: *mut LtEntity, cap: i32) -> i32 {
+        with(s, |h| h.render(slice(out, cap)) as i32)
+    }
+
+    /// The newest sample of every player, undelayed (server ghosts): fills
+    /// `out` (up to `cap`), returns how many it wrote.
+    fn lt_ghosts(s: *mut LtSession, out: *mut LtEntity, cap: i32) -> i32 {
+        with(s, |h| h.ghosts(slice(out, cap)) as i32)
+    }
+
+    /// This frame's combat, after `lt_render`: news to events, shots starting
+    /// as their shooters are drawn firing, tracers flown to now (with their
+    /// impacts). Then drain `lt_events`, `lt_fx` and read `lt_tracers`.
+    fn lt_combat(s: *mut LtSession) -> () {
+        with(s, |h| h.combat())
+    }
+
+    /// Moves up to `cap` combat events into `out`, oldest first; returns how
+    /// many it moved.
+    fn lt_events(s: *mut LtSession, out: *mut LtEvent, cap: i32) -> i32 {
+        with(s, |h| h.take_events(slice(out, cap)) as i32)
+    }
+
+    /// Moves up to `cap` effects (shots drawn firing, impacts) into `out`,
+    /// oldest first; returns how many it moved.
+    fn lt_fx(s: *mut LtSession, out: *mut LtFx, cap: i32) -> i32 {
+        with(s, |h| h.take_fx(slice(out, cap)) as i32)
+    }
+
+    /// Every tracer in flight, as streaks: fills `out` (up to `cap`) and
+    /// returns how many there are.
+    fn lt_tracers(s: *mut LtSession, out: *mut LtTracer, cap: i32) -> i32 {
+        with(s, |h| h.tracers(slice(out, cap)) as i32)
+    }
+
+    /// Where others' drawn muzzles are from their eyes (meters right, up and
+    /// forward of their aim): their tracers leave from there.
+    fn lt_set_others_muzzle(s: *mut LtSession, offset: *const LtVec3) -> () {
+        if let Some(o) = offset.as_ref() {
+            with(s, |h| h.set_others_muzzle((*o).into()))
+        }
+    }
+
+    /// End of the frame: packets out.
+    fn lt_flush(s: *mut LtSession) -> () {
+        with(s, |h| h.flush())
+    }
+
+    /// The net graph's numbers.
+    fn lt_stats(s: *mut LtSession, out: *mut LtStats) -> () {
+        if let Some(o) = out.as_mut() {
+            *o = with(s, |h| Wrapped(h.stats())).0;
+            if o.state == 0 && s.as_ref().is_none_or(|s| s.handle.is_none()) {
+                o.state = STATE_ERROR;
+            }
+        }
+    }
+
+    /// Gaps between the last snapshots' arrivals (ms, oldest first): fills
+    /// `out` (up to `cap`), returns how many it wrote.
+    fn lt_snapshot_gaps(s: *mut LtSession, out: *mut f32, cap: i32) -> i32 {
+        with(s, |h| {
+            let gaps = &h.session.snapshot_gaps;
+            let out = slice(out, cap);
+            let n = out.len().min(gaps.len());
+            out[..n].copy_from_slice(&gaps[gaps.len() - n..]);
+            n as i32
+        })
+    }
+
+    /// The report for `lattice-report.txt` (who, where, then the
+    /// connection's numbers): copied into `buf`; returns its length.
+    fn lt_summary(s: *mut LtSession, buf: *mut u8, cap: i32) -> i32 {
+        with(s, |h| put_text(&h.summary(), buf, cap))
+    }
+
+    /// A world from a seed (the server's is in its Welcome), shared with any
+    /// session in the process that uses it. Free with `lt_world_free`.
+    fn lt_world_new(seed: u64) -> *mut LtWorld {
+        Box::into_raw(Box::new(LtWorld { world: World::shared(seed) }))
+    }
+
+    /// The session's world, once welcomed (else null). Free with
+    /// `lt_world_free`.
+    fn lt_session_world(s: *mut LtSession) -> *mut LtWorld {
+        with(s, |h| h.world().map_or(std::ptr::null_mut(), |world| Box::into_raw(Box::new(LtWorld { world }))))
+    }
+
+    fn lt_world_free(w: *mut LtWorld) -> () {
+        if !w.is_null() {
+            drop(Box::from_raw(w));
+        }
+    }
+
+    fn lt_world_info(w: *const LtWorld, out: *mut LtWorldInfo) -> () {
+        if let (Some(w), Some(o)) = (world(w), out.as_mut()) {
+            *o = LtWorldInfo {
+                seed: w.seed,
+                digest: w.digest(),
+                size: lattice_game::movement::WORLD_SIZE,
+                res: TERRAIN_RES,
+                samples: TERRAIN_N as u32,
+                boxes: w.boxes().len() as u32,
+                sites: w.sites().len() as u32,
+            };
+        }
+    }
+
+    /// Terrain heights (m) of the `nx` × `ny` samples from sample (`x0`,
+    /// `y0`), row by row (y north), into `out`; samples past the edge repeat
+    /// it. Returns how many it wrote.
+    fn lt_world_heights(w: *const LtWorld, x0: i32, y0: i32, nx: i32, ny: i32, out: *mut f32) -> i32 {
+        let Some(w) = world(w) else { return 0 };
+        if out.is_null() || nx <= 0 || ny <= 0 {
+            return 0;
+        }
+        let out = std::slice::from_raw_parts_mut(out, nx as usize * ny as usize);
+        let last = TERRAIN_N as i32 - 1;
+        for iy in 0..ny {
+            let sy = (y0 + iy).clamp(0, last) as usize;
+            for ix in 0..nx {
+                let sx = (x0 + ix).clamp(0, last) as usize;
+                out[(iy * nx + ix) as usize] = w.sample(sx, sy);
+            }
+        }
+        nx * ny
+    }
+
+    /// Every cover box: fills `out` (up to `cap`), returns how many there are.
+    fn lt_world_boxes(w: *const LtWorld, out: *mut LtBox, cap: i32) -> i32 {
+        let Some(w) = world(w) else { return 0 };
+        for (o, b) in slice(out, cap).iter_mut().zip(w.boxes()) {
+            *o = LtBox { min: [b.min[0], b.min[1], b.bottom].into(), max: [b.max[0], b.max[1], b.top].into(), kind: b.kind as u8, facing: b.facing };
+        }
+        w.boxes().len() as i32
+    }
+
+    /// Every base and outpost: fills `out` (up to `cap`), returns how many.
+    fn lt_world_sites(w: *const LtWorld, out: *mut LtSite, cap: i32) -> i32 {
+        let Some(w) = world(w) else { return 0 };
+        for (o, s) in slice(out, cap).iter_mut().zip(w.sites()) {
+            *o = LtSite { x: s.center[0], y: s.center[1], half: s.half, level: s.level, base: s.base as u8 };
+        }
+        w.sites().len() as i32
+    }
+
+    /// The terrain's height at (`x`, `y`), as movement samples it.
+    fn lt_world_height(w: *const LtWorld, x: f32, y: f32) -> f32 {
+        world(w).map_or(0.0, |w| w.terrain(x, y))
+    }
+
+    /// The highest surface at (`x`, `y`) feet at `z` can stand on: the
+    /// terrain, or a box's top no higher than `z + reach`.
+    fn lt_world_ground(w: *const LtWorld, x: f32, y: f32, z: f32, reach: f32) -> f32 {
+        world(w).map_or(0.0, |w| w.ground(x, y, z, reach))
+    }
+
+    /// Where the segment `from` -> `to` first hits the ground or cover
+    /// (shots' rules): 1 and `out` filled, or 0.
+    fn lt_world_raycast(w: *const LtWorld, from: *const LtVec3, to: *const LtVec3, out: *mut LtHit) -> i32 {
+        let (Some(w), Some(a), Some(b)) = (world(w), from.as_ref(), to.as_ref()) else { return 0 };
+        let (a, b): ([f32; 3], [f32; 3]) = ((*a).into(), (*b).into());
+        match segment_hit(w, a, b) {
+            Some(hit) => {
+                if let Some(o) = out.as_mut() {
+                    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                    let t = if len2 > 0.0 { ((hit.pos[0] - a[0]) * d[0] + (hit.pos[1] - a[1]) * d[1] + (hit.pos[2] - a[2]) * d[2]) / len2 } else { 0.0 };
+                    *o = LtHit { pos: hit.pos.into(), normal: hit.normal.into(), t, surface: hit.cover.unwrap_or(SURFACE_TERRAIN) };
+                }
+                1
+            }
+            None => 0,
+        }
+    }
+}
+
+/// A struct returned through `with` (which needs a fallback for it).
+struct Wrapped<T>(T);
+
+impl<T: Default> Fallback for Wrapped<T> {
+    fn fallback() -> Self {
+        Wrapped(T::default())
+    }
+}

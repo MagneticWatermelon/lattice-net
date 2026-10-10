@@ -2836,6 +2836,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "lattice-client-core",
+ "lattice-client-ffi",
  "lattice-game",
  "lattice-net",
  "lattice-sim",
@@ -2845,6 +2846,15 @@ dependencies = [
 name = "lattice-client-core"
 version = "0.1.0"
 dependencies = [
+ "lattice-game",
+ "lattice-net",
+]
+
+[[package]]
+name = "lattice-client-ffi"
+version = "0.1.0"
+dependencies = [
+ "lattice-client-core",
  "lattice-game",
  "lattice-net",
 ]
