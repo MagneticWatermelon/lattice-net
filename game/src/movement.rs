@@ -17,6 +17,10 @@ pub const DT: f32 = 1.0 / TICK_HZ as f32;
 pub const WORLD_SIZE: f32 = 8192.0;
 pub const RUN_SPEED: f32 = 6.0;
 pub const SPRINT_SPEED: f32 = 9.0;
+/// Crouching (`BUTTON_CROUCH`): this speed, no sprint and no jump; the
+/// collider's height and the eyes' (`weapon::CROUCH_EYE_HEIGHT`) lower.
+pub const CROUCH_SPEED: f32 = 3.0;
+pub const CROUCH_HEIGHT: f32 = 1.2;
 /// Max change of velocity per second (m/s²); a third of it in the air.
 const ACCEL: f32 = 60.0;
 const AIR_ACCEL: f32 = ACCEL / 3.0;
@@ -40,6 +44,11 @@ pub const BUTTON_FIRE: u8 = 4;
 /// Aiming down sights: slower (`weapon::ADS_SPEED`), no sprint, a tighter
 /// cone of fire.
 pub const BUTTON_ADS: u8 = 8;
+/// Crouching while held: lower (`CROUCH_HEIGHT`), slower (`CROUCH_SPEED`),
+/// no sprint or jump, a tighter cone of fire (`weapon::CONE_CROUCH`).
+pub const BUTTON_CROUCH: u8 = 16;
+/// Reload the rifle (`weapon::Ammo`); movement ignores it.
+pub const BUTTON_RELOAD: u8 = 32;
 
 /// One tick of player intent. `move_*` is a world-space stick in [-127, 127].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,16 +69,27 @@ pub struct MoveState {
     pub z: f32,
     pub vz: f32,
     pub grounded: bool,
+    /// Crouching: its input held `BUTTON_CROUCH`.
+    pub crouched: bool,
 }
 
 impl MoveState {
     /// Standing at (x, y): pushed out of any cover, on the ground.
     pub fn standing(world: &World, pos: [f32; 2]) -> Self {
-        let mut s = MoveState { pos, vel: [0.0; 2], z: f32::MAX, vz: 0.0, grounded: true };
+        let mut s = MoveState { pos, vel: [0.0; 2], z: f32::MAX, vz: 0.0, grounded: true, crouched: false };
         s.z = world.terrain(pos[0], pos[1]);
         collide(world, &mut s);
         s.z = world.ground(s.pos[0], s.pos[1], s.z, STEP_UP);
         s
+    }
+
+    /// The collider's height: standing or crouched.
+    pub fn height(&self) -> f32 {
+        if self.crouched {
+            CROUCH_HEIGHT
+        } else {
+            HEIGHT
+        }
     }
 }
 
@@ -105,7 +125,10 @@ pub fn step(world: &World, s: MoveState, input: Input) -> MoveState {
     if len > 1.0 {
         wish = [wish[0] / len, wish[1] / len];
     }
-    let speed = if input.buttons & BUTTON_ADS != 0 {
+    let crouched = input.buttons & BUTTON_CROUCH != 0;
+    let speed = if crouched {
+        CROUCH_SPEED
+    } else if input.buttons & BUTTON_ADS != 0 {
         RUN_SPEED * crate::weapon::ADS_SPEED
     } else if input.buttons & BUTTON_SPRINT != 0 {
         SPRINT_SPEED
@@ -122,8 +145,9 @@ pub fn step(world: &World, s: MoveState, input: Input) -> MoveState {
     }
 
     let mut n = s;
+    n.crouched = crouched;
     n.vel = [s.vel[0] + dv[0], s.vel[1] + dv[1]];
-    if s.grounded && input.buttons & BUTTON_JUMP != 0 {
+    if s.grounded && input.buttons & BUTTON_JUMP != 0 && !crouched {
         n.vz = JUMP_SPEED;
         n.grounded = false;
     }
@@ -196,9 +220,10 @@ pub fn nudge(world: &World, s: MoveState, delta: [f32; 2]) -> MoveState {
 /// height and can't step onto, taking away the velocity into the box (so they
 /// slide along it). Boxes come in the index's fixed order.
 fn collide(world: &World, s: &mut MoveState) {
+    let height = s.height();
     for _ in 0..2 {
         world.boxes_near(s.pos[0], s.pos[1], RADIUS, |b| {
-            if b.top <= s.z + STEP_UP || b.bottom >= s.z + HEIGHT {
+            if b.top <= s.z + STEP_UP || b.bottom >= s.z + height {
                 return; // below the feet's reach, or above the head
             }
             let cx = s.pos[0].clamp(b.min[0], b.max[0]);
@@ -324,6 +349,26 @@ mod tests {
     }
 
     #[test]
+    fn crouching_is_slow_low_and_never_sprints_or_jumps() {
+        let w = world();
+        let p = open_spot(&w, 30.0);
+        let mut s = MoveState::standing(&w, p);
+        for _ in 0..30 {
+            s = step(&w, s, Input { move_x: 127, buttons: BUTTON_CROUCH | BUTTON_SPRINT, ..Default::default() });
+        }
+        let v = (s.vel[0] * s.vel[0] + s.vel[1] * s.vel[1]).sqrt();
+        assert!((v - CROUCH_SPEED).abs() < 1e-3, "{v}");
+        assert!(s.crouched && s.height() == CROUCH_HEIGHT);
+        let t = step(&w, s, Input { buttons: BUTTON_CROUCH | BUTTON_JUMP, ..Default::default() });
+        assert!(t.grounded && t.vz == 0.0, "no jump while crouched: {t:?}");
+        // Let go: standing again at once.
+        let t = step(&w, t, Input::default());
+        assert!(!t.crouched && t.height() == HEIGHT);
+        // The dead don't crouch.
+        assert!(!step(&w, s, dead_input(Input { buttons: BUTTON_CROUCH, ..Default::default() })).crouched);
+    }
+
+    #[test]
     fn cover_blocks_and_slides() {
         let w = world();
         // A tall wall, approached head-on along x then diagonally.
@@ -385,12 +430,13 @@ mod tests {
                 move_y: ((i * 91) % 255) as i8,
                 yaw: (i * 999) as u16,
                 pitch: 0,
-                buttons: (i % 3) as u8 & (BUTTON_SPRINT | BUTTON_JUMP),
+                buttons: (i % 3) as u8 & (BUTTON_SPRINT | BUTTON_JUMP) | if i % 7 < 2 { BUTTON_CROUCH } else { 0 },
             })
             .collect();
         let run = || inputs.iter().fold(MoveState::standing(&w, p), |s, &i| step(&w, s, i));
         let (a, b) = (run(), run());
         assert_eq!(a.pos[0].to_bits(), b.pos[0].to_bits());
         assert_eq!(a.z.to_bits(), b.z.to_bits());
+        assert_eq!(a.crouched, b.crouched);
     }
 }

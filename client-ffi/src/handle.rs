@@ -25,8 +25,8 @@ use lattice_client_core::tracers::{Fired, Tracers};
 use lattice_client_core::{ClientConfig, How};
 use lattice_game::events::{Event, SeenShot};
 use lattice_game::faction::faction;
-use lattice_game::movement::{Input, BUTTON_ADS, BUTTON_JUMP, BUTTON_SPRINT};
-use lattice_game::weapon::EYE_HEIGHT;
+use lattice_game::movement::{Input, BUTTON_ADS, BUTTON_CROUCH, BUTTON_JUMP, BUTTON_RELOAD, BUTTON_SPRINT, TICK_HZ};
+use lattice_game::weapon::eye_height;
 use lattice_game::world::World;
 use lattice_net::{ClientState, ConnectToken};
 
@@ -177,7 +177,7 @@ impl Handle {
         let core = &mut self.session.core;
         let dir = core.fire(now, aim::yaw_u16(f.yaw), aim::pitch_i16(f.pitch), f.ads != 0)?;
         let feet = core.own_render(now);
-        let eye = [feet[0], feet[1], feet[2] + EYE_HEIGHT];
+        let eye = [feet[0], feet[1], feet[2] + eye_height(&core.predicted())];
         let step = core.last_shot_step();
         let fired = self.tracers.fire_own(eye, f.yaw, f.pitch, dir, f.muzzle.into(), step, faction);
         Some(LtShot { dir: dir.into(), muzzle: fired.origin.into(), eye: eye.into() })
@@ -189,7 +189,7 @@ impl Handle {
         let clamp = |v: f32| if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 };
         let (yaw, pitch) = (if i.yaw.is_finite() { i.yaw } else { 0.0 }, if i.pitch.is_finite() { i.pitch } else { 0.0 });
         let (move_x, move_y) = aim::stick(yaw, clamp(i.forward), clamp(i.right));
-        let buttons = i.buttons & (BUTTON_SPRINT | BUTTON_JUMP | BUTTON_ADS);
+        let buttons = i.buttons & (BUTTON_SPRINT | BUTTON_JUMP | BUTTON_ADS | BUTTON_CROUCH | BUTTON_RELOAD);
         let input = Input { move_x, move_y, yaw: aim::yaw_u16(yaw), pitch: aim::pitch_i16(pitch), buttons };
         if self.threaded {
             self.intent = input;
@@ -204,6 +204,7 @@ impl Handle {
         let Some(w) = core.welcome() else { return LtOwn::default() };
         let p = core.predicted();
         let ghost = core.server_own().map_or([0.0; 3], |(s, _)| [s.pos[0], s.pos[1], s.z]);
+        let ammo = core.ammo();
         LtOwn {
             pos: core.own_render(now).into(),
             vel: [p.vel[0], p.vel[1], p.vz].into(),
@@ -217,6 +218,10 @@ impl Handle {
             welcomed: 1,
             faction: faction(w.entity),
             life: core.life(),
+            crouched: p.crouched as u8,
+            mag: ammo.mag,
+            reserve: ammo.reserve,
+            reload: ammo.reload as f32 / TICK_HZ as f32,
         }
     }
 
@@ -230,7 +235,11 @@ impl Handle {
             total += 1;
             drawn[st.tier as usize] += 1;
             if let Some(e) = out.get_mut(n) {
-                let flags = if st.airborne { FLAG_AIRBORNE } else { 0 } | if st.dead { FLAG_DEAD } else { 0 } | if st.ads { FLAG_ADS } else { 0 };
+                let flags = if st.airborne { FLAG_AIRBORNE } else { 0 }
+                    | if st.dead { FLAG_DEAD } else { 0 }
+                    | if st.ads { FLAG_ADS } else { 0 }
+                    | if st.crouched { FLAG_CROUCHED } else { 0 }
+                    | if st.reloading { FLAG_RELOADING } else { 0 };
                 *e = LtEntity {
                     id,
                     faction: faction(id),
@@ -282,7 +291,11 @@ impl Handle {
                 faction: faction(id),
                 tier: s.tier as u8,
                 how: 0,
-                flags: if s.airborne { FLAG_AIRBORNE } else { 0 } | if s.dead { FLAG_DEAD } else { 0 } | if s.ads { FLAG_ADS } else { 0 },
+                flags: if s.airborne { FLAG_AIRBORNE } else { 0 }
+                    | if s.dead { FLAG_DEAD } else { 0 }
+                    | if s.ads { FLAG_ADS } else { 0 }
+                    | if s.crouched { FLAG_CROUCHED } else { 0 }
+                    | if s.reloading { FLAG_RELOADING } else { 0 },
                 health: s.health,
                 reserved: 0,
                 pos: s.pos.into(),
@@ -434,6 +447,7 @@ impl Handle {
             snapshots: st.snapshots,
             corrections: st.corrections,
             push_corrections: st.push_corrections,
+            ammo_corrections: st.ammo_corrections,
             resyncs: st.resyncs,
             shots_dropped: st.shots_dropped,
             life_events: st.life_events,

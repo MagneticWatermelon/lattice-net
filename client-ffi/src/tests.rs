@@ -35,6 +35,8 @@ struct Client {
     impacts: Vec<LtFx>,
     most_tracers: i32,
     fired: u32,
+    /// Held every frame (`LT_BUTTON_*`), besides the sights while firing.
+    buttons: u8,
 }
 
 impl Client {
@@ -53,6 +55,7 @@ impl Client {
             impacts: Vec::new(),
             most_tracers: 0,
             fired: 0,
+            buttons: 0,
         }
     }
 
@@ -78,7 +81,7 @@ impl Client {
                     assert!((len - 1.0).abs() < 1e-4, "a unit direction");
                 }
             }
-            let intent = LtIntent { yaw, pitch, forward: 0.0, right: 0.0, buttons: if fire { LT_BUTTON_ADS } else { 0 } };
+            let intent = LtIntent { yaw, pitch, forward: 0.0, right: 0.0, buttons: self.buttons | if fire { LT_BUTTON_ADS } else { 0 } };
             lt_inputs(self.s, &intent);
             lt_own(self.s, fire as u8, &mut self.own);
             let n = lt_render(self.s, self.ents.as_mut_ptr(), self.ents.len() as i32);
@@ -110,6 +113,7 @@ impl Client {
 }
 
 const LT_BUTTON_ADS: u8 = lattice_game::movement::BUTTON_ADS;
+const LT_BUTTON_CROUCH: u8 = lattice_game::movement::BUTTON_CROUCH;
 
 #[test]
 fn two_sessions_join_see_each_other_and_fight_through_the_c_api() {
@@ -216,6 +220,90 @@ fn two_sessions_join_see_each_other_and_fight_through_the_c_api() {
     let text = String::from_utf8_lossy(&buf[..n]);
     assert!(text.contains("corrections 0") && text.contains("user 1"), "{text}");
 
+    unsafe {
+        lt_close(a.s);
+        lt_close(b.s);
+    }
+}
+
+/// Crouch and the rifle's rounds through the C API. B crouches: it says so,
+/// A sees it (the flag), and A's shots at a standing head's height pass
+/// over it, while at its crouched body they hit. A empties its magazine
+/// (it can't fire while the reload runs) and fires again from the next:
+/// predicted exactly, no correction, no shot refused.
+#[test]
+fn crouch_and_the_magazine_through_the_c_api() {
+    let start = Instant::now();
+    let mut cfg = SimConfig { spawn: SpawnMode::Disk(20.0), ..Default::default() };
+    cfg.interest.squad_size = 0;
+    cfg.immortal = true;
+    let mut server = LoopServer::with(cfg, start);
+    let id = server.sim.config().identity.clone();
+    let key = hex(&id.token_key);
+    let addr = server.addr().to_string();
+    let mut a = Client::connect(&addr, 1, &key, id.server_id);
+    let mut b = Client::connect(&addr, 2, &key, id.server_id);
+    b.buttons = LT_BUTTON_CROUCH;
+
+    let hits = |a: &Client, b: &Client| a.events.iter().filter(|e| e.kind == EVENT_HIT && e.a == b.own.entity).count() as u32;
+    let frame = Duration::from_micros(8333);
+    let mut next = start;
+    let (mut seen_crouched, mut emptied, mut blocked) = (false, false, 0u32);
+    let (mut high_fired, mut high_hits, mut reload_seen) = (0u32, None, 0f32);
+    while next < start + Duration::from_secs(11) {
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        let t = (next - start).as_secs_f64();
+        let drawn = a.ents[..a.drawn].iter().find(|e| e.id == b.own.entity && b.own.welcomed == 1).copied();
+        seen_crouched |= drawn.is_some_and(|e| e.flags & FLAG_CROUCHED != 0);
+        // Until 5 s, at a standing player's head; after, at the crouched body.
+        let high = t < 5.0;
+        let target = drawn.map(|e| [e.pos.x, e.pos.y, e.pos.z + if high { 1.6 } else { 0.6 }]);
+        let shooting = t > 2.0 && target.is_some();
+        // (With a step or two of the reload left, the next input's step may
+        // finish it, and a shot in that step fires.)
+        let (before, reloading) = (a.fired, a.own.reload > 0.07);
+        a.frame(target, shooting);
+        if shooting && reloading {
+            blocked += 1;
+            assert_eq!(a.fired, before, "no shot while the reload runs");
+        }
+        if high {
+            high_fired = a.fired;
+        }
+        if a.own.mag == 0 && a.fired > 0 {
+            emptied = true;
+            reload_seen = reload_seen.max(a.own.reload);
+        }
+        // The high shots have all landed (or not) before the reload ends.
+        if t > 6.5 && high_hits.is_none() {
+            high_hits = Some(hits(&a, &b));
+        }
+        b.frame(None, false);
+        server.run(Instant::now());
+        next += frame;
+    }
+    let (sa, sb) = (a.stats(), b.stats());
+    for (name, st) in [("A", &sa), ("B", &sb)] {
+        assert_eq!((st.corrections, st.ammo_corrections, st.resyncs), (0, 0, 0), "{name}: predicted exactly");
+    }
+    assert_eq!(server.sim.counters().shots_refused, 0, "no shot without a round");
+    // B crouched, and A saw it.
+    assert_eq!(b.own.crouched, 1);
+    assert!(seen_crouched, "A drew B crouched");
+    // A's magazine: 30 at its head's height, a reload from empty, then more.
+    let r = lattice_game::weapon::RELOAD_EMPTY_STEPS as f32 / lattice_game::movement::TICK_HZ as f32;
+    assert!(emptied && reload_seen > r - 0.1 && reload_seen <= r, "emptied, reloaded ({reload_seen} s)");
+    assert!(blocked > 100, "the trigger held through the reload: {blocked} frames");
+    assert_eq!(high_fired, lattice_game::weapon::MAGAZINE as u32, "a magazine's worth before the reload");
+    let low_fired = a.fired - high_fired;
+    assert!(low_fired >= 20, "{low_fired} after the reload");
+    assert_eq!(a.own.mag as u32, lattice_game::weapon::MAGAZINE as u32 - low_fired.min(30), "the second magazine's count");
+    assert_eq!(a.own.reserve, lattice_game::weapon::RESERVE - lattice_game::weapon::MAGAZINE as u16);
+    // Over its head: nothing. At its body: nearly every shot.
+    let high_hits = high_hits.expect("measured");
+    let low_hits = hits(&a, &b) - high_hits;
+    assert!(high_hits <= 1, "{high_hits} of {high_fired} hit over a crouched head");
+    assert!(low_hits >= low_fired * 8 / 10, "{low_hits} of {low_fired} hit the crouched body");
     unsafe {
         lt_close(a.s);
         lt_close(b.s);
@@ -385,9 +473,10 @@ fn the_net_thread_rides_out_frozen_frames() {
     assert_eq!(s.repeated + s.frozen, 0, "no stand-ins: the inputs kept coming");
     assert_eq!((s.shots_refused, s.renders_held, s.rewinds_trimmed), (0, 0, 0), "no shot refused, held or trimmed");
     // Every shot reached the server (the last pull may still have been
-    // waiting for its step's input when the session closed).
+    // waiting for its step's input when the session closed). A magazine is
+    // 30 rounds, then a 2.7 s reload: ~50 shots in the run.
     let fired = threaded.fired as u64;
-    assert!(fired > 60 && (fired - 1..=fired).contains(&s.shots), "{fired} fired, {} reached the server", s.shots);
+    assert!(fired > 40 && (fired - 1..=fired).contains(&s.shots), "{fired} fired, {} reached the server", s.shots);
     assert!(pumped.server.repeated + pumped.server.frozen > 20, "the control: pump mode's freezes cost inputs");
     // Our own player is drawn as smoothly as in pump mode: the thread's
     // ticks between a frame's start and its calls must not hold the drawn

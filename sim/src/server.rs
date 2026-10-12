@@ -32,9 +32,9 @@ use crate::grid::{Grid, Knn};
 use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
-use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, GRACE_TICKS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
+use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, BUTTON_RELOAD, GRACE_TICKS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
 use crate::shots::{self, ClockRate, Cut, Dips, Fire, FlyStats, History, Judgment, Outcome, Projectile, RenderFloor, Sky, SpreadKey};
-use lattice_game::weapon::{self, shot_time, Bloom, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
+use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
 use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::events::{self, Event};
 use lattice_game::faction::{faction, FACTIONS, MAX_HEALTH, RESPAWN_STEPS};
@@ -371,6 +371,8 @@ struct Body {
     pitch: i16,
     /// Aiming down sights (its last input), for others to see.
     ads: bool,
+    /// Reloading (its rifle), for others to see.
+    reloading: bool,
     /// Ticks this player was pushed apart from a crowd (wrapping), for the snapshot.
     pushes: u8,
     squad: u32,
@@ -400,6 +402,7 @@ impl Default for Body {
             yaw: 0,
             pitch: 0,
             ads: false,
+            reloading: false,
             pushes: 0,
             squad: NO_SQUAD,
             spawned: 0,
@@ -639,6 +642,8 @@ struct InputQueue {
     /// fire (`SimConfig::cone_of_fire`).
     bloom: Bloom,
     cone: bool,
+    /// The rifle's rounds, as of `last_seq` (and the late shots fired since).
+    ammo: Ammo,
     /// The server's secret for where in the cone each shot goes, and this
     /// spawn's number under it. None before the first spawn.
     spread: Option<(Arc<SpreadKey>, u64)>,
@@ -676,6 +681,7 @@ impl Default for InputQueue {
             refused: 0,
             bloom: Bloom::default(),
             cone: true,
+            ammo: Ammo::FULL,
             spread: None,
             claims: RenderFloor::default(),
             batch: Vec::new(),
@@ -840,7 +846,8 @@ impl InputQueue {
 
     /// Fires `shot` from input `seq` (already consumed): from the shooter's
     /// eye between its states before and after that seq, unless it comes too
-    /// soon after the last shot (or is a copy of one). It leaves somewhere in
+    /// soon after the last shot (or is a copy of one), or the rifle has no
+    /// round ready (`Ammo`: its client predicts the same). It leaves somewhere in
     /// its cone of fire: aiming down sights (`ads`) or not, from the state
     /// before the seq, with the shooter's bloom. Its claimed view is the one
     /// the render floor `held` it to, if it did.
@@ -855,6 +862,11 @@ impl InputQueue {
             self.refused += 1;
             return;
         };
+        if !self.ammo.ready() {
+            self.refused += 1;
+            return;
+        }
+        self.ammo.fire();
         self.last_shot = Some(time);
         let cone = if self.cone { self.bloom.fire(time, ads, &before) } else { 0.0 };
         let pick = self.spread.as_ref().map_or(0, |(key, spawn)| key.pick(*spawn, seq));
@@ -926,6 +938,9 @@ impl InputQueue {
             let kind = if self.starved_run <= GRACE_TICKS { Step::Repeated } else { Step::Frozen };
             (movement::stand_in(self.last, self.starved_run), kind)
         };
+        // The rifle as its client predicts it (`Ammo::step`): the reload counts
+        // down, then a shot in this input (in `fire`), then its reload button.
+        self.ammo.tick();
         let before = body.state;
         body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input });
         self.steps[next as usize % STEP_RING] = (next, step_no, before, body.state);
@@ -950,6 +965,10 @@ impl InputQueue {
                 self.fire(e, next, shot, held, render, false, input.buttons & BUTTON_ADS != 0);
             }
         }
+        if input.buttons & BUTTON_RELOAD != 0 && !body.dead() {
+            self.ammo.start_reload();
+        }
+        body.reloading = !body.dead() && self.ammo.reload > 0;
         kind
     }
 }
@@ -975,7 +994,9 @@ fn frame(shard: &mut lattice_net::Shard, snaps: &mut Vec<(ClientId, Vec<u8>, Opt
 /// between them).
 fn in_sight(world: &World, history: &History, shooter: u16, target: u16) -> bool {
     let (Some(a), Some(b)) = (history.now(shooter), history.now(target)) else { return false };
-    let (p0, p1) = ([a.pos[0], a.pos[1], a.pos[2] + weapon::EYE_HEIGHT], [b.pos[0], b.pos[1], b.pos[2] + 1.0]);
+    let eye = if a.crouched { weapon::CROUCH_EYE_HEIGHT } else { weapon::EYE_HEIGHT };
+    let chest = if b.crouched { 0.6 } else { 1.0 };
+    let (p0, p1) = ([a.pos[0], a.pos[1], a.pos[2] + eye], [b.pos[0], b.pos[1], b.pos[2] + chest]);
     lattice_game::hit::line_clear(world, p0, p1)
 }
 
@@ -1605,7 +1626,12 @@ impl SimServer {
         lap(4);
 
         // 6. lag-comp history
-        let entries = self.bodies.iter().map(|b| shots::HistEntry { pos: [b.state.pos[0], b.state.pos[1], b.state.z], life: b.life, live: b.alive && !b.dead() });
+        let entries = self.bodies.iter().map(|b| shots::HistEntry {
+            pos: [b.state.pos[0], b.state.pos[1], b.state.z],
+            life: b.life,
+            live: b.alive && !b.dead(),
+            crouched: b.state.crouched,
+        });
         self.history.record(self.tick, self.step, entries);
         lap(5);
 
@@ -1631,7 +1657,7 @@ impl SimServer {
             .filter(|(_, (_, b))| b.alive)
             .for_each(|(i, ((near, far), b))| {
                 let e = i as u16;
-                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health, b.ads);
+                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health, b.ads, b.reloading);
                 let prev = tick.wrapping_sub(1);
                 if due(e, tick, mid_period) || due(e, tick, far_period) || due(e, prev, far_period) {
                     *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch, b.health);
@@ -2051,7 +2077,8 @@ impl SimServer {
             let p = self.rng.in_disk(center, b.radius * 0.3);
             let p = [p[0].clamp(1.0, WORLD_SIZE - 1.0), p[1].clamp(1.0, WORLD_SIZE - 1.0)];
             b.state = MoveState::standing(&self.world, p);
-            (b.health, b.respawn_at, b.life) = (MAX_HEALTH, None, b.life.wrapping_add(1));
+            (b.health, b.respawn_at, b.life, b.reloading) = (MAX_HEALTH, None, b.life.wrapping_add(1), false);
+            self.inputs[e].get_mut().unwrap().ammo = Ammo::FULL;
             self.counters.respawns += 1;
         }
     }
@@ -2437,9 +2464,9 @@ impl View<'_> {
         sc.tally.degraded += (slot.ladder.level() > 0) as u64;
 
         // Messages.
-        let (ack_seq, buffered, wait) = {
+        let (ack_seq, buffered, wait, ammo) = {
             let q = self.inputs[e as usize].lock().unwrap();
-            (q.last_seq, q.depth, q.wait)
+            (q.last_seq, q.depth, q.wait, q.ammo)
         };
         let mut w = Writer::with_capacity(SNAPSHOT_LEN);
         msg::write_snapshot(
@@ -2457,6 +2484,7 @@ impl View<'_> {
                 pushes: me.pushes,
                 health: me.health,
                 life: me.life,
+                ammo,
             },
         );
         let mut bytes = w.len() + near_bytes + shots_bytes;

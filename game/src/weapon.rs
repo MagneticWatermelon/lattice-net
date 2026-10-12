@@ -11,7 +11,7 @@
 //! else's tracers show the real shot). *Recoil* kicks the shooter's view; it's
 //! the client's, since shots go where the view points.
 
-use crate::movement::{MoveState, TICK_HZ};
+use crate::movement::{MoveState, BUTTON_RELOAD, TICK_HZ};
 
 /// Muzzle speed, m/s: ~20 m a step.
 pub const MUZZLE_SPEED: f32 = 600.0;
@@ -24,8 +24,26 @@ pub const RANGE_STEPS: u32 = 60;
 pub const SUBSTEPS: u32 = 2;
 pub const DAMAGE_BODY: u8 = 20;
 pub const DAMAGE_HEAD: u8 = 40;
-/// Eyes (and the muzzle) above the feet.
+/// Eyes (and the muzzle) above the feet, standing and crouched.
 pub const EYE_HEIGHT: f32 = 1.6;
+pub const CROUCH_EYE_HEIGHT: f32 = 1.15;
+
+/// The rifle's magazine and the rounds carried for it (refilled on
+/// respawning), and how long a reload takes, in steps: 2.2 s, or 2.7 s from
+/// empty (a round to chamber).
+pub const MAGAZINE: u8 = 30;
+pub const RESERVE: u16 = 180;
+pub const RELOAD_STEPS: u8 = 66;
+pub const RELOAD_EMPTY_STEPS: u8 = 81;
+
+/// Eyes above the feet in state `s`.
+pub fn eye_height(s: &MoveState) -> f32 {
+    if s.crouched {
+        CROUCH_EYE_HEIGHT
+    } else {
+        EYE_HEIGHT
+    }
+}
 
 /// Cone of fire, degrees across its radius: aiming down sights or from the
 /// hip, standing or moving (faster than `MOVING` m/s).
@@ -34,8 +52,10 @@ pub const CONE_ADS_MOVING: f32 = 0.4;
 pub const CONE_HIP: f32 = 2.0;
 pub const CONE_HIP_MOVING: f32 = 2.75;
 pub const MOVING: f32 = 1.0;
-/// In the air the cone is this many times wider.
+/// In the air the cone is this many times wider; crouched, this many times
+/// (tighter).
 pub const CONE_AIR: f32 = 2.5;
+pub const CONE_CROUCH: f32 = 0.75;
 /// Bloom: each shot widens the next one's cone by this much (degrees), up
 /// to the max; it starts recovering `BLOOM_DELAY` steps after a shot, at
 /// `BLOOM_RECOVERY` degrees a step.
@@ -92,7 +112,14 @@ impl Bloom {
             (false, false) => CONE_HIP,
             (false, true) => CONE_HIP_MOVING,
         };
-        (base + self.recovered(time)) * if state.grounded { 1.0 } else { CONE_AIR }
+        let stance = if !state.grounded {
+            CONE_AIR
+        } else if state.crouched {
+            CONE_CROUCH
+        } else {
+            1.0
+        };
+        (base + self.recovered(time)) * stance
     }
 
     fn recovered(&self, time: u64) -> f32 {
@@ -163,12 +190,93 @@ pub fn aim(yaw: u16, pitch: i16) -> [f32; 3] {
     [cp * cy, cp * sy, sp]
 }
 
-/// Where shots leave from: the eyes, with the body between two predicted
-/// states `frac` of the way (both sides compute it the same way).
+/// Where shots leave from: the eyes, with the body (and its stance) between
+/// two predicted states `frac` of the way (both sides compute it the same way).
 pub fn muzzle(before: &MoveState, after: &MoveState, frac: u8) -> [f32; 3] {
     let t = frac as f32 / 256.0;
     let l = |a: f32, b: f32| a + (b - a) * t;
-    [l(before.pos[0], after.pos[0]), l(before.pos[1], after.pos[1]), l(before.z, after.z) + EYE_HEIGHT]
+    [l(before.pos[0], after.pos[0]), l(before.pos[1], after.pos[1]), l(before.z, after.z) + l(eye_height(before), eye_height(after))]
+}
+
+/// The rifle's rounds: a magazine, a reserve, and a reload under way. Both
+/// sides run it on each input's step in the same order (`step`): the
+/// counts are part of the prediction, like movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ammo {
+    pub mag: u8,
+    pub reserve: u16,
+    /// Steps until the reload under way is done; 0: none.
+    pub reload: u8,
+}
+
+impl Default for Ammo {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
+impl Ammo {
+    /// As a player spawns.
+    pub const FULL: Ammo = Ammo { mag: MAGAZINE, reserve: RESERVE, reload: 0 };
+
+    /// One input's step: the reload counts down (and, done, fills the
+    /// magazine from the reserve); a shot in the step fires if a round is
+    /// ready (returns whether it did); then the reload button. The last round
+    /// starts a reload by itself.
+    pub fn step(&mut self, buttons: u8, shot: bool) -> bool {
+        self.tick();
+        let fired = shot && self.ready();
+        if fired {
+            self.fire();
+        }
+        if buttons & BUTTON_RELOAD != 0 {
+            self.start_reload();
+        }
+        fired
+    }
+
+    /// The start of a step.
+    pub fn tick(&mut self) {
+        if self.reload > 0 {
+            self.reload -= 1;
+            if self.reload == 0 {
+                let take = (MAGAZINE - self.mag).min(self.reserve.min(MAGAZINE as u16) as u8);
+                self.mag += take;
+                self.reserve -= take as u16;
+            }
+        }
+    }
+
+    /// A round in the magazine and no reload under way.
+    pub fn ready(&self) -> bool {
+        self.mag > 0 && self.reload == 0
+    }
+
+    /// Whether a shot in the step `steps` from now (1: the next) would have
+    /// a round ready: a reload under way may be done by then.
+    pub fn ready_in(&self, steps: u32) -> bool {
+        let mut a = *self;
+        for _ in 0..steps.min(RELOAD_EMPTY_STEPS as u32 + 1) {
+            a.tick();
+        }
+        a.ready()
+    }
+
+    /// A shot fired.
+    pub fn fire(&mut self) {
+        self.mag -= 1;
+        if self.mag == 0 {
+            self.start_reload();
+        }
+    }
+
+    /// Starts a reload, unless the magazine is full, the reserve empty, or
+    /// one is under way.
+    pub fn start_reload(&mut self) {
+        if self.reload == 0 && self.mag < MAGAZINE && self.reserve > 0 {
+            self.reload = if self.mag == 0 { RELOAD_EMPTY_STEPS } else { RELOAD_STEPS };
+        }
+    }
 }
 
 /// A projectile in flight.
@@ -261,6 +369,53 @@ mod tests {
         assert_eq!(spread(yaw, pitch, 0.0, x), d, "no cone: straight down the aim");
         let (y, p) = angles(d);
         assert!((y as i32 - yaw as i32).abs() <= 1 && (p as i32 - pitch as i32).abs() <= 1);
+    }
+
+    #[test]
+    fn crouching_tightens_the_cone_and_lowers_the_eyes() {
+        let stand = MoveState { grounded: true, ..Default::default() };
+        let crouch = MoveState { crouched: true, ..stand };
+        let b = Bloom::default();
+        assert_eq!(b.cone(0, false, &crouch), CONE_HIP * CONE_CROUCH);
+        assert_eq!(b.cone(0, true, &crouch), CONE_ADS * CONE_CROUCH);
+        assert_eq!(muzzle(&stand, &stand, 77)[2], EYE_HEIGHT);
+        assert_eq!(muzzle(&crouch, &crouch, 0)[2], CROUCH_EYE_HEIGHT);
+        let half = muzzle(&stand, &crouch, 128)[2];
+        assert!(half < EYE_HEIGHT && half > CROUCH_EYE_HEIGHT, "between: {half}");
+    }
+
+    #[test]
+    fn a_magazine_empties_reloads_by_itself_and_the_reserve_runs_out() {
+        let mut a = Ammo::FULL;
+        // Thirty shots, one per step: the last starts the (empty) reload.
+        for k in 0..MAGAZINE {
+            assert!(a.step(0, true), "shot {k}");
+        }
+        assert_eq!((a.mag, a.reload), (0, RELOAD_EMPTY_STEPS));
+        assert!(!a.ready() && !a.ready_in(RELOAD_EMPTY_STEPS as u32 - 1) && a.ready_in(RELOAD_EMPTY_STEPS as u32));
+        // Shots while reloading don't fire.
+        for _ in 0..RELOAD_EMPTY_STEPS - 1 {
+            assert!(!a.step(0, true));
+        }
+        assert!(a.step(0, true), "the reload done at the start of the step: it fires");
+        assert_eq!((a.mag, a.reserve), (MAGAZINE - 1, RESERVE - MAGAZINE as u16));
+        // A reload by the button: the shorter one, topping the magazine up.
+        a.step(BUTTON_RELOAD, false);
+        assert_eq!(a.reload, RELOAD_STEPS);
+        for _ in 0..RELOAD_STEPS {
+            a.step(BUTTON_RELOAD, false); // held: no second reload
+        }
+        assert_eq!((a.mag, a.reserve, a.reload), (MAGAZINE, RESERVE - MAGAZINE as u16 - 1, 0));
+        // A full magazine doesn't reload; an empty reserve can't.
+        a.step(BUTTON_RELOAD, false);
+        assert_eq!(a.reload, 0);
+        let mut dry = Ammo { mag: 2, reserve: 0, reload: 0 };
+        assert!(dry.step(0, true) && dry.step(0, true) && !dry.step(0, true));
+        assert_eq!((dry.mag, dry.reload), (0, 0), "nothing to reload with");
+        // The last rounds of the reserve: a partial magazine.
+        let mut low = Ammo { mag: 0, reserve: 7, reload: 1 };
+        low.tick();
+        assert_eq!((low.mag, low.reserve), (7, 0));
     }
 
     #[test]

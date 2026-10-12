@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 use lattice_client_core::{How, RenderState};
 use lattice_game::faction::faction;
-use lattice_game::movement::{HEIGHT, RADIUS};
+use lattice_game::movement::{CROUCH_HEIGHT, HEIGHT, RADIUS};
 use lattice_game::world::World;
 
 use crate::coords::{look_rotation, to_bevy, yaw_rotation};
@@ -187,15 +187,19 @@ fn tint(entity: u16, s: &RenderState, tier_colors: bool) -> Color {
 
 /// Centered capsule transform for feet at game (x, y, z), facing `yaw`;
 /// the dead lie on the ground, along where they faced. (For the ghosts.)
-fn body(pos: [f32; 3], yaw: f32, dead: bool) -> Transform {
+fn body(pos: [f32; 3], yaw: f32, dead: bool, crouched: bool) -> Transform {
     let root = Transform::from_translation(to_bevy(pos[0], pos[1], pos[2])).with_rotation(yaw_rotation(yaw));
-    root.mul_transform(capsule(dead))
+    root.mul_transform(capsule(dead, crouched))
 }
 
-/// The capsule in its player's frame (feet, facing -z).
-fn capsule(dead: bool) -> Transform {
+/// The capsule in its player's frame (feet, facing -z). Crouched, it's the
+/// crouched collider's height (there's no crouching soldier to draw).
+fn capsule(dead: bool, crouched: bool) -> Transform {
     if dead {
         Transform::from_xyz(0.0, RADIUS, 0.0).with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
+    } else if crouched {
+        let s = (CROUCH_HEIGHT - 2.0 * RADIUS) / (HEIGHT - 2.0 * RADIUS);
+        Transform::from_xyz(0.0, CROUCH_HEIGHT / 2.0, 0.0).with_scale(Vec3::new(1.0, s, 1.0))
     } else {
         Transform::from_xyz(0.0, HEIGHT / 2.0, 0.0)
     }
@@ -210,6 +214,7 @@ struct Drawn {
     airborne: bool,
     dead: bool,
     ads: bool,
+    crouched: bool,
     mat: Handle<StandardMaterial>,
     tint: Color,
 }
@@ -267,7 +272,18 @@ pub fn sync_players(
     for (e, s) in &states {
         scene.drawn[s.tier as usize] += 1;
         let mat = material(&looks, *e, s, settings.tier_colors).clone();
-        drawn.push(Drawn { key: *e, feet: s.pos, yaw: s.yaw, pitch: s.pitch, airborne: s.airborne, dead: s.dead, ads: s.ads, mat, tint: tint(*e, s, settings.tier_colors) });
+        drawn.push(Drawn {
+            key: *e,
+            feet: s.pos,
+            yaw: s.yaw,
+            pitch: s.pitch,
+            airborne: s.airborne,
+            dead: s.dead,
+            ads: s.ads,
+            crouched: s.crouched,
+            mat,
+            tint: tint(*e, s, settings.tier_colors),
+        });
     }
     if view.mode != crate::controls::Mode::FirstPerson && view.has_body {
         let dead = net.0.core.is_dead();
@@ -275,8 +291,9 @@ pub fn sync_players(
             Some(e) => (looks.factions[faction(e) as usize].clone(), FACTION_COLORS[faction(e) as usize]),
             None => (looks.plain.clone(), Color::WHITE),
         };
-        let airborne = !net.0.core.predicted().grounded;
-        drawn.push(Drawn { key: OWN, feet: view.feet, yaw: view.yaw, pitch: view.pitch, airborne, dead, ads: gun.ads, mat, tint });
+        let p = net.0.core.predicted();
+        let (airborne, crouched) = (!p.grounded, p.crouched);
+        drawn.push(Drawn { key: OWN, feet: view.feet, yaw: view.yaw, pitch: view.pitch, airborne, dead, ads: gun.ads, crouched, mat, tint });
     }
 
     // Everyone's a soldier (up to the cap, nearest first).
@@ -292,7 +309,7 @@ pub fn sync_players(
             let root = commands
                 .spawn((Player, root_tf, Visibility::default(), Motion::default(), Aim { pitch: d.pitch, key: d.key }))
                 .with_children(|p| {
-                    p.spawn((Capsule, Mesh3d(looks.capsule.clone()), MeshMaterial3d(d.mat.clone()), capsule(d.dead))).with_child((
+                    p.spawn((Capsule, Mesh3d(looks.capsule.clone()), MeshMaterial3d(d.mat.clone()), capsule(d.dead, d.crouched))).with_child((
                         Nose,
                         Mesh3d(looks.nose.clone()),
                         MeshMaterial3d(looks.nose_mat.clone()),
@@ -311,10 +328,12 @@ pub fn sync_players(
         let child = children.iter().find(|&c| soldiers.contains(c));
         let mut soldier = child.and_then(|c| soldiers.get_mut(c).ok().map(|s| (c, s)));
         let arg = soldier.as_mut().map(|(c, s)| (*c, &mut **s));
-        let shown = models::drive(&mut commands, &mut models, &mut mats, root, want.contains(&d.key), &pose, frame.dt, &mut motion, arg, &mut anim, &mut soldier_meshes);
+        // The soldier has no crouch: the crouched are drawn as their capsule.
+        let soldier_wanted = want.contains(&d.key) && (d.dead || !d.crouched);
+        let shown = models::drive(&mut commands, &mut models, &mut mats, root, soldier_wanted, &pose, frame.dt, &mut motion, arg, &mut anim, &mut soldier_meshes);
         for c in children.iter() {
             if let Ok((mut ctf, mut m, mut vis, kids)) = capsules.get_mut(c) {
-                *ctf = capsule(d.dead);
+                *ctf = capsule(d.dead, d.crouched);
                 if m.0 != d.mat {
                     m.0 = d.mat.clone();
                 }
@@ -340,16 +359,16 @@ pub fn sync_players(
 
     // Server ghosts: where the newest samples say everyone is, and where the
     // server has us.
-    let wanted: Vec<(u16, [f32; 3], f32, bool)> = if settings.ghosts {
+    let wanted: Vec<(u16, [f32; 3], f32, bool, bool)> = if settings.ghosts {
         let ents = net.0.core.entities();
-        states.iter().filter_map(|(e, _)| ents.and_then(|x| x.newest(*e)).map(|n| (*e, n.pos, n.yaw, n.dead))).collect()
+        states.iter().filter_map(|(e, _)| ents.and_then(|x| x.newest(*e)).map(|n| (*e, n.pos, n.yaw, n.dead, n.crouched))).collect()
     } else {
         Vec::new()
     };
     let mut keep = std::collections::HashSet::with_capacity(wanted.len());
-    for (e, pos, yaw, dead) in wanted {
+    for (e, pos, yaw, dead, crouched) in wanted {
         keep.insert(e);
-        let t = body(pos, yaw, dead);
+        let t = body(pos, yaw, dead, crouched);
         match scene.ghosts.get(&e) {
             Some(&id) => {
                 commands.entity(id).insert(t);
@@ -370,10 +389,10 @@ pub fn sync_players(
     let own_server = net.0.core.server_own().filter(|_| settings.ghosts);
     match (own_server, scene.own_ghost) {
         (Some((s, _)), Some(id)) => {
-            commands.entity(id).insert(body([s.pos[0], s.pos[1], s.z], 0.0, false));
+            commands.entity(id).insert(body([s.pos[0], s.pos[1], s.z], 0.0, false, s.crouched));
         }
         (Some((s, _)), None) => {
-            let t = body([s.pos[0], s.pos[1], s.z], 0.0, false);
+            let t = body([s.pos[0], s.pos[1], s.z], 0.0, false, s.crouched);
             scene.own_ghost = Some(commands.spawn((Mesh3d(looks.capsule.clone()), MeshMaterial3d(looks.own_ghost.clone()), t)).id());
         }
         (None, Some(id)) => {

@@ -24,6 +24,9 @@ pub struct GraphPanel;
 pub struct FrameBar(usize);
 #[derive(Component)]
 pub struct HealthFill;
+/// Rounds in the magazine and carried, bottom right.
+#[derive(Component)]
+pub struct AmmoText;
 #[derive(Component)]
 pub struct HitMark;
 #[derive(Component)]
@@ -104,6 +107,13 @@ pub fn setup(mut commands: Commands) {
         ))
         .with_child((HealthFill, Node { width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(Color::srgb(0.3, 0.85, 0.4))));
     commands.spawn((
+        AmmoText,
+        Node { position_type: PositionType::Absolute, right: Val::Px(16.0), bottom: Val::Px(20.0), ..default() },
+        Text::new(""),
+        TextFont { font_size: FontSize::Px(22.0), ..default() },
+        TextColor(Color::WHITE),
+    ));
+    commands.spawn((
         DeathText,
         Node { position_type: PositionType::Absolute, left: Val::Percent(50.0), top: Val::Percent(40.0), margin: UiRect::left(Val::Px(-160.0)), width: Val::Px(320.0), justify_content: JustifyContent::Center, ..default() },
         Text::new(""),
@@ -140,7 +150,7 @@ pub fn setup(mut commands: Commands) {
     ));
     commands.spawn((
         Node { position_type: PositionType::Absolute, left: Val::Px(8.0), bottom: Val::Px(6.0), ..default() },
-        Text::new("click: grab mouse, then fire  RMB: aim  Esc: release  WASD Shift Space: move  V: view  G: server ghosts  T: tier/faction colors  N: net graph"),
+        Text::new("click: grab mouse, then fire  RMB: aim  R: reload  Esc: release  WASD Shift Space Ctrl: move, crouch  V: view  G: server ghosts  T: tier/faction colors  N: net graph"),
         TextFont { font_size: FontSize::Px(12.0), ..default() },
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
     ));
@@ -228,12 +238,14 @@ pub fn combat(
     }
 }
 
-/// The health bar, and while dead, the time to respawn (from when we heard).
+/// The health bar, the rounds, and while dead, the time to respawn (from
+/// when we heard).
 pub fn vitals(
     net: Res<Net>,
     mut died_at: Local<Option<Instant>>,
     mut fill: Query<(&mut Node, &mut BackgroundColor), With<HealthFill>>,
-    mut text: Query<&mut Text, With<DeathText>>,
+    mut text: Query<&mut Text, (With<DeathText>, Without<AmmoText>)>,
+    mut ammo_text: Query<(&mut Text, &mut TextColor), With<AmmoText>>,
 ) {
     let core = &net.0.core;
     let hp = core.health() as f32 / lattice_game::faction::MAX_HEALTH as f32;
@@ -252,6 +264,21 @@ pub fn vitals(
     if let Ok(mut t) = text.single_mut() {
         if t.0 != msg {
             t.0 = msg;
+        }
+    }
+    let a = core.ammo();
+    let rounds = if core.welcome().is_none() || core.is_dead() {
+        String::new()
+    } else if a.reload > 0 {
+        format!("reloading  {}", a.reserve)
+    } else {
+        format!("{}  {}", a.mag, a.reserve)
+    };
+    if let Ok((mut t, mut c)) = ammo_text.single_mut() {
+        let low = a.mag as u32 * 4 <= lattice_game::weapon::MAGAZINE as u32;
+        c.0 = if a.reload > 0 { Color::srgb(0.8, 0.8, 0.8) } else if low { Color::srgb(1.0, 0.7, 0.25) } else { Color::WHITE };
+        if t.0 != rounds {
+            t.0 = rounds;
         }
     }
 }

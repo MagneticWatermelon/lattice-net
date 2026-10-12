@@ -5,10 +5,11 @@
 //!   cargo run --release -p lattice-game --example determinism [seed]
 //!
 //! - **world:** the terrain and every cover box the client builds itself;
-//! - **movement:** players walking, sprinting, jumping and aiming down
-//!   sights over the map for thousands of steps, pushed now and then and
-//!   dead for a while: the prediction the client and server must agree on;
-//! - **weapon:** aim, spread, bloom, flights and their hits;
+//! - **movement:** players walking, sprinting, jumping, crouching and aiming
+//!   down sights over the map for thousands of steps, pushed now and then
+//!   and dead for a while: the prediction the client and server must agree on;
+//! - **weapon:** aim, spread, bloom, flights and their hits (standing and
+//!   crouched), and the rifle's rounds over shots and reloads;
 //! - **codecs:** what both sides quantize and decode (near states, blobs,
 //!   distant fights, directions, render steps).
 
@@ -16,9 +17,9 @@ use lattice_game::activity;
 use lattice_game::delta::{self, NearEntry, NearHistory, NearQ};
 use lattice_game::events;
 use lattice_game::hit;
-use lattice_game::movement::{dead_input, nudge, step, Input, MoveState, BUTTON_ADS, BUTTON_JUMP, BUTTON_SPRINT};
+use lattice_game::movement::{dead_input, nudge, step, Input, MoveState, BUTTON_ADS, BUTTON_CROUCH, BUTTON_JUMP, BUTTON_RELOAD, BUTTON_SPRINT};
 use lattice_game::msg;
-use lattice_game::weapon::{aim, angles, muzzle, spread, Bloom, Flight};
+use lattice_game::weapon::{aim, angles, muzzle, spread, Ammo, Bloom, Flight};
 use lattice_game::world::World;
 use lattice_net::wire::Writer;
 
@@ -47,7 +48,7 @@ impl Hash {
         for v in [s.pos[0], s.pos[1], s.vel[0], s.vel[1], s.z, s.vz] {
             self.f32(v);
         }
-        self.u64(s.grounded as u64);
+        self.u64(s.grounded as u64 + 2 * s.crouched as u64);
     }
 }
 
@@ -102,7 +103,8 @@ fn main() {
         let mut dead = 0;
         for k in 0..3000 {
             if k % 20 == 0 {
-                let buttons = [0, BUTTON_SPRINT, BUTTON_JUMP, BUTTON_ADS, BUTTON_SPRINT | BUTTON_JUMP][rng.below(5) as usize];
+                let buttons = [0, BUTTON_SPRINT, BUTTON_JUMP, BUTTON_ADS, BUTTON_SPRINT | BUTTON_JUMP, BUTTON_CROUCH, BUTTON_CROUCH | BUTTON_ADS, BUTTON_CROUCH | BUTTON_JUMP]
+                    [rng.below(8) as usize];
                 let (mx, my) = (rng.below(255) as i32 - 127, rng.below(255) as i32 - 127);
                 input = Input { move_x: mx as i8, move_y: my as i8, yaw: rng.next() as u16, pitch: (rng.below(65535) as i32 - 32767) as i16, buttons };
             }
@@ -135,11 +137,12 @@ fn main() {
         h.u64(y2 as u64);
         h.u64(p2 as u16 as u64);
         let at = [300.0 + rng.unit() * 7400.0, 300.0 + rng.unit() * 7400.0];
-        let s = MoveState::standing(&world, at);
+        let s = MoveState { crouched: k % 4 == 0, ..MoveState::standing(&world, at) };
         let cone = bloom.fire(k * 768, k % 3 == 0, &s);
         h.f32(cone);
         let dir = spread(yaw, pitch, cone, rng.next());
-        let origin = muzzle(&s, &s, (k % 256) as u8);
+        let after = MoveState { crouched: k % 6 == 0, ..s };
+        let origin = muzzle(&s, &after, (k % 256) as u8);
         let mut f = Flight::new(origin, dir);
         let target = [origin[0] + a[0] * 30.0, origin[1] + a[1] * 30.0, s.z];
         for _ in 0..40 {
@@ -148,7 +151,7 @@ fn main() {
                 h.f32(t);
                 break;
             }
-            if let Some((t, head)) = hit::player(f.pos, next.pos, target) {
+            if let Some((t, head)) = hit::player(f.pos, next.pos, target, k % 5 == 0) {
                 h.f32(t);
                 h.u64(head as u64);
                 break;
@@ -171,6 +174,18 @@ fn main() {
         }
         h.u64(hit::line_clear(&world, origin, target) as u64);
     }
+    // The rifle's rounds over bursts, reloads by hand and by themselves, and
+    // a reserve running out (respawning full now and then).
+    let mut ammo = Ammo::FULL;
+    for k in 0..20_000u32 {
+        if k % 3000 == 2999 {
+            ammo = Ammo::FULL;
+        }
+        let buttons = if rng.below(40) == 0 { BUTTON_RELOAD } else { 0 };
+        h.u64(ammo.step(buttons, rng.below(3) == 0) as u64);
+        h.u64(ammo.mag as u64 | (ammo.reserve as u64) << 8 | (ammo.reload as u64) << 24);
+        h.u64(ammo.ready_in(1 + rng.below(4) as u32) as u64);
+    }
     println!("weapon {:016x}", h.0);
 
     // What both sides quantize and decode.
@@ -182,7 +197,8 @@ fn main() {
                 let at = [rng.unit() * 8190.0, rng.unit() * 8190.0];
                 let mut s = MoveState::standing(&world, at);
                 s.vel = [rng.unit() * 12.0 - 6.0, rng.unit() * 12.0 - 6.0];
-                let q = NearQ::new(&s, rng.next() as u16, (rng.below(60000) as i32 - 30000) as i16, rng.below(101) as u8, rng.below(2) == 0);
+                s.crouched = rng.below(3) == 0;
+                let q = NearQ::new(&s, rng.next() as u16, (rng.below(60000) as i32 - 30000) as i16, rng.below(101) as u8, rng.below(2) == 0, rng.below(4) == 0);
                 let base = (tick > 0 && e % 2 == 0).then(|| hist.get(e, tick - 1).map(|b| (1u8, b))).flatten();
                 NearEntry { entity: e, state: q, base }
             })
@@ -196,15 +212,17 @@ fn main() {
             for v in [q.pos()[0], q.pos()[1], q.vel()[0], q.vel()[1], q.z(), q.yaw()] {
                 h.f32(v);
             }
+            h.u64(q.flags as u64);
         })
         .expect("decodes");
         for e in 0..10u16 {
-            let s = MoveState::standing(&world, [rng.unit() * 8190.0, rng.unit() * 8190.0]);
+            let s = MoveState { crouched: e % 3 == 0, ..MoveState::standing(&world, [rng.unit() * 8190.0, rng.unit() * 8190.0]) };
             let blob = msg::encode_blob(e, &s, rng.next() as u16, (rng.below(60000) as i32 - 30000) as i16, rng.below(101) as u8);
             let b = msg::decode_blob(&blob).expect("decodes");
             for v in [b.pos[0], b.pos[1], b.z, b.yaw, b.pitch] {
                 h.f32(v);
             }
+            h.u64(b.crouched as u64);
         }
         let shots = rng.below(5000) as u32;
         h.u64(activity::shots_from_code(activity::shots_code(shots)) as u64);

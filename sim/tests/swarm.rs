@@ -1416,7 +1416,7 @@ fn walls_stop_shots() {
     }
     let c = s.server.counters();
     let g = s.gunner.unwrap();
-    assert!(g.shots > 30);
+    assert!(g.shots >= 25, "a magazine's worth: {}", g.shots);
     assert_eq!(c.hits_body + c.hits_head, 0, "nothing goes through a wall");
     assert!(c.hits_cover + c.hits_ground >= g.shots - 2, "they stop on it: cover {} ground {}", c.hits_cover, c.hits_ground);
     assert!(c.hits_cover > 0);
@@ -1866,10 +1866,11 @@ fn picking_the_best_render_step_for_each_shot_is_floored() {
     // claim older than its inputs said it drew, and getting stale again
     // after a fresh claim takes time. So it hits about as an honest gunner
     // holding the same aim does, even when every input lies too.
-    let (honest, shots_h, floored_h, _) = held_aim(0.0, 0.0, true, 20);
-    let (free, shots_f, _, trimmed_f) = held_aim(4.0, 0.0, false, 20);
-    let (cheat, shots_c, floored_c, trimmed_c) = held_aim(4.0, 0.0, true, 20);
-    let (stale, shots_s, floored_s, trimmed_s) = held_aim(4.0, 4.0, true, 20);
+    // 30 s of fire: six magazines, reloads between.
+    let (honest, shots_h, floored_h, _) = held_aim(0.0, 0.0, true, 30);
+    let (free, shots_f, _, trimmed_f) = held_aim(4.0, 0.0, false, 30);
+    let (cheat, shots_c, floored_c, trimmed_c) = held_aim(4.0, 0.0, true, 30);
+    let (stale, shots_s, floored_s, trimmed_s) = held_aim(4.0, 4.0, true, 30);
     eprintln!("held aim: honest {honest} of {shots_h} hit; picking its render step, {free} of {shots_f} without the floor ({trimmed_f} trimmed), {cheat} of {shots_c} with it ({floored_c} held, {trimmed_c} trimmed), {stale} of {shots_s} with stale inputs too ({floored_s} held, {trimmed_s} trimmed)");
     assert_eq!(floored_h, 0, "an honest gunner is never held");
     assert!(shots_h > 150 && shots_f > 150 && shots_c > 150 && shots_s > 150);
@@ -1899,6 +1900,22 @@ struct Stalls {
     after: Vec<(u64, u64, f64)>,
 }
 
+/// Bot 0 reloads (its gunner can't fire meanwhile): what's measured next
+/// starts from a full magazine.
+fn top_up(s: &mut Swarm) {
+    s.bots[0].2.reload();
+    let mut started = false;
+    for _ in 0..4 * TICK_HZ {
+        s.step();
+        let a = s.bots[0].2.core().ammo();
+        started |= a.reload > 0;
+        if a.reload == 0 && (started || a.mag == lattice_game::weapon::MAGAZINE) {
+            return;
+        }
+    }
+    panic!("no reload");
+}
+
 /// A gunner (bot 0) firing at a standing target 40 m away as fast as the
 /// rifle allows, run like the game client (`frames`: frames a second, its
 /// input clock by elapsed time) or like a bot (a step per tick), `lag`
@@ -1920,6 +1937,8 @@ fn stalled_gunner(frames: Option<u32>, lag: u32) -> Stalls {
     s.server.take_hits();
     let mut after = Vec::new();
     for stall_ms in [100u32, 300, 1000] {
+        // The 2 s after the freeze take 20 of the magazine's 30 rounds.
+        top_up(&mut s);
         s.stall_bot0 = true;
         for _ in 0..(stall_ms * TICK_HZ).div_ceil(1000) {
             s.step();
@@ -2072,7 +2091,8 @@ fn distant_fights_are_seen() {
         drain(&mut s, &mut ambient);
     }
     let fired = s.server.counters().shots - shots0;
-    assert!(fired > 300, "{fired} shots");
+    // Six rifles for 6 s: a magazine each, a reload, a few more rounds.
+    assert!(fired > 180, "{fired} shots");
     for (w, d) in watch.iter().enumerate() {
         let st = &s.bots[6 + w].2.core().stats;
         let (counted, made) = (st.activity_shots - before[w].activity_shots, st.ambient - before[w].ambient);
@@ -2212,17 +2232,21 @@ fn a_slow_game_client_keeps_its_inputs_coming() {
                 s.step();
             }
             let (c0, st0) = (s.server.counters().clone(), s.bots[0].2.stats().clone());
+            let mut ready = 0u32;
             for _ in 0..10 * TICK_HZ {
                 s.step();
+                ready += s.bots[0].2.core().ammo().ready() as u32;
             }
             let (c, st) = (s.server.counters(), s.bots[0].2.stats());
             let stand_ins = (c.repeated + c.frozen) - (c0.repeated + c0.frozen);
             let got = (stand_ins, c.late_inputs - c0.late_inputs, st.resyncs - st0.resyncs, st.corrections - st0.corrections);
             assert_eq!(got, (0, 0, 0, 0), "{fps} fps, lag {lag}: stand-ins, late inputs, resyncs, corrections");
             assert_eq!((c.rewinds_trimmed - c0.rewinds_trimmed, c.renders_held - c0.renders_held), (0, 0), "{fps} fps, lag {lag}: trimmed, held");
-            // The rifle every 3 steps, a pull per frame: 7 or 10 a second.
+            // The rifle every 3 steps, a pull per frame: 7 or 10 a second
+            // while it has a round (not through its reloads).
             let rate = (fps as f64).min(TICK_HZ as f64 / 3.0) * 0.75;
-            assert!((c.shots - c0.shots) as f64 >= 10.0 * rate * 0.95, "{fps} fps: {} shots", c.shots - c0.shots);
+            let secs = ready as f64 / TICK_HZ as f64;
+            assert!((c.shots - c0.shots) as f64 >= secs * rate * 0.95, "{fps} fps: {} shots in {secs:.1} s with a round", c.shots - c0.shots);
         }
     }
 }

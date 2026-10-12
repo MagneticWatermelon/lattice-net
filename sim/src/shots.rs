@@ -82,6 +82,8 @@ pub struct HistEntry {
     pub life: u8,
     /// Connected and not dead.
     pub live: bool,
+    /// Crouched: its hitboxes are lower (`hit::player`).
+    pub crouched: bool,
 }
 
 #[derive(Debug, Default)]
@@ -147,14 +149,15 @@ impl History {
     }
 
     /// Entity `e`'s feet at the bracket's time, if it was alive and on one
-    /// life throughout (never across a death, respawn or teleport), and that
-    /// life's counter.
-    pub fn at(&self, br: Bracket, e: u16) -> Option<([f32; 3], u8)> {
+    /// life throughout (never across a death, respawn or teleport), that
+    /// life's counter, and whether it was crouched (as of the nearer tick).
+    pub fn at(&self, br: Bracket, e: u16) -> Option<([f32; 3], u8, bool)> {
         let (a, b) = (self.ticks[br.a].at.get(e as usize)?, self.ticks[br.b].at.get(e as usize)?);
         if !a.live || !b.live || a.life != b.life {
             return None;
         }
-        Some(([0, 1, 2].map(|k| a.pos[k] + (b.pos[k] - a.pos[k]) * br.t), a.life))
+        let crouched = if br.t < 0.5 { a.crouched } else { b.crouched };
+        Some(([0, 1, 2].map(|k| a.pos[k] + (b.pos[k] - a.pos[k]) * br.t), a.life, crouched))
     }
 
     /// The newest recorded entry for `e`.
@@ -644,8 +647,8 @@ pub fn fly(p: &mut Projectile, until: f64, sky: &Sky, stats: &mut FlyStats) -> O
             }
             stats.candidates += 1;
             let tier = if near.is_some_and(|n| n.contains(j)) { 0 } else { 1 };
-            let Some((feet, life)) = brackets[tier].and_then(|br| sky.history.at(br, j)) else { return };
-            if let Some((t, head)) = hit::player(p0, p1, feet) {
+            let Some((feet, life, crouched)) = brackets[tier].and_then(|br| sky.history.at(br, j)) else { return };
+            if let Some((t, head)) = hit::player(p0, p1, feet, crouched) {
                 take(t, Outcome::Player { target: j, head, rewind: p.d[tier], life });
             }
         });
@@ -668,7 +671,7 @@ mod tests {
     use super::*;
 
     fn entry(x: f32, life: u8, live: bool) -> HistEntry {
-        HistEntry { pos: [x, 0.0, 0.0], life, live }
+        HistEntry { pos: [x, 0.0, 0.0], life, live, crouched: false }
     }
 
     #[test]
@@ -680,13 +683,13 @@ mod tests {
             h.record(tick, step, [entry(x, 0, true), entry(x, (tick == 12) as u8, true), entry(x, 0, tick != 11)].into_iter());
         }
         let br = h.bracket(102.0).unwrap();
-        assert_eq!(h.at(br, 0), Some(([102.0, 0.0, 0.0], 0)), "halfway between steps 101 and 103");
+        assert_eq!(h.at(br, 0), Some(([102.0, 0.0, 0.0], 0, false)), "halfway between steps 101 and 103");
         assert_eq!(h.at(br, 1), None, "respawned in between");
         assert_eq!(h.at(br, 2), None, "dead at one end");
         assert_eq!(h.at(h.bracket(100.5).unwrap(), 2), None);
         assert!(h.bracket(103.5).is_none(), "the future");
         assert!(h.bracket(99.0).is_none(), "before the history");
-        assert_eq!(h.at(h.bracket(103.0).unwrap(), 0), Some(([103.0, 0.0, 0.0], 0)));
+        assert_eq!(h.at(h.bracket(103.0).unwrap(), 0), Some(([103.0, 0.0, 0.0], 0, false)));
     }
 
     #[test]

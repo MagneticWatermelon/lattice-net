@@ -6,7 +6,7 @@ use std::time::Instant;
 
 pub use lattice_client_core::{ClientConfig, ClientCore, ClientStats, Entities, InputTiming};
 
-use crate::movement::{Input, MoveState, BUTTON_ADS, BUTTON_JUMP, BUTTON_SPRINT};
+use crate::movement::{Input, MoveState, BUTTON_ADS, BUTTON_CROUCH, BUTTON_JUMP, BUTTON_RELOAD, BUTTON_SPRINT};
 use crate::msg::Welcome;
 use crate::rng::Rng;
 
@@ -21,6 +21,8 @@ pub struct BotBrain {
     fighter: Option<Fighter>,
     /// Aims down sights (tests); fighters do whenever they have a target.
     ads: bool,
+    /// Presses reload with its next input (`reload`).
+    reload_once: bool,
     seed: u64,
 }
 
@@ -43,7 +45,7 @@ impl BotBrain {
     }
 
     pub fn with_config(seed: u64, cfg: ClientConfig) -> Self {
-        Self { core: ClientCore::new(cfg), ai: Wander::new(seed), trigger: false, fighter: None, ads: false, seed }
+        Self { core: ClientCore::new(cfg), ai: Wander::new(seed), trigger: false, fighter: None, ads: false, reload_once: false, seed }
     }
 
     /// Fights: aims at the nearest enemy it draws and fires in bursts. It
@@ -58,6 +60,11 @@ impl BotBrain {
     /// Holds the trigger: a shot every 100 ms, level along its heading.
     pub fn set_trigger(&mut self, on: bool) {
         self.trigger = on;
+    }
+
+    /// Presses reload once, with its next input.
+    pub fn reload(&mut self) {
+        self.reload_once = true;
     }
 
     /// Where it walks (and, held or with the trigger, faces and fires), in
@@ -124,7 +131,8 @@ impl BotBrain {
     }
 
     /// One tick of the input clock, with the AI choosing each input. Fighters
-    /// aim down sights while they have a target, as players do; trigger bots
+    /// aim down sights while they have a target, as players do (some of them
+    /// crouched), and top up their magazine between fights; trigger bots
     /// spray from the hip.
     pub fn tick_inputs(&mut self, now: Instant) -> Option<Vec<u8>> {
         if let Some(f) = &mut self.fighter {
@@ -133,15 +141,30 @@ impl BotBrain {
             let yaw = (self.ai.heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16;
             self.core.fire(now, yaw, 0, self.ads);
         }
-        let ads = self.ads || self.fighter.as_ref().is_some_and(|f| f.cfg.ads && f.target.is_some());
+        let engaged = self.fighter.as_ref().is_some_and(|f| f.target.is_some());
+        let ads = self.ads || self.fighter.as_ref().is_some_and(|f| f.cfg.ads && engaged);
+        let crouch = self.fighter.as_ref().is_some_and(|f| f.crouches && engaged);
+        let ammo = self.core.ammo();
+        let reload = self.fighter.is_some() && !engaged && ammo.reload == 0 && ammo.mag < lattice_game::weapon::MAGAZINE / 3;
+        let mut reload_once = std::mem::take(&mut self.reload_once);
         let ai = &mut self.ai;
-        self.core.step_inputs(now, |s, w| {
+        let out = self.core.step_inputs(now, |s, w| {
             let mut input = ai.think(s, w);
             if ads {
                 input.buttons = (input.buttons | BUTTON_ADS) & !BUTTON_SPRINT;
             }
+            if crouch {
+                input.buttons = (input.buttons | BUTTON_CROUCH) & !(BUTTON_SPRINT | BUTTON_JUMP);
+            }
+            if reload || reload_once {
+                input.buttons |= BUTTON_RELOAD;
+                reload_once = false;
+            }
             input
-        })
+        });
+        // No input made this tick: the press waits for the next.
+        self.reload_once = reload_once;
+        out
     }
 }
 
@@ -214,6 +237,8 @@ impl Default for FightConfig {
 struct Fighter {
     cfg: FightConfig,
     rng: Rng,
+    /// Crouches while it fights (two bots in five).
+    crouches: bool,
     target: Option<u16>,
     retarget_in: u32,
     burst: u32,
@@ -221,11 +246,12 @@ struct Fighter {
 }
 
 /// Where to aim at `target` as `core` draws it at render step `r`: at its
-/// body (or head), leading for the flight time and the drop at its drawn
-/// velocity, plus `extra_lead` steps. The aim as the wire carries it.
+/// body (or head), standing or crouched, leading for the flight time and the
+/// drop at its drawn velocity, plus `extra_lead` steps. The aim as the wire
+/// carries it.
 pub fn aim_at(core: &ClientCore, target: u16, r: f64, head: bool, extra_lead: f32) -> Option<(u16, i16)> {
-    use lattice_game::hit::{BODY_HIGH, BODY_LOW, HEAD_AT};
-    use lattice_game::weapon::{EYE_HEIGHT, GRAVITY, MUZZLE_SPEED};
+    use lattice_game::hit::{BODY_HIGH, BODY_LOW, CROUCH_BODY_HIGH, CROUCH_HEAD_AT, HEAD_AT};
+    use lattice_game::weapon::{eye_height, GRAVITY, MUZZLE_SPEED};
     let ents = core.entities()?;
     let (st, was) = (ents.render_one(target, r)?, ents.render_one(target, r - 0.5)?);
     if st.dead {
@@ -234,8 +260,14 @@ pub fn aim_at(core: &ClientCore, target: u16, r: f64, head: bool, extra_lead: f3
     let tick_hz = crate::movement::TICK_HZ as f32;
     let vel = [0, 1].map(|k| (st.pos[k] - was.pos[k]) * 2.0 * tick_hz);
     let me = core.predicted();
-    let eye = [me.pos[0], me.pos[1], me.z + EYE_HEIGHT];
-    let at = st.pos[2] + if head { HEAD_AT } else { (BODY_LOW + BODY_HIGH) / 2.0 };
+    let eye = [me.pos[0], me.pos[1], me.z + eye_height(&me)];
+    let at = st.pos[2]
+        + match (head, st.crouched) {
+            (true, false) => HEAD_AT,
+            (true, true) => CROUCH_HEAD_AT,
+            (false, false) => (BODY_LOW + BODY_HIGH) / 2.0,
+            (false, true) => (BODY_LOW + CROUCH_BODY_HIGH) / 2.0,
+        };
     let flight = ((st.pos[0] - eye[0]).powi(2) + (st.pos[1] - eye[1]).powi(2)).sqrt() / MUZZLE_SPEED;
     let lead = flight + extra_lead / tick_hz;
     let p = [st.pos[0] + vel[0] * lead, st.pos[1] + vel[1] * lead, at + 0.5 * GRAVITY * flight * flight];
@@ -247,7 +279,9 @@ pub fn aim_at(core: &ClientCore, target: u16, r: f64, head: bool, extra_lead: f3
 
 impl Fighter {
     fn new(cfg: FightConfig, seed: u64) -> Self {
-        Self { cfg, rng: Rng::new(seed ^ 0x000F_1647), target: None, retarget_in: 0, burst: 0, pause: 0 }
+        let mut rng = Rng::new(seed ^ 0x000F_1647);
+        let crouches = rng.chance(0.4);
+        Self { cfg, rng, crouches, target: None, retarget_in: 0, burst: 0, pause: 0 }
     }
 
     /// A normal deviate (Box-Muller).
@@ -261,16 +295,16 @@ impl Fighter {
         let (ents, world, me) = (core.entities()?, core.world()?, core.welcome()?.entity);
         let side = lattice_game::faction::faction(me);
         let s = core.predicted();
-        let eye = [s.pos[0], s.pos[1], s.z + lattice_game::weapon::EYE_HEIGHT];
+        let eye = [s.pos[0], s.pos[1], s.z + lattice_game::weapon::eye_height(&s)];
         let mut near: Vec<(f32, u16, [f32; 3])> = ents
             .ids()
             .filter(|&e| lattice_game::faction::faction(e) != side)
-            .filter_map(|e| ents.render_one(e, r).filter(|st| !st.dead).map(|st| (e, st.pos)))
+            .filter_map(|e| ents.render_one(e, r).filter(|st| !st.dead).map(|st| (e, [st.pos[0], st.pos[1], st.pos[2] + if st.crouched { 0.6 } else { 1.0 }])))
             .map(|(e, p)| (((p[0] - eye[0]).powi(2) + (p[1] - eye[1]).powi(2)).sqrt(), e, p))
             .filter(|&(d, ..)| d <= self.cfg.range)
             .collect();
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        near.into_iter().take(3).find(|&(_, _, p)| lattice_game::hit::line_clear(world, eye, [p[0], p[1], p[2] + 1.0])).map(|(_, e, _)| e)
+        near.into_iter().take(3).find(|&(_, _, p)| lattice_game::hit::line_clear(world, eye, p)).map(|(_, e, _)| e)
     }
 
     /// One tick: pick a target now and then, fire in bursts (0.5-1 s, with

@@ -5,12 +5,15 @@
 use crate::world::World;
 
 /// Player hitboxes, from the feet: a body capsule and a head sphere. (Only
-/// for shots; moving uses the movement collider.)
+/// for shots; moving uses the movement collider.) Crouched, both fit the
+/// crouched collider (1.2 m): the body 0-1.0 m, the head 0.8-1.2 m.
 pub const BODY_RADIUS: f32 = 0.4;
 pub const BODY_LOW: f32 = 0.4;
 pub const BODY_HIGH: f32 = 1.1;
 pub const HEAD_RADIUS: f32 = 0.2;
 pub const HEAD_AT: f32 = 1.6;
+pub const CROUCH_BODY_HIGH: f32 = 0.6;
+pub const CROUCH_HEAD_AT: f32 = 1.0;
 
 type V = [f32; 3];
 
@@ -86,18 +89,19 @@ pub fn capsule(p0: V, p1: V, a: V, b: V, r: f32) -> Option<f32> {
     best.filter(|&t| (0.0..=len).contains(&t)).map(|t| t / len)
 }
 
-/// Where a segment hits a player standing with feet at `feet`: (t, head).
-/// The head counts when it's first along the segment.
-pub fn player(p0: V, p1: V, feet: V) -> Option<(f32, bool)> {
+/// Where a segment hits a player with feet at `feet`, standing or
+/// `crouched`: (t, head). The head counts when it's first along the segment.
+pub fn player(p0: V, p1: V, feet: V, crouched: bool) -> Option<(f32, bool)> {
+    let (body_high, head_at) = if crouched { (CROUCH_BODY_HIGH, CROUCH_HEAD_AT) } else { (BODY_HIGH, HEAD_AT) };
     // Cheap reject: the segment's box against the player's.
     let lo = [p0[0].min(p1[0]), p0[1].min(p1[1]), p0[2].min(p1[2])];
     let hi = [p0[0].max(p1[0]), p0[1].max(p1[1]), p0[2].max(p1[2])];
     let r = BODY_RADIUS;
-    if hi[0] < feet[0] - r || lo[0] > feet[0] + r || hi[1] < feet[1] - r || lo[1] > feet[1] + r || hi[2] < feet[2] || lo[2] > feet[2] + HEAD_AT + HEAD_RADIUS {
+    if hi[0] < feet[0] - r || lo[0] > feet[0] + r || hi[1] < feet[1] - r || lo[1] > feet[1] + r || hi[2] < feet[2] || lo[2] > feet[2] + head_at + HEAD_RADIUS {
         return None;
     }
-    let head = sphere(p0, p1, [feet[0], feet[1], feet[2] + HEAD_AT], HEAD_RADIUS);
-    let body = capsule(p0, p1, [feet[0], feet[1], feet[2] + BODY_LOW], [feet[0], feet[1], feet[2] + BODY_HIGH], BODY_RADIUS);
+    let head = sphere(p0, p1, [feet[0], feet[1], feet[2] + head_at], HEAD_RADIUS);
+    let body = capsule(p0, p1, [feet[0], feet[1], feet[2] + BODY_LOW], [feet[0], feet[1], feet[2] + body_high], BODY_RADIUS);
     match (head, body) {
         (Some(h), Some(b)) if h <= b => Some((h, true)),
         (_, Some(b)) => Some((b, false)),
@@ -203,15 +207,27 @@ mod tests {
     #[test]
     fn players_are_hit_in_the_head_or_the_body() {
         let feet = [10.0, 0.0, 0.0];
-        let (t, head) = player([0.0, 0.0, 1.6], [20.0, 0.0, 1.6], feet).unwrap();
+        let (t, head) = player([0.0, 0.0, 1.6], [20.0, 0.0, 1.6], feet, false).unwrap();
         assert!(head && (t - 0.49).abs() < 1e-4, "eye level: head ({t})");
-        let (_, head) = player([0.0, 0.0, 0.8], [20.0, 0.0, 0.8], feet).unwrap();
+        let (_, head) = player([0.0, 0.0, 0.8], [20.0, 0.0, 0.8], feet, false).unwrap();
         assert!(!head, "chest");
-        assert!(player([0.0, 0.0, 2.0], [20.0, 0.0, 2.0], feet).is_none(), "over the head");
-        assert!(player([0.0, 0.6, 0.8], [20.0, 0.6, 0.8], feet).is_none(), "beside");
+        assert!(player([0.0, 0.0, 2.0], [20.0, 0.0, 2.0], feet, false).is_none(), "over the head");
+        assert!(player([0.0, 0.6, 0.8], [20.0, 0.6, 0.8], feet, false).is_none(), "beside");
         // From above (a hill), the head comes first.
-        let (_, head) = player([10.0, 0.0, 10.0], [10.0, 0.0, 0.0], feet).unwrap();
+        let (_, head) = player([10.0, 0.0, 10.0], [10.0, 0.0, 0.0], feet, false).unwrap();
         assert!(head);
+    }
+
+    #[test]
+    fn crouched_players_are_lower() {
+        let feet = [10.0, 0.0, 0.0];
+        // A standing head shot passes over a crouched player.
+        assert!(player([0.0, 0.0, 1.6], [20.0, 0.0, 1.6], feet, true).is_none());
+        assert!(player([0.0, 0.0, 1.3], [20.0, 0.0, 1.3], feet, true).is_none(), "over the crouched head");
+        let (_, head) = player([0.0, 0.0, 1.05], [20.0, 0.0, 1.05], feet, true).unwrap();
+        assert!(head, "its head at 1 m");
+        let (_, head) = player([0.0, 0.0, 0.5], [20.0, 0.0, 0.5], feet, true).unwrap();
+        assert!(!head, "its body");
     }
 
     #[test]

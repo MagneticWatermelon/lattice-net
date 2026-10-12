@@ -7,14 +7,17 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use lattice_client_core::tracers::Kind;
-use lattice_game::movement::{Input, BUTTON_ADS, BUTTON_JUMP, BUTTON_SPRINT};
+use lattice_game::movement::{Input, BUTTON_ADS, BUTTON_CROUCH, BUTTON_JUMP, BUTTON_RELOAD, BUTTON_SPRINT};
 
 use crate::coords::{look_rotation, pitch_i16, stick, to_bevy, yaw_u16};
 use crate::{Frame, Net, Settings};
 
-/// Eye height above the feet.
-pub const EYE: f32 = 1.6;
+/// Eye height above the feet, standing.
+pub const EYE: f32 = lattice_game::weapon::EYE_HEIGHT;
 const SENSITIVITY: f32 = 0.0025;
+/// How long a reload key press is held out to the input clock at most (it
+/// makes an input every 33 ms; a frame's press alone could miss it).
+const RELOAD_PRESS: f32 = 0.2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -36,7 +39,12 @@ pub struct View {
     pub pitch: f32,
     /// Our player's drawn feet, once we have a state.
     pub feet: [f32; 3],
+    /// Our eyes above them: down as we crouch, eased.
+    pub eye_height: f32,
     pub has_body: bool,
+    /// The reload key's press, held out until the reload starts (or this
+    /// time passes: a full magazine).
+    reload_until: f32,
     /// The spectator camera's own aim, kept while in other views.
     spec_yaw: f32,
     spec_pitch: f32,
@@ -61,7 +69,9 @@ impl View {
             yaw: 0.0,
             pitch: 0.0,
             feet: [0.0; 3],
+            eye_height: EYE,
             has_body: false,
+            reload_until: 0.0,
             spec_yaw: 0.0,
             spec_pitch: -0.4,
             spec_placed: false,
@@ -216,6 +226,21 @@ pub fn play(
         if keys.pressed(KeyCode::Space) {
             buttons |= BUTTON_JUMP;
         }
+        // Crouched: no sprint, no jump (the server agrees).
+        if keys.pressed(KeyCode::ControlLeft) {
+            buttons = (buttons | BUTTON_CROUCH) & !(BUTTON_SPRINT | BUTTON_JUMP);
+        }
+        if keys.just_pressed(KeyCode::KeyR) {
+            view.reload_until = frame.secs + RELOAD_PRESS;
+        }
+        // Held only until the reload is under way: held past its end, the
+        // next shot would start another.
+        if net.0.core.ammo().reload > 0 {
+            view.reload_until = 0.0;
+        }
+        if frame.secs < view.reload_until {
+            buttons |= BUTTON_RELOAD;
+        }
         Input { move_x: mx, move_y: my, yaw: yaw_u16(view.yaw), pitch: pitch_i16(view.pitch), buttons }
     };
     // Held left button (once the mouse is ours): a shot whenever the rifle is
@@ -230,7 +255,7 @@ pub fn play(
             let f = view.feet;
             let step = net.0.core.last_shot_step();
             let faction = net.0.core.welcome().map_or(0, |w| lattice_game::faction::faction(w.entity));
-            tracers.0.fire_own([f[0], f[1], f[2] + EYE], view.yaw, view.pitch, dir, own_muzzle(1.0 - gun.blend), step, faction);
+            tracers.0.fire_own([f[0], f[1], f[2] + view.eye_height], view.yaw, view.pitch, dir, own_muzzle(1.0 - gun.blend), step, faction);
             gun.shot(view, frame.secs);
             fire_times.0.insert(crate::scene::OWN, frame.secs);
         }
@@ -303,19 +328,23 @@ pub fn place_camera(frame: Res<Frame>, net: Res<Net>, mut view: ResMut<View>, mu
     if core.welcome().is_some() {
         view.feet = core.own_render(frame.now);
         view.has_body = true;
+        // Down and up in about 0.15 s, as the shots' eye moves at once.
+        let want = lattice_game::weapon::eye_height(&core.predicted());
+        view.eye_height += (want - view.eye_height) * (frame.dt * 20.0).min(1.0);
     }
     let Ok(mut tf) = cam.single_mut() else { return };
     let f = view.feet;
+    let eye = view.eye_height;
     match view.mode {
         Mode::FirstPerson => {
-            view.eye = [f[0], f[1], f[2] + EYE];
-            *tf = Transform::from_translation(to_bevy(f[0], f[1], f[2] + EYE)).with_rotation(look_rotation(view.yaw, view.pitch));
+            view.eye = [f[0], f[1], f[2] + eye];
+            *tf = Transform::from_translation(to_bevy(f[0], f[1], f[2] + eye)).with_rotation(look_rotation(view.yaw, view.pitch));
         }
         Mode::Chase => {
             // 6 m behind and 2.5 m above the eye, looking where the player looks.
             let (s, c) = view.yaw.sin_cos();
-            view.eye = [f[0] - c * 6.0, f[1] - s * 6.0, f[2] + EYE + 2.5];
-            let at = to_bevy(f[0] + c * 4.0, f[1] + s * 4.0, f[2] + EYE);
+            view.eye = [f[0] - c * 6.0, f[1] - s * 6.0, f[2] + eye + 2.5];
+            let at = to_bevy(f[0] + c * 4.0, f[1] + s * 4.0, f[2] + eye);
             *tf = Transform::from_translation(to_bevy(view.eye[0], view.eye[1], view.eye[2])).looking_at(at, Vec3::Y);
         }
         Mode::Spectator => {

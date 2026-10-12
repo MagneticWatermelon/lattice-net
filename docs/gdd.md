@@ -192,10 +192,11 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 | step up / step down | 0.45 / 0.6 m |
 | steepest walkable slope | 45° |
 | collider | a cylinder: radius 0.4 m, height 1.8 m |
+| crouch (while `BUTTON_CROUCH` is held; exists since 2026-10-12) | 3 m/s; height 1.2 m, eyes at 1.15 m; no sprint or jump; the cone ×0.75 |
 
 - Movement is deterministic. Prediction matches the server bit for bit, and it's checked (exists).
+- Crouched, a player passes under cover whose underside is above 1.2 m. Standing up there pushes them out of it, as walking into it would: there are no ceilings yet; with them (C1) standing up needs headroom.
 - **Proposed additions,** each a change to `movement.rs` and predicted like the rest:
-  - **crouch:** height 1.2 m, eyes at 1.15 m, 3 m/s, a tighter cone;
   - **fall damage** past 8 m;
   - **ceilings:** jumping into one stops you, which interiors need;
   - **jump jets** for the Skirmisher: fuel-limited vertical thrust;
@@ -209,7 +210,8 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 - **Health regenerates only out of combat** (after 8 s untouched, +5/s), or from medics.
 - **Hitboxes** (exists, `game/src/hit.rs`):
   - a body capsule, radius 0.4 m around a segment 0.4–1.1 m above the feet, so it covers 0–1.5 m;
-  - a head sphere, radius 0.2 m at 1.6 m, so 1.4–1.8 m.
+  - a head sphere, radius 0.2 m at 1.6 m, so 1.4–1.8 m;
+  - crouched: the segment's top at 0.6 m (the body covers 0–1.0 m) and the head at 1.0 m (0.8–1.2 m). The server's history keeps each tick's stance, so a shot is tested against the stance the shooter saw.
   - A headshot doubles damage (decided for the rifle: 20 body, 40 head).
 - **Explosions** deal radius damage with falloff. Cover blocks them: a target takes damage only with a line of sight from the blast's center.
 
@@ -268,7 +270,11 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
   - Infantry precision reaches 500 m: the mid tier, 10 Hz, interpolated.
   - Targets beyond are in the far tier (2 Hz): visible, but not reliably hittable.
   - Scopes fix that by promoting what's in the scope's cone (§10).
-- **Ammo (proposed).** Magazines and reloads are predicted: the counts are deterministic, and reloading is a `BUTTON_RELOAD`. Reserves refill at terminals and ammo packs. The server rejects shots it considers impossible.
+- **Ammo (exists for the rifle, 2026-10-12).** A 30-round magazine and 180 rounds carried, refilled on respawning. A reload takes 2.2 s, or 2.7 s from empty (a round to chamber); the last round starts one by itself, and `BUTTON_RELOAD` starts one early. Nothing fires while it runs.
+  - **Predicted like movement:** each input's step counts the reload down, fires its shot if a round is ready, then takes the reload button (`weapon::Ammo::step`). The own snapshot carries the magazine, the reserve and the reload's steps left; a mismatch is replayed like a movement correction (`ammo_corrections`).
+  - **The server refuses a shot without a round** (`shots_refused`), and a client never claims one: it checks the round it will have at the shot's step.
+  - Others see a reload as a near flag (for the animation).
+  - *Proposed:* reserves refill at terminals and ammo packs; magazine sizes per weapon and loadout.
 
 ## 5. Vehicles
 
@@ -321,7 +327,7 @@ Everything that blocks movement or shots must exist in the shared world (`game/s
 | ceiling height | ≥ 2.4 m; ≥ 2.6 m where players jump | 1.8 m tall, plus a 0.68 m jump |
 | stair riser | ≤ 0.4 m | step up is 0.45 m |
 | ledge a player can jump onto | ≤ 1.1 m | a 0.68 m jump, plus 0.45 m of ledge catch |
-| low cover | 1.0–1.2 m | covers most of a crouching player (proposed crouch: 1.2 m tall) |
+| low cover | 1.0–1.2 m | a crouching player is 1.2 m tall, eyes at 1.15 m: 1.2 m hides them; at 1.0–1.1 m they shoot over it, head showing |
 | full cover | ≥ 1.9 m | the head's top is at 1.8 m |
 | heights to avoid | 1.4–1.65 m | the eyes (1.6 m) see over while the body (up to 1.5 m) hides: head-only peeking |
 | walkable slope | ≤ 45° | `MAX_SLOPE` |
@@ -455,7 +461,7 @@ The whole client-side network stack exists in Rust. The bots and the Bevy client
 | `on_message(bytes, now)` | takes everything the server sends: Welcome, Snapshot, Near, Entities, Events, Shots, Activity |
 | `fire(now, yaw, pitch, ads)` | pulls the trigger; returns the direction for our own tracer |
 | `tick_inputs(now, source)` | runs the input clock by elapsed time; returns input batches to send unreliably |
-| `render(now, f)` | draws every other entity at the render step as a `RenderState` (pos, yaw, pitch, airborne, health, dead, ads, tier, how, at). Call it once per frame: it also adapts the near delay |
+| `render(now, f)` | draws every other entity at the render step as a `RenderState` (pos, yaw, pitch, airborne, health, dead, ads, crouched, reloading, tier, how, at). Call it once per frame: it also adapts the near delay |
 | `own_render(now)` | where to draw our own player: between predicted steps, with corrections smoothed away |
 | `drain_news`, `drain_ambient` | combat events; others' shots, for tracers; ambient shots for distant fights |
 | `cone`, `health`, `is_dead`, `server_own`, `stats` | the reticle, vitals, the server ghost, the net graph |
@@ -469,7 +475,7 @@ The whole client-side network stack exists in Rust. The bots and the Bevy client
 | message | channel | when, and what |
 |---|---|---|
 | Welcome | reliable | once: entity id, spawn, world seed |
-| Snapshot | unreliable | every tick: own state (full f32), acked input, queue depth, pace, levels, health, life |
+| Snapshot | unreliable | every tick: own state (full f32, stance), acked input, queue depth, pace, levels, health, life, rounds (magazine, reserve, reload) |
 | Near | unreliable | every tick: up to 64 entities within 150 m (plus squad and contacts), as deltas against acked baselines |
 | Entities | unreliable | mid (500 m, 10 Hz) and far (1.5 km, 2 Hz) blobs, 11 B each |
 | Events | reliable | Hit, Hurt, Kill |
@@ -529,12 +535,12 @@ typedef struct LtSession LtSession;
 typedef struct {
     float yaw, pitch;        // radians: yaw counterclockwise from east, pitch up
     float forward, right;    // -1..1, from the keys or a stick
-    uint8_t buttons;         // SPRINT, JUMP, ADS (later CROUCH, RELOAD, USE...)
+    uint8_t buttons;         // SPRINT, JUMP, ADS, CROUCH, RELOAD (later USE...)
 } LtIntent;
 
 typedef struct {
     uint16_t id;
-    uint8_t faction, tier, how, flags;   // flags: airborne, dead, ads
+    uint8_t faction, tier, how, flags;   // flags: airborne, dead, ads, crouched, reloading
     uint8_t health;
     float pos[3], yaw, pitch;
     double at;                           // the game step it's drawn at
@@ -545,6 +551,9 @@ typedef struct {
     uint8_t health, dead, life;
     float cone_deg;          // the reticle
     float server_pos[3];     // the server ghost
+    uint8_t crouched, mag;   // predicted, like the position
+    uint16_t reserve;
+    float reload;            // seconds left of a reload; 0: none
 } LtOwn;
 
 uint32_t   lt_version(void);
@@ -675,7 +684,7 @@ PostLateUpdate (inserted,      lt_flush
 - **Bands go by screen size, not distance,** so a 4–12× scope brings the rich band out with the zoom.
 - **Animation comes from `RenderState`:**
   - velocity from the drawn positions, smoothed;
-  - airborne, aiming down sights and dead from its flags;
+  - airborne, aiming down sights, crouched, reloading and dead from its flags;
   - firing from the tracer feed.
 - **Death:** a ragdoll or a clip, then hold still: the server's corpse doesn't move.
 - **Transforms for the rich band update in a Burst job** over a `TransformAccessArray`. The crowd band is only an instance buffer.
@@ -801,7 +810,7 @@ continent package (.lcp) ----> the server:        World::load(package)
 | U0–U3 | none | none |
 | U4 | the deploy flow (no body until deployed), death recap, reward events, a continent-wide fight list every 5 s | Deploy (C→S reliable); Recap, Reward, Fights (S→C) |
 | U5 | territory: sites, capture, lanes, spawn rooms, Landings; collision C1 (ceilings, rotated boxes, wedges, faction shields) | Territory (reliable: the full state at join, then changes); site state for nearby sites at 1–2 Hz |
-| U6 | classes and loadouts; crouch; ammo and reloads; jump jets; Exo bodies; cloak in interest; healing and revives; deployables (proximity checks on the shared grid); spotting; appearance | more input buttons and a weapon slot (+1 B per input); wider near and far flags; appearance records for entities entering a client's near or mid set; deployables (reliable, static); the spotted list |
+| U6 | classes and loadouts; crouch (built); ammo and reloads (built for the rifle); jump jets; Exo bodies; cloak in interest; healing and revives; deployables (proximity checks on the shared grid); spotting; appearance | more input buttons and a weapon slot (+1 B per input); wider near and far flags; appearance records for entities entering a client's near or mid set; deployables (reliable, static); the spotted list |
 | U7 | vehicles (M4): physics, seats, interest by size, faster far updates for aircraft | vehicle states, seat changes |
 | U8 | continent packages | Welcome v2: continent id and content hash |
 | the shell | login, characters, the war service, chat, voice | HTTPS or QUIC, outside the game connection |
@@ -854,8 +863,10 @@ continent package (.lcp) ----> the server:        World::load(package)
 | bloom | down the sights +0.04° per shot, up to +0.5°; from the hip +0.1°, up to +1.5°; recovers after 133 ms, at 12°/s | |
 | recoil | 0.32° up per shot (the first ×1.75); 0.16° left to 0.22° right; drifts back down after 0.12 s, at 9°/s | |
 | aiming down sights | 0.2 s to raise; 1.35× zoom; half speed | `client/src/gun.rs`, `weapon.rs` |
-| hitboxes | body capsule, radius 0.4, 0.4–1.1 m; head sphere, radius 0.2, at 1.6 m | `hit.rs` |
-| eye height | 1.6 m | `weapon.rs` |
+| hitboxes | body capsule, radius 0.4, 0.4–1.1 m; head sphere, radius 0.2, at 1.6 m; crouched 0.4–0.6 m and 1.0 m | `hit.rs` |
+| eye height | 1.6 m; crouched 1.15 m | `weapon.rs` |
+| crouch | 3 m/s, 1.2 m tall, the cone ×0.75, no sprint or jump | `movement.rs`, `weapon.rs` |
+| rifle rounds | 30 in the magazine, 180 carried; reload 2.2 s, 2.7 s from empty | `weapon.rs` |
 | health and respawn | 100; 5 s | `faction.rs` |
 | ambient shots | up to 600/s | `client-core/src/distant.rs` |
 

@@ -31,7 +31,7 @@ use lattice_game::delta;
 use lattice_game::events::{self, Event, SeenShot};
 use lattice_game::movement::{dead_input, stand_in, step, Input, MoveState, TICK_HZ};
 use lattice_game::msg::{self, InputEntry, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
-use lattice_game::weapon::{self, shot_time, Bloom, Shot, FIRE_STEPS};
+use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot, FIRE_STEPS};
 use lattice_game::tier::Tier;
 use lattice_game::world::World;
 
@@ -118,6 +118,9 @@ pub struct ClientStats {
     /// crowd (unpredictable by design), and the largest such error, in meters.
     pub push_corrections: u64,
     pub push_error_max: f32,
+    /// Snapshots whose rifle rounds disagreed with ours (a late shot the
+    /// server fired at its own time, say): replayed like a correction.
+    pub ammo_corrections: u64,
     /// Sum and max of those position errors, in meters.
     pub correction_error_sum: f64,
     pub correction_error_max: f32,
@@ -204,6 +207,8 @@ struct Predicted {
     render: Option<u16>,
     /// A shot fired during this input's step.
     shot: Option<Shot>,
+    /// The rifle's rounds after it.
+    ammo: Ammo,
 }
 
 pub struct ClientCore {
@@ -220,6 +225,8 @@ pub struct ClientCore {
     world: Option<Arc<World>>,
     seq: u32,
     state: MoveState,
+    /// The rifle's rounds after `seq` (`weapon::Ammo`), predicted like `state`.
+    ammo: Ammo,
     history: Vec<Predicted>,
     /// Input clock: `rate` inputs per 1/30 s, accumulated in `clock`.
     rate: f32,
@@ -344,6 +351,7 @@ impl ClientCore {
             world: None,
             seq: 0,
             state: MoveState::default(),
+            ammo: Ammo::FULL,
             history: vec![Predicted::default(); HISTORY],
             rate: 1.0,
             pace: 1.0,
@@ -400,6 +408,11 @@ impl ClientCore {
 
     pub fn predicted(&self) -> MoveState {
         self.state
+    }
+
+    /// The rifle's rounds, predicted to the newest input.
+    pub fn ammo(&self) -> Ammo {
+        self.ammo
     }
 
     /// Smoothed count of our inputs the server had queued when it consumed one.
@@ -672,6 +685,7 @@ impl ClientCore {
                 let world = World::shared(w.world_seed);
                 // The server starts us exactly here too.
                 self.state = MoveState::standing(&world, w.spawn);
+                self.ammo = Ammo::FULL;
                 self.world = Some(world);
                 self.distant = Distant::new(0x9E37_79B9_7F4A_7C15 ^ w.entity as u64);
                 self.welcome = Some(w);
@@ -757,7 +771,7 @@ impl ClientCore {
             // We died or respawned: whatever we predicted since is under the
             // wrong rule (or the wrong place). Replay from the server's state.
             self.stats.life_events += 1;
-            self.rebase(h.ack_seq, h.own, now, true);
+            self.rebase(h.ack_seq, h.own, h.ammo, now, true);
             return;
         }
         let (s, o) = (&slot.state, &h.own);
@@ -766,20 +780,23 @@ impl ClientCore {
         // Below the epsilon a miss is left alone, but never after a push: a
         // push can be under a millimeter, and left alone it would grow into
         // a "misprediction" later, with no push to explain it.
-        let tiny = err <= CORRECTION_EPSILON && vel_err <= CORRECTION_EPSILON && s.grounded == o.grounded;
-        if *s == *o || (tiny && !pushed) {
+        let tiny = err <= CORRECTION_EPSILON && vel_err <= CORRECTION_EPSILON && s.grounded == o.grounded && s.crouched == o.crouched;
+        let moved = !(*s == *o || (tiny && !pushed));
+        let ammo_miss = slot.ammo != h.ammo;
+        if !moved && !ammo_miss {
             return;
         }
-        if pushed {
+        if moved && pushed {
             self.stats.push_corrections += 1;
             self.stats.push_error_max = self.stats.push_error_max.max(err);
-        } else {
+        } else if moved {
             self.stats.corrections += 1;
             self.stats.correction_error_sum += err as f64;
             self.stats.correction_error_max = self.stats.correction_error_max.max(err);
         }
+        self.stats.ammo_corrections += ammo_miss as u64;
 
-        self.rebase(h.ack_seq, h.own, now, false);
+        self.rebase(h.ack_seq, h.own, h.ammo, now, false);
     }
 
     /// Steers the input clock by how many of our inputs the server had
@@ -825,19 +842,21 @@ impl ClientCore {
         let last = if p.seq == self.made && p.sent_at.is_some() { p.input } else { Input::default() };
         let dead = self.is_dead();
         let to = h.ack_seq + (self.lead.round().max(1.0) as u32 - 1).min(MAX_STAND_INS);
-        let (mut seq, mut s) = (h.ack_seq, h.own);
+        let (mut seq, mut s, mut ammo) = (h.ack_seq, h.own, h.ammo);
         loop {
             let input = stand_in(last, seq - self.made);
             if seq > h.ack_seq {
-                s = step(&world, s, if dead { dead_input(input) } else { input });
+                let applied = if dead { dead_input(input) } else { input };
+                s = step(&world, s, applied);
+                ammo.step(applied.buttons, false);
             }
-            self.history[seq as usize % HISTORY] = Predicted { seq, input, state: s, sent_at: None, render: None, shot: None };
+            self.history[seq as usize % HISTORY] = Predicted { seq, input, state: s, sent_at: None, render: None, shot: None, ammo };
             if seq == to {
                 break;
             }
             seq += 1;
         }
-        (self.seq, self.state, self.excused_to, self.last_acked) = (to, s, to, h.ack_seq);
+        (self.seq, self.state, self.ammo, self.excused_to, self.last_acked) = (to, s, ammo, to, h.ack_seq);
         if self.pending_shot.take_if(|(seq, _)| *seq <= to).is_some() {
             self.stats.shots_dropped += 1;
         }
@@ -849,19 +868,24 @@ impl ClientCore {
         self.lead_sample = None;
     }
 
-    /// Rebases on the server's state `own` for input `ack` and replays
-    /// everything it hasn't seen yet. What that moves on screen is smoothed
-    /// away, unless it's a `cut` (a death or respawn) or a teleport.
-    fn rebase(&mut self, ack: u32, own: MoveState, now: Instant, cut: bool) {
-        let mut s = own;
+    /// Rebases on the server's state `own` and rounds `ammo` for input
+    /// `ack` and replays everything it hasn't seen yet. What that moves on
+    /// screen is smoothed away, unless it's a `cut` (a death or respawn) or
+    /// a teleport.
+    fn rebase(&mut self, ack: u32, own: MoveState, ammo: Ammo, now: Instant, cut: bool) {
+        let (mut s, mut a) = (own, ammo);
         let world = self.world.as_ref().expect("welcomed");
         let dead = self.is_dead();
-        self.history[ack as usize % HISTORY].state = s;
+        let base = &mut self.history[ack as usize % HISTORY];
+        (base.state, base.ammo) = (s, a);
         for seq in ack + 1..=self.seq {
             let p = &mut self.history[seq as usize % HISTORY];
-            s = step(world, s, if dead { dead_input(p.input) } else { p.input });
-            p.state = s;
+            let applied = if dead { dead_input(p.input) } else { p.input };
+            s = step(world, s, applied);
+            a.step(applied.buttons, p.shot.is_some());
+            (p.state, p.ammo) = (s, a);
         }
+        self.ammo = a;
         let (old, cur) = (self.state, self.own_offset(now));
         let o = [cur[0] + old.pos[0] - s.pos[0], cur[1] + old.pos[1] - s.pos[1], cur[2] + old.z - s.z];
         let len = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
@@ -882,7 +906,8 @@ impl ClientCore {
     /// what the server tests it against. Returns a direction for our own
     /// tracer (in the cone of fire the server will use, but not its pick,
     /// which is secret), or nothing while dead, before the render clock runs,
-    /// or faster than the rifle fires (`FIRE_STEPS`).
+    /// faster than the rifle fires (`FIRE_STEPS`), or with no round ready
+    /// (an empty magazine, a reload under way: `ammo`).
     pub fn fire(&mut self, now: Instant, yaw: u16, pitch: i16, ads: bool) -> Option<[f32; 3]> {
         self.fire_claiming(now, yaw, pitch, ads, 0.0)
     }
@@ -952,6 +977,10 @@ impl ClientCore {
         let entity = self.welcome.as_ref()?.entity;
         let (time, seq, frac) = self.shot_at(now);
         if self.last_shot.is_some_and(|last| time < last + FIRE_STEPS as u64 * 256) {
+            return None;
+        }
+        // The rounds as of the shot's step: a reload may be done by then.
+        if !self.ammo.ready_in(seq - self.seq) {
             return None;
         }
         let render = self.render_clock.render_at(now)?;
@@ -1076,8 +1105,9 @@ impl ClientCore {
                 self.pending_shot = None;
                 self.stats.shots += 1;
             }
+            self.ammo.step(applied.buttons, shot.is_some());
             self.history[self.seq as usize % HISTORY] =
-                Predicted { seq: self.seq, input, state: self.state, sent_at: Some(now), render, shot };
+                Predicted { seq: self.seq, input, state: self.state, sent_at: Some(now), render, shot, ammo: self.ammo };
             made += 1;
         }
         match made {

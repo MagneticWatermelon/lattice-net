@@ -42,7 +42,9 @@ use crate::session::dev_token;
 
 /// The API's version: bump it with any change a caller must follow.
 /// 2: `LT_CONFIG_NET_THREAD`.
-pub const VERSION: u32 = 2;
+/// 3: crouch and the rifle's rounds (`LtOwn`, `LT_BUTTON_CROUCH`,
+/// `LT_BUTTON_RELOAD`, `LT_FLAG_CROUCHED`, `LT_FLAG_RELOADING`).
+pub const VERSION: u32 = 3;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]

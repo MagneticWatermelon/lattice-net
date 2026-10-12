@@ -130,6 +130,13 @@ ffi_structs! {
         pub faction: u8,
         /// Changes with every death and respawn.
         pub life: u8,
+        /// Crouching (predicted, like the position).
+        pub crouched: u8,
+        /// The rifle's rounds (predicted): in the magazine, and carried.
+        pub mag: u8,
+        pub reserve: u16,
+        /// Seconds left of the reload under way; 0: none.
+        pub reload: f32,
     }
 
     /// Another player, as drawn this frame.
@@ -140,7 +147,7 @@ ffi_structs! {
         pub tier: u8,
         /// `LT_HOW_*`: interpolated, extrapolated, held, new.
         pub how: u8,
-        /// `LT_FLAG_*`: airborne, dead, aiming down sights.
+        /// `LT_FLAG_*`: airborne, dead, aiming down sights, crouched, reloading.
         pub flags: u8,
         pub health: u8,
         pub reserved: u8,
@@ -236,6 +243,8 @@ ffi_structs! {
         pub snapshots: u64,
         pub corrections: u64,
         pub push_corrections: u64,
+        /// Snapshots whose rifle rounds disagreed with ours (replayed).
+        pub ammo_corrections: u64,
         pub resyncs: u64,
         pub shots_dropped: u64,
         pub life_events: u64,
@@ -325,6 +334,8 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_BUTTON_SPRINT", lattice_game::movement::BUTTON_SPRINT as i64, "Sprint (ignored down the sights)."),
     ("LT_BUTTON_JUMP", lattice_game::movement::BUTTON_JUMP as i64, "Jump."),
     ("LT_BUTTON_ADS", lattice_game::movement::BUTTON_ADS as i64, "Aim down sights: half speed, no sprint, a tight cone."),
+    ("LT_BUTTON_CROUCH", lattice_game::movement::BUTTON_CROUCH as i64, "Crouch while held: lower, slower, no sprint or jump, a tighter cone."),
+    ("LT_BUTTON_RELOAD", lattice_game::movement::BUTTON_RELOAD as i64, "Reload the rifle (an empty magazine reloads by itself)."),
     ("LT_TIER_NEAR", 0, "30 Hz, within 150 m (plus squad and contacts)."),
     ("LT_TIER_MID", 1, "10 Hz, within 500 m."),
     ("LT_TIER_FAR", 2, "2 Hz, within 1.5 km."),
@@ -335,6 +346,8 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_FLAG_AIRBORNE", 1, "In the air."),
     ("LT_FLAG_DEAD", 2, "Dead, waiting to respawn."),
     ("LT_FLAG_ADS", 4, "Aiming down sights (near tier only)."),
+    ("LT_FLAG_CROUCHED", 8, "Crouched."),
+    ("LT_FLAG_RELOADING", 16, "Reloading (near tier only)."),
     ("LT_EVENT_HIT", 1, "Our shot hit `a` for `amount`."),
     ("LT_EVENT_HURT", 2, "`a` hit us for `amount`, from `dir`."),
     ("LT_EVENT_KILL", 3, "`a` killed `b`."),
@@ -370,6 +383,8 @@ pub const STATE_ERROR: i32 = -1;
 pub const FLAG_AIRBORNE: u8 = 1;
 pub const FLAG_DEAD: u8 = 2;
 pub const FLAG_ADS: u8 = 4;
+pub const FLAG_CROUCHED: u8 = 8;
+pub const FLAG_RELOADING: u8 = 16;
 pub const EVENT_HIT: u8 = 1;
 pub const EVENT_HURT: u8 = 2;
 pub const EVENT_KILL: u8 = 3;
