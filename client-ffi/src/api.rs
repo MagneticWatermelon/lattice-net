@@ -3,7 +3,11 @@
 //! which also records each signature (`FNS`) for the C# generator.
 //!
 //! **The rules for callers:**
-//! - One thread at a time per session (pump mode: the engine's main thread).
+//! - One thread at a time per session (the engine's main thread). With
+//!   `LT_CONFIG_NET_THREAD` the plugin's own net thread runs the session too
+//!   (`net_thread`): every call takes the session's lock, and `lt_poll`,
+//!   `lt_inputs` (which then only sets the intent) and `lt_flush` hand their
+//!   work to it. The frame's calls and their order stay the same.
 //! - Buffers belong to the caller: functions fill `out` arrays of `cap`
 //!   items and return how many there are (which can be more than `cap`: grow
 //!   the buffer). Nothing they return points into the plugin.
@@ -23,7 +27,7 @@ use std::cell::RefCell;
 use std::ffi::CStr;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lattice_client_core::invite::Invite;
@@ -33,10 +37,12 @@ use lattice_game::world::{World, TERRAIN_N, TERRAIN_RES};
 
 use crate::abi::*;
 use crate::handle::{Handle, Player};
+use crate::net_thread::{lock, NetThread, Shared};
 use crate::session::dev_token;
 
 /// The API's version: bump it with any change a caller must follow.
-pub const VERSION: u32 = 1;
+/// 2: `LT_CONFIG_NET_THREAD`.
+pub const VERSION: u32 = 2;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]
@@ -47,9 +53,11 @@ pub struct FnInfo {
     pub ret: &'static str,
 }
 
-/// An open session (opaque to callers).
+/// An open session (opaque to callers): the handle behind its lock, and the
+/// net thread if it has one.
 pub struct LtSession {
-    handle: Option<Handle>,
+    handle: Shared,
+    net: Option<NetThread>,
 }
 
 /// A world, shared (opaque to callers).
@@ -101,20 +109,25 @@ fn guard<R: Fallback>(name: &str, f: impl FnOnce() -> R) -> R {
     }
 }
 
-/// Runs a call on an open session; a panic closes it.
+/// Runs a call on an open session, under its lock; a panic closes it.
 unsafe fn with<R: Fallback>(s: *mut LtSession, f: impl FnOnce(&mut Handle) -> R) -> R {
-    let Some(s) = s.as_mut() else {
+    let Some(s) = s.as_ref() else {
         set_error("null session");
         return R::fallback();
     };
-    let Some(h) = s.handle.as_mut() else {
+    let mut g = lock(&s.handle);
+    let Some(h) = g.as_mut() else {
+        // Closed by the net thread: say why.
+        if let Some(e) = s.net.as_ref().and_then(NetThread::error) {
+            set_error(e);
+        }
         return R::fallback();
     };
     match catch_unwind(AssertUnwindSafe(|| f(h))) {
         Ok(r) => r,
         Err(e) => {
             set_error(format!("session closed after a panic: {}", panic_text(&*e)));
-            s.handle = None;
+            *g = None;
             R::fallback()
         }
     }
@@ -174,14 +187,33 @@ fn resolve(addr: &str) -> Result<SocketAddr, String> {
     addr.to_socket_addrs().map_err(|e| format!("{addr}: {e}"))?.next().ok_or_else(|| format!("{addr}: no address"))
 }
 
-fn open(h: std::io::Result<Handle>) -> *mut LtSession {
-    match h {
-        Ok(h) => Box::into_raw(Box::new(LtSession { handle: Some(h) })),
+/// A session for the caller: on the net thread if `cfg` asks.
+fn open(h: std::io::Result<Handle>, cfg: Option<&LtConfig>) -> *mut LtSession {
+    let mut h = match h {
+        Ok(h) => h,
         Err(e) => {
             set_error(format!("socket: {e}"));
-            std::ptr::null_mut()
+            return std::ptr::null_mut();
         }
-    }
+    };
+    let threaded = cfg.is_some_and(|c| c.flags & CONFIG_NET_THREAD != 0);
+    h.set_threaded(threaded);
+    let handle: Shared = Arc::new(Mutex::new(Some(h)));
+    let net = if threaded {
+        match NetThread::spawn(Arc::clone(&handle)) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                set_error(format!("net thread: {e}"));
+                if let Some(h) = lock(&handle).as_mut() {
+                    h.close();
+                }
+                return std::ptr::null_mut();
+            }
+        }
+    } else {
+        None
+    };
+    Box::into_raw(Box::new(LtSession { handle, net }))
 }
 
 macro_rules! ffi_fns {
@@ -242,7 +274,7 @@ ffi_fns! {
             }
             let token = dev_token(&key, server_id, user);
             let player = Player { server: addr_text.to_string(), user, name: String::new() };
-            Ok(open(Handle::connect(server, token, config(cfg.as_ref()), player)))
+            Ok(open(Handle::connect(server, token, config(cfg.as_ref()), player), cfg.as_ref()))
         };
         run().unwrap_or_else(|e| {
             set_error(e);
@@ -265,7 +297,7 @@ ffi_fns! {
                 Err(e) => return Err(format!("counting the invite's used tokens: {e}")),
             };
             let player = Player { server: invite.server.clone(), user: invite.user, name: invite.name.clone() };
-            Ok(open(Handle::connect(server, token, config(cfg.as_ref()), player)))
+            Ok(open(Handle::connect(server, token, config(cfg.as_ref()), player), cfg.as_ref()))
         };
         run().unwrap_or_else(|e| {
             set_error(e);
@@ -273,11 +305,16 @@ ffi_fns! {
         })
     }
 
-    /// Disconnects (the server hears at once) and frees the session.
+    /// Disconnects (the server hears at once) and frees the session (its net
+    /// thread stopped first).
     fn lt_close(s: *mut LtSession) -> () {
         if !s.is_null() {
             let mut s = Box::from_raw(s);
-            if let Some(h) = s.handle.as_mut() {
+            if let Some(net) = s.net.as_mut() {
+                net.stop();
+            }
+            let mut g = lock(&s.handle);
+            if let Some(h) = g.as_mut() {
                 h.close();
             }
         }
@@ -295,7 +332,8 @@ ffi_fns! {
     }
 
     /// Receives and delivers everything that arrived; returns the state
-    /// (`LT_STATE_*`).
+    /// (`LT_STATE_*`). On the net thread, the thread receives: this only
+    /// returns the state.
     fn lt_poll(s: *mut LtSession) -> i32 {
         with(s, |h| match h.poll() {
             Ok(state) => state,
@@ -329,7 +367,8 @@ ffi_fns! {
     }
 
     /// This frame's intent to the input clock: inputs (with any shot) go out
-    /// at the server's pace.
+    /// at the server's pace. On the net thread, the thread makes them from
+    /// the latest intent, every tick, frames or not.
     fn lt_inputs(s: *mut LtSession, intent: *const LtIntent) -> () {
         if let Some(i) = intent.as_ref() {
             with(s, |h| h.inputs(i))
@@ -389,7 +428,8 @@ ffi_fns! {
         }
     }
 
-    /// End of the frame: packets out.
+    /// End of the frame: packets out. On the net thread, the thread sends:
+    /// this does nothing.
     fn lt_flush(s: *mut LtSession) -> () {
         with(s, |h| h.flush())
     }
@@ -398,7 +438,7 @@ ffi_fns! {
     fn lt_stats(s: *mut LtSession, out: *mut LtStats) -> () {
         if let Some(o) = out.as_mut() {
             *o = with(s, |h| Wrapped(h.stats())).0;
-            if o.state == 0 && s.as_ref().is_none_or(|s| s.handle.is_none()) {
+            if o.state == 0 && s.as_ref().is_none_or(|s| lock(&s.handle).is_none()) {
                 o.state = STATE_ERROR;
             }
         }

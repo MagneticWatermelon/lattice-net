@@ -62,12 +62,12 @@ ffi_structs! {
     }
 
     /// How to connect: the render delays (0 = the defaults: near 67 ms,
-    /// growing up to 133 ms; mid and far 200 ms).
+    /// growing up to 133 ms; mid and far 200 ms), and how to run.
     pub struct LtConfig {
         pub near_delay_ms: f32,
         pub near_delay_max_ms: f32,
         pub mid_delay_ms: f32,
-        /// Reserved, 0.
+        /// `LT_CONFIG_*`.
         pub flags: u32,
     }
 
@@ -354,6 +354,11 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_COVER_COMMAND", lattice_game::world::Kind::Command as i64, "A base's command building."),
     ("LT_COVER_BUNKER", lattice_game::world::Kind::Bunker as i64, "A bunker."),
     ("LT_NOBODY", 0xFFFF, "No shooter (a distant fight's shot from no one drawn)."),
+    (
+        "LT_CONFIG_NET_THREAD",
+        CONFIG_NET_THREAD as i64,
+        "Run the session on the plugin's net thread (U3): it receives, runs the input clock with the latest intent and sends about a thousand times a second, so the connection and the inputs keep going while the caller's frames stall. lt_poll and lt_flush then do nothing, and lt_inputs only sets the intent.",
+    ),
 ];
 
 pub const STATE_CONNECTING: i32 = 0;
@@ -374,6 +379,7 @@ pub const FX_SHOT: u8 = 1;
 pub const FX_IMPACT: u8 = 2;
 pub const SURFACE_TERRAIN: u8 = 255;
 pub const NOBODY: u16 = 0xFFFF;
+pub const CONFIG_NET_THREAD: u32 = 1;
 
 impl From<[f32; 3]> for LtVec3 {
     fn from(v: [f32; 3]) -> Self {

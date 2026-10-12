@@ -573,9 +573,11 @@ void       lt_close(LtSession*);                    // disconnect and free
 ### 12.3 Threading
 
 - **U1–U2: pump mode.** The main thread calls the plugin in the frame order of §13. That's exactly what the Bevy client does today, and its tests prove it.
-- **U3: a net thread (proposed).**
-  - The session runs on a plugin thread a few hundred times a second (a blocking receive with a short timeout, then the input clock, then a flush), behind a mutex.
-  - The main thread sets the intent, pulls the trigger (with the Input System's event time, converted to the plugin's clock) and reads render states.
+- **U3: a net thread (exists, 2026-10-12; `client-ffi/src/net_thread.rs`, `LT_CONFIG_NET_THREAD`).**
+  - The session runs on a plugin thread about a thousand times a second (receive, the input clock with the latest intent, send), behind the session's lock. On Windows it sleeps on a high-resolution waitable timer (the default 15.6 ms timer tick would hold inputs back) at above-normal priority.
+  - The main thread sets the intent, pulls the trigger and reads render states. Its calls that read the clocks (`lt_fire`, `lt_own`, `lt_render`, `lt_combat`) take the time as they run, under the lock: the thread may have run the input and render clocks past the frame's start, and a call at an earlier time would be held at theirs (a judder of up to a thread tick, in our own camera most of all). Lock order keeps every claim increasing, so the server's render floor never holds a shot.
+  - The trigger takes the call's time, not yet the Input System's event time (proposed).
+  - **Measured** (2026-10-12): the C API test freezes the frames for 100 ms, 300 ms and 1 s while running and firing, then for 10 s: 0 stand-ins, late inputs, refused, held or trimmed shots, resyncs and corrections, and the drawn speed within ±1% frame to frame; the same freezes pumped cost 39 stand-ins and 3 resyncs. The Unity player in a 300-bot fight, same freezes: 0 stand-ins and resyncs, 324 shots none refused, held or trimmed, connected through the 10 s freeze; pumped, 195 stand-ins, 7 resyncs, and the connection lost.
 - **Why Unity needs it:**
   - The connection times out after 5 s, and Unity's main thread can stall longer than that while it loads a continent. It also stalls for hundreds of milliseconds on shader compiles and garbage collection.
   - In pump mode, a stalled main thread means stand-ins, resyncs and trimmed shots: the input clock catches up 300 ms at most.
@@ -782,7 +784,7 @@ continent package (.lcp) ----> the server:        World::load(package)
 | **U0: plugin** | `client-ffi` (`Session`, the C API, generated C#); a Unity scene that connects with a dev token or an invite and shows the net graph | Rust: the C API joins an in-process server and predicts with 0 corrections. Unity: connects to a local server; 0 corrections over 60 s; no managed allocations per frame |
 | **U1: walk** (the Bevy client's M3c) | terrain, props, soldiers by band, cameras (first person, chase, spectator), net graph, ghosts, tier colors | M3c's bars: 0 corrections walking alone; smoothness per tier matches the Bevy client on the same link (near ≥ 99%; mid within a point of Bevy's); render time never goes backwards; frame p99 under the refresh interval with a 1k blob in view on the Windows desktop; smooth by eye |
 | **U2: fight** (the Bevy client's M3d) | firing, aiming down sights, cone, recoil, tracers (own re-aimed), hit markers, damage direction, death and respawn, kill feed, distant fights, battle audio | an honest Unity client is never trimmed or held (`rewinds_trimmed` and `renders_held` 0 in the session log); a 300-bot fight within budget; you play it and it feels right |
-| **U3: net thread** | the session on a plugin thread | with the main thread frozen for 100, 300 and 1,000 ms: no resyncs or trims (like the Bevy client's freeze tests); a 10 s scene load keeps the connection |
+| **U3: net thread** (built, 2026-10-12) | the session on a plugin thread | with the main thread frozen for 100, 300 and 1,000 ms: no resyncs or trims (like the Bevy client's freeze tests); a 10 s scene load keeps the connection. **Met** (§12.3) |
 | **U4: shell** | login or invite, deploy screen, map, loadout (stubbed), settings, death recap | |
 | **U5: territory** | sites, points, the capture panel, lanes on the map, spawn rooms | needs §21's server work |
 | **U6: classes** | the six classes, their tools and abilities | |

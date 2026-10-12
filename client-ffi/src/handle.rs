@@ -5,6 +5,15 @@
 //! **Time** is the plugin's own monotonic clock: `begin_frame` reads it once
 //! per frame and every call in that frame uses the same `now`. The engine's
 //! time never reaches the netcode.
+//!
+//! **On the net thread** (`set_threaded`), the thread polls, runs the input
+//! clock with the latest intent and flushes (`net_tick`); `poll` and `flush`
+//! do nothing and `inputs` only keeps the intent. The caller's calls that read
+//! the clocks (`fire`, `own`, `render`, `combat`) then take the time as they
+//! run, under the session's lock: the thread may have run the input and
+//! render clocks past the frame's start, and a call made at an earlier time
+//! would be held at theirs (a judder of up to a thread tick, in our own
+//! camera most of all). Lock order keeps every call's time increasing.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -59,6 +68,10 @@ pub struct Handle {
     drawn: [u32; 3],
     pops: [u64; 3],
     pop_max: [u32; 3],
+    /// Run by the net thread (see the module's doc).
+    threaded: bool,
+    /// The latest intent, as an input: the net thread makes inputs from it.
+    intent: Input,
 }
 
 impl Handle {
@@ -83,7 +96,38 @@ impl Handle {
             drawn: [0; 3],
             pops: [0; 3],
             pop_max: [0; 3],
+            threaded: false,
+            intent: Input::default(),
         })
+    }
+
+    /// Hands the polling, the input clock and the flushing to a net thread
+    /// (which calls `net_tick`), or back to the caller's frames.
+    pub fn set_threaded(&mut self, on: bool) {
+        self.threaded = on;
+    }
+
+    pub fn threaded(&self) -> bool {
+        self.threaded
+    }
+
+    /// The net thread's work, every tick: receive and deliver, run the input
+    /// clock with the latest intent (inputs carry any shot pulled since),
+    /// send. `now` is read under the session's lock.
+    pub fn net_tick(&mut self, now: Instant) -> std::io::Result<()> {
+        let r = self.session.poll(now);
+        self.session.send_inputs(now, self.intent);
+        self.session.flush(now);
+        r
+    }
+
+    /// The time for a call that reads the clocks: the frame's, or on the net
+    /// thread, now (see the module's doc).
+    fn clock(&mut self) -> Instant {
+        if self.threaded {
+            self.now = self.now.max(Instant::now());
+        }
+        self.now
     }
 
     /// Starts a frame at `now`: every call until the next one uses it.
@@ -112,9 +156,12 @@ impl Handle {
         }
     }
 
-    /// Receives everything that arrived and delivers it.
+    /// Receives everything that arrived and delivers it (on the net thread,
+    /// the thread does: this only reads the state).
     pub fn poll(&mut self) -> std::io::Result<i32> {
-        self.session.poll(self.now)?;
+        if !self.threaded {
+            self.session.poll(self.now)?;
+        }
         Ok(self.state())
     }
 
@@ -125,7 +172,7 @@ impl Handle {
     /// Pulls the trigger: a shot rides this frame's input if the rifle is
     /// ready, and its tracer leaves from the muzzle at once.
     pub fn fire(&mut self, f: &LtFire) -> Option<LtShot> {
-        let now = self.now;
+        let now = self.clock();
         let faction = self.own_faction();
         let core = &mut self.session.core;
         let dir = core.fire(now, aim::yaw_u16(f.yaw), aim::pitch_i16(f.pitch), f.ads != 0)?;
@@ -136,26 +183,32 @@ impl Handle {
         Some(LtShot { dir: dir.into(), muzzle: fired.origin.into(), eye: eye.into() })
     }
 
-    /// This frame's intent to the input clock, and any batch out.
+    /// This frame's intent to the input clock, and any batch out (on the net
+    /// thread, kept for the thread's next inputs).
     pub fn inputs(&mut self, i: &LtIntent) {
         let clamp = |v: f32| if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 };
         let (yaw, pitch) = (if i.yaw.is_finite() { i.yaw } else { 0.0 }, if i.pitch.is_finite() { i.pitch } else { 0.0 });
         let (move_x, move_y) = aim::stick(yaw, clamp(i.forward), clamp(i.right));
         let buttons = i.buttons & (BUTTON_SPRINT | BUTTON_JUMP | BUTTON_ADS);
         let input = Input { move_x, move_y, yaw: aim::yaw_u16(yaw), pitch: aim::pitch_i16(pitch), buttons };
-        self.session.send_inputs(self.now, input);
+        if self.threaded {
+            self.intent = input;
+        } else {
+            self.session.send_inputs(self.now, input);
+        }
     }
 
-    pub fn own(&self, ads: bool) -> LtOwn {
+    pub fn own(&mut self, ads: bool) -> LtOwn {
+        let now = self.clock();
         let core = &self.session.core;
         let Some(w) = core.welcome() else { return LtOwn::default() };
         let p = core.predicted();
         let ghost = core.server_own().map_or([0.0; 3], |(s, _)| [s.pos[0], s.pos[1], s.z]);
         LtOwn {
-            pos: core.own_render(self.now).into(),
+            pos: core.own_render(now).into(),
             vel: [p.vel[0], p.vel[1], p.vz].into(),
             server_pos: ghost.into(),
-            cone_deg: core.cone(self.now, ads),
+            cone_deg: core.cone(now, ads),
             seq: core.predicted_seq(),
             entity: w.entity,
             health: core.health(),
@@ -171,7 +224,7 @@ impl Handle {
     /// many as fit), and returns how many there were. Once per frame: it
     /// also adapts the near render delay.
     pub fn render(&mut self, out: &mut [LtEntity]) -> usize {
-        let now = self.now;
+        let now = self.clock();
         let (mut n, mut total, mut drawn) = (0, 0, [0u32; 3]);
         self.session.core.render(now, |id, st| {
             total += 1;
@@ -248,7 +301,7 @@ impl Handle {
     /// tracer flies on to now, and those that hit something end in an
     /// `LT_FX_IMPACT`. Call it after `render`.
     pub fn combat(&mut self) {
-        let now = self.now;
+        let now = self.clock();
         let dt = self.combat_at.map_or(0.0, |t| now.saturating_duration_since(t).min(MAX_FRAME).as_secs_f32());
         self.combat_at = Some(now);
         let secs = self.secs() as f32;
@@ -330,8 +383,11 @@ impl Handle {
         self.others_muzzle = offset;
     }
 
+    /// Packets out (on the net thread, the thread sends: this does nothing).
     pub fn flush(&mut self) {
-        self.session.flush(self.now);
+        if !self.threaded {
+            self.session.flush(self.now);
+        }
     }
 
     pub fn stats(&self) -> LtStats {

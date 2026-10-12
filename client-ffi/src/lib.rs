@@ -10,6 +10,8 @@
 //! - `session`: a UDP socket, the transport and a `ClientCore`, pumped once
 //!   per frame. The Bevy client shares it (this crate is also an rlib).
 //! - `handle`: a session plus its frame clock, tracers and buffers.
+//! - `net_thread`: the session run on a plugin thread (U3), so the caller's
+//!   stalled frames cost no inputs.
 //! - `api`: the C functions; `abi`: the structs and codes they use.
 //! - `csharp`: the C# bindings, generated from `abi` and `api`'s own records
 //!   of their layouts and signatures (`cargo run -p lattice-client-ffi --bin
@@ -20,6 +22,7 @@ pub mod abi;
 pub mod api;
 pub mod csharp;
 pub mod handle;
+pub mod net_thread;
 pub mod session;
 
 #[cfg(test)]
