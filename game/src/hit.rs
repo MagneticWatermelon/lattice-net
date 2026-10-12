@@ -5,15 +5,28 @@
 use crate::world::World;
 
 /// Player hitboxes, from the feet: a body capsule and a head sphere. (Only
-/// for shots; moving uses the movement collider.) Crouched, both fit the
-/// crouched collider (1.2 m): the body 0-1.0 m, the head 0.8-1.2 m.
+/// for shots; moving uses the movement collider.) The head is centered on
+/// the eyes, standing (1.6 m) and crouched (1.15 m: a kneel, torso upright),
+/// so no stance sees over cover with less of its head than standing does.
+/// Crouched, the body covers 0-1.1 m and the head 0.95-1.35 m: its top
+/// shows over the crouched collider's 1.2 m, as cover rules expect (GDD
+/// §6.2: low cover hides most of a crouching player).
 pub const BODY_RADIUS: f32 = 0.4;
 pub const BODY_LOW: f32 = 0.4;
 pub const BODY_HIGH: f32 = 1.1;
 pub const HEAD_RADIUS: f32 = 0.2;
 pub const HEAD_AT: f32 = 1.6;
-pub const CROUCH_BODY_HIGH: f32 = 0.6;
-pub const CROUCH_HEAD_AT: f32 = 1.0;
+pub const CROUCH_BODY_HIGH: f32 = 0.7;
+pub const CROUCH_HEAD_AT: f32 = 1.15;
+
+/// Where to check a line of sight to a player, from its feet: its chest.
+pub const fn chest(crouched: bool) -> f32 {
+    if crouched {
+        0.75
+    } else {
+        1.0
+    }
+}
 
 type V = [f32; 3];
 
@@ -223,11 +236,15 @@ mod tests {
         let feet = [10.0, 0.0, 0.0];
         // A standing head shot passes over a crouched player.
         assert!(player([0.0, 0.0, 1.6], [20.0, 0.0, 1.6], feet, true).is_none());
-        assert!(player([0.0, 0.0, 1.3], [20.0, 0.0, 1.3], feet, true).is_none(), "over the crouched head");
-        let (_, head) = player([0.0, 0.0, 1.05], [20.0, 0.0, 1.05], feet, true).unwrap();
-        assert!(head, "its head at 1 m");
+        assert!(player([0.0, 0.0, 1.4], [20.0, 0.0, 1.4], feet, true).is_none(), "over the crouched head");
+        let (_, head) = player([0.0, 0.0, 1.2], [20.0, 0.0, 1.2], feet, true).unwrap();
+        assert!(head, "its head at the crouched eyes' height");
         let (_, head) = player([0.0, 0.0, 0.5], [20.0, 0.0, 0.5], feet, true).unwrap();
         assert!(!head, "its body");
+        // Over a 1.1 m wall, a crouched player's eyes see; so does a shooter
+        // its head, as much of it as a standing head over a 1.5 m wall.
+        let shown = |at: f32, wall: f32| at + HEAD_RADIUS - wall;
+        assert!(crate::weapon::CROUCH_EYE_HEIGHT > 1.1 && (shown(CROUCH_HEAD_AT, 1.1) - shown(HEAD_AT, 1.5)).abs() < 0.06);
     }
 
     #[test]

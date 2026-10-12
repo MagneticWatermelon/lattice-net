@@ -749,7 +749,10 @@ impl InputQueue {
                     self.claims.input(seq, [near, near - lag], newest, arrived, judge.clock);
                     let held = shot.map(|s| {
                         let near = place(s.render);
-                        let h = self.claims.shot(seq, [near, near - lag], before);
+                        // Reckoned with this message's mid lag: as a copy
+                        // (newest - seq) steps late, it may have slewed since.
+                        let drift = newest.saturating_sub(seq) as f64 * lattice_client_core::clock::SLEW;
+                        let h = self.claims.shot(seq, [near, near - lag], before, drift);
                         let m = (near - h[0]).abs().max((near - lag - h[1]).abs());
                         (h, m)
                     });
@@ -995,7 +998,7 @@ fn frame(shard: &mut lattice_net::Shard, snaps: &mut Vec<(ClientId, Vec<u8>, Opt
 fn in_sight(world: &World, history: &History, shooter: u16, target: u16) -> bool {
     let (Some(a), Some(b)) = (history.now(shooter), history.now(target)) else { return false };
     let eye = if a.crouched { weapon::CROUCH_EYE_HEIGHT } else { weapon::EYE_HEIGHT };
-    let chest = if b.crouched { 0.6 } else { 1.0 };
+    let chest = lattice_game::hit::chest(b.crouched);
     let (p0, p1) = ([a.pos[0], a.pos[1], a.pos[2] + eye], [b.pos[0], b.pos[1], b.pos[2] + chest]);
     lattice_game::hit::line_clear(world, p0, p1)
 }

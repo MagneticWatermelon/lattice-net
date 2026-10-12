@@ -299,7 +299,7 @@ impl Fighter {
         let mut near: Vec<(f32, u16, [f32; 3])> = ents
             .ids()
             .filter(|&e| lattice_game::faction::faction(e) != side)
-            .filter_map(|e| ents.render_one(e, r).filter(|st| !st.dead).map(|st| (e, [st.pos[0], st.pos[1], st.pos[2] + if st.crouched { 0.6 } else { 1.0 }])))
+            .filter_map(|e| ents.render_one(e, r).filter(|st| !st.dead).map(|st| (e, [st.pos[0], st.pos[1], st.pos[2] + lattice_game::hit::chest(st.crouched)])))
             .map(|(e, p)| (((p[0] - eye[0]).powi(2) + (p[1] - eye[1]).powi(2)).sqrt(), e, p))
             .filter(|&(d, ..)| d <= self.cfg.range)
             .collect();

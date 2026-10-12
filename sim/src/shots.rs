@@ -459,7 +459,14 @@ impl RenderFloor {
     /// views. That happens in a client's first seconds (`before` = None:
     /// only its own input bounds the shot) and for a step after the server
     /// fills in a missing input (the client then runs its clock a step ahead).
-    pub fn shot(&mut self, seq: u32, claim: [f64; 2], before: Option<f64>) -> [f64; 2] {
+    ///
+    /// `mid_drift` (steps) is how much older its mid claim may read than the
+    /// view it had: a message carries one mid lag for all its inputs, the
+    /// lag at its sending, and the lag slews (`clock::SLEW` a step) while the
+    /// near delay changes. A shot whose input came only as a copy, a few
+    /// steps after it was made, is reckoned with that later lag. (The slack
+    /// covers the step between an input and the next, and the rounding.)
+    pub fn shot(&mut self, seq: u32, claim: [f64; 2], before: Option<f64>, mid_drift: f64) -> [f64; 2] {
         let known = |s: u32| self.recent[s as usize % RECENT].seq == s;
         let mut held = claim;
         if known(seq) {
@@ -468,13 +475,13 @@ impl RenderFloor {
         }
         if let (Some(slack), true) = (before, seq > 1 && known(seq - 1)) {
             let prev = self.recent[(seq - 1) as usize % RECENT];
-            held = [held[0].max(prev.held[0] - slack - FLOOR_SLACK_NEAR), held[1].max(prev.held[1] - slack - FLOOR_SLACK_MID)];
+            held = [held[0].max(prev.held[0] - slack - FLOOR_SLACK_NEAR), held[1].max(prev.held[1] - slack - FLOOR_SLACK_MID - mid_drift)];
             // How far the shot's view dipped under the strictest it could
             // have: the input before it's, without allowances. An honest shot
             // fires once that input is made, so it dips no more than the
             // input did.
             if let Some(before) = prev.dip {
-                let dip = (prev.strict[0] - FLOOR_SLACK_NEAR - claim[0]).max(prev.strict[1] - FLOOR_SLACK_MID - claim[1]).max(0.0);
+                let dip = (prev.strict[0] - FLOOR_SLACK_NEAR - claim[0]).max(prev.strict[1] - FLOOR_SLACK_MID - mid_drift - claim[1]).max(0.0);
                 self.window.shot(dip, before);
                 self.total.shot(dip, before);
             }
@@ -746,7 +753,7 @@ mod tests {
                 self.floor.input(first + k as u32, [r, r - 3.0], self.seq, at, ClockRate { rate: RATE, jitter });
             }
             shot.map(|r| {
-                let h = self.floor.shot(self.seq, [r, r - 3.0], Some(self.before));
+                let h = self.floor.shot(self.seq, [r, r - 3.0], Some(self.before), 0.0);
                 (h[0] - r).abs().max((h[1] - (r - 3.0)).abs())
             })
         }
@@ -834,10 +841,34 @@ mod tests {
         let first = seq - 1;
         let clock = ClockRate { rate: RATE, jitter: 0.0 };
         c.floor.input(first, [r + 1.0, r - 2.0], seq, at, clock);
-        let h = c.floor.shot(first, [r + 1.0, r - 2.0], Some(0.0));
+        let h = c.floor.shot(first, [r + 1.0, r - 2.0], Some(0.0), 0.0);
         assert_eq!(h, [r + 1.0, r - 2.0], "a shot in a copy");
         c.floor.input(seq, [r + 2.0, r - 1.0], seq, at, clock);
         c.unsent.clear();
+    }
+
+    #[test]
+    fn a_shot_in_a_late_copy_is_reckoned_with_its_messages_mid_lag() {
+        // The near delay changed, so the client's mid lag slews up, 0.1 step
+        // a step. A shot fired as input 61 was made rides 62, whose own
+        // message is lost: 62 comes as a copy with 63 and 64, in a message
+        // sent at a mid lag 0.3 steps longer than 61's. The shot's mid claim
+        // reads that much older than the view it had, and older than 61's
+        // claim: not held (it was, by 0.05 steps, before the drift counted).
+        let mut c = Client::new();
+        c.run(60, 0.0, |t| t * 30.0, 0.0, 0.0, |t| t * 30.0);
+        let clock = ClockRate { rate: RATE, jitter: 0.0 };
+        let at = |s: f64| c.t0 + std::time::Duration::from_secs_f64(s);
+        let r = 60.0;
+        c.floor.input(61, [r, r - 3.1], 61, at(2.0 + 0.040), clock);
+        for (seq, made) in [(62u32, r + 1.0), (63, r + 2.0), (64, r + 3.0)] {
+            c.floor.input(seq, [made, made - 3.4], 64, at(2.0 + 3.0 * STEP + 0.040), clock);
+        }
+        let drift = (64 - 62) as f64 * lattice_client_core::clock::SLEW;
+        let mut strict = c.floor.clone();
+        assert_eq!(c.floor.shot(62, [r, r - 3.4], Some(0.0), drift), [r, r - 3.4], "not held");
+        let h = strict.shot(62, [r, r - 3.4], Some(0.0), 0.0);
+        assert!(h[1] > r - 3.4 + 0.01, "held without the drift: {h:?}");
     }
 
     #[test]

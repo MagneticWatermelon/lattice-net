@@ -211,7 +211,7 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 - **Hitboxes** (exists, `game/src/hit.rs`):
   - a body capsule, radius 0.4 m around a segment 0.4–1.1 m above the feet, so it covers 0–1.5 m;
   - a head sphere, radius 0.2 m at 1.6 m, so 1.4–1.8 m;
-  - crouched: the segment's top at 0.6 m (the body covers 0–1.0 m) and the head at 1.0 m (0.8–1.2 m). The server's history keeps each tick's stance, so a shot is tested against the stance the shooter saw.
+  - crouched: the segment's top at 0.7 m (the body covers 0–1.1 m) and the head at 1.15 m (0.95–1.35 m). The head is centered on the eyes in both stances, so crouching never sees over cover with less head showing than standing does. The server's history keeps each tick's stance, so a shot is tested against the stance the shooter saw.
   - A headshot doubles damage (decided for the rifle: 20 body, 40 head).
 - **Explosions** deal radius damage with falloff. Cover blocks them: a target takes damage only with a line of sight from the blast's center.
 
@@ -327,7 +327,7 @@ Everything that blocks movement or shots must exist in the shared world (`game/s
 | ceiling height | ≥ 2.4 m; ≥ 2.6 m where players jump | 1.8 m tall, plus a 0.68 m jump |
 | stair riser | ≤ 0.4 m | step up is 0.45 m |
 | ledge a player can jump onto | ≤ 1.1 m | a 0.68 m jump, plus 0.45 m of ledge catch |
-| low cover | 1.0–1.2 m | a crouching player is 1.2 m tall, eyes at 1.15 m: 1.2 m hides them; at 1.0–1.1 m they shoot over it, head showing |
+| low cover | 1.0–1.1 m | a crouching player's eyes are at 1.15 m: they shoot over it, the head showing as a standing player's does over 1.5 m; up to 1.35 m hides all but the top of the head, from 1.4 m all of them |
 | full cover | ≥ 1.9 m | the head's top is at 1.8 m |
 | heights to avoid | 1.4–1.65 m | the eyes (1.6 m) see over while the body (up to 1.5 m) hides: head-only peeking |
 | walkable slope | ≤ 45° | `MAX_SLOPE` |
@@ -863,7 +863,7 @@ continent package (.lcp) ----> the server:        World::load(package)
 | bloom | down the sights +0.04° per shot, up to +0.5°; from the hip +0.1°, up to +1.5°; recovers after 133 ms, at 12°/s | |
 | recoil | 0.32° up per shot (the first ×1.75); 0.16° left to 0.22° right; drifts back down after 0.12 s, at 9°/s | |
 | aiming down sights | 0.2 s to raise; 1.35× zoom; half speed | `client/src/gun.rs`, `weapon.rs` |
-| hitboxes | body capsule, radius 0.4, 0.4–1.1 m; head sphere, radius 0.2, at 1.6 m; crouched 0.4–0.6 m and 1.0 m | `hit.rs` |
+| hitboxes | body capsule, radius 0.4, 0.4–1.1 m; head sphere, radius 0.2, at 1.6 m; crouched 0.4–0.7 m and 1.15 m | `hit.rs` |
 | eye height | 1.6 m; crouched 1.15 m | `weapon.rs` |
 | crouch | 3 m/s, 1.2 m tall, the cone ×0.75, no sprint or jump | `movement.rs`, `weapon.rs` |
 | rifle rounds | 30 in the magazine, 180 carried; reload 2.2 s, 2.7 s from empty | `weapon.rs` |
