@@ -49,6 +49,9 @@
 # Env: REPEAT, PORT (40500), PROFILE=1 (perf profiles of the first 10k and GSO
 # blob runs), FORCE=1 (run despite failed checks), SERVER_THREADS, BOT_THREADS,
 # SERVER_ARGS (extra lattice-server flags for every run, e.g. "--sockets 8").
+# Every run gives the rifle unlimited rounds (lattice-server --unlimited-rounds):
+# held triggers fire at 10 shots/s for the whole run, as in the baselines from
+# before rounds and reloads; LIMITED_ROUNDS=1 plays with magazines instead.
 #
 # Two machines: BOTS_SSH=user@host runs the bots there (from ~/lattice-net,
 # built), SERVER_IP=<this machine's address on the link between them> is where
@@ -57,6 +60,7 @@
 # scripts/cloud-run.sh sets all three.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+rounds_args=$([ "${LIMITED_ROUNDS:-0}" = 1 ] || echo --unlimited-rounds)
 
 mode=${1:-full}
 name=${2:-$(hostname -s)}
@@ -315,7 +319,7 @@ for r in $(seq 1 "$repeat"); do
     # shellcheck disable=SC2086 # $key_args is empty or a flag and its value
     if ! OUT=$out PROFILE=$profile PROFILE_DELAY=$profile_delay SERVER_THREADS=$server_threads BOT_THREADS=$bot_threads \
       BOTS_SSH=$remote BOT_ARGS="--server $server_ip:$port $key_args $ramp_args ${botargs:-} ${BOT_ARGS:-}" \
-      scripts/m1.sh "$scenario" "$count" "$run_secs" --bind "$server_ip:$port" $key_args $extra ${SERVER_ARGS:-} > "$out/console.log" 2>&1; then
+      scripts/m1.sh "$scenario" "$count" "$run_secs" --bind "$server_ip:$port" $key_args $extra ${SERVER_ARGS:-} $rounds_args > "$out/console.log" 2>&1; then
       echo "  failed: see $out/console.log"
     fi
     sleep 2 # let the last datagrams and sockets drain

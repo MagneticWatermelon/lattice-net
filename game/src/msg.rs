@@ -232,16 +232,24 @@ pub struct Welcome {
     pub radius: f32,
     /// The client builds the same world from it (`World::shared`).
     pub world_seed: u64,
+    /// The server's rules that prediction must follow (`RULE_*`).
+    pub rules: u8,
 }
 
+/// `Welcome::rules` bit: the rifle never runs dry (load tests, immortal
+/// fights, where nobody dies to be refilled): full again after every step,
+/// on the server and in prediction.
+pub const RULE_UNLIMITED_ROUNDS: u8 = 1;
+
 pub fn encode_welcome(m: &Welcome) -> Vec<u8> {
-    let mut w = Writer::with_capacity(31);
+    let mut w = Writer::with_capacity(32);
     w.u8(MSG_WELCOME);
     w.u16(m.entity);
     for v in [m.spawn[0], m.spawn[1], m.anchor[0], m.anchor[1], m.radius] {
         w.u32(v.to_bits());
     }
     w.u64(m.world_seed);
+    w.u8(m.rules);
     w.into_inner()
 }
 
@@ -332,8 +340,9 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             let anchor = [read_f32(&mut r)?, read_f32(&mut r)?];
             let radius = read_f32(&mut r)?;
             let world_seed = r.u64()?;
+            let rules = r.u8()?;
             r.finish()?;
-            Ok(ServerMsg::Welcome(Welcome { entity, spawn, anchor, radius, world_seed }))
+            Ok(ServerMsg::Welcome(Welcome { entity, spawn, anchor, radius, world_seed, rules }))
         }
         MSG_SNAPSHOT => {
             let server_tick = r.u32()?;
@@ -512,7 +521,7 @@ mod tests {
 
     #[test]
     fn welcome_snapshot_and_entities_roundtrip() {
-        let w = Welcome { entity: 7, spawn: [1.5, 2.5], anchor: [4096.0, 4096.0], radius: 200.0, world_seed: u64::MAX - 3 };
+        let w = Welcome { entity: 7, spawn: [1.5, 2.5], anchor: [4096.0, 4096.0], radius: 200.0, world_seed: u64::MAX - 3, rules: RULE_UNLIMITED_ROUNDS };
         assert!(matches!(decode_server_msg(&encode_welcome(&w)), Ok(ServerMsg::Welcome(x)) if x == w));
 
         let h = SnapshotHeader {

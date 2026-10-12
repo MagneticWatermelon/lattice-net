@@ -274,6 +274,7 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
   - **Predicted like movement:** each input's step counts the reload down, fires its shot if a round is ready, then takes the reload button (`weapon::Ammo::step`). The own snapshot carries the magazine, the reserve and the reload's steps left; a mismatch is replayed like a movement correction (`ammo_corrections`).
   - **The server refuses a shot without a round** (`shots_refused`), and a client never claims one: it checks the round it will have at the shot's step.
   - Others see a reload as a near flag (for the animation).
+  - **Unlimited rounds** is a server rule for tests (`--unlimited-rounds`; implied by `--immortal`, where nobody dies to be refilled): the rifle is full again after every step, on the server and in prediction (the Welcome announces it). Load baselines run with it, so held triggers fire at 10 shots/s as in those from before rounds.
   - *Proposed:* reserves refill at terminals and ammo packs; magazine sizes per weapon and loadout.
 
 ## 5. Vehicles

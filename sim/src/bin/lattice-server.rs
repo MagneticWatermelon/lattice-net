@@ -103,7 +103,10 @@ lattice-server: M1 movement-only authoritative server
   --deaths-per-sec R   kill R random players a second, to exercise death and respawn
                        until there are weapons (they respawn after 5 s) [0]
   --immortal           hits land (and are confirmed) but deal no damage: hit rates then
-                       measure aim and lag compensation, not who died first
+                       measure aim and lag compensation, not who died first (and, as
+                       nobody dies to be refilled, rounds are unlimited)
+  --unlimited-rounds   the rifle never runs dry (no reloads): held triggers fire at its
+                       rate as long as a run lasts (load tests; clients are told)
   --no-cone            shots go exactly where aimed: no cone of fire or bloom (to compare
                        with fight baselines from before it)
   --no-render-floor    don't hold shots' claimed render steps to each client's render clock
@@ -603,6 +606,7 @@ fn main() -> std::io::Result<()> {
         separation: !a.flag("no-separation"),
         deaths_per_sec: a.get("deaths-per-sec", 0.0),
         immortal: a.flag("immortal"),
+        unlimited_rounds: a.flag("unlimited-rounds"),
         cone_of_fire: !a.flag("no-cone"),
         // Where shots go in their cones: a fresh secret from the OS.
         spread_secret: None,

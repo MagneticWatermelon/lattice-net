@@ -211,8 +211,13 @@ pub struct SimConfig {
     /// players a second (they respawn after `RESPAWN_STEPS`).
     pub deaths_per_sec: f32,
     /// Measurement aid: hits land (and are confirmed) but deal no damage, so
-    /// hit rates measure aim and lag compensation, not who died first.
+    /// hit rates measure aim and lag compensation, not who died first. Nobody
+    /// dies to have their rounds refilled, so it implies `unlimited_rounds`.
     pub immortal: bool,
+    /// Load-test aid: the rifle never runs dry (`msg::RULE_UNLIMITED_ROUNDS`,
+    /// announced in the Welcome so clients predict it): held triggers fire at
+    /// the rifle's rate for as long as a run lasts, as before rounds existed.
+    pub unlimited_rounds: bool,
     /// Shots leave within their cone of fire (`weapon::Bloom`, `spread`).
     /// Off only for tests that measure lag compensation's geometry.
     pub cone_of_fire: bool,
@@ -252,6 +257,7 @@ impl Default for SimConfig {
             separation: true,
             deaths_per_sec: 0.0,
             immortal: false,
+            unlimited_rounds: false,
             cone_of_fire: true,
             spread_secret: None,
             render_floor: true,
@@ -644,6 +650,8 @@ struct InputQueue {
     cone: bool,
     /// The rifle's rounds, as of `last_seq` (and the late shots fired since).
     ammo: Ammo,
+    /// The server's rules give unlimited rounds: the rifle is full after every step.
+    unlimited: bool,
     /// The server's secret for where in the cone each shot goes, and this
     /// spawn's number under it. None before the first spawn.
     spread: Option<(Arc<SpreadKey>, u64)>,
@@ -682,6 +690,7 @@ impl Default for InputQueue {
             bloom: Bloom::default(),
             cone: true,
             ammo: Ammo::FULL,
+            unlimited: false,
             spread: None,
             claims: RenderFloor::default(),
             batch: Vec::new(),
@@ -971,6 +980,9 @@ impl InputQueue {
         if input.buttons & BUTTON_RELOAD != 0 && !body.dead() {
             self.ammo.start_reload();
         }
+        if self.unlimited {
+            self.ammo = Ammo::FULL;
+        }
         body.reloading = !body.dead() && self.ammo.reload > 0;
         kind
     }
@@ -1146,6 +1158,11 @@ pub struct SimServer {
 const PACE_TICKS: usize = 60;
 
 impl SimServer {
+    /// The rifle never runs dry here (`SimConfig::unlimited_rounds`, or immortal).
+    fn unlimited_rounds(&self) -> bool {
+        self.cfg.unlimited_rounds || self.cfg.immortal
+    }
+
     pub fn new(cfg: SimConfig, now: Instant) -> Self {
         assert!(cfg.max_clients <= u16::MAX as usize, "entity ids are u16");
         let mut net =
@@ -2101,7 +2118,7 @@ impl SimServer {
                 let id = self.bodies.len() as u16;
                 self.bodies.push(Body::default());
                 self.pushes.push([0.0; 2]);
-                self.inputs.push(Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, ..InputQueue::default() }));
+                self.inputs.push(Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, unlimited: self.unlimited_rounds(), ..InputQueue::default() }));
                 self.far_blobs.push([0; FAR_BLOB]);
                 if faction(id) as u64 == side {
                     break id;
@@ -2122,7 +2139,7 @@ impl SimServer {
         };
         let spread = Some((Arc::clone(&self.spread), self.counters.spawns));
         let session = Session { user, joined_unix: unix_now, joined: Some(now), ..Session::default() };
-        self.inputs[i] = Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, spread, session, ..InputQueue::default() });
+        self.inputs[i] = Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, unlimited: self.unlimited_rounds(), spread, session, ..InputQueue::default() });
         if squad != NO_SQUAD {
             self.squads.entry(squad).or_default().push(e);
         }
@@ -2146,7 +2163,8 @@ impl SimServer {
         }
         self.slot_of[i] = Some((k as u16, (self.shard_clients[k].len() - 1) as u32));
         self.counters.spawns += 1;
-        let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius, world_seed: self.cfg.world_seed });
+        let rules = if self.unlimited_rounds() { msg::RULE_UNLIMITED_ROUNDS } else { 0 };
+        let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius, world_seed: self.cfg.world_seed, rules });
         let _ = self.net.send(client, Channel::Reliable, welcome);
     }
 

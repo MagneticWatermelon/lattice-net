@@ -227,6 +227,9 @@ pub struct ClientCore {
     state: MoveState,
     /// The rifle's rounds after `seq` (`weapon::Ammo`), predicted like `state`.
     ammo: Ammo,
+    /// The server's rules give unlimited rounds (`msg::RULE_UNLIMITED_ROUNDS`):
+    /// predicted as it has it, full after every step.
+    unlimited: bool,
     history: Vec<Predicted>,
     /// Input clock: `rate` inputs per 1/30 s, accumulated in `clock`.
     rate: f32,
@@ -352,6 +355,7 @@ impl ClientCore {
             seq: 0,
             state: MoveState::default(),
             ammo: Ammo::FULL,
+            unlimited: false,
             history: vec![Predicted::default(); HISTORY],
             rate: 1.0,
             pace: 1.0,
@@ -686,6 +690,7 @@ impl ClientCore {
                 // The server starts us exactly here too.
                 self.state = MoveState::standing(&world, w.spawn);
                 self.ammo = Ammo::FULL;
+                self.unlimited = w.rules & msg::RULE_UNLIMITED_ROUNDS != 0;
                 self.world = Some(world);
                 self.distant = Distant::new(0x9E37_79B9_7F4A_7C15 ^ w.entity as u64);
                 self.welcome = Some(w);
@@ -849,6 +854,9 @@ impl ClientCore {
                 let applied = if dead { dead_input(input) } else { input };
                 s = step(&world, s, applied);
                 ammo.step(applied.buttons, false);
+                if self.unlimited {
+                    ammo = Ammo::FULL;
+                }
             }
             self.history[seq as usize % HISTORY] = Predicted { seq, input, state: s, sent_at: None, render: None, shot: None, ammo };
             if seq == to {
@@ -883,6 +891,9 @@ impl ClientCore {
             let applied = if dead { dead_input(p.input) } else { p.input };
             s = step(world, s, applied);
             a.step(applied.buttons, p.shot.is_some());
+            if self.unlimited {
+                a = Ammo::FULL;
+            }
             (p.state, p.ammo) = (s, a);
         }
         self.ammo = a;
@@ -1106,6 +1117,9 @@ impl ClientCore {
                 self.stats.shots += 1;
             }
             self.ammo.step(applied.buttons, shot.is_some());
+            if self.unlimited {
+                self.ammo = Ammo::FULL;
+            }
             self.history[self.seq as usize % HISTORY] =
                 Predicted { seq: self.seq, input, state: self.state, sent_at: Some(now), render, shot, ammo: self.ammo };
             made += 1;
@@ -1207,7 +1221,7 @@ mod tests {
     fn a_frame_loop_makes_30_inputs_a_second_and_draws_its_player_smoothly() {
         let t0 = Instant::now();
         let mut c = ClientCore::default();
-        let w = Welcome { entity: 1, spawn: [4096.0, 4096.0], anchor: [4096.0, 4096.0], radius: 100.0, world_seed: 7 };
+        let w = Welcome { entity: 1, spawn: [4096.0, 4096.0], anchor: [4096.0, 4096.0], radius: 100.0, world_seed: 7, rules: 0 };
         c.on_message(&msg::encode_welcome(&w), t0);
         let frame = Duration::from_secs_f64(1.0 / 144.0);
         let run = Input { move_x: 127, ..Default::default() };

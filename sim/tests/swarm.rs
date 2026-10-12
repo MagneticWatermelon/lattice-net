@@ -2034,6 +2034,38 @@ fn hits_from_an_earlier_life_deal_nothing() {
 }
 
 #[test]
+fn unlimited_rounds_never_run_dry() {
+    // Load tests and immortal fights hold the trigger for minutes, where
+    // nobody dies to be refilled. With unlimited rounds (announced in the
+    // Welcome, predicted the same), the rifle fires at its rate for good:
+    // no reloads, no ammo corrections. Without, it runs dry: 210 rounds.
+    for (immortal, unlimited, dry) in [(false, true, false), (true, false, false), (false, false, true)] {
+        let cfg = SimConfig { spawn: SpawnMode::Disk(30.0), immortal, unlimited_rounds: unlimited, ..Default::default() };
+        let mut s = Swarm::with_config(2, cfg);
+        for _ in 0..TICK_HZ {
+            s.step();
+        }
+        s.bots[0].2.set_trigger(true);
+        let shots0 = s.server.counters().shots;
+        let mut reloads = 0;
+        for _ in 0..40 * TICK_HZ {
+            s.step();
+            reloads += (s.bots[0].2.core().ammo().reload > 0) as u32;
+        }
+        let shots = s.server.counters().shots - shots0;
+        let st = &s.bots[0].2.core().stats;
+        assert_eq!((st.ammo_corrections, st.corrections), (0, 0), "predicted exactly");
+        if dry {
+            let rounds = lattice_game::weapon::MAGAZINE as u64 + lattice_game::weapon::RESERVE as u64;
+            assert_eq!(shots, rounds, "a magazine and the reserve, then nothing");
+        } else {
+            assert!(shots >= 390, "immortal {immortal}, unlimited {unlimited}: {shots} shots in 40 s");
+            assert_eq!(reloads, 0, "never reloading");
+        }
+    }
+}
+
+#[test]
 fn distant_fights_are_seen() {
     use lattice_sim::bot::Moves;
     // Six shooters in a 15 m line fire east; watchers stand 40 m (near),

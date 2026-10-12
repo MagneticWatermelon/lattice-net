@@ -229,14 +229,15 @@ fn two_sessions_join_see_each_other_and_fight_through_the_c_api() {
 /// Crouch and the rifle's rounds through the C API. B crouches: it says so,
 /// A sees it (the flag), and A's shots at a standing head's height pass
 /// over it, while at its crouched body they hit. A empties its magazine
-/// (it can't fire while the reload runs) and fires again from the next:
-/// predicted exactly, no correction, no shot refused.
+/// (it can't fire while the reload runs; B sees it reloading) and fires
+/// again from the next: predicted exactly, no correction, no shot refused.
+/// (B can't die: invulnerable, not an immortal server, whose rounds never
+/// run out.)
 #[test]
 fn crouch_and_the_magazine_through_the_c_api() {
     let start = Instant::now();
     let mut cfg = SimConfig { spawn: SpawnMode::Disk(20.0), ..Default::default() };
     cfg.interest.squad_size = 0;
-    cfg.immortal = true;
     let mut server = LoopServer::with(cfg, start);
     let id = server.sim.config().identity.clone();
     let key = hex(&id.token_key);
@@ -248,7 +249,7 @@ fn crouch_and_the_magazine_through_the_c_api() {
     let hits = |a: &Client, b: &Client| a.events.iter().filter(|e| e.kind == EVENT_HIT && e.a == b.own.entity).count() as u32;
     let frame = Duration::from_micros(8333);
     let mut next = start;
-    let (mut seen_crouched, mut emptied, mut blocked) = (false, false, 0u32);
+    let (mut seen_crouched, mut emptied, mut blocked, mut seen_reloading) = (false, false, 0u32, false);
     let (mut high_fired, mut high_hits, mut reload_seen) = (0u32, None, 0f32);
     while next < start + Duration::from_secs(11) {
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
@@ -279,6 +280,10 @@ fn crouch_and_the_magazine_through_the_c_api() {
             high_hits = Some(hits(&a, &b));
         }
         b.frame(None, false);
+        if b.own.welcomed == 1 {
+            server.sim.set_invulnerable(b.own.entity, true);
+        }
+        seen_reloading |= b.ents[..b.drawn].iter().any(|e| e.id == a.own.entity && a.own.welcomed == 1 && e.flags & FLAG_RELOADING != 0);
         server.run(Instant::now());
         next += frame;
     }
@@ -287,9 +292,10 @@ fn crouch_and_the_magazine_through_the_c_api() {
         assert_eq!((st.corrections, st.ammo_corrections, st.resyncs), (0, 0, 0), "{name}: predicted exactly");
     }
     assert_eq!(server.sim.counters().shots_refused, 0, "no shot without a round");
-    // B crouched, and A saw it.
+    // B crouched, and A saw it; A reloaded, and B saw that.
     assert_eq!(b.own.crouched, 1);
     assert!(seen_crouched, "A drew B crouched");
+    assert!(seen_reloading, "B drew A reloading");
     // A's magazine: 30 at its head's height, a reload from empty, then more.
     let r = lattice_game::weapon::RELOAD_EMPTY_STEPS as f32 / lattice_game::movement::TICK_HZ as f32;
     assert!(emptied && reload_seen > r - 0.1 && reload_seen <= r, "emptied, reloaded ({reload_seen} s)");
