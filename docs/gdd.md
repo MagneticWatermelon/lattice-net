@@ -405,8 +405,9 @@ Everything that blocks movement or shots must exist in the shared world (`game/s
   - damage direction;
   - the kill feed;
   - the net graph (N).
+- **Exists in the Unity client,** besides those: health, and the rounds (2026-10-12): the cell's count over what's carried, a segment per round that refills as the reload runs, RELOAD under the reticle when a quarter or less is left, NO AMMO when there's nothing to reload with (and as the trigger clicks dry). The rifle's ammo cell glows with the rounds left: the gauge is on the gun too.
 - **Proposed:**
-  - health, ability, ammo and grenades;
+  - ability and grenades;
   - a compass with squadmates, waypoints and spotted enemies;
   - a minimap with every friendly the client knows about within 500 m (free, from the entity store);
   - a capture panel inside a site: points, owners, meter;
@@ -797,7 +798,7 @@ continent package (.lcp) ----> the server:        World::load(package)
 | **U3: net thread** (built, 2026-10-12) | the session on a plugin thread | with the main thread frozen for 100, 300 and 1,000 ms: no resyncs or trims (like the Bevy client's freeze tests); a 10 s scene load keeps the connection. **Met** (§12.3) |
 | **U4: shell** | login or invite, deploy screen, map, loadout (stubbed), settings, death recap | |
 | **U5: territory** | sites, points, the capture panel, lanes on the map, spawn rooms | needs §21's server work |
-| **U6: classes** | the six classes, their tools and abilities | |
+| **U6: classes** (crouch and the rifle's rounds built, 2026-10-12) | the six classes, their tools and abilities. Built: crouch (Ctrl held, C toggled; the view eases down; soldiers kneel or crouch-walk, the crowd from baked crouched poses) and the rifle's rounds (a first-person reload that swaps its ammo cell, timed by the predicted reload; the HUD's rounds; handling sounds, near soldiers' reloads heard) | crouched heads drawn on their hitbox; prediction exact. **Measured:** a crouched fight (`--autotarget --crouch`, 1,000 bots): 0 corrections, 0 ammo corrections, 6 reloads; frame p99 4.7 ms, no managed allocations |
 | **U7: vehicles** (M4) | ground, then air | |
 | **U8: the first authored continent** | the exporter and package; Harrow rebuilt by hand | |
 | after that | squads, platoons and outfits; progression; surges and rotation; more continents | |
