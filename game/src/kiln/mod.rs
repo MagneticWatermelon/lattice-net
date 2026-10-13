@@ -489,6 +489,7 @@ pub(crate) fn build_kiln() -> Kiln {
     build::hollow(&mut kiln); tick("build::hollow");
     let decks = lanes::stamp(&mut kiln, &routes); tick("lanes::stamp");
     build::sites(&mut kiln); tick("build::sites");
+    build::spawn_rooms(&mut kiln); tick("build::spawn_rooms");
     deep::tunnels(&mut kiln); tick("deep::tunnels");
     build::scatter(&mut kiln); tick("build::scatter");
     // (A tunnel's lane only on the surface: to its mouths.)

@@ -183,6 +183,24 @@ pub(crate) fn room(k: &mut Kiln, q: [f64; 2], u: [f64; 2], hu: f64, hv: f64, hig
     k.fixed.push(oriented(q, [hu + 0.4, hv + 0.4], u, floor + high, floor + high + 0.6, Kind::Block));
 }
 
+/// A spawn room (K3, GDD §3.4): a room (as `room`) whose doors are shielded
+/// for site `site`, held by `faction` at the start (`territory::NONE`: no one,
+/// sealed till someone takes it), with a baffle wall `BAFFLE` m out from each
+/// door: you leave it sideways, and nothing outside is in sight from inside.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_room(k: &mut Kiln, q: [f64; 2], u: [f64; 2], hu: f64, hv: f64, floor: f64, site: usize, faction: u8) {
+    room(k, q, u, hu, hv, 4.5, floor, Some((site, faction)));
+    let v = [-u[1], u[0]];
+    for s in [-1.0, 1.0] {
+        let at = |b: f64| add(add(q, scale(u, s * (hu + BAFFLE))), scale(v, b));
+        // Wider than the room: from a step inside the door, nothing past it shows.
+        k.fixed.push(strip(at(-hv - 2.5), at(hv + 2.5), 0.4, floor - 0.3, floor + 3.6, Kind::Block));
+    }
+}
+
+/// How far a spawn room's baffles stand out from its doors.
+pub(crate) const BAFFLE: f64 = 3.0;
+
 /// A chamber under the ground (K1, K2): an axis-aligned room, its walls
 /// left open where a trench, tubes and shafts come in (`walls`, once they're
 /// all known).

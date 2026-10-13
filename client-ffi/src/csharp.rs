@@ -76,6 +76,8 @@ fn constants() -> Vec<(&'static str, Value, &'static str)> {
         ("TERRAIN_RES", F32(world::TERRAIN_RES), "Height sample spacing, m."),
         ("TERRAIN_N", Int(world::TERRAIN_N as i64, "int"), "Height samples per side."),
         ("SITE_BLEND", F32(world::SITE_BLEND), "A site's flat ground blends back to the hills over this, m."),
+        ("POINT_RADIUS", F32(lattice_game::territory::POINT_RADIUS), "A control point counts whoever stands within this of it, m,"),
+        ("POINT_HEIGHT", F32(lattice_game::territory::POINT_HEIGHT), "and this above or below it, m."),
         ("MAX_NEAR_DELAY", F64(msg::MAX_NEAR_DELAY), "The longest render delays the server accepts, steps: near,"),
         ("MAX_MID_DELAY", F64(msg::MAX_MID_DELAY), "mid and far."),
         ("TELEPORT", F32(entities::TELEPORT), "A drawn jump longer than this is a teleport (a respawn), m."),

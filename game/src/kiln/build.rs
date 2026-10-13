@@ -744,9 +744,9 @@ pub(crate) fn sites(k: &mut Kiln) {
                     let m = deep::mouth_at(k, 0, top, deep::axis_of(scale(rift.dir, -1.0)));
                     deep::tube(k, m, heart, deep::Ends::Inside { from: Some(rift.at(560.0, 0.0)), to: None });
                 }
-                // The owner's spawn room at the spire's foot (no shields: the
-                // Hollow has no owner until U5's territory).
-                deep::room(k, add(c, [0.0, 39.0]), [0.0, 1.0], 7.0, 8.0, 5.0, HOLLOW_FLOOR, None);
+                // The owner's spawn room at the spire's foot: no one's at the
+                // start (sealed till someone takes the Hollow).
+                deep::room(k, add(c, [0.0, 39.0]), [0.0, 1.0], 7.0, 8.0, 5.0, HOLLOW_FLOOR, Some((i, crate::territory::NONE)));
                 // Lifts and drop shafts up each terrace's cliff, on each
                 // sector's side clear of its switchbacks.
                 for s in 0..3 {
@@ -1350,6 +1350,84 @@ pub(crate) fn sites(k: &mut Kiln) {
         k.points.extend(points.into_iter().map(|q| Point { pos: [q[0] as f32, q[1] as f32, q[2] as f32], site }));
         k.boxes.extend(out);
         k.fixed.extend(fixed);
+    }
+}
+
+/// A spawn room at every base and Geode (K3; the Spans', Cliffholds' and
+/// the Hollow's are built with them): on level ground within the site, clear
+/// of its lanes, points, cover and features, its doors along the ring round
+/// the site's center (not facing it), the ground under it padded flat.
+/// Placed where it fits, the nearest the site's free direction first.
+pub(crate) fn spawn_rooms(k: &mut Kiln) {
+    const HU: f64 = 7.0;
+    const HV: f64 = 5.0;
+    // Out to the baffles, and the padding's blend past that.
+    let reach = HU + deep::BAFFLE + 1.0;
+    let blend = 3.0;
+    for i in 0..k.sites.len() {
+        let p = k.sites[i].clone();
+        if !(p.kind.base() || p.kind == SiteKind::Geode) {
+            continue;
+        }
+        let fd = free_dir(&p);
+        let fits = |k: &Kiln, q: [f64; 2]| -> Result<(), &'static str> {
+            // Off the lanes and the ways inside sites.
+            let inside = k.internal.iter().flat_map(|r| &r.legs).flat_map(|l| l.path.windows(2)).map(|w| seg_dist(q, w[0], w[1]).0).fold(f64::MAX, f64::min);
+            if land::clearance(k, q).0.min(inside) < reach + 2.0 {
+                return Err("lane");
+            }
+            if k.points.iter().any(|pt| dist([pt.pos[0] as f64, pt.pos[1] as f64], q) < reach + 9.0) {
+                return Err("point");
+            }
+            if k.chambers.iter().any(|ch| dist(ch.center, q) < ch.half + reach + 6.0) {
+                return Err("chamber");
+            }
+            let near_box = |b: &CoverBox| {
+                let dx = (b.min[0] as f64 - q[0]).max(q[0] - b.max[0] as f64).max(0.0);
+                let dy = (b.min[1] as f64 - q[1]).max(q[1] - b.max[1] as f64).max(0.0);
+                len([dx, dy]) < reach + blend + 1.0
+            };
+            if k.boxes.iter().chain(&k.fixed).any(near_box) {
+                return Err("box");
+            }
+            if k.volumes.iter().any(|v| dist([(v.min[0] + v.max[0]) as f64 / 2.0, (v.min[1] + v.max[1]) as f64 / 2.0], q) < reach + blend + 4.0) {
+                return Err("volume");
+            }
+            let (x0, x1, y0, y1) = Kiln::samples(sub(q, [reach, reach]), add(q, [reach, reach]));
+            let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+            for iy in y0..=y1 {
+                for ix in x0..=x1 {
+                    if dist(Kiln::pos(ix, iy), q) > reach {
+                        continue;
+                    }
+                    let j = iy * TERRAIN_N + ix;
+                    if k.mask[j] & MASK_ROAD != 0 {
+                        return Err("road");
+                    }
+                    lo = lo.min(k.h[j]);
+                    hi = hi.max(k.h[j]);
+                }
+            }
+            if hi - lo <= 2.5 { Ok(()) } else { Err("slope") }
+        };
+        let mut placed = None;
+        'search: for r in [0.55, 0.7, 0.45, 0.4, 0.85, 1.0, 1.15] {
+            let r = (p.half * r).max(28.0);
+            for step in 0..36 {
+                let a = fd + if step % 2 == 0 { 1.0 } else { -1.0 } * ((step + 1) / 2) as f64 * 10.0;
+                let q = add(p.center, scale(unit(a), r));
+                if fits(k, q).is_ok() {
+                    placed = Some((q, a));
+                    break 'search;
+                }
+            }
+        }
+        // (Every base and Geode has room for one: `kiln`'s tests say.)
+        let Some((q, a)) = placed else { continue };
+        let floor = k.mean(q, reach);
+        pad(k, q, reach, floor, blend);
+        deep::spawn_room(k, q, unit(a + 90.0), HU, HV, floor, i, p.sector);
+        deep::keep_clear(k, q, reach + 2.0);
     }
 }
 

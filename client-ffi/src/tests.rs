@@ -14,6 +14,15 @@ use crate::abi::*;
 use crate::api::*;
 use crate::session::tests::LoopServer;
 
+/// The tests that run a frame loop in real time hold this to read; one that
+/// loads the machine (building Kiln) holds it to write, so it never runs
+/// beside them (a stalled frame loop resyncs, and they'd fail for it).
+static QUIET: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn quiet() -> std::sync::RwLockReadGuard<'static, ()> {
+    QUIET.read().unwrap_or_else(|e| e.into_inner())
+}
+
 fn hex(key: &[u8]) -> CString {
     CString::new(key.iter().map(|b| format!("{b:02x}")).collect::<String>()).unwrap()
 }
@@ -117,6 +126,7 @@ const LT_BUTTON_CROUCH: u8 = lattice_game::movement::BUTTON_CROUCH;
 
 #[test]
 fn two_sessions_join_see_each_other_and_fight_through_the_c_api() {
+    let _quiet = quiet();
     assert_eq!(unsafe { lt_version() }, VERSION);
     assert_eq!(unsafe { lt_layout_hash() }, layout_hash(FNS));
 
@@ -235,6 +245,7 @@ fn two_sessions_join_see_each_other_and_fight_through_the_c_api() {
 /// run out.)
 #[test]
 fn crouch_and_the_magazine_through_the_c_api() {
+    let _quiet = quiet();
     let start = Instant::now();
     let mut cfg = SimConfig { spawn: SpawnMode::Disk(20.0), ..Default::default() };
     cfg.interest.squad_size = 0;
@@ -453,6 +464,7 @@ fn judder(speeds: &[f32]) -> (f32, f32) {
 /// (the control) leave the server standing in for the inputs never made.
 #[test]
 fn the_net_thread_rides_out_frozen_frames() {
+    let _quiet = quiet();
     let freezes = [(3.0, 0.1), (5.0, 0.3), (7.0, 1.0)];
     let threaded = std::thread::spawn(move || run_with_freezes(true, &freezes, 10.0));
     let pumped = run_with_freezes(false, &freezes, 10.0);
@@ -497,6 +509,7 @@ fn the_net_thread_rides_out_frozen_frames() {
 /// timeout): connected after, nothing stood in.
 #[test]
 fn the_net_thread_keeps_the_connection_through_a_scene_load() {
+    let _quiet = quiet();
     let r = run_with_freezes(true, &[(2.5, 10.0)], 15.0);
     eprintln!("scene load: stand-ins {}, resyncs {}, corrections {}, fired {}", r.server.repeated + r.server.frozen, r.client.resyncs, r.client.corrections, r.fired);
     assert_eq!(r.client.state, STATE_CONNECTED, "still connected");
@@ -538,4 +551,59 @@ fn the_kit_world_has_its_turned_boxes_volumes_and_holes() {
         assert_eq!(cells, [0, 0, 0, 0, 0, 1, 1, 1], "row cy-1: none; row cy: from cx");
         lt_world_free(w);
     }
+}
+
+#[test]
+fn territory_through_the_c_api() {
+    let _alone = QUIET.write().unwrap_or_else(|e| e.into_inner());
+    use lattice_game::territory::NONE;
+    // Kiln, its meters 120 times faster: the Hollow (5 min) flips in 2.5 s.
+    let start = Instant::now();
+    let cfg = SimConfig { world: lattice_game::world::KILN, spawn: SpawnMode::Uniform, capture_speed: 120, ..Default::default() };
+    let mut server = LoopServer::with(cfg, start);
+    let id = server.sim.config().identity.clone();
+    let key = hex(&id.token_key);
+    let mut a = Client::connect(&server.addr().to_string(), 1, &key, id.server_id);
+    let frame = Duration::from_micros(8333);
+    let mut next = start;
+    let mut states = vec![LtSiteState::default(); 128];
+    let read = |a: &Client, states: &mut Vec<LtSiteState>| unsafe { lt_territory(a.s, states.as_mut_ptr(), states.len() as i32) } as usize;
+    let (mut teleported, mut flipped_at, mut meter_seen) = (None, None, 0f32);
+    while next < start + Duration::from_secs(12) && flipped_at.is_none() {
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        a.frame(None, false);
+        let n = read(&a, &mut states);
+        if a.own.welcomed == 1 && n > 0 {
+            let us = lattice_game::faction::faction(a.own.entity);
+            let hollow = states[0];
+            if teleported.is_none() {
+                // At the start: the Hollow no one's, open to every faction.
+                assert_eq!(n, server.sim.world().sites().len());
+                assert_eq!((hollow.owner, hollow.attackable, hollow.locked_secs), (NONE, 0b111, 0.0));
+                assert!(hollow.point_count >= 1 && hollow.points[..hollow.point_count as usize].iter().all(|&p| p == NONE));
+                for (s, st) in server.sim.world().sites().iter().zip(&states[..n]).skip(1) {
+                    assert_eq!(st.owner, s.sector, "the rest their sectors'");
+                }
+                let p = server.sim.territory().points(0)[0];
+                server.sim.teleport(a.own.entity, [p[0], p[1]]);
+                teleported = Some(Instant::now());
+            } else {
+                if hollow.attacker == us {
+                    meter_seen = meter_seen.max(hollow.meter);
+                }
+                if hollow.owner == us {
+                    assert_eq!(hollow.points[0], us, "and we hold its point");
+                    assert!(hollow.locked_secs > 170.0, "locked for 3 minutes: {}", hollow.locked_secs);
+                    flipped_at = Some(Instant::now());
+                }
+            }
+        }
+        server.run(Instant::now());
+        next += frame;
+    }
+    let took = flipped_at.expect("the Hollow flipped to us") - teleported.unwrap();
+    assert!(meter_seen > 0.5, "the meter climbed ({meter_seen})");
+    assert!(took.as_secs_f32() < 5.0, "in {took:?}");
+    assert_eq!(a.stats().corrections, 0, "prediction stayed exact");
+    unsafe { lt_close(a.s) };
 }

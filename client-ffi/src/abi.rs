@@ -328,6 +328,10 @@ ffi_structs! {
         pub facing: u8,
         /// A shield's faction, the one it lets through; `LT_SOLID` for the rest.
         pub pass: u8,
+        /// A shield that belongs to a site: it lets through whoever holds
+        /// the site (`lt_territory`), and `pass` is who held it at the start.
+        /// `LT_NO_SITE` for the rest.
+        pub site: u16,
     }
 
     /// A force volume (an axis-aligned box of air): a lift, a drop shaft or
@@ -372,6 +376,29 @@ ffi_structs! {
     pub struct LtPoint {
         pub pos: LtVec3,
         pub site: u16,
+    }
+
+    /// A site's state (U5): who holds it, and its fight, as the server last
+    /// said, at the step we're predicting.
+    pub struct LtSiteState {
+        /// How far its meter is toward `attacker` taking it, 0..1.
+        pub meter: f32,
+        /// Seconds since it last changed hands (since the start: large).
+        pub held_secs: f32,
+        /// Seconds till it can be attacked again (0: it can).
+        pub locked_secs: f32,
+        /// Its holder (`LT_NO_ONE`: no one).
+        pub owner: u8,
+        /// The faction its meter is moving toward (`LT_NO_ONE`: none).
+        pub attacker: u8,
+        /// Bit f: faction f may attack it now (linked to a site it holds,
+        /// not its own, not locked, not a Landing).
+        pub attackable: u8,
+        /// How many points it has; who holds each (`LT_NO_ONE`: no one);
+        /// bit i: point i is contested.
+        pub point_count: u8,
+        pub points: [u8; 6],
+        pub contested: u8,
     }
 
     /// Where a segment first hits the ground or cover.
@@ -434,6 +461,8 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_COVER_BONE", lattice_game::world::Kind::Bone as i64, "The Dry Sea's bones."),
     ("LT_COVER_SHIELD", lattice_game::world::Kind::Shield as i64, "A faction's shield: drawn in its colors, see-through."),
     ("LT_SOLID", lattice_game::world::SOLID as i64, "`LtBox::pass` of everything but shields: it blocks every faction."),
+    ("LT_NO_SITE", lattice_game::world::NO_SITE as i64, "`LtBox::site` of a box that belongs to no site."),
+    ("LT_NO_ONE", lattice_game::territory::NONE as i64, "No faction: who holds a site or a point no one holds."),
     ("LT_FORCE_LIFT", lattice_game::world::Force::Lift as i64, "An updraft: a lift or a vent lift."),
     ("LT_FORCE_DROP", lattice_game::world::Force::Drop as i64, "A drop shaft: a fall slowed."),
     ("LT_FORCE_SPRING", lattice_game::world::Force::Spring as i64, "A lattice spring: a throw."),

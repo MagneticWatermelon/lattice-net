@@ -25,6 +25,7 @@ use lattice_client_core::tracers::{Fired, Tracers};
 use lattice_client_core::{ClientConfig, How};
 use lattice_game::events::{Event, SeenShot};
 use lattice_game::faction::faction;
+use lattice_game::territory::FULL;
 use lattice_game::movement::{Input, BUTTON_ADS, BUTTON_CROUCH, BUTTON_JUMP, BUTTON_RELOAD, BUTTON_SPRINT, TICK_HZ};
 use lattice_game::weapon::eye_height;
 use lattice_game::world::World;
@@ -390,6 +391,31 @@ impl Handle {
             *o = LtTracer { head: head.into(), tail: tail.into(), kind: t.kind as u8, faction: t.faction, reserved: 0, age: t.age };
         }
         self.tracers.flying.len()
+    }
+
+    /// Every site's state at the step we're predicting (as many as fit);
+    /// returns how many sites there are.
+    pub fn territory(&self, out: &mut [LtSiteState]) -> usize {
+        let core = &self.session.core;
+        let Some(t) = core.territory() else { return 0 };
+        let step = core.step();
+        let secs = |steps: u32| steps as f32 / TICK_HZ as f32;
+        for (i, (o, s)) in out.iter_mut().zip(&t.sites).enumerate() {
+            let n = t.points(i).len().min(s.points.len());
+            let attackable = (0..3u8).filter(|&f| t.attackable(i, f, step)).fold(0, |m, f| m | 1 << f);
+            *o = LtSiteState {
+                meter: s.meter as f32 / FULL as f32,
+                held_secs: secs(step.saturating_sub(s.since)),
+                locked_secs: secs(s.locked_until.saturating_sub(step)),
+                owner: s.owner_at(step),
+                attacker: s.attacker,
+                attackable,
+                point_count: n as u8,
+                points: s.points,
+                contested: s.contested,
+            };
+        }
+        t.sites.len()
     }
 
     pub fn set_others_muzzle(&mut self, offset: [f32; 3]) {

@@ -47,7 +47,7 @@ use crate::session::dev_token;
 /// 4: worlds by id (Kiln), lanes, points, materials.
 /// 5: the collision kit (K1): turned boxes, wedges and shields in `LtBox`,
 /// one-way lanes, `lt_world_volumes`, `lt_world_holes`.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]
@@ -439,6 +439,13 @@ ffi_fns! {
         with(s, |h| h.flush())
     }
 
+    /// Every site's state (who holds it, its fight; U5): fills `out` (up to
+    /// `cap`, in `lt_world_sites`' order), returns how many sites there are
+    /// (0 before we're welcomed).
+    fn lt_territory(s: *mut LtSession, out: *mut LtSiteState, cap: i32) -> i32 {
+        with(s, |h| h.territory(slice(out, cap)) as i32)
+    }
+
     /// The net graph's numbers.
     fn lt_stats(s: *mut LtSession, out: *mut LtStats) -> () {
         if let Some(o) = out.as_mut() {
@@ -542,6 +549,7 @@ ffi_fns! {
                 kind: b.kind as u8,
                 facing: b.facing,
                 pass: b.pass,
+                site: b.site,
             };
         }
         w.boxes().len() as i32

@@ -288,3 +288,35 @@ fn every_point_is_reached_from_every_landing() {
     }).collect();
     assert!(r.unreached.is_empty(), "{} unreached: {named:#?}", r.unreached.len());
 }
+
+#[test]
+fn every_base_and_great_site_has_a_spawn_room_that_sees_no_point() {
+    use crate::world::{Kind, NO_SITE};
+    let w = kiln();
+    let sites = w.sites();
+    let shields: Vec<_> = w.boxes().iter().filter(|b| b.kind == Kind::Shield && b.site != NO_SITE).copied().collect();
+    for (i, s) in sites.iter().enumerate() {
+        let wants = s.kind.base() || s.kind.major() || s.kind == SiteKind::Landing;
+        let has = shields.iter().any(|b| b.site as usize == i);
+        assert!(!wants || has, "site {i} ({:?}) has no spawn room", s.kind);
+    }
+    // From a step inside each door (under its roof), at eye height, no point
+    // of its site is in sight (GDD §6.3): the baffles and walls hide them.
+    let mut doors = 0;
+    for b in shields.iter().filter(|b| {
+        let k = sites[b.site as usize].kind;
+        k.base() || k == SiteKind::Geode
+    }) {
+        let n = if b.half[0] < b.half[1] { b.world_dir([1.0, 0.0]) } else { b.world_dir([0.0, 1.0]) };
+        let floor = b.bottom + 0.3;
+        let inside = [-1.0f32, 1.0].into_iter().map(|s| [b.center[0] + n[0] * s * 1.2, b.center[1] + n[1] * s * 1.2]).find(|q| w.ceiling(q[0], q[1], 0.1, floor + 1.0) < floor + 6.0).expect("a door under a roof on one side");
+        let eye = [inside[0], inside[1], floor + 1.6];
+        let owners: Vec<u8> = sites.iter().map(|s| s.sector).collect();
+        for p in w.points().iter().filter(|p| p.site == b.site) {
+            let seen = crate::hit::line_clear(&w, eye, [p.pos[0], p.pos[1], p.pos[2] + 1.0], crate::movement::Mover { faction: sites[b.site as usize].sector, owners: &owners });
+            assert!(!seen, "site {} ({:?}): its point at {:?} is in sight from the door at {eye:?}", b.site, sites[b.site as usize].kind, p.pos);
+        }
+        doors += 1;
+    }
+    assert_eq!(doors, 2 * (18 + 3), "two doors at each base and Geode");
+}

@@ -467,6 +467,11 @@ impl ClientCore {
         self.territory.as_ref()
     }
 
+    /// The step we're predicting: our newest input's.
+    pub fn step(&self) -> u32 {
+        self.step_of(self.seq)
+    }
+
     /// The game step input `seq` is (or will be) applied at, as far as we know.
     pub fn step_of(&self, seq: u32) -> u32 {
         (seq as i64 + self.step_offset.unwrap_or(0)).max(0) as u32
