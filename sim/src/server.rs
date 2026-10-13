@@ -38,6 +38,7 @@ use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot, DAMAGE_BODY, DAMA
 use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::events::{self, Event};
 use lattice_game::faction::{faction, FACTIONS, MAX_HEALTH, RESPAWN_STEPS};
+use lattice_game::territory::{self, Territory};
 use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
 use crate::msg::{self, Blob, PacketFill, RenderTime, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
 use crate::rng::Rng;
@@ -224,6 +225,9 @@ pub struct SimConfig {
     /// announced in the Welcome so clients predict it): held triggers fire at
     /// the rifle's rate for as long as a run lasts, as before rounds existed.
     pub unlimited_rounds: bool,
+    /// Test aid: territory's meters move this many times faster (1: the
+    /// GDD's minutes; `territory::Territory::with_speed`).
+    pub capture_speed: u32,
     /// Shots leave within their cone of fire (`weapon::Bloom`, `spread`).
     /// Off only for tests that measure lag compensation's geometry.
     pub cone_of_fire: bool,
@@ -264,6 +268,7 @@ impl Default for SimConfig {
             deaths_per_sec: 0.0,
             immortal: false,
             unlimited_rounds: false,
+            capture_speed: 1,
             cone_of_fire: true,
             spread_secret: None,
             render_floor: true,
@@ -277,6 +282,8 @@ impl Default for SimConfig {
 #[derive(Debug, Clone, Default)]
 pub struct Counters {
     pub ticks: u64,
+    /// Sites that changed hands (U5).
+    pub site_flips: u64,
     pub spawns: u64,
     pub despawns: u64,
     pub deaths: u64,
@@ -929,7 +936,8 @@ impl InputQueue {
 
     /// Advance one movement step, consuming seq `last_seq + 1`. `now` is the
     /// tick's time, `step` the game step the result is at.
-    fn advance(&mut self, e: u16, body: &mut Body, now: Instant, step_no: u32, world: &World) -> Step {
+    fn advance(&mut self, e: u16, body: &mut Body, now: Instant, step_no: u32, world: &World, owners: &[u8]) -> Step {
+        let who = movement::Mover { faction: faction(e), owners };
         self.depth = self.pending.len().min(u8::MAX as usize) as u8;
         self.rewind = None;
         let next = self.last_seq + 1;
@@ -944,7 +952,7 @@ impl InputQueue {
             self.starved_run = 0;
             (input, Step::Applied)
         } else if self.last_seq == 0 {
-            body.state = step(world, body.state, Input::default(), faction(e)); // (dead or not, it stands)
+            body.state = step(world, body.state, Input::default(), who); // (dead or not, it stands)
             return Step::Waiting;
         } else {
             // The input for `next` is late or lost: a stand-in takes its seq, and
@@ -960,7 +968,7 @@ impl InputQueue {
         // down, then a shot in this input (in `fire`), then its reload button.
         self.ammo.tick();
         let before = body.state;
-        body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input }, faction(e));
+        body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input }, who);
         self.steps[next as usize % STEP_RING] = (next, step_no, before, body.state);
         // A body keeps the aim it died with: the dead player's own camera
         // still turns (on its client), but a corpse doesn't spin for others.
@@ -1013,12 +1021,12 @@ fn frame(shard: &mut lattice_net::Shard, snaps: &mut Vec<(ClientId, Vec<u8>, Opt
 
 /// Whether `shooter`'s eye sees `target`'s chest now (no terrain or cover
 /// between them).
-fn in_sight(world: &World, history: &History, shooter: u16, target: u16) -> bool {
+fn in_sight(world: &World, owners: &[u8], history: &History, shooter: u16, target: u16) -> bool {
     let (Some(a), Some(b)) = (history.now(shooter), history.now(target)) else { return false };
     let eye = if a.crouched { weapon::CROUCH_EYE_HEIGHT } else { weapon::EYE_HEIGHT };
     let chest = lattice_game::hit::chest(b.crouched);
     let (p0, p1) = ([a.pos[0], a.pos[1], a.pos[2] + eye], [b.pos[0], b.pos[1], b.pos[2] + chest]);
-    lattice_game::hit::line_clear(world, p0, p1, faction(shooter))
+    lattice_game::hit::line_clear(world, p0, p1, movement::Mover { faction: faction(shooter), owners })
 }
 
 /// A projectile that ended this tick: where it was in the list, how, and
@@ -1136,6 +1144,12 @@ pub struct SimServer {
     counters: Counters,
     ladder: Ladder,
     world: Arc<World>,
+    /// Who holds what (U5), updated twice a second; who holds each site at
+    /// this tick's steps (two at 20 Hz), for the shields.
+    territory: Territory,
+    owners: [Vec<u8>; 2],
+    /// The step of the last territory update.
+    territory_step: u32,
     /// This tick's separation push per entity.
     pushes: Vec<[f32; 2]>,
     pace: PaceMeter,
@@ -1180,6 +1194,9 @@ impl SimServer {
         let spread_secret = cfg.spread_secret;
         Self {
             world: World::shared(cfg.world),
+            territory: Territory::with_speed(&World::shared(cfg.world), cfg.capture_speed.max(1)),
+            owners: [Vec::new(), Vec::new()],
+            territory_step: 0,
             pushes: Vec::new(),
             net,
             shard_clients: (0..cfg.shards).map(|_| Vec::new()).collect(),
@@ -1516,8 +1533,14 @@ impl SimServer {
         // 2. respawns due this tick (before its movement: the inputs it
         // applies are the new life's), then movement
         self.respawn_due(self.step + steps);
-        let world = &*self.world;
         let base_step = self.step;
+        // Who holds each site at this tick's steps (shields follow them).
+        for k in 0..2 {
+            let mut o = std::mem::take(&mut self.owners[k]);
+            self.territory.owners_at(base_step + k as u32 + 1, &mut o);
+            self.owners[k] = o;
+        }
+        let (world, owners) = (&*self.world, &self.owners);
         // Movement also gathers the shots fired (here, or by late inputs at
         // ingress) for the shots phase, in entity order.
         let ([applied, repeated, frozen], fires, refused, flagged) = self
@@ -1534,7 +1557,7 @@ impl SimServer {
                         // A tick consumes `steps` 1/30 s movement steps (1 or 2 at 20 Hz).
                         let queued = q.pending.len();
                         for k in 0..steps {
-                            match q.advance(e as u16, b, now, base_step + k + 1, world) {
+                            match q.advance(e as u16, b, now, base_step + k + 1, world, &owners[(k as usize).min(1)]) {
                                 Step::Applied => n[0] += 1,
                                 Step::Repeated => n[1] += 1,
                                 Step::Frozen => n[2] += 1,
@@ -1638,10 +1661,10 @@ impl SimServer {
             .sum();
         // Most ticks of a spread-out crowd push nobody: skip the second pass.
         if pushed > 0 {
-            let world = &*self.world;
+            let (world, owners) = (&*self.world, &self.owners[0][..]);
             self.bodies.par_iter_mut().zip(self.pushes.par_iter()).enumerate().with_min_len(256).for_each(|(e, (b, &push))| {
                 if b.alive && push != [0.0; 2] {
-                    b.state = movement::nudge(world, b.state, push, faction(e as u16));
+                    b.state = movement::nudge(world, b.state, push, movement::Mover { faction: faction(e as u16), owners });
                     b.pushes = b.pushes.wrapping_add(1);
                 }
             });
@@ -1664,6 +1687,11 @@ impl SimServer {
         // 6b. shots: new projectiles, then every projectile flies to now
         self.spans[6] = self.shots_phase();
         self.post_news();
+        // 6c. territory, twice a second: who's on each point, the meters,
+        // flips (announced now, in effect `FLIP_DELAY` steps on).
+        if self.step >= self.territory_step + territory::UPDATE_STEPS && !self.territory.is_empty() {
+            self.territory_phase();
+        }
         if (tick + 1).is_multiple_of(activity::WINDOW) {
             self.counters.activity_cells += self.activity.finish(self.step) as u64;
         }
@@ -1883,8 +1911,8 @@ impl SimServer {
             Some(&Some((k, i))) => Some(&clients[k as usize][i as usize].near),
             _ => None,
         };
-        let (world, history) = (&*self.world, &self.history);
-        let sky = Sky { world, grid: &self.grid, history, near: &near };
+        let (world, history, owners) = (&*self.world, &self.history, &self.owners[0][..]);
+        let sky = Sky { world, grid: &self.grid, history, near: &near, owners };
         let until = self.step as f64;
         // Fly in chunks of 64 projectiles; a chunk is a task (its time is
         // the span's "longest task"). A hit also learns whether the shooter
@@ -1898,7 +1926,7 @@ impl SimServer {
                 let (mut ends, mut st) = (Vec::new(), FlyStats::default());
                 for (i, p) in chunk.iter_mut().enumerate() {
                     if let Some((outcome, at)) = shots::fly(p, until, &sky, &mut st) {
-                        let after_cover = matches!(outcome, Outcome::Player { target, .. } if !in_sight(world, history, p.shooter, target));
+                        let after_cover = matches!(outcome, Outcome::Player { target, .. } if !in_sight(world, owners, history, p.shooter, target));
                         ends.push(Ended { id: p.id, index: c * 64 + i, shooter: p.shooter, outcome, at, after_cover });
                     }
                 }
@@ -1974,6 +2002,56 @@ impl SimServer {
             to.dedup();
             self.outbox.extend(to.into_iter().map(|e| (e, kill)));
         }
+    }
+
+    /// Territory's update: each faction's living players on each point (from
+    /// this tick's grid), the meters and flips; what changed, to every client.
+    fn territory_phase(&mut self) {
+        let dt = self.step - self.territory_step;
+        self.territory_step = self.step;
+        let (grid, bodies, t) = (&self.grid, &self.bodies, &self.territory);
+        let mut counts: Vec<Vec<[u16; 3]>> = Vec::with_capacity(t.len());
+        for i in 0..t.len() {
+            counts.push(
+                t.points(i)
+                    .iter()
+                    .map(|q| {
+                        let mut c = [0u16; 3];
+                        grid.for_each_within([q[0], q[1]], territory::POINT_RADIUS, |j, _, _| {
+                            let b = &bodies[j as usize];
+                            if b.alive && !b.dead() && (b.state.z - q[2]).abs() <= territory::POINT_HEIGHT {
+                                c[faction(j as u16) as usize] += 1;
+                            }
+                        });
+                        c
+                    })
+                    .collect(),
+            );
+        }
+        let mut changed = Vec::new();
+        let flipped = self.territory.update(self.step, dt, &mut |i, p| counts[i][p], &mut changed);
+        self.counters.site_flips += flipped.len() as u64;
+        let mut msgs = Vec::new();
+        if !flipped.is_empty() {
+            msgs.push(self.territory.encode_owners(self.step, Some(&flipped)));
+        }
+        if !changed.is_empty() {
+            msgs.push(self.territory.encode_fronts(self.step, &changed));
+        }
+        if msgs.is_empty() {
+            return;
+        }
+        self.reliable_out.resize_with(self.shard_count(), Vec::new);
+        for client in self.client_of.iter().flatten() {
+            for m in &msgs {
+                self.reliable_out[self.net.shard_of_client(*client)].push((*client, m.clone()));
+            }
+        }
+    }
+
+    /// Who holds what (tests, the debug map).
+    pub fn territory(&self) -> &Territory {
+        &self.territory
     }
 
     /// The outbox as one reliable message per client, bucketed by shard.
@@ -2172,6 +2250,12 @@ impl SimServer {
         let rules = if self.unlimited_rounds() { msg::RULE_UNLIMITED_ROUNDS } else { 0 };
         let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius, world: self.cfg.world, world_digest: self.world.digest(), rules });
         let _ = self.net.send(client, Channel::Reliable, welcome);
+        // Who holds what, and every site's fight.
+        if !self.territory.is_empty() {
+            let all: Vec<u16> = (0..self.territory.len() as u16).collect();
+            let _ = self.net.send(client, Channel::Reliable, self.territory.encode_owners(self.step, None));
+            let _ = self.net.send(client, Channel::Reliable, self.territory.encode_fronts(self.step, &all));
+        }
     }
 
     fn despawn(&mut self, client: ClientId, now: Instant) {
@@ -2694,11 +2778,11 @@ mod tests {
         q.push(0, 1, fwd(), None, None, ms(0), false);
         q.push(0, 1, fwd(), None, None, ms(20), false); // a redundant copy doesn't reset the clock
         q.push(0, 2, fwd(), None, None, ms(20), false);
-        assert_eq!(q.advance(0, &mut b, ms(33), 1, &tw()), Step::Applied);
+        assert_eq!(q.advance(0, &mut b, ms(33), 1, &tw(), &[]), Step::Applied);
         assert_eq!(q.wait, 330, "33 ms in 0.1 ms units");
-        assert_eq!(q.advance(0, &mut b, ms(66), 1, &tw()), Step::Applied);
+        assert_eq!(q.advance(0, &mut b, ms(66), 1, &tw(), &[]), Step::Applied);
         assert_eq!(q.wait, 460);
-        assert_eq!(q.advance(0, &mut b, ms(99), 1, &tw()), Step::Repeated);
+        assert_eq!(q.advance(0, &mut b, ms(99), 1, &tw(), &[]), Step::Repeated);
         assert_eq!(q.wait, WAIT_STAND_IN);
     }
 
@@ -2708,15 +2792,15 @@ mod tests {
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
 
-        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Waiting, "no input yet consumes nothing");
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw(), &[]), Step::Waiting, "no input yet consumes nothing");
         assert_eq!(q.last_seq, 0);
         assert_eq!(q.push(0, 2, fwd(), None, None, t, false), Push::Queued);
         assert_eq!(q.push(0, 1, fwd(), None, None, t, false), Push::Queued);
         assert_eq!(q.push(0, 2, fwd(), None, None, t, false), Push::Duplicate);
-        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Applied);
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw(), &[]), Step::Applied);
         assert_eq!((q.last_seq, q.depth), (1, 2));
         assert_eq!(q.push(0, 1, fwd(), None, None, t, false), Push::Duplicate, "already applied");
-        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Applied);
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw(), &[]), Step::Applied);
         assert_eq!(q.last_seq, 2);
 
         // A backlog drains one per tick; overflow discards the oldest unapplied.
@@ -2725,7 +2809,7 @@ mod tests {
         }
         assert_eq!(q.pending.len(), MAX_QUEUED_INPUTS);
         assert_eq!(q.last_seq, 3, "seq 3 was discarded");
-        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Applied);
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw(), &[]), Step::Applied);
         assert_eq!(q.last_seq, 4);
     }
 
@@ -2738,7 +2822,7 @@ mod tests {
         let w = tw();
         // seq 1 fires; its redundant copy doesn't fire again.
         q.push(0, 1, fwd(), None, shot(128), t, false);
-        q.advance(0, &mut b, t, 1, &w);
+        q.advance(0, &mut b, t, 1, &w, &[]);
         q.push(0, 1, fwd(), None, shot(128), t, false);
         assert_eq!((q.fires.len(), q.refused), (1, 0));
         let f = q.fires[0];
@@ -2746,16 +2830,16 @@ mod tests {
         // Seq 2 is too soon (one step later); seq 4 (three) is fine.
         for seq in 2..=4 {
             q.push(0, seq, fwd(), None, shot(128), t, false);
-            q.advance(0, &mut b, t, seq, &w);
+            q.advance(0, &mut b, t, seq, &w, &[]);
         }
         assert_eq!((q.fires.len(), q.refused), (2, 2), "seqs 2 and 3 too soon");
         // Seq 5 never arrives: the stand-in repeats its movement, not a shot.
-        assert_eq!(q.advance(0, &mut b, t, 5, &w), Step::Repeated);
+        assert_eq!(q.advance(0, &mut b, t, 5, &w, &[]), Step::Repeated);
         assert_eq!(q.fires.len(), 2);
         // ...and when seq 5 turns up late, its shot still fires (counted late),
         // from where the stand-in left the shooter.
-        q.advance(0, &mut b, t, 6, &w); // seq 6: another stand-in (too soon anyway)
-        q.advance(0, &mut b, t, 7, &w);
+        q.advance(0, &mut b, t, 6, &w, &[]); // seq 6: another stand-in (too soon anyway)
+        q.advance(0, &mut b, t, 7, &w, &[]);
         // (frac 200: three steps after seq 4's shot at frac 128)
         q.push(0, 7, fwd(), None, shot(200), t, false);
         assert_eq!(q.push(0, 7, fwd(), None, shot(200), t, false), Push::Duplicate, "counted once");
@@ -2765,12 +2849,12 @@ mod tests {
         assert_eq!(q.fires[2].origin, weapon::muzzle(&before, &after, 200), "from where the stand-in moved it");
         // A shot whose seq is more than 8 steps gone, or from the dead, is refused.
         for seq in 8..=20 {
-            q.advance(0, &mut b, t, seq, &w);
+            q.advance(0, &mut b, t, seq, &w, &[]);
         }
         q.push(0, 10, fwd(), None, shot(0), t, false);
         b.health = 0;
         q.push(0, 21, fwd(), None, shot(0), t, false);
-        q.advance(0, &mut b, t, 21, &w);
+        q.advance(0, &mut b, t, 21, &w, &[]);
         assert_eq!((q.fires.len(), q.refused), (3, 4));
     }
 
@@ -2780,10 +2864,10 @@ mod tests {
         let mut q = InputQueue::default();
         let mut b = Body { alive: true, ..Default::default() };
         q.push(0, 1, fwd(), None, None, t, false);
-        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Applied);
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw(), &[]), Step::Applied);
 
         // Lag switch: nothing arrives for 10 ticks.
-        let kinds: Vec<Step> = (0..10).map(|_| q.advance(0, &mut b, t, 1, &tw())).collect();
+        let kinds: Vec<Step> = (0..10).map(|_| q.advance(0, &mut b, t, 1, &tw(), &[])).collect();
         assert_eq!(&kinds[..2], &[Step::Repeated; 2]);
         assert!(kinds[2..].iter().all(|&k| k == Step::Frozen));
         assert_eq!(q.last_seq, 11, "every stand-in consumes a seq");
@@ -2797,13 +2881,13 @@ mod tests {
         }
         assert!(q.pending.is_empty());
         for _ in 0..30 {
-            q.advance(0, &mut b, t, 1, &tw());
+            q.advance(0, &mut b, t, 1, &tw(), &[]);
         }
         assert!(b.state.vel == [0.0, 0.0] && b.state.pos[0] - frozen_at[0] < 0.5, "{:?}", b.state);
 
         // Fresh input for the next seq resumes movement and resets the grace.
         assert_eq!(q.push(0, q.last_seq + 1, fwd(), None, None, t, false), Push::Queued);
-        assert_eq!(q.advance(0, &mut b, t, 1, &tw()), Step::Applied);
+        assert_eq!(q.advance(0, &mut b, t, 1, &tw(), &[]), Step::Applied);
         assert_eq!(q.starved_run, 0);
         assert!(b.state.vel[0] > 0.0);
     }

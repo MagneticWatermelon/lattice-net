@@ -798,7 +798,7 @@ pub(crate) fn sites(k: &mut Kiln) {
                 let q = add(c, scale(u, 36.0));
                 let floor = k.mean(q, 12.0);
                 pad(k, q, 14.0, floor, 8.0);
-                deep::room(k, q, u, 7.0, 10.0, 5.0, floor, Some(p.sector));
+                deep::room(k, q, u, 7.0, 10.0, 5.0, floor, Some((i, p.sector)));
                 keep_clear(k, q, 16.0);
                 for j in 0..6 {
                     let q = add(c, scale(unit(axis + 60.0 * j as f64 + 30.0), 70.0));
@@ -845,7 +845,7 @@ pub(crate) fn sites(k: &mut Kiln) {
                 k.internal.push(Route { a: i, b: i, legs: vec![gallery], one_way: false });
                 // The owner's spawn room in the gallery over one pylon: its
                 // door onto the gallery shielded for the Span's sector's faction.
-                deep::room(k, at(mid_s + 70.0, -6.0), v, 4.0, 8.0, 5.0, DECK - 8.0, Some(p.sector));
+                deep::room(k, at(mid_s + 70.0, -6.0), v, 4.0, 8.0, 5.0, DECK - 8.0, Some((i, p.sector)));
                 let n = (l / 16.0) as usize;
                 for j in 0..n {
                     let t0 = j as f64 / n as f64;
@@ -985,7 +985,7 @@ pub(crate) fn sites(k: &mut Kiln) {
                 // The spawn room mid-wall, on the fourth terrace, its doors
                 // shielded for its sector's faction.
                 let room_at = rift.at(CLIFFHOLD_ALONG - 100.0, -(w + 51.0));
-                deep::room(k, room_at, rift.dir, 8.0, 4.0, 5.0, k.height(room_at), Some(p.sector));
+                deep::room(k, room_at, rift.dir, 8.0, 4.0, 5.0, k.height(room_at), Some((i, p.sector)));
                 // The deep gallery: a hall 30 m under the summit, a shaft down
                 // to it from the summit, and an approach tunnel from the plains
                 // behind (down a trench), where both keep clear of the lanes.
@@ -1098,7 +1098,7 @@ pub(crate) fn sites(k: &mut Kiln) {
                 points.push(on(k, r.at(along - 45.0, side * (w + 5.0))));
                 points.push(on(k, r.at(along + 45.0, side * (w + 5.0))));
                 if big {
-                    points.push(on(k, r.at(along, side * (w - 25.0))));
+                    points.push(on(k, r.at(along + 14.0, side * (w - 25.0))));
                 }
             }
             SiteKind::MesaCitadel => {
@@ -1123,8 +1123,10 @@ pub(crate) fn sites(k: &mut Kiln) {
                 for &deg in &SLOTS {
                     let u = unit(deg + axis);
                     for r in [35.0, 62.0] {
+                        // Across the slot and 5 m onto each rim: the terrain's
+                        // samples round a sheer cut's edge off by a cell.
                         let q = add(c, scale(u, r));
-                        fixed.push(bx(sub(q, [8.0, 8.0]), add(q, [8.0, 8.0]), top - 1.0, top, Kind::Block, 0));
+                        fixed.push(oriented(q, [6.0, 8.0 + TERRAIN_RES as f64 + 5.0], u, top - 1.0, top, Kind::Block));
                     }
                     let room = add(c, scale(unit(deg + axis + 60.0), 55.0));
                     out.push(stand(k, room, [16.0, 12.0], 5.0, Kind::Block, 0));
@@ -1145,12 +1147,13 @@ pub(crate) fn sites(k: &mut Kiln) {
                 points.push(on(k, p.anchors[2]));
             }
             SiteKind::ReefWarren => {
-                // A tower on the reef's crest, reached by stairs from the corridor.
+                // A tower on the reef's crest; a lookout stair beside it from the corridor.
                 let u = unit(axis);
                 let v = [-u[1], u[0]];
                 let mouth = add(c, scale(u, 70.0));
                 let foot = add(mouth, scale(v, 20.0));
                 let stair = stairs_at(k, foot, 9.0, SALT, SALT + 55.0, mouth, Kind::Block, &mut fixed);
+                let lookout = [foot[0], foot[1], *stair.1.last().unwrap()];
                 internal_up(k, i, vec![vec![c, mouth, stair.0[0]]], stair);
                 let tower = add(c, add(scale(u, 40.0), scale(v, 22.0)));
                 fixed.push(bx(sub(tower, [5.0, 5.0]), add(tower, [5.0, 5.0]), SALT + 54.0, SALT + 70.0, Kind::Block, 0));
@@ -1159,7 +1162,7 @@ pub(crate) fn sites(k: &mut Kiln) {
                     out.push(stand(k, q, [5.0, 5.0], 2.5, Kind::Block, 0));
                 }
                 points.push([c[0], c[1], SALT]);
-                points.push([tower[0], tower[1] - 8.0, SALT + 55.0]);
+                points.push(lookout);
                 points.push(on(k, add(c, scale(v, -45.0))));
             }
             SiteKind::Ossuary => {
@@ -1218,11 +1221,12 @@ pub(crate) fn sites(k: &mut Kiln) {
                 fixed.push(bx(sub(spire, [3.0, 3.0]), add(spire, [3.0, 3.0]), base_z - 1.0, base_z + 44.0, Kind::Crystal, 0));
                 let foot = add(c, scale(unit(fd), p.half + 4.0));
                 let stair = stairs_at(k, foot, 9.0, k.height(foot), k.height(foot) + 30.0, c, Kind::Crystal, &mut fixed);
+                let lookout = [foot[0], foot[1], *stair.1.last().unwrap()];
                 internal_up(k, i, vec![vec![c, stair.0[0]]], stair);
                 points.push(on(k, hall));
-                points.push(on(k, gh));
+                points.push(on(k, add(gh, scale(unit(axis + 180.0), 13.0))));
                 if p.half > 60.0 {
-                    points.push([spire[0] + 8.5, spire[1], base_z + 30.0]);
+                    points.push(lookout);
                 }
             }
             SiteKind::Arch => {
@@ -1292,12 +1296,13 @@ pub(crate) fn sites(k: &mut Kiln) {
                 let spire = add(c, scale(unit(clear_dir(k, &p, &|d| vec![(add(c, scale(unit(d), 22.0)), 6.5)])), 22.0));
                 let g = k.height(spire);
                 let stair = stairs_at(k, spire, 9.0, g, g + 34.0, c, Kind::Rock, &mut fixed);
+                let top = *stair.1.last().unwrap();
                 internal_up(k, i, vec![vec![c, stair.0[0]]], stair);
                 for j in 0..4 {
                     let q = add(c, scale(unit(axis + 90.0 * j as f64 + 45.0), 22.0));
                     out.push(stand(k, q, [6.0, 1.2], 1.1, Kind::Block, 0));
                 }
-                points.push([c[0], c[1], g + 34.0]);
+                points.push([spire[0], spire[1], top]);
             }
             SiteKind::WellShrine => {
                 let g = k.height(c);
@@ -1364,6 +1369,10 @@ fn rect(a: [f64; 2], b: [f64; 2], half: f64, along_x: bool) -> ([f64; 2], [f64; 
 pub(crate) fn scatter(k: &mut Kiln) {
     let mut rng = Rng::new(0x5CA7);
     let free = |k: &Kiln, q: [f64; 2], r: f64| {
+        let clear = r + crate::territory::POINT_RADIUS as f64;
+        if k.points.iter().any(|p| dist([p.pos[0] as f64, p.pos[1] as f64], q) < clear) {
+            return false;
+        }
         let (x0, x1, y0, y1) = Kiln::samples(sub(q, [r, r]), add(q, [r, r]));
         for iy in y0..=y1 {
             for ix in x0..=x1 {

@@ -108,6 +108,8 @@ lattice-server: M1 movement-only authoritative server
   --immortal           hits land (and are confirmed) but deal no damage: hit rates then
                        measure aim and lag compensation, not who died first (and, as
                        nobody dies to be refilled, rounds are unlimited)
+  --capture-speed N    territory's meters move N times faster: sites flip in seconds,
+                       not minutes (tests) [1]
   --unlimited-rounds   the rifle never runs dry (no reloads): held triggers fire at its
                        rate as long as a run lasts (load tests; clients are told)
   --no-cone            shots go exactly where aimed: no cone of fire or bloom (to compare
@@ -620,6 +622,7 @@ fn main() -> std::io::Result<()> {
         deaths_per_sec: a.get("deaths-per-sec", 0.0),
         immortal: a.flag("immortal"),
         unlimited_rounds: a.flag("unlimited-rounds"),
+        capture_speed: a.get("capture-speed", 1),
         cone_of_fire: !a.flag("no-cone"),
         // Where shots go in their cones: a fresh secret from the OS.
         spread_secret: None,

@@ -234,10 +234,11 @@ pub fn solid_normal(p0: V, p1: V, t: f32, b: &CoverBox) -> V {
 }
 
 /// Whether nothing (terrain or cover) stands between `p0` and `p1`: what a
-/// player of `faction` at `p0` can see of `p1` (their own shields don't
-/// hide it). The server's "after cover" count and the bots' targeting use
-/// the same test.
-pub fn line_clear(world: &World, p0: V, p1: V, faction: u8) -> bool {
+/// player (`who`: a faction, and who holds each site) at `p0` can see of
+/// `p1` (their own shields don't hide it). The server's "after cover" count
+/// and the bots' targeting use the same test.
+pub fn line_clear<'a>(world: &World, p0: V, p1: V, who: impl Into<crate::movement::Mover<'a>>) -> bool {
+    let who = who.into();
     if terrain(world, p0, p1).is_some() {
         return false;
     }
@@ -246,7 +247,7 @@ pub fn line_clear(world: &World, p0: V, p1: V, faction: u8) -> bool {
     let half = (dx * dx + dy * dy).sqrt() / 2.0;
     let mut clear = true;
     world.boxes_near(mid[0], mid[1], half + 1.0, |c| {
-        clear &= !c.blocks(faction) || solid(p0, p1, c).is_none();
+        clear &= !c.blocks_for(who.faction, who.owners) || solid(p0, p1, c).is_none();
     });
     clear
 }

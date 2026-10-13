@@ -2283,3 +2283,34 @@ fn a_slow_game_client_keeps_its_inputs_coming() {
     }
 }
 
+
+#[test]
+fn players_on_its_points_capture_a_site_and_every_client_hears() {
+    use lattice_game::territory::NONE;
+    use lattice_game::world::KILN;
+    // Kiln, its meters 120 times faster: the Hollow (5 min) flips in 2.5 s.
+    let mut s = Swarm::with_config(3, SimConfig { world: KILN, spawn: SpawnMode::Uniform, capture_speed: 120, ..Default::default() });
+    for (_, _, b) in &mut s.bots {
+        b.set_moves(lattice_sim::bot::Moves::Hold);
+    }
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    assert!(s.bots.iter().all(|(_, _, b)| b.core().territory().is_some_and(|t| t.sites[0].owner == NONE)), "everyone hears the Hollow is no one's");
+    // A faction-0 player on one of the Hollow's plazas' points.
+    let e = s.bots.iter().map(|(_, _, b)| b.welcome().unwrap().entity).find(|&e| lattice_game::faction::faction(e) == 0).expect("a faction-0 bot");
+    let point = s.server.territory().points(0)[0];
+    s.server.teleport(e, [point[0], point[1]]);
+    for _ in 0..5 * TICK_HZ {
+        s.step();
+    }
+    let t = s.server.territory();
+    assert_eq!(t.sites[0].owner, 0, "the Hollow flipped: {:?}", t.sites[0]);
+    assert_eq!(s.server.counters().site_flips, 1);
+    for (_, _, b) in &s.bots {
+        let mine = b.core().territory().unwrap();
+        assert_eq!((mine.sites[0].owner, mine.sites[0].since), (0, t.sites[0].since), "every client heard, with when it takes effect");
+        assert_eq!(mine.sites[0].points[0], 0, "and who holds the point");
+    }
+    assert_eq!(s.corrections(), 0, "prediction stays exact");
+}

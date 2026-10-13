@@ -166,16 +166,17 @@ pub(crate) fn keep_clear(k: &mut Kiln, c: [f64; 2], r: f64) {
 
 /// A room (C1): walls round a `2 hu` × `2 hv` footprint at `q` (its ends
 /// across `u`), a door in the middle of each end, a roof `high` over `floor`;
-/// the doors shielded for `shield`'s faction, if any.
+/// the doors shielded for site `shield.0`, held by faction `shield.1` at the
+/// start (they let its holder through), if any.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn room(k: &mut Kiln, q: [f64; 2], u: [f64; 2], hu: f64, hv: f64, high: f64, floor: f64, shield: Option<u8>) {
+pub(crate) fn room(k: &mut Kiln, q: [f64; 2], u: [f64; 2], hu: f64, hv: f64, high: f64, floor: f64, shield: Option<(usize, u8)>) {
     let v = [-u[1], u[0]];
     let at = |a: f64, b: f64| add(add(q, scale(u, a)), scale(v, b));
     for s in [-1.0, 1.0] {
         k.fixed.push(strip(at(s * hu, -hv), at(s * hu, -2.0), 0.4, floor - 0.3, floor + high, Kind::Block));
         k.fixed.push(strip(at(s * hu, 2.0), at(s * hu, hv), 0.4, floor - 0.3, floor + high, Kind::Block));
-        if let Some(f) = shield {
-            k.fixed.push(strip(at(s * hu, -2.0), at(s * hu, 2.0), 0.2, floor - 0.3, floor + high, Kind::Shield).shield(f));
+        if let Some((site, f)) = shield {
+            k.fixed.push(strip(at(s * hu, -2.0), at(s * hu, 2.0), 0.2, floor - 0.3, floor + high, Kind::Shield).site_shield(site as u16, f));
         }
         k.fixed.push(strip(at(-hu, s * hv), at(hu, s * hv), 0.4, floor - 0.3, floor + high, Kind::Block));
     }

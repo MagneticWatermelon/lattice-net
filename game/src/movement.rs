@@ -47,6 +47,21 @@ const LIFT_ACCEL: f32 = 30.0;
 /// The faction of a mover that belongs to none: every shield blocks it.
 pub const NO_FACTION: u8 = 254;
 
+/// Who's moving, for the shields: their faction, and who holds each site
+/// at the step being taken (`territory::Territory::owners_at`; empty: as at
+/// the start). A bare faction converts into one.
+#[derive(Debug, Clone, Copy)]
+pub struct Mover<'a> {
+    pub faction: u8,
+    pub owners: &'a [u8],
+}
+
+impl From<u8> for Mover<'_> {
+    fn from(faction: u8) -> Self {
+        Mover { faction, owners: &[] }
+    }
+}
+
 pub const BUTTON_SPRINT: u8 = 1;
 pub const BUTTON_JUMP: u8 = 2;
 /// On the wire only: this input carries a shot (`weapon::Shot`). Movement
@@ -89,7 +104,7 @@ impl MoveState {
     pub fn standing(world: &World, pos: [f32; 2]) -> Self {
         let mut s = MoveState { pos, vel: [0.0; 2], z: f32::MAX, vz: 0.0, grounded: true, crouched: false };
         s.z = world.terrain(pos[0], pos[1]);
-        collide(world, &mut s, NO_FACTION);
+        collide(world, &mut s, NO_FACTION.into());
         s.z = world.ground(s.pos[0], s.pos[1], s.z, STEP_UP);
         s
     }
@@ -98,7 +113,7 @@ impl MoveState {
     /// tunnel's floor under the terrain): pushed out of any cover.
     pub fn standing_at(world: &World, pos: [f32; 2], z: f32) -> Self {
         let mut s = MoveState { pos, vel: [0.0; 2], z, vz: 0.0, grounded: true, crouched: false };
-        collide(world, &mut s, NO_FACTION);
+        collide(world, &mut s, NO_FACTION.into());
         s.z = world.ground(s.pos[0], s.pos[1], z + 0.5, 1.0);
         s
     }
@@ -141,7 +156,8 @@ pub fn stand_in(last: Input, run: u32) -> Input {
 
 /// One step of a player of `faction` (`faction::faction`: it decides which
 /// shields let them through).
-pub fn step(world: &World, s: MoveState, input: Input, faction: u8) -> MoveState {
+pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<'a>>) -> MoveState {
+    let who = who.into();
     let mut wish = [input.move_x as f32 / 127.0, input.move_y as f32 / 127.0];
     let len = (wish[0] * wish[0] + wish[1] * wish[1]).sqrt();
     if len > 1.0 {
@@ -211,7 +227,7 @@ pub fn step(world: &World, s: MoveState, input: Input, faction: u8) -> MoveState
     // at a time); not under someone on a deck above it.
     let feet = if n.grounded { s.z } else { s.z + n.vz * DT };
     n.pos = terrain_move(world, s.pos, n.pos, feet, height, &mut n.vel);
-    collide(world, &mut n, faction);
+    collide(world, &mut n, who);
 
     // Vertical: follow the ground while walking, fall and land otherwise.
     if n.grounded {
@@ -256,13 +272,14 @@ pub fn step(world: &World, s: MoveState, input: Input, faction: u8) -> MoveState
 /// inputs (a crowd's separation push): kept in the world and out of cover,
 /// and on the ground if they were on it. Clients can't predict these; they
 /// reconcile.
-pub fn nudge(world: &World, s: MoveState, delta: [f32; 2], faction: u8) -> MoveState {
+pub fn nudge<'a>(world: &World, s: MoveState, delta: [f32; 2], who: impl Into<Mover<'a>>) -> MoveState {
+    let who = who.into();
     let mut n = s;
     n.pos = [(s.pos[0] + delta[0]).clamp(0.0, WORLD_SIZE), (s.pos[1] + delta[1]).clamp(0.0, WORLD_SIZE)];
     // Never up a cliff: a crowd at its foot would push its edge up it.
     let mut vel = n.vel;
     n.pos = terrain_move(world, s.pos, n.pos, s.z, s.height(), &mut vel);
-    collide(world, &mut n, faction);
+    collide(world, &mut n, who);
     if n.grounded {
         let g = world.ground(n.pos[0], n.pos[1], n.z, STEP_UP);
         if g >= n.z - STEP_DOWN {
@@ -347,11 +364,11 @@ fn terrain_move(world: &World, from: [f32; 2], to: [f32; 2], feet: f32, height: 
 /// height and can't step onto (its top where it's nearest), and every
 /// shield but their `faction`'s, taking away the velocity into the box (so
 /// they slide along it). Boxes come in the index's fixed order.
-fn collide(world: &World, s: &mut MoveState, faction: u8) {
+fn collide(world: &World, s: &mut MoveState, who: Mover) {
     let height = s.height();
     for _ in 0..2 {
         world.boxes_near(s.pos[0], s.pos[1], RADIUS, |b| {
-            if b.bottom >= s.z + height || !b.blocks(faction) {
+            if b.bottom >= s.z + height || !b.blocks_for(who.faction, who.owners) {
                 return; // above the head, or a shield that lets them through
             }
             if b.is_turned() {

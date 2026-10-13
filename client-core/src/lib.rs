@@ -29,7 +29,8 @@ use std::time::{Duration, Instant};
 use lattice_game::activity;
 use lattice_game::delta;
 use lattice_game::events::{self, Event, SeenShot};
-use lattice_game::movement::{dead_input, stand_in, step, Input, MoveState, NO_FACTION, TICK_HZ};
+use lattice_game::movement::{dead_input, stand_in, step, Input, MoveState, Mover, NO_FACTION, TICK_HZ};
+use lattice_game::territory::{self, Territory};
 use lattice_game::msg::{self, InputEntry, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
 use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot, FIRE_STEPS};
 use lattice_game::tier::Tier;
@@ -323,6 +324,10 @@ pub struct ClientCore {
     /// The server's step minus our input seq: each step consumes a seq, so
     /// it's fixed for the connection (stand-ins and resyncs included).
     step_offset: Option<i64>,
+    /// Who holds what (U5), as the server last said; and who holds each site
+    /// at the step being predicted (shields follow them).
+    territory: Option<Territory>,
+    owners: Vec<u8>,
     /// Own-player correction being smoothed away, as of `own_offset_at`.
     own_offset: [f32; 3],
     own_offset_at: Option<Instant>,
@@ -391,6 +396,8 @@ impl ClientCore {
             mid_delay: steps(cfg.mid_delay),
             server_own: None,
             step_offset: None,
+            territory: None,
+            owners: Vec::new(),
             keep_news: false,
             news: Vec::new(),
             seen_shots: Vec::new(),
@@ -453,6 +460,24 @@ impl ClientCore {
     /// server has us, a round trip behind our prediction (the server ghost).
     pub fn server_own(&self) -> Option<(MoveState, u32)> {
         self.server_own
+    }
+
+    /// Who holds what, as the server last said (None before we're welcomed).
+    pub fn territory(&self) -> Option<&Territory> {
+        self.territory.as_ref()
+    }
+
+    /// The game step input `seq` is (or will be) applied at, as far as we know.
+    pub fn step_of(&self, seq: u32) -> u32 {
+        (seq as i64 + self.step_offset.unwrap_or(0)).max(0) as u32
+    }
+
+    /// Who holds each site when input `seq` is applied, into `owners`.
+    fn owners_for(territory: Option<&Territory>, step: u32, owners: &mut Vec<u8>) {
+        match territory {
+            Some(t) => t.owners_at(step, owners),
+            None => owners.clear(),
+        }
     }
 
     /// Our faction (from our entity id), which shields let us through;
@@ -614,6 +639,14 @@ impl ClientCore {
 
     pub fn on_message(&mut self, data: &[u8], now: Instant) {
         match data.first() {
+            Some(&territory::MSG_TERRITORY) => {
+                if let Some(t) = &mut self.territory {
+                    if t.apply(data).is_err() {
+                        self.stats.bad_messages += 1;
+                    }
+                }
+                return;
+            }
             Some(&events::MSG_EVENTS) => {
                 let Ok(evs) = events::decode_events(data) else {
                     self.stats.bad_messages += 1;
@@ -703,6 +736,7 @@ impl ClientCore {
                 self.state = MoveState::standing(&world, w.spawn);
                 self.ammo = Ammo::FULL;
                 self.unlimited = w.rules & msg::RULE_UNLIMITED_ROUNDS != 0;
+                self.territory = Some(Territory::new(&world));
                 self.world = Some(world);
                 self.distant = Distant::new(0x9E37_79B9_7F4A_7C15 ^ w.entity as u64);
                 self.welcome = Some(w);
@@ -865,7 +899,8 @@ impl ClientCore {
             let input = stand_in(last, seq - self.made);
             if seq > h.ack_seq {
                 let applied = if dead { dead_input(input) } else { input };
-                s = step(&world, s, applied, side);
+                Self::owners_for(self.territory.as_ref(), h.step + (seq - h.ack_seq), &mut self.owners);
+                s = step(&world, s, applied, Mover { faction: side, owners: &self.owners });
                 ammo.step(applied.buttons, false);
                 if self.unlimited {
                     ammo = Ammo::FULL;
@@ -898,12 +933,14 @@ impl ClientCore {
         let side = self.faction();
         let world = self.world.as_ref().expect("welcomed");
         let dead = self.is_dead();
+        let offset = self.step_offset.unwrap_or(0);
         let base = &mut self.history[ack as usize % HISTORY];
         (base.state, base.ammo) = (s, a);
         for seq in ack + 1..=self.seq {
             let p = &mut self.history[seq as usize % HISTORY];
             let applied = if dead { dead_input(p.input) } else { p.input };
-            s = step(world, s, applied, side);
+            Self::owners_for(self.territory.as_ref(), (seq as i64 + offset).max(0) as u32, &mut self.owners);
+            s = step(world, s, applied, Mover { faction: side, owners: &self.owners });
             a.step(applied.buttons, p.shot.is_some());
             if self.unlimited {
                 a = Ammo::FULL;
@@ -1123,7 +1160,9 @@ impl ClientCore {
             let stale = self.stale_inputs + if before_shot { self.stale_shots } else { 0.0 };
             let render = render_step.map(|r| msg::render_units(r - stale));
             let applied = if self.is_dead() { dead_input(input) } else { input };
-            self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied, self.faction());
+            let (side, at) = (self.faction(), self.step_of(self.seq));
+            Self::owners_for(self.territory.as_ref(), at, &mut self.owners);
+            self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied, Mover { faction: side, owners: &self.owners });
             // A shot fired during this step (a resync drops one it skips).
             let shot = self.pending_shot.filter(|&(seq, _)| seq <= self.seq).map(|(_, shot)| shot);
             if shot.is_some() {

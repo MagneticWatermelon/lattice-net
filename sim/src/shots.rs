@@ -612,6 +612,8 @@ pub struct Sky<'a> {
     /// Each shooter's near set, if it has a client: targets in it are
     /// rewound by the near delay, the rest by the mid one.
     pub near: &'a (dyn Fn(u16) -> Option<&'a NearState> + Sync),
+    /// Who holds each site (shields let their holder's shots through).
+    pub owners: &'a [u8],
 }
 
 /// Flies `p` up to step `until`, a half step at a time. Returns how it
@@ -640,7 +642,7 @@ pub fn fly(p: &mut Projectile, until: f64, sky: &Sky, stats: &mut FlyStats) -> O
         let half_len = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt() / 2.0;
         sky.world.boxes_near(mid[0], mid[1], half_len + 1.0, |b| {
             // Shields stop all but their own faction's shots.
-            if b.blocks(side) {
+            if b.blocks_for(side, sky.owners) {
                 if let Some(t) = hit::solid(p0, p1, b) {
                     take(t, Outcome::Cover);
                 }

@@ -137,7 +137,14 @@ pub struct CoverBox {
     pub low: f32,
     /// A shield's faction, the one it lets through; `SOLID` for the rest.
     pub pass: u8,
+    /// A shield that belongs to a site (`NO_SITE`: none): it lets through
+    /// whoever holds the site (`territory`), and `pass` is who held it at
+    /// the start.
+    pub site: u16,
 }
+
+/// `CoverBox::site` of a box that belongs to no site.
+pub const NO_SITE: u16 = u16::MAX;
 
 /// `CoverBox::pass` for everything but shields: it blocks every faction.
 pub const SOLID: u8 = u8::MAX;
@@ -152,7 +159,7 @@ impl CoverBox {
     pub fn new(min: [f32; 2], max: [f32; 2], bottom: f32, top: f32, kind: Kind, facing: u8) -> Self {
         let center = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5];
         let half = [(max[0] - min[0]) * 0.5, (max[1] - min[1]) * 0.5];
-        CoverBox { min, max, bottom, top, kind, facing, center, half, axis: [1.0, 0.0], low: top, pass: SOLID }
+        CoverBox { min, max, bottom, top, kind, facing, center, half, axis: [1.0, 0.0], low: top, pass: SOLID, site: NO_SITE }
     }
 
     /// A box turned about the vertical: its footprint `half` along `axis` (a
@@ -161,7 +168,7 @@ impl CoverBox {
         let ex = axis[0].abs() * half[0] + axis[1].abs() * half[1];
         let ey = axis[1].abs() * half[0] + axis[0].abs() * half[1];
         let (min, max) = ([center[0] - ex, center[1] - ey], [center[0] + ex, center[1] + ey]);
-        CoverBox { min, max, bottom, top, kind, facing, center, half, axis, low: top, pass: SOLID }
+        CoverBox { min, max, bottom, top, kind, facing, center, half, axis, low: top, pass: SOLID, site: NO_SITE }
     }
 
     /// This as a wedge: its top `low` at the low end of its axis, rising to `top`.
@@ -174,6 +181,12 @@ impl CoverBox {
         CoverBox { pass: faction, ..self }
     }
 
+    /// This as a shield of site `site`, held by `faction` at the start: it
+    /// lets through whoever holds the site.
+    pub fn site_shield(self, site: u16, faction: u8) -> Self {
+        CoverBox { pass: faction, site, ..self }
+    }
+
     pub fn is_turned(&self) -> bool {
         self.axis != [1.0, 0.0]
     }
@@ -182,10 +195,23 @@ impl CoverBox {
         self.low != self.top
     }
 
-    /// Whether it blocks `faction` (a shield lets its own through).
+    /// Whether it blocks `faction` (a shield lets its own through, as of
+    /// the start).
     #[inline]
     pub fn blocks(&self, faction: u8) -> bool {
-        self.pass == SOLID || self.pass != faction
+        self.blocks_for(faction, &[])
+    }
+
+    /// Whether it blocks `faction` while the sites are held by `owners` (by
+    /// site; empty: as at the start). No one passes a shield of a site no
+    /// one holds.
+    #[inline]
+    pub fn blocks_for(&self, faction: u8, owners: &[u8]) -> bool {
+        if self.pass == SOLID {
+            return true;
+        }
+        let pass = if self.site != NO_SITE { owners.get(self.site as usize).copied().unwrap_or(self.pass) } else { self.pass };
+        pass != faction
     }
 
     /// (x, y) in its frame: along its axis and across, from its center.
@@ -1021,7 +1047,7 @@ impl World {
                 for v in [b.center[0], b.center[1], b.half[0], b.half[1], b.axis[0], b.axis[1], b.low] {
                     eat(v.to_bits() as u64);
                 }
-                eat(b.pass as u64);
+                eat(b.pass as u64 | (b.site as u64) << 8);
             }
         }
         for (i, &w) in self.holes.iter().enumerate() {

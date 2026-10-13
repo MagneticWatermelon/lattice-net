@@ -3,7 +3,7 @@
 //! the same in every sector, within 10%.
 
 use super::*;
-use crate::movement::{step, Input, MoveState, BUTTON_SPRINT, DT, HEIGHT};
+use crate::movement::{step, Input, MoveState, HEIGHT};
 use crate::world::{SiteKind, World, KILN};
 use std::sync::Arc;
 
@@ -11,41 +11,7 @@ fn kiln() -> Arc<World> {
     World::shared(KILN)
 }
 
-/// Walks lane `l` (backward from its end if `backward`), sprinting: the time
-/// it took, or where it got stuck.
-pub(crate) fn walk(w: &World, l: &crate::world::Lane, backward: bool) -> Result<f32, String> {
-    let start = l.waypoint(0, backward);
-    // On whatever's there (a stair's top, a deck): the highest surface
-    // under the route's own height; under the ground (a chamber), its floor.
-    let mut s = if start[2] < w.terrain(start[0], start[1]) - 2.0 {
-        MoveState::standing_at(w, [start[0], start[1]], start[2])
-    } else {
-        let s = MoveState::standing(w, [start[0], start[1]]);
-        MoveState { z: w.ground(start[0], start[1], start[2].max(s.z) + 1.0, 1.5).max(s.z), ..s }
-    };
-    let mut next = 1;
-    // Sprinting along it, and up lifts and down drop shafts at 5 m/s or so.
-    let climb: f32 = l.path.windows(2).map(|w| ((w[1][2] - w[0][2]).abs() - (w[0][0] - w[1][0]).abs() - (w[0][1] - w[1][1]).abs()).max(0.0)).sum();
-    let budget = (l.length() / 9.0 * 1.6 + climb / 5.0 + 30.0) / DT;
-    let mut best = (f32::MAX, 0u32);
-    for i in 0..budget as u32 {
-        let Some((mx, my)) = l.steer([s.pos[0], s.pos[1], s.z], &mut next, backward) else {
-            let end = l.waypoint(l.path.len() - 1, backward);
-            let dz = s.z - end[2];
-            return if dz > -4.0 { Ok(i as f32 * DT) } else { Err(format!("reached the end at z {:.1}, not {:.1}", s.z, end[2])) };
-        };
-        // Stuck: no closer to the next waypoint in 10 s.
-        let w_next = l.waypoint(next.min(l.path.len() - 1), backward);
-        let d = ((w_next[0] - s.pos[0]) * (w_next[0] - s.pos[0]) + (w_next[1] - s.pos[1]) * (w_next[1] - s.pos[1])).sqrt();
-        if d < best.0 - 0.5 || next as u32 != best.1 {
-            best = (d, next as u32);
-            best.0 = d;
-        }
-        s = step(w, s, Input { move_x: mx, move_y: my, yaw: 0, pitch: 0, buttons: BUTTON_SPRINT }, 0);
-    }
-    let w_next = l.waypoint(next.min(l.path.len() - 1), backward);
-    Err(format!("stuck at ({:.0}, {:.0}, {:.1}) heading for waypoint {next}/{} at ({:.0}, {:.0}, {:.1})", s.pos[0], s.pos[1], s.z, l.path.len(), w_next[0], w_next[1], w_next[2]))
-}
+pub(crate) use crate::reach::walk;
 
 #[test]
 fn kiln_is_built_to_its_design() {
@@ -263,4 +229,62 @@ fn landing_spawn_rooms_shield_their_own() {
             }
         }
     }
+}
+
+#[test]
+fn a_sites_shields_let_its_holder_through() {
+    use crate::movement::Mover;
+    use crate::world::{Kind, NO_SITE};
+    let w = kiln();
+    // A Span's gallery spawn room: its door's shield belongs to the Span.
+    let span = w.sites().iter().position(|s| s.kind == SiteKind::Span).unwrap();
+    // (The door with floor outside it: the one onto the gallery.)
+    let (b, n) = w
+        .boxes()
+        .iter()
+        .filter(|b| b.kind == Kind::Shield && b.site == span as u16)
+        .flat_map(|b| {
+            let n = if b.half[0] < b.half[1] { b.world_dir([1.0, 0.0]) } else { b.world_dir([0.0, 1.0]) };
+            [(*b, n), (*b, [-n[0], -n[1]])]
+        })
+        .find(|(b, n)| {
+            let (x, y) = (b.center[0] + n[0] * 4.0, b.center[1] + n[1] * 4.0);
+            (w.ground(x, y, b.bottom + 0.8, 1.0) - b.bottom).abs() < 0.6 && (w.ground(b.center[0] - n[0] * 3.0, b.center[1] - n[1] * 3.0, b.bottom + 0.8, 1.0) - b.bottom).abs() < 0.6
+        })
+        .expect("the Span's spawn room's door onto its gallery");
+    assert_ne!(b.site, NO_SITE);
+    let through = |faction: u8, owners: &[u8]| {
+        let start = [b.center[0] + n[0] * 4.0, b.center[1] + n[1] * 4.0];
+        let mut m = MoveState::standing_at(&w, start, b.bottom + 0.3);
+        for _ in 0..60 {
+            m = step(&w, m, Input { move_x: (-n[0] * 127.0) as i8, move_y: (-n[1] * 127.0) as i8, ..Default::default() }, Mover { faction, owners });
+        }
+        (m.pos[0] - b.center[0]) * n[0] + (m.pos[1] - b.center[1]) * n[1] < -1.0
+    };
+    let held = w.sites()[span].sector;
+    let other = (held + 1) % 3;
+    let mut owners: Vec<u8> = w.sites().iter().map(|s| s.sector).collect();
+    assert!(through(held, &owners) && !through(other, &owners), "its sector's faction's at the start");
+    owners[span] = other;
+    assert!(through(other, &owners) && !through(held, &owners), "the new holder's once it flips");
+    owners[span] = crate::territory::NONE;
+    assert!((0..3).all(|f| !through(f, &owners)), "no one's while no one holds it");
+}
+
+#[test]
+fn every_point_is_reached_from_every_landing() {
+    // The exporter's reachability check (GDD §16), on Kiln.
+    let w = kiln();
+    let t = std::time::Instant::now();
+    let r = crate::reach::check(&w);
+    eprintln!("{} places reached, {} grid steps walked, in {:.1} s; {} Landings", r.places, r.steps, t.elapsed().as_secs_f32(), r.landings);
+    assert!(r.broken_routes.is_empty(), "routes that don't walk: {:?}", r.broken_routes);
+    assert_eq!(r.landings, 3);
+    let buried: Vec<String> = r.buried.iter().map(|&p| format!("point {p} of {:?} at {:?}", w.sites()[w.points()[p].site as usize].kind, w.points()[p].pos)).collect();
+    assert!(buried.is_empty(), "points inside something: {buried:#?}");
+    let named: Vec<String> = r.unreached.iter().map(|&(p, l, near)| {
+        let pt = w.points()[p];
+        format!("point {p} of {:?} {} at ({:.0}, {:.0}, {:.1}) from Landing {l}: nearest reached ({:.0}, {:.0}, {:.1})", w.sites()[pt.site as usize].kind, pt.site, pt.pos[0], pt.pos[1], pt.pos[2], near[0], near[1], near[2])
+    }).collect();
+    assert!(r.unreached.is_empty(), "{} unreached: {named:#?}", r.unreached.len());
 }
