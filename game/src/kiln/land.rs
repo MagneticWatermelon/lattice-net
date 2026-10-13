@@ -423,8 +423,10 @@ pub(crate) fn features(k: &mut Kiln) {
         if !clear_everywhere(k, l, size * 1.25, 45.0, 60.0, 50.0, &others) {
             continue;
         }
+        // As tall over the ground as a mesa of 318-462 m over the mesa
+        // country's flats (where the Dry Sea's basin reaches in, over its salt).
         let top = lerp(462.0, 318.0, (r - 1520.0) / 1040.0) + rng.range(-22.0, 8.0);
-        placed.push((l, size, top));
+        placed.push((l, size, top - MESA_FLATS_OUT));
     }
     // Buttes: small and tall, and hoodoo-like crags.
     let mut buttes: Vec<([f64; 2], f64, f64)> = Vec::new();
@@ -439,15 +441,17 @@ pub(crate) fn features(k: &mut Kiln) {
             continue;
         }
         // In the Dry Sea's basin they'd stand in the salt: fine, but not in its dunes' troughs.
-        let top = lerp(400.0, 290.0, ((r - 1500.0) / 1800.0).clamp(0.0, 1.0)) + rng.range(-25.0, 25.0);
-        buttes.push((l, size, top));
+        // 35-100 m over the ground, wherever they stand.
+        let tall = rng.range(35.0, 100.0) * lerp(1.0, 0.6, ((r - 1500.0) / 1800.0).clamp(0.0, 1.0));
+        buttes.push((l, size, tall));
     }
-    for (i, &(l, size, top)) in placed.iter().chain(buttes.iter()).enumerate() {
+    for (i, &(l, size, tall)) in placed.iter().chain(buttes.iter()).enumerate() {
         let harm: Vec<(f64, f64, f64)> = (1..5).map(|n| (n as f64, rng.range(0.0, std::f64::consts::TAU), rng.range(0.03, 0.16) / n as f64)).collect();
         for f in &frames {
             let c = f.world(l);
             let rot = rad(Frame::axis_deg(f.k));
             let radius = |a: f64| size * (1.0 + harm.iter().map(|&(n, ph, amp)| amp * libm::sin(n * (a - rot) + ph)).sum::<f64>());
+            let top = k.height(c) + tall;
             mesa(k, c, &radius, top, size * 1.4, if i < placed.len() { 1.5 } else { 0.6 });
             k.mesas.push((c, size * 1.4));
         }
