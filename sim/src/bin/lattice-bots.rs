@@ -52,7 +52,7 @@ lattice-bots: M1 bot swarm
                        login service) [the public dev key]
   --server-id N        the server id tokens are minted for [1]
   --seed N             [1]
-  --world W            build this world before the bots join (kiln, harrow or a seed), so
+  --world W            build this world before the bots join (kiln, kit, harrow or a seed), so
                        their first Welcome doesn't stall a thread building it
   --run-lanes          each bot walks the lane the server spawned it at an end of
                        (lattice-server --spawn lanes), sprinting, and reports its time:
@@ -497,8 +497,9 @@ fn main() -> std::io::Result<()> {
     let world = a.opt::<String>("world").map(|w| {
         let id = match w.as_str() {
             "kiln" => lattice_game::world::KILN,
+            "kit" => lattice_game::kit::KIT,
             "harrow" => 1,
-            n => n.parse().unwrap_or_else(|_| panic!("--world: kiln, harrow or a number, not {n:?}")),
+            n => n.parse().unwrap_or_else(|_| panic!("--world: kiln, kit, harrow or a number, not {n:?}")),
         };
         let t = Instant::now();
         let w = lattice_game::world::World::shared(id);

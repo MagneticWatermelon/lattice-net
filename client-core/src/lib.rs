@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use lattice_game::activity;
 use lattice_game::delta;
 use lattice_game::events::{self, Event, SeenShot};
-use lattice_game::movement::{dead_input, stand_in, step, Input, MoveState, TICK_HZ};
+use lattice_game::movement::{dead_input, stand_in, step, Input, MoveState, NO_FACTION, TICK_HZ};
 use lattice_game::msg::{self, InputEntry, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
 use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot, FIRE_STEPS};
 use lattice_game::tier::Tier;
@@ -455,6 +455,12 @@ impl ClientCore {
         self.server_own
     }
 
+    /// Our faction (from our entity id), which shields let us through;
+    /// `NO_FACTION` before we're welcomed.
+    pub fn faction(&self) -> u8 {
+        self.welcome.as_ref().map_or(NO_FACTION, |w| lattice_game::faction::faction(w.entity))
+    }
+
     /// The newest predicted state and its input seq.
     pub fn predicted_seq(&self) -> u32 {
         self.seq
@@ -847,6 +853,7 @@ impl ClientCore {
         self.stats.resyncs += !self.resyncing as u64;
         self.resyncing = true;
         let world = Arc::clone(self.world.as_ref().expect("welcomed"));
+        let side = self.faction();
         // The server stands in from the last input it applied: ours, unless
         // that one was lost too (then the repeats may differ; frozen ones never).
         let p = self.history[self.made as usize % HISTORY];
@@ -858,7 +865,7 @@ impl ClientCore {
             let input = stand_in(last, seq - self.made);
             if seq > h.ack_seq {
                 let applied = if dead { dead_input(input) } else { input };
-                s = step(&world, s, applied);
+                s = step(&world, s, applied, side);
                 ammo.step(applied.buttons, false);
                 if self.unlimited {
                     ammo = Ammo::FULL;
@@ -888,6 +895,7 @@ impl ClientCore {
     /// a teleport.
     fn rebase(&mut self, ack: u32, own: MoveState, ammo: Ammo, now: Instant, cut: bool) {
         let (mut s, mut a) = (own, ammo);
+        let side = self.faction();
         let world = self.world.as_ref().expect("welcomed");
         let dead = self.is_dead();
         let base = &mut self.history[ack as usize % HISTORY];
@@ -895,7 +903,7 @@ impl ClientCore {
         for seq in ack + 1..=self.seq {
             let p = &mut self.history[seq as usize % HISTORY];
             let applied = if dead { dead_input(p.input) } else { p.input };
-            s = step(world, s, applied);
+            s = step(world, s, applied, side);
             a.step(applied.buttons, p.shot.is_some());
             if self.unlimited {
                 a = Ammo::FULL;
@@ -1115,7 +1123,7 @@ impl ClientCore {
             let stale = self.stale_inputs + if before_shot { self.stale_shots } else { 0.0 };
             let render = render_step.map(|r| msg::render_units(r - stale));
             let applied = if self.is_dead() { dead_input(input) } else { input };
-            self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied);
+            self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied, self.faction());
             // A shot fired during this step (a resync drops one it skips).
             let shot = self.pending_shot.filter(|&(seq, _)| seq <= self.seq).map(|(_, shot)| shot);
             if shot.is_some() {

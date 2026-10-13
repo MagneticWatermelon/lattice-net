@@ -108,19 +108,167 @@ const OUTPOST: [Piece; 11] = [
     piece(Kind::Crate, [-15.0, 2.0], [1.2, 2.0], 1.0, 1),
 ];
 
-/// A static axis-aligned box: blocks movement and shots.
+/// A static solid: blocks movement and shots (GDD §6.1). Its footprint is a
+/// rectangle, turned about the vertical by its `axis` (C1); it stands from
+/// `bottom` up to its top, which is level (a box) or rises evenly along its
+/// axis (a wedge: a ramp, C1). A shield (C1) blocks all but the faction it
+/// lets through, and is never stood on.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CoverBox {
+    /// The footprint's bounds (for a box that isn't turned, the footprint).
     pub min: [f32; 2],
     pub max: [f32; 2],
-    /// Its base sits at the terrain's lowest corner (or on another box); its
-    /// top is level.
+    /// Its base sits at the terrain's lowest corner (or on another box).
     pub bottom: f32,
+    /// Its top: a wedge's at the high end of its axis.
     pub top: f32,
     /// What it is, for drawing: collision doesn't care.
     pub kind: Kind,
-    /// Which way its front faces: 0 east (+x), 1 north (+y), 2 west, 3 south.
+    /// Which way its front faces, in its own frame: 0 along its axis (east
+    /// for a box that isn't turned), 1 a quarter turn left of it (north), 2, 3.
     pub facing: u8,
+    /// The footprint's center and its half-sizes along the axis and across.
+    pub center: [f32; 2],
+    pub half: [f32; 2],
+    /// A unit vector: (1, 0) for a box that isn't turned.
+    pub axis: [f32; 2],
+    /// A wedge's top at the low end of its axis (`-half[0]` along it), rising
+    /// evenly to `top` at the other; `top` for a box.
+    pub low: f32,
+    /// A shield's faction, the one it lets through; `SOLID` for the rest.
+    pub pass: u8,
+}
+
+/// `CoverBox::pass` for everything but shields: it blocks every faction.
+pub const SOLID: u8 = u8::MAX;
+/// How far below the terrain's surface the feet must be to be under it (in a
+/// tunnel, through a hole): there the surface is a ceiling, not the ground.
+/// More than any slope a move can climb in a step, less than any tunnel's
+/// depth.
+pub const UNDER: f32 = 2.0;
+
+impl CoverBox {
+    /// A box that isn't turned, from its footprint's bounds.
+    pub fn new(min: [f32; 2], max: [f32; 2], bottom: f32, top: f32, kind: Kind, facing: u8) -> Self {
+        let center = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5];
+        let half = [(max[0] - min[0]) * 0.5, (max[1] - min[1]) * 0.5];
+        CoverBox { min, max, bottom, top, kind, facing, center, half, axis: [1.0, 0.0], low: top, pass: SOLID }
+    }
+
+    /// A box turned about the vertical: its footprint `half` along `axis` (a
+    /// unit vector) and across it, around `center`.
+    pub fn turned(center: [f32; 2], half: [f32; 2], axis: [f32; 2], bottom: f32, top: f32, kind: Kind, facing: u8) -> Self {
+        let ex = axis[0].abs() * half[0] + axis[1].abs() * half[1];
+        let ey = axis[1].abs() * half[0] + axis[0].abs() * half[1];
+        let (min, max) = ([center[0] - ex, center[1] - ey], [center[0] + ex, center[1] + ey]);
+        CoverBox { min, max, bottom, top, kind, facing, center, half, axis, low: top, pass: SOLID }
+    }
+
+    /// This as a wedge: its top `low` at the low end of its axis, rising to `top`.
+    pub fn wedge(self, low: f32) -> Self {
+        CoverBox { low, ..self }
+    }
+
+    /// This as a shield that lets `faction` through.
+    pub fn shield(self, faction: u8) -> Self {
+        CoverBox { pass: faction, ..self }
+    }
+
+    pub fn is_turned(&self) -> bool {
+        self.axis != [1.0, 0.0]
+    }
+
+    pub fn is_wedge(&self) -> bool {
+        self.low != self.top
+    }
+
+    /// Whether it blocks `faction` (a shield lets its own through).
+    #[inline]
+    pub fn blocks(&self, faction: u8) -> bool {
+        self.pass == SOLID || self.pass != faction
+    }
+
+    /// (x, y) in its frame: along its axis and across, from its center.
+    #[inline]
+    pub fn local(&self, x: f32, y: f32) -> [f32; 2] {
+        let (dx, dy) = (x - self.center[0], y - self.center[1]);
+        [dx * self.axis[0] + dy * self.axis[1], dy * self.axis[0] - dx * self.axis[1]]
+    }
+
+    /// A direction in its frame, in the world's.
+    #[inline]
+    pub fn world_dir(&self, l: [f32; 2]) -> [f32; 2] {
+        [l[0] * self.axis[0] - l[1] * self.axis[1], l[0] * self.axis[1] + l[1] * self.axis[0]]
+    }
+
+    /// Whether (x, y) is on its footprint.
+    #[inline]
+    pub fn covers(&self, x: f32, y: f32) -> bool {
+        if !self.is_turned() {
+            return x >= self.min[0] && x <= self.max[0] && y >= self.min[1] && y <= self.max[1];
+        }
+        let l = self.local(x, y);
+        l[0].abs() <= self.half[0] && l[1].abs() <= self.half[1]
+    }
+
+    /// Its top at `along` its axis (clamped to its footprint).
+    #[inline]
+    pub fn top_along(&self, along: f32) -> f32 {
+        if self.low == self.top {
+            return self.top;
+        }
+        let a = along.clamp(-self.half[0], self.half[0]);
+        self.low + (self.top - self.low) * ((a + self.half[0]) / (2.0 * self.half[0]))
+    }
+
+    /// Its top over (x, y) (the footprint's nearest point's, outside it).
+    #[inline]
+    pub fn top_at(&self, x: f32, y: f32) -> f32 {
+        if self.low == self.top {
+            return self.top;
+        }
+        self.top_along(self.local(x, y)[0])
+    }
+
+    /// The square of the distance from (x, y) to its footprint (0 on it).
+    #[inline]
+    pub fn distance2(&self, x: f32, y: f32) -> f32 {
+        let l = if self.is_turned() { self.local(x, y) } else { [x - self.center[0], y - self.center[1]] };
+        let dx = (l[0].abs() - self.half[0]).max(0.0);
+        let dy = (l[1].abs() - self.half[1]).max(0.0);
+        dx * dx + dy * dy
+    }
+}
+
+/// What a force volume does to a player inside it (Kiln's connectors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Force {
+    /// An updraft (a vent lift, a lift): carries players up at `vel[2]`.
+    Lift = 0,
+    /// A drop shaft: a fall slowed to `vel[2]` (negative), one way, down.
+    Drop = 1,
+    /// A lattice spring: a player who stands on it is thrown at `vel`.
+    Spring = 2,
+}
+
+/// A force volume: an axis-aligned box of air that moves players in it.
+/// Static: it acts on whoever's feet are in it, the same on every machine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Volume {
+    /// Its bounds; the feet are in it from `min[2]` up to (not at) `max[2]`.
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub force: Force,
+    /// What it does: see `Force`.
+    pub vel: [f32; 3],
+}
+
+impl Volume {
+    #[inline]
+    pub fn contains(&self, x: f32, y: f32, z: f32) -> bool {
+        x >= self.min[0] && x <= self.max[0] && y >= self.min[1] && y <= self.max[1] && z >= self.min[2] && z < self.max[2]
+    }
 }
 
 /// What a cover box is drawn as.
@@ -148,6 +296,8 @@ pub enum Kind {
     Crystal = 9,
     /// The bones of the Dry Sea's megafauna.
     Bone = 10,
+    /// A faction's shield (C1): drawn in its colors, see-through.
+    Shield = 11,
 }
 
 /// Which generator made a world: how it's drawn, and what its sites mean.
@@ -233,12 +383,16 @@ pub const NO_SECTOR: u8 = u8::MAX;
 /// A route between two sites (`a` != `b`: a lane of the lattice, GDD §3.2), or
 /// inside one (`a` == `b`: e.g. from a rim gate down to a crater's floor). Its
 /// path is waypoints to walk, feet heights included; walking it straight from
-/// one to the next gets there (`kiln`'s tests walk them all).
+/// one to the next gets there (`kiln`'s tests walk them all). Where it goes
+/// up a lift or down a drop shaft, two waypoints stand one over the other:
+/// whoever walks it waits there to be carried (`steer`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lane {
     pub a: u16,
     pub b: u16,
     pub path: Vec<[f32; 3]>,
+    /// Only walked from `a` to `b` (up a lift, down a drop shaft).
+    pub one_way: bool,
 }
 
 impl Lane {
@@ -277,6 +431,10 @@ impl Lane {
             if (d < 1.5 && level) || passed {
                 *next += 1;
                 continue;
+            }
+            if d < 1.5 {
+                // Right under it (or over it): carried there, by a lift or a fall.
+                return Some((0, 0));
             }
             return Some(((dx / d * 127.0) as i8, (dy / d * 127.0) as i8));
         }
@@ -329,8 +487,18 @@ pub struct World {
     ground: Vec<u8>,
     lanes: Vec<Lane>,
     points: Vec<Point>,
+    /// Holes in the terrain (tunnel mouths, shafts), a bit per height cell
+    /// (`hole`); empty: none.
+    holes: Vec<u64>,
+    volumes: Vec<Volume>,
+    /// Volumes overlapping each cover cell, as for boxes.
+    vol_start: Vec<u32>,
+    vol_items: Vec<u32>,
     digest: OnceLock<u64>,
 }
+
+/// Height cells per side (between samples).
+pub const CELLS: usize = TERRAIN_N - 1;
 
 /// What a generator makes, for `World::from_parts`.
 pub struct Parts {
@@ -343,6 +511,10 @@ pub struct Parts {
     pub ground: Vec<u8>,
     pub lanes: Vec<Lane>,
     pub points: Vec<Point>,
+    /// A bit per height cell (`CELLS` × `CELLS`, row by row, 64 a word):
+    /// set, the terrain has a hole there. Empty: none.
+    pub holes: Vec<u64>,
+    pub volumes: Vec<Volume>,
 }
 
 pub(crate) fn hash(seed: u64, octave: u64, x: i64, y: i64) -> u64 {
@@ -411,6 +583,10 @@ impl World {
             ground: Vec::new(),
             lanes: Vec::new(),
             points: Vec::new(),
+            holes: Vec::new(),
+            volumes: Vec::new(),
+            vol_start: Vec::new(),
+            vol_items: Vec::new(),
             digest: OnceLock::new(),
         };
         world.place_sites();
@@ -418,10 +594,13 @@ impl World {
         world
     }
 
-    /// The world with id `id`: Kiln for `KILN`, else Harrow from that seed.
+    /// The world with id `id`: Kiln for `KILN`, the collision kit's test
+    /// level for `kit::KIT`, else Harrow from that seed.
     pub fn build(id: u64) -> Self {
         if id == KILN {
             crate::kiln::generate()
+        } else if id == crate::kit::KIT {
+            crate::kit::level()
         } else {
             Self::generate(id)
         }
@@ -431,6 +610,7 @@ impl World {
     pub fn from_parts(p: Parts) -> Self {
         assert_eq!(p.heights.len(), TERRAIN_N * TERRAIN_N);
         assert!(p.ground.is_empty() || p.ground.len() == TERRAIN_N * TERRAIN_N);
+        assert!(p.holes.is_empty() || p.holes.len() == (CELLS * CELLS).div_ceil(64));
         let mut world = Self {
             seed: p.id,
             continent: p.continent,
@@ -442,6 +622,10 @@ impl World {
             ground: p.ground,
             lanes: p.lanes,
             points: p.points,
+            holes: p.holes,
+            volumes: p.volumes,
+            vol_start: Vec::new(),
+            vol_items: Vec::new(),
             digest: OnceLock::new(),
         };
         world.index_cover();
@@ -507,7 +691,7 @@ impl World {
                 let (low, high) = self.ground_under(min, max);
                 let kind = if wall { Kind::Wall } else { Kind::Crate };
                 let facing = (if hx < hy { 0 } else { 1 }) + 2 * ((h >> 5) & 1) as u8;
-                self.boxes.push(CoverBox { min, max, bottom: low, top: high + tall, kind, facing });
+                self.boxes.push(CoverBox::new(min, max, low, high + tall, kind, facing));
             }
         }
         for i in 0..self.sites.len() {
@@ -516,27 +700,86 @@ impl World {
         self.index_cover();
     }
 
-    /// The static index: every box under every cover cell it overlaps.
+    /// The static index: every box (and force volume) under every cover cell
+    /// it overlaps.
     fn index_cover(&mut self) {
-        let mut cells: Vec<Vec<u32>> = vec![Vec::new(); COVER_DIM * COVER_DIM];
-        for (i, b) in self.boxes.iter().enumerate() {
-            let c = |v: f32| ((v / COVER_CELL) as usize).min(COVER_DIM - 1);
-            for y in c(b.min[1])..=c(b.max[1]) {
-                for x in c(b.min[0])..=c(b.max[0]) {
-                    cells[y * COVER_DIM + x].push(i as u32);
-                }
-            }
-        }
-        self.box_start = Vec::with_capacity(cells.len() + 1);
-        self.box_start.push(0);
-        for c in &cells {
-            self.box_items.extend_from_slice(c);
-            self.box_start.push(self.box_items.len() as u32);
-        }
+        let bounds: Vec<([f32; 2], [f32; 2])> = self.boxes.iter().map(|b| (b.min, b.max)).collect();
+        (self.box_start, self.box_items) = index(&bounds);
+        let bounds: Vec<([f32; 2], [f32; 2])> = self.volumes.iter().map(|v| ([v.min[0], v.min[1]], [v.max[0], v.max[1]])).collect();
+        (self.vol_start, self.vol_items) = index(&bounds);
     }
 
     pub fn boxes(&self) -> &[CoverBox] {
         &self.boxes
+    }
+
+    /// Force volumes: lifts, drop shafts, springs.
+    pub fn volumes(&self) -> &[Volume] {
+        &self.volumes
+    }
+
+    /// The force volume the feet at (x, y, z) are in, if any (the first in
+    /// the index's order).
+    pub fn volume_at(&self, x: f32, y: f32, z: f32) -> Option<&Volume> {
+        if self.volumes.is_empty() {
+            return None;
+        }
+        let c = |v: f32| ((v.clamp(0.0, WORLD_SIZE) / COVER_CELL) as usize).min(COVER_DIM - 1);
+        let cell = c(y) * COVER_DIM + c(x);
+        self.vol_items[self.vol_start[cell] as usize..self.vol_start[cell + 1] as usize]
+            .iter()
+            .map(|&i| &self.volumes[i as usize])
+            .find(|v| v.contains(x, y, z))
+    }
+
+    /// Whether the terrain has a hole at (x, y): no ground there, open to
+    /// what's under the surface.
+    #[inline]
+    pub fn hole(&self, x: f32, y: f32) -> bool {
+        if self.holes.is_empty() {
+            return false;
+        }
+        let c = |v: f32| ((v.clamp(0.0, WORLD_SIZE) / TERRAIN_RES) as usize).min(CELLS - 1);
+        self.hole_cell(c(x), c(y))
+    }
+
+    /// Whether height cell (cx, cy) (between samples cx..cx+1, cy..cy+1) is a hole.
+    #[inline]
+    pub fn hole_cell(&self, cx: usize, cy: usize) -> bool {
+        let i = cy * CELLS + cx;
+        self.holes.get(i / 64).is_some_and(|w| w >> (i % 64) & 1 != 0)
+    }
+
+    /// Whether the world has any holes at all.
+    pub fn has_holes(&self) -> bool {
+        !self.holes.is_empty()
+    }
+
+    /// The lowest underside above `above` over the circle of radius `r` at
+    /// (x, y): a box's bottom (not a shield's), or the terrain's surface
+    /// where (x, y) is under it; `f32::MAX` if there's none. What a head
+    /// bumps into (C1: ceilings).
+    pub fn ceiling(&self, x: f32, y: f32, r: f32, above: f32) -> f32 {
+        let mut c = f32::MAX;
+        if !self.holes.is_empty() {
+            let t = self.terrain(x, y);
+            if t >= above && !self.hole(x, y) {
+                c = t;
+            }
+        }
+        self.boxes_near(x, y, r, |b| {
+            if b.pass == SOLID && b.bottom >= above && b.bottom < c && b.distance2(x, y) < r * r {
+                c = b.bottom;
+            }
+        });
+        c
+    }
+
+    /// Whether feet at `z` over (x, y) are under the terrain's surface there
+    /// (in a tunnel): it's a ceiling over them, not their ground.
+    #[inline]
+    pub fn under(&self, x: f32, y: f32, z: f32) -> bool {
+        !self.holes.is_empty() && self.terrain(x, y) > z + UNDER
     }
 
     /// Routes along the lattice's lanes, and inside sites (none on Harrow).
@@ -714,7 +957,7 @@ impl World {
                 let (low, high) = self.ground_under(min, max);
                 let bottom = if p.stacked { low + CONTAINER_HEIGHT } else { low };
                 let top = (if p.stacked { bottom } else { high }) + p.height;
-                self.boxes.push(CoverBox { min, max, bottom, top, kind: p.kind, facing: (p.facing + turn + k) % 4 });
+                self.boxes.push(CoverBox::new(min, max, bottom, top, p.kind, (p.facing + turn + k) % 4));
             }
         }
     }
@@ -737,11 +980,18 @@ impl World {
     /// The highest surface at (x, y) a player whose feet are at `z` can stand
     /// on: the terrain, or the top of a box under (x, y) no higher than `z +
     /// reach` (so a player steps up onto low boxes and lands on high ones).
+    /// Under the terrain's surface (more than `UNDER` below it) or over a
+    /// hole in it, the terrain isn't ground: only boxes are, and with none,
+    /// the bottom of the world (0). Shields are never ground.
     pub fn ground(&self, x: f32, y: f32, z: f32, reach: f32) -> f32 {
-        let mut g = self.terrain(x, y);
+        let t = self.terrain(x, y);
+        let mut g = if self.holes.is_empty() || (t <= z + UNDER.max(reach) && !self.hole(x, y)) { t } else { 0.0 };
         self.boxes_near(x, y, 0.0, |b| {
-            if x >= b.min[0] && x <= b.max[0] && y >= b.min[1] && y <= b.max[1] && b.top <= z + reach && b.top > g {
-                g = b.top;
+            if b.pass == SOLID && b.covers(x, y) {
+                let top = b.top_at(x, y);
+                if top <= z + reach && top > g {
+                    g = top;
+                }
             }
         });
         g
@@ -767,6 +1017,24 @@ impl World {
                 eat(v.to_bits() as u64);
             }
             eat(b.kind as u64 | (b.facing as u64) << 8);
+            if b.is_turned() || b.is_wedge() || b.pass != SOLID {
+                for v in [b.center[0], b.center[1], b.half[0], b.half[1], b.axis[0], b.axis[1], b.low] {
+                    eat(v.to_bits() as u64);
+                }
+                eat(b.pass as u64);
+            }
+        }
+        for (i, &w) in self.holes.iter().enumerate() {
+            if w != 0 {
+                eat(i as u64);
+                eat(w);
+            }
+        }
+        for v in &self.volumes {
+            for x in v.min.iter().chain(&v.max).chain(&v.vel) {
+                eat(x.to_bits() as u64);
+            }
+            eat(v.force as u64);
         }
         for s in &self.sites {
             for v in [s.center[0], s.center[1], s.half, s.level] {
@@ -775,7 +1043,7 @@ impl World {
             eat(s.kind as u64 | (s.sector as u64) << 8);
         }
         for l in &self.lanes {
-            eat(l.a as u64 | (l.b as u64) << 16);
+            eat(l.a as u64 | (l.b as u64) << 16 | (l.one_way as u64) << 32);
             for p in &l.path {
                 for v in p {
                     eat(v.to_bits() as u64);
@@ -790,6 +1058,38 @@ impl World {
         }
         h
     }
+}
+
+/// `Parts::holes` with a hole in each of `cells` (height cells, (x, y)).
+pub fn hole_bits(cells: &[(usize, usize)]) -> Vec<u64> {
+    let mut bits = vec![0u64; (CELLS * CELLS).div_ceil(64)];
+    for &(x, y) in cells {
+        let i = y * CELLS + x;
+        bits[i / 64] |= 1 << (i % 64);
+    }
+    bits
+}
+
+/// An index over cover cells: each item under every cell its bounds overlap,
+/// as (where each cell's items start, and one past the last; the items).
+fn index(bounds: &[([f32; 2], [f32; 2])]) -> (Vec<u32>, Vec<u32>) {
+    let mut cells: Vec<Vec<u32>> = vec![Vec::new(); COVER_DIM * COVER_DIM];
+    for (i, (min, max)) in bounds.iter().enumerate() {
+        let c = |v: f32| ((v.max(0.0) / COVER_CELL) as usize).min(COVER_DIM - 1);
+        for y in c(min[1])..=c(max[1]) {
+            for x in c(min[0])..=c(max[0]) {
+                cells[y * COVER_DIM + x].push(i as u32);
+            }
+        }
+    }
+    let mut start = Vec::with_capacity(cells.len() + 1);
+    let mut items = Vec::new();
+    start.push(0);
+    for c in &cells {
+        items.extend_from_slice(c);
+        start.push(items.len() as u32);
+    }
+    (start, items)
 }
 
 #[cfg(test)]
@@ -890,7 +1190,7 @@ mod tests {
                 let wobble = if (i / 30) % 2 == 0 { 0.6 } else { -0.6 };
                 let (c, sn) = libm::sincosf(wobble as f32); // as before: (sin, cos)
                 let dir = [(to[0] * sn - to[1] * c) / d, (to[0] * c + to[1] * sn) / d];
-                p = step(&w, p, Input { move_x: (dir[0] * 127.0) as i8, move_y: (dir[1] * 127.0) as i8, ..Default::default() });
+                p = step(&w, p, Input { move_x: (dir[0] * 127.0) as i8, move_y: (dir[1] * 127.0) as i8, ..Default::default() }, 0);
                 inside |= (p.pos[0] - s.center[0]).abs() < 40.0 && (p.pos[1] - s.center[1]).abs() < 40.0;
             }
             assert!(inside, "got in from ({dx}, {dy}): ended at {:?}", p.pos);

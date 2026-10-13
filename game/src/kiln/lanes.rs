@@ -59,6 +59,8 @@ pub(crate) struct Route {
     pub a: usize,
     pub b: usize,
     pub legs: Vec<Leg>,
+    /// Only from `a` to `b` (up a lift, down a drop shaft).
+    pub one_way: bool,
 }
 
 /// Builds a route leg by leg.
@@ -69,7 +71,7 @@ pub(crate) struct R {
 
 impl R {
     pub fn from(a: usize, at: [f64; 2]) -> Self {
-        Self { route: Route { a, b: a, legs: Vec::new() }, at }
+        Self { route: Route { a, b: a, legs: Vec::new(), one_way: false }, at }
     }
 
     pub fn road(mut self, to: [f64; 2]) -> Self {
@@ -443,25 +445,24 @@ pub(crate) fn stamp_ramp(k: &mut Kiln, path: &[[f64; 2]], z0: f64, z1: f64) -> f
     (z1 - z0).abs() / total.max(1e-9)
 }
 
-/// Cuts the ground under a deck from `a` to `b` (axis-aligned) down to its
-/// underside (`z` its top) where it rises above that (a bank's rim higher
-/// than the deck): on a deck, the ground is never at the feet.
+/// Cuts the ground under a deck from `a` to `b` down to its underside (`z`
+/// its top) where it rises above that (a bank's rim higher than the deck):
+/// on a deck, the ground is never at the feet.
 fn trim_under(k: &mut Kiln, a: [f64; 2], b: [f64; 2], z: f64) {
     let z = z - 2.6;
-    // Its length exactly (the banks at its ends stay level with it), and
-    // a little wider than it.
+    // Its length but its ends (the banks at its ends stay level with it),
+    // and a little wider than it.
     let (half, ends) = (9.0, 6.0);
-    let along_x = (b[0] - a[0]).abs() > (b[1] - a[1]).abs();
-    let (min, max) = if along_x {
-        ([a[0].min(b[0]) + ends, a[1] - half], [a[0].max(b[0]) - ends, a[1] + half])
-    } else {
-        ([a[0] - half, a[1].min(b[1]) + ends], [a[0] + half, a[1].max(b[1]) - ends])
-    };
+    let l = dist(a, b);
+    let u = scale(sub(b, a), 1.0 / l);
+    let (min, max) = ([a[0].min(b[0]) - half, a[1].min(b[1]) - half], [a[0].max(b[0]) + half, a[1].max(b[1]) + half]);
     let (x0, x1, y0, y1) = Kiln::samples(min, max);
     for iy in y0..=y1 {
         for ix in x0..=x1 {
+            let q = sub(Kiln::pos(ix, iy), a);
+            let (s, t) = (dot(q, u), (q[0] * u[1] - q[1] * u[0]).abs());
             let i = iy * TERRAIN_N + ix;
-            if k.h[i] > z {
+            if s >= ends && s <= l - ends && t <= half && k.h[i] > z {
                 k.h[i] = z;
             }
         }
@@ -547,7 +548,7 @@ pub(crate) fn finish(k: &Kiln, routes: &[Route], decks: &[Vec<Option<f64>>]) -> 
                     }
                 }
             }
-            Lane { a: r.a as u16, b: r.b as u16, path }
+            Lane { a: r.a as u16, b: r.b as u16, path, one_way: r.one_way }
         })
         .collect()
 }

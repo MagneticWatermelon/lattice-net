@@ -27,6 +27,6 @@ fn main() {
             let v = (s.vel[0] * s.vel[0] + s.vel[1] * s.vel[1]).sqrt();
             println!("{:5.1} s  ({:7.1}, {:7.1}, {:6.1}) v {v:4.1}  -> wp {next} ({:.0}, {:.0}, {:.1})", t as f32 * DT, s.pos[0], s.pos[1], s.z, wp[0], wp[1], wp[2]);
         }
-        s = step(&w, s, Input { move_x: mx, move_y: my, yaw: 0, pitch: 0, buttons: BUTTON_SPRINT });
+        s = step(&w, s, Input { move_x: mx, move_y: my, yaw: 0, pitch: 0, buttons: BUTTON_SPRINT }, 0);
     }
 }

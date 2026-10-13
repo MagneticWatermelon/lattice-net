@@ -113,8 +113,9 @@ impl Tracer {
     }
 }
 
-/// Where a segment from `a` to `b` first hits the ground or cover.
-pub fn segment_hit(world: &World, a: [f32; 3], b: [f32; 3]) -> Option<Impact> {
+/// Where a segment from `a` to `b`, fired by `faction`, first hits the
+/// ground or cover (its own faction's shields let it through).
+pub fn segment_hit(world: &World, a: [f32; 3], b: [f32; 3], faction: u8) -> Option<Impact> {
     let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
     let dir = if len > 1e-6 { d.map(|v| v / len) } else { [0.0, 0.0, -1.0] };
@@ -125,10 +126,17 @@ pub fn segment_hit(world: &World, a: [f32; 3], b: [f32; 3]) -> Option<Impact> {
     });
     let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
     world.boxes_near(mid[0], mid[1], len / 2.0 + 1.0, |c| {
-        let (min, max) = ([c.min[0], c.min[1], c.bottom], [c.max[0], c.max[1], c.top]);
-        if let Some(t) = hit::aabb(a, b, min, max) {
+        if !c.blocks(faction) {
+            return;
+        }
+        if let Some(t) = hit::solid(a, b, c) {
             if best.is_none_or(|(bt, _, _)| t < bt) {
-                best = Some((t, box_normal(at(t), min, max, dir), Some(c.kind as u8)));
+                let normal = if c.is_turned() || c.is_wedge() {
+                    hit::solid_normal(a, b, t, c)
+                } else {
+                    box_normal(at(t), [c.min[0], c.min[1], c.bottom], [c.max[0], c.max[1], c.top], dir)
+                };
+                best = Some((t, normal, Some(c.kind as u8)));
             }
         }
     });
@@ -281,7 +289,7 @@ impl Tracers {
         let mut flown = 0.0;
         while flown + SEG <= t.age + 1e-6 {
             let next = real.flight.advance();
-            if segment_hit(world, real.flight.pos, next.pos).is_some() {
+            if segment_hit(world, real.flight.pos, next.pos, real.faction).is_some() {
                 self.flying.swap_remove(i);
                 return;
             }
@@ -301,7 +309,7 @@ impl Tracers {
                 let next = t.flight.advance();
                 t.owed -= SEG;
                 t.age += SEG;
-                if let Some(hit) = segment_hit(world, t.flight.pos, next.pos) {
+                if let Some(hit) = segment_hit(world, t.flight.pos, next.pos, t.faction) {
                     impact(t, hit);
                     return false;
                 }
@@ -413,7 +421,7 @@ mod tests {
         // The first wall, hit square on from the west, a meter below its top.
         let b = world.boxes().iter().find(|b| b.kind == lattice_game::world::Kind::Wall && b.max[0] - b.min[0] < 1.0).unwrap();
         let (y, z) = ((b.min[1] + b.max[1]) / 2.0, b.top - 1.0);
-        let hit = segment_hit(&world, [b.min[0] - 5.0, y, z], [b.max[0] + 5.0, y, z]).expect("it hits the wall");
+        let hit = segment_hit(&world, [b.min[0] - 5.0, y, z], [b.max[0] + 5.0, y, z], 0).expect("it hits the wall");
         assert_eq!(hit.cover, Some(lattice_game::world::Kind::Wall as u8));
         assert!((hit.pos[0] - b.min[0]).abs() < 1e-3, "on its west face");
         assert_eq!(hit.normal, [-1.0, 0.0, 0.0]);

@@ -1,8 +1,9 @@
-//! Segment tests for projectiles: against players' hitboxes, cover boxes and
-//! the terrain. Each returns the fraction `t` in [0, 1] along the segment
-//! where it first hits, if it does.
+//! Segment tests for projectiles: against players' hitboxes, cover (boxes,
+//! turned boxes, wedges, shields) and the terrain (a shell, open at its
+//! holes). Each returns the fraction `t` in [0, 1] along the segment where
+//! it first hits, if it does.
 
-use crate::world::World;
+use crate::world::{CoverBox, World};
 
 /// Player hitboxes, from the feet: a body capsule and a head sphere. (Only
 /// for shots; moving uses the movement collider.) The head is centered on
@@ -147,10 +148,96 @@ pub fn aabb(p0: V, p1: V, min: V, max: V) -> Option<f32> {
     Some(t0)
 }
 
+/// The segment p0 -> p1 against a cover box of any shape (C1): in its frame
+/// if it's turned, the slab test, and a wedge's sloped top as one more
+/// plane. (Shields: the caller decides whom they stop, `CoverBox::blocks`.)
+pub fn solid(p0: V, p1: V, b: &CoverBox) -> Option<f32> {
+    if !b.is_turned() && !b.is_wedge() {
+        return aabb(p0, p1, [b.min[0], b.min[1], b.bottom], [b.max[0], b.max[1], b.top]);
+    }
+    let (a, c) = (b.local(p0[0], p0[1]), b.local(p1[0], p1[1]));
+    let (q0, q1) = ([a[0], a[1], p0[2]], [c[0], c[1], p1[2]]);
+    let mut t = aabb_span(q0, q1, [-b.half[0], -b.half[1], b.bottom], [b.half[0], b.half[1], b.top])?;
+    if b.is_wedge() {
+        // Under the top: z <= low + k (along + half), k its rise per meter.
+        let k = (b.top - b.low) / (2.0 * b.half[0]);
+        let f = |q: V| q[2] - b.low - k * (q[0] + b.half[0]);
+        let (f0, f1) = (f(q0), f(q1));
+        if f0 > 0.0 && f1 > 0.0 {
+            return None;
+        }
+        if f0 > 0.0 {
+            t.0 = t.0.max(f0 / (f0 - f1));
+        } else if f1 > 0.0 {
+            t.1 = t.1.min(f0 / (f0 - f1));
+        }
+        if t.0 > t.1 {
+            return None;
+        }
+    }
+    Some(t.0)
+}
+
+/// Where segment p0 -> p1 enters and leaves an axis-aligned box, as
+/// fractions clipped to [0, 1].
+fn aabb_span(p0: V, p1: V, min: V, max: V) -> Option<(f32, f32)> {
+    let d = sub(p1, p0);
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for k in 0..3 {
+        if d[k].abs() < 1e-9 {
+            if p0[k] < min[k] || p0[k] > max[k] {
+                return None;
+            }
+        } else {
+            let (mut a, mut b) = ((min[k] - p0[k]) / d[k], (max[k] - p0[k]) / d[k]);
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            t0 = t0.max(a);
+            t1 = t1.min(b);
+            if t0 > t1 {
+                return None;
+            }
+        }
+    }
+    Some((t0, t1))
+}
+
+/// A box's outward unit normal where segment p0 -> p1 hits it at `t`
+/// (`solid`'s answer): the face nearest that point, in its frame (a
+/// wedge's slope, where it's nearest); back along the segment from inside.
+pub fn solid_normal(p0: V, p1: V, t: f32, b: &CoverBox) -> V {
+    let p = [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t, p0[2] + (p1[2] - p0[2]) * t];
+    let l = b.local(p[0], p[1]);
+    let d = sub(p1, p0);
+    let len = dot(d, d).sqrt().max(1e-6);
+    let mut best = (f32::MAX, [-d[0] / len, -d[1] / len, -d[2] / len]);
+    let mut face = |gap: f32, n: V| {
+        if gap < best.0 {
+            best = (gap, n);
+        }
+    };
+    let (x, y) = (b.world_dir([1.0, 0.0]), b.world_dir([0.0, 1.0]));
+    face((l[0] + b.half[0]).abs(), [-x[0], -x[1], 0.0]);
+    face((b.half[0] - l[0]).abs(), [x[0], x[1], 0.0]);
+    face((l[1] + b.half[1]).abs(), [-y[0], -y[1], 0.0]);
+    face((b.half[1] - l[1]).abs(), [y[0], y[1], 0.0]);
+    face((p[2] - b.bottom).abs(), [0.0, 0.0, -1.0]);
+    if b.is_wedge() {
+        let k = (b.top - b.low) / (2.0 * b.half[0]);
+        let s = (1.0 + k * k).sqrt();
+        face((p[2] - b.top_along(l[0])).abs() / s, [-k * x[0] / s, -k * x[1] / s, 1.0 / s]);
+    } else {
+        face((p[2] - b.top).abs(), [0.0, 0.0, 1.0]);
+    }
+    best.1
+}
+
 /// Whether nothing (terrain or cover) stands between `p0` and `p1`: what a
-/// player at `p0` can see of `p1`. The server's "after cover" count and the
-/// bots' targeting use the same test.
-pub fn line_clear(world: &World, p0: V, p1: V) -> bool {
+/// player of `faction` at `p0` can see of `p1` (their own shields don't
+/// hide it). The server's "after cover" count and the bots' targeting use
+/// the same test.
+pub fn line_clear(world: &World, p0: V, p1: V, faction: u8) -> bool {
     if terrain(world, p0, p1).is_some() {
         return false;
     }
@@ -159,19 +246,24 @@ pub fn line_clear(world: &World, p0: V, p1: V) -> bool {
     let half = (dx * dx + dy * dy).sqrt() / 2.0;
     let mut clear = true;
     world.boxes_near(mid[0], mid[1], half + 1.0, |c| {
-        clear &= aabb(p0, p1, [c.min[0], c.min[1], c.bottom], [c.max[0], c.max[1], c.top]).is_none();
+        clear &= !c.blocks(faction) || solid(p0, p1, c).is_none();
     });
     clear
 }
 
 /// The segment p0 -> p1 against the terrain: sampled at most every 2 m,
-/// then the crossing refined by bisection.
+/// then the crossing refined by bisection. Where it has holes, the terrain
+/// is a shell: a segment hits it where it crosses the surface (from above,
+/// or from under it in a tunnel) anywhere but through a hole.
 pub fn terrain(world: &World, p0: V, p1: V) -> Option<f32> {
+    let at = |t: f32| [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t, p0[2] + (p1[2] - p0[2]) * t];
     let below = |t: f32| {
-        let p = [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t, p0[2] + (p1[2] - p0[2]) * t];
+        let p = at(t);
         p[2] < world.terrain(p[0], p[1])
     };
-    if below(0.0) {
+    let shell = world.has_holes();
+    let mut side = below(0.0);
+    if side && !shell {
         return Some(0.0);
     }
     let len = dot(sub(p1, p0), sub(p1, p0)).sqrt();
@@ -179,17 +271,21 @@ pub fn terrain(world: &World, p0: V, p1: V) -> Option<f32> {
     let mut prev = 0.0;
     for k in 1..=n {
         let t = k as f32 / n as f32;
-        if below(t) {
+        if below(t) != side {
             let (mut lo, mut hi) = (prev, t);
             for _ in 0..8 {
                 let mid = (lo + hi) / 2.0;
-                if below(mid) {
+                if below(mid) != side {
                     hi = mid;
                 } else {
                     lo = mid;
                 }
             }
-            return Some(hi);
+            let p = at(hi);
+            if !shell || !world.hole(p[0], p[1]) {
+                return Some(hi);
+            }
+            side = !side; // through a hole
         }
         prev = t;
     }

@@ -152,6 +152,15 @@ pub fn spawn_cover(commands: &mut Commands, models: &Models, world: &World, unit
         let building = matches!(b.kind, Kind::Command | Kind::Bunker | Kind::Post);
         let range = if building { BUILDING_RANGE } else { PROP_RANGE };
         let center = to_bevy((b.min[0] + b.max[0]) / 2.0, (b.min[1] + b.max[1]) / 2.0, (b.bottom + b.top) / 2.0);
+        // Turned boxes and wedges (C1): a plain box along the footprint, turned
+        // (a wedge drawn to its top).
+        if b.is_turned() || b.is_wedge() {
+            let c = to_bevy(b.center[0], b.center[1], (b.bottom + b.top) / 2.0);
+            let yaw = Quat::from_rotation_y(b.axis[1].atan2(b.axis[0]));
+            let tf = Transform::from_translation(c).with_rotation(yaw).with_scale(Vec3::new(2.0 * b.half[0], h, 2.0 * b.half[1]));
+            commands.spawn((Mesh3d(unit.clone()), MeshMaterial3d(plain[0].clone()), tf));
+            continue;
+        }
         // Kiln's blockout volumes have no model: their plain box at every distance.
         let Some((mesh, mat)) = models.props.get(b.kind as usize) else {
             commands.spawn((Mesh3d(unit.clone()), MeshMaterial3d(plain[0].clone()), Transform::from_translation(center).with_scale(Vec3::new(sx, h, sy))));

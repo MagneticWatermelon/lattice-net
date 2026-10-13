@@ -296,18 +296,49 @@ ffi_structs! {
         pub lanes: u32,
         pub lane_points: u32,
         pub points: u32,
+        /// Force volumes (`lt_world_volumes`), and how many height cells are
+        /// holes in the terrain (`lt_world_holes`).
+        pub volumes: u32,
+        pub holes: u32,
     }
 
-    /// A cover box: blocks movement and shots.
+    /// A cover box: blocks movement and shots. Turned about the vertical (its
+    /// axis), its top level or rising along its axis (a wedge), or a shield
+    /// that lets one faction through.
     pub struct LtBox {
-        /// z: its bottom.
+        /// Its footprint's bounds (a turned box's: around it); z: its bottom.
         pub min: LtVec3,
-        /// z: its top.
+        /// z: its top (a wedge's at the high end of its axis).
         pub max: LtVec3,
+        /// Its footprint's center.
+        pub center_x: f32,
+        pub center_y: f32,
+        /// Half its size along its axis and across it.
+        pub half_along: f32,
+        pub half_across: f32,
+        /// Its axis, a unit vector: (1, 0) for a box that isn't turned.
+        pub axis_x: f32,
+        pub axis_y: f32,
+        /// A wedge's top at the low end of its axis (`max.z` for a box).
+        pub low: f32,
         /// `LT_COVER_*`: what it's drawn as.
         pub kind: u8,
-        /// Which way its front faces: 0 east, 1 north, 2 west, 3 south.
+        /// Which way its front faces, in its own frame: 0 along its axis, 1 a
+        /// quarter turn left of it, 2, 3.
         pub facing: u8,
+        /// A shield's faction, the one it lets through; `LT_SOLID` for the rest.
+        pub pass: u8,
+    }
+
+    /// A force volume (an axis-aligned box of air): a lift, a drop shaft or
+    /// a spring.
+    pub struct LtVolume {
+        pub min: LtVec3,
+        pub max: LtVec3,
+        /// What it does (`LT_FORCE_*`): a lift's speed up (z), a drop shaft's
+        /// down (z, negative), a spring's throw.
+        pub vel: LtVec3,
+        pub force: u8,
     }
 
     /// A site: a base, an outpost, a great site or a Landing.
@@ -333,6 +364,8 @@ ffi_structs! {
         pub b: u16,
         pub first: u32,
         pub count: u32,
+        /// 1: only walked from `a` to `b` (up a lift, down a drop shaft).
+        pub one_way: u8,
     }
 
     /// A control point: holding it holds the site's tap.
@@ -399,7 +432,13 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_COVER_ROCK", lattice_game::world::Kind::Rock as i64, "Natural rock: a boulder, a hoodoo, a crag, an arch."),
     ("LT_COVER_CRYSTAL", lattice_game::world::Kind::Crystal as i64, "Glass and crystal: fulgurite spikes, a Geode's crystals."),
     ("LT_COVER_BONE", lattice_game::world::Kind::Bone as i64, "The Dry Sea's bones."),
+    ("LT_COVER_SHIELD", lattice_game::world::Kind::Shield as i64, "A faction's shield: drawn in its colors, see-through."),
+    ("LT_SOLID", lattice_game::world::SOLID as i64, "`LtBox::pass` of everything but shields: it blocks every faction."),
+    ("LT_FORCE_LIFT", lattice_game::world::Force::Lift as i64, "An updraft: a lift or a vent lift."),
+    ("LT_FORCE_DROP", lattice_game::world::Force::Drop as i64, "A drop shaft: a fall slowed."),
+    ("LT_FORCE_SPRING", lattice_game::world::Force::Spring as i64, "A lattice spring: a throw."),
     ("LT_WORLD_KILN", lattice_game::world::KILN as i64, "Kiln's world id (any other is a seed for Harrow)."),
+    ("LT_WORLD_KIT", lattice_game::kit::KIT as i64, "The collision kit's test level (K1)."),
     ("LT_CONTINENT_HARROW", lattice_game::world::Continent::Harrow as i64, "Harrow, the procedural hills."),
     ("LT_CONTINENT_KILN", lattice_game::world::Continent::Kiln as i64, "Kiln, the desert continent."),
     ("LT_GROUND_NONE", 255, "The world doesn't say what the ground is (Harrow)."),

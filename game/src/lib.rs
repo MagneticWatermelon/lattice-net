@@ -12,6 +12,7 @@ pub mod events;
 pub mod faction;
 pub mod hit;
 pub mod kiln;
+pub mod kit;
 pub mod movement;
 pub mod msg;
 pub mod tier;

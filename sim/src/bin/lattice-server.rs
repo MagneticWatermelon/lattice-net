@@ -98,7 +98,8 @@ lattice-server: M1 movement-only authoritative server
                        login service) [the public dev key]
   --server-id N        the server id tokens are minted for [1]
   --seed N             spawn RNG seed [1]
-  --world W            the continent: kiln (the desert, docs/kiln.md), or harrow or a number
+  --world W            the continent: kiln (the desert, docs/kiln.md), kit (the
+                       collision kit's test level), or harrow or a number
                        (Harrow's hills from that seed); clients build it from the Welcome [1]
   --world-seed N       the same as --world N
   --no-separation      don't push overlapping players apart (for comparisons)
@@ -574,8 +575,9 @@ struct NetCounters {
 fn parse_world(w: &str) -> u64 {
     match w {
         "kiln" => lattice_game::world::KILN,
+        "kit" => lattice_game::kit::KIT,
         "harrow" => 1,
-        n => n.parse().unwrap_or_else(|_| panic!("--world: kiln, harrow or a number, not {n:?}")),
+        n => n.parse().unwrap_or_else(|_| panic!("--world: kiln, kit, harrow or a number, not {n:?}")),
     }
 }
 

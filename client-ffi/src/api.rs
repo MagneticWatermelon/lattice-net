@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use lattice_client_core::invite::Invite;
 use lattice_client_core::tracers::segment_hit;
 use lattice_client_core::ClientConfig;
-use lattice_game::world::{World, TERRAIN_N, TERRAIN_RES};
+use lattice_game::world::{World, CELLS, TERRAIN_N, TERRAIN_RES};
 
 use crate::abi::*;
 use crate::handle::{Handle, Player};
@@ -44,7 +44,10 @@ use crate::session::dev_token;
 /// 2: `LT_CONFIG_NET_THREAD`.
 /// 3: crouch and the rifle's rounds (`LtOwn`, `LT_BUTTON_CROUCH`,
 /// `LT_BUTTON_RELOAD`, `LT_FLAG_CROUCHED`, `LT_FLAG_RELOADING`).
-pub const VERSION: u32 = 4;
+/// 4: worlds by id (Kiln), lanes, points, materials.
+/// 5: the collision kit (K1): turned boxes, wedges and shields in `LtBox`,
+/// one-way lanes, `lt_world_volumes`, `lt_world_holes`.
+pub const VERSION: u32 = 5;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]
@@ -496,6 +499,8 @@ ffi_fns! {
                 lanes: w.lanes().len() as u32,
                 lane_points: w.lanes().iter().map(|l| l.path.len() as u32).sum(),
                 points: w.points().len() as u32,
+                volumes: w.volumes().len() as u32,
+                holes: if w.has_holes() { (0..CELLS).map(|y| (0..CELLS).filter(|&x| w.hole_cell(x, y)).count() as u32).sum() } else { 0 },
             };
         }
     }
@@ -524,7 +529,20 @@ ffi_fns! {
     fn lt_world_boxes(w: *const LtWorld, out: *mut LtBox, cap: i32) -> i32 {
         let Some(w) = world(w) else { return 0 };
         for (o, b) in slice(out, cap).iter_mut().zip(w.boxes()) {
-            *o = LtBox { min: [b.min[0], b.min[1], b.bottom].into(), max: [b.max[0], b.max[1], b.top].into(), kind: b.kind as u8, facing: b.facing };
+            *o = LtBox {
+                min: [b.min[0], b.min[1], b.bottom].into(),
+                max: [b.max[0], b.max[1], b.top].into(),
+                center_x: b.center[0],
+                center_y: b.center[1],
+                half_along: b.half[0],
+                half_across: b.half[1],
+                axis_x: b.axis[0],
+                axis_y: b.axis[1],
+                low: b.low,
+                kind: b.kind as u8,
+                facing: b.facing,
+                pass: b.pass,
+            };
         }
         w.boxes().len() as i32
     }
@@ -547,7 +565,7 @@ ffi_fns! {
             .lanes()
             .iter()
             .map(|l| {
-                let lane = LtLane { a: l.a, b: l.b, first, count: l.path.len() as u32 };
+                let lane = LtLane { a: l.a, b: l.b, first, count: l.path.len() as u32, one_way: l.one_way as u8 };
                 first += l.path.len() as u32;
                 lane
             })
@@ -582,6 +600,35 @@ ffi_fns! {
         w.points().len() as i32
     }
 
+    /// Every force volume: fills `out` (up to `cap`), returns how many.
+    fn lt_world_volumes(w: *const LtWorld, out: *mut LtVolume, cap: i32) -> i32 {
+        let Some(w) = world(w) else { return 0 };
+        for (o, v) in slice(out, cap).iter_mut().zip(w.volumes()) {
+            *o = LtVolume { min: v.min.into(), max: v.max.into(), vel: v.vel.into(), force: v.force as u8 };
+        }
+        w.volumes().len() as i32
+    }
+
+    /// Whether each of the `nx` × `ny` height cells from cell (`x0`, `y0`)
+    /// (the cell between samples x..x+1, y..y+1) is a hole in the terrain: 1
+    /// or 0, row by row, into `out`. Returns how many it wrote.
+    fn lt_world_holes(w: *const LtWorld, x0: i32, y0: i32, nx: i32, ny: i32, out: *mut u8) -> i32 {
+        let Some(w) = world(w) else { return 0 };
+        if out.is_null() || nx <= 0 || ny <= 0 {
+            return 0;
+        }
+        let out = std::slice::from_raw_parts_mut(out, nx as usize * ny as usize);
+        let last = CELLS as i32 - 1;
+        for iy in 0..ny {
+            let cy = (y0 + iy).clamp(0, last) as usize;
+            for ix in 0..nx {
+                let cx = (x0 + ix).clamp(0, last) as usize;
+                out[(iy * nx + ix) as usize] = w.hole_cell(cx, cy) as u8;
+            }
+        }
+        nx * ny
+    }
+
     /// What the ground is (`LT_GROUND_*`) at the `nx` × `ny` samples from
     /// sample (`x0`, `y0`), row by row, into `out`. Returns how many it wrote.
     fn lt_world_materials(w: *const LtWorld, x0: i32, y0: i32, nx: i32, ny: i32, out: *mut u8) -> i32 {
@@ -613,11 +660,11 @@ ffi_fns! {
     }
 
     /// Where the segment `from` -> `to` first hits the ground or cover
-    /// (shots' rules): 1 and `out` filled, or 0.
+    /// (shots' rules; every shield stops it): 1 and `out` filled, or 0.
     fn lt_world_raycast(w: *const LtWorld, from: *const LtVec3, to: *const LtVec3, out: *mut LtHit) -> i32 {
         let (Some(w), Some(a), Some(b)) = (world(w), from.as_ref(), to.as_ref()) else { return 0 };
         let (a, b): ([f32; 3], [f32; 3]) = ((*a).into(), (*b).into());
-        match segment_hit(w, a, b) {
+        match segment_hit(w, a, b, lattice_game::movement::NO_FACTION) {
             Some(hit) => {
                 if let Some(o) = out.as_mut() {
                     let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];

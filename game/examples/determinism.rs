@@ -8,6 +8,10 @@
 //! - **kiln:** Kiln, the desert continent, as the client builds it (heights,
 //!   boxes, sites, lanes, points, what its ground is made of), and players
 //!   walking its lanes and pressing into its cliffs;
+//! - **kit:** the collision kit's level (`lattice_game::kit`: turned walls,
+//!   wedges, ceilings, shields, a tunnel through holes in the ground, a lift,
+//!   a drop shaft, a spring), players of every faction roaming it, and shots
+//!   across it;
 //! - **movement:** players walking, sprinting, jumping, crouching and aiming
 //!   down sights over the map for thousands of steps, pushed now and then
 //!   and dead for a while: the prediction the client and server must agree on;
@@ -20,6 +24,7 @@ use lattice_game::activity;
 use lattice_game::delta::{self, NearEntry, NearHistory, NearQ};
 use lattice_game::events;
 use lattice_game::hit;
+use lattice_game::kit::{self, KIT};
 use lattice_game::movement::{dead_input, nudge, step, Input, MoveState, BUTTON_ADS, BUTTON_CROUCH, BUTTON_JUMP, BUTTON_RELOAD, BUTTON_SPRINT};
 use lattice_game::msg;
 use lattice_game::weapon::{aim, angles, muzzle, spread, Ammo, Bloom, Flight};
@@ -100,7 +105,8 @@ fn main() {
     while starts.len() < 64 {
         starts.push([200.0 + rng.unit() * 7800.0, 200.0 + rng.unit() * 7800.0]);
     }
-    for start in starts.into_iter().take(64) {
+    for (i, start) in starts.into_iter().take(64).enumerate() {
+        let side = (i % 3) as u8;
         let mut s = MoveState::standing(&world, start);
         let mut input = Input::default();
         let mut dead = 0;
@@ -116,12 +122,12 @@ fn main() {
             }
             s = if dead > 0 {
                 dead -= 1;
-                step(&world, s, dead_input(input))
+                step(&world, s, dead_input(input), side)
             } else {
-                step(&world, s, input)
+                step(&world, s, input, side)
             };
             if k % 97 == 0 {
-                s = nudge(&world, s, [rng.unit() - 0.5, rng.unit() - 0.5]);
+                s = nudge(&world, s, [rng.unit() - 0.5, rng.unit() - 0.5], side);
             }
             h.state(&s);
         }
@@ -154,11 +160,85 @@ fn main() {
             } else {
                 Input { move_x: mx, move_y: my, buttons: if k % 37 == 0 { BUTTON_JUMP } else { BUTTON_SPRINT }, ..Input::default() }
             };
-            s = step(&kiln, s, input);
+            s = step(&kiln, s, input, (i % 3) as u8);
             h.state(&s);
         }
     }
     println!("kiln-move {:016x}", h.0);
+
+    // The collision kit: players of each faction heading for random spots
+    // on it (over the turned wall, up the ramp, under the slab and the
+    // crawlway, at the shield, down the tunnel, up the lift, down the drop
+    // shaft, onto the spring), jumping and crouching, pushed now and then;
+    // its route walked; shots across it.
+    let kitw = World::shared(KIT);
+    let mut h = Hash::new();
+    h.u64(kitw.digest());
+    let area = |rng: &mut Rng| [960.0 + rng.unit() * 420.0, 975.0 + rng.unit() * 65.0];
+    // What the roaming covered (to stderr: not part of the hash).
+    let mut seen = [0u32; 5];
+    for p in 0..60 {
+        let side = (p % 3) as u8;
+        let mut s = MoveState::standing(&kitw, area(&mut rng));
+        let (mut to, mut buttons) = ([0.0f32; 2], 0u8);
+        for k in 0..2400 {
+            if k % 45 == 0 {
+                // Half the time one of its features, else anywhere on it.
+                let spots = [
+                    [(kit::LIFT_X[0] + kit::LIFT_X[1]) / 2.0, kit::TOWER.1[0] + 2.0],
+                    [(kit::SPRING.0[0] + kit::SPRING.0[1]) / 2.0, 1000.0],
+                    [kit::TUNNEL_IN.0 + 2.0, 1000.0],
+                    [(kit::DROP_X[0] + kit::DROP_X[1]) / 2.0, 995.0],
+                    [(kit::GAP.0 + kit::GAP.1) / 2.0, kit::GAP_Y],
+                    [kit::CRAWL.0 + 5.0, 1000.0],
+                ];
+                to = if rng.below(2) == 0 { spots[rng.below(spots.len() as u64) as usize] } else { area(&mut rng) };
+                buttons = [0, BUTTON_SPRINT, BUTTON_JUMP, BUTTON_CROUCH, BUTTON_SPRINT | BUTTON_JUMP, BUTTON_ADS][rng.below(6) as usize];
+            }
+            let (dx, dy) = (to[0] - s.pos[0], to[1] - s.pos[1]);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            let input = Input { move_x: (dx / d * 127.0) as i8, move_y: (dy / d * 127.0) as i8, buttons, ..Input::default() };
+            s = step(&kitw, s, input, side);
+            if k % 211 == 0 {
+                s = nudge(&kitw, s, [rng.unit() - 0.5, rng.unit() - 0.5], side);
+            }
+            h.state(&s);
+            seen[0] += (kitw.under(s.pos[0], s.pos[1], s.z) && !kitw.hole(s.pos[0], s.pos[1])) as u32;
+            if let Some(v) = kitw.volume_at(s.pos[0], s.pos[1], s.z) {
+                seen[1 + v.force as usize] += 1;
+            }
+            seen[4] += (s.crouched && input.buttons & BUTTON_CROUCH == 0) as u32;
+        }
+    }
+    eprintln!("kit: steps in the tunnel {}, in lifts {}, drop shafts {}, on springs {}, kept crouched by a ceiling {}", seen[0], seen[1], seen[2], seen[3], seen[4]);
+    let lane = &kitw.lanes()[0];
+    let mut s = MoveState::standing(&kitw, [lane.path[0][0], lane.path[0][1]]);
+    let mut next = 1;
+    for _ in 0..900 {
+        let (mx, my) = lane.steer([s.pos[0], s.pos[1], s.z], &mut next, false).unwrap_or((0, 0));
+        s = step(&kitw, s, Input { move_x: mx, move_y: my, buttons: BUTTON_SPRINT, ..Input::default() }, 0);
+        h.state(&s);
+    }
+    for _ in 0..20_000 {
+        let a = area(&mut rng);
+        let p0 = [a[0], a[1], kit::TUNNEL_FLOOR - 2.0 + rng.unit() * 60.0];
+        let dir = [rng.unit() - 0.5, rng.unit() - 0.5, rng.unit() - 0.5];
+        let len = 1.0 + rng.unit() * 60.0;
+        let p1 = [p0[0] + dir[0] * len, p0[1] + dir[1] * len, p0[2] + dir[2] * len];
+        h.u64(hit::line_clear(&kitw, p0, p1, rng.below(3) as u8) as u64);
+        if let Some(t) = hit::terrain(&kitw, p0, p1) {
+            h.f32(t);
+        }
+        kitw.boxes_near((p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0, len / 2.0 + 1.0, |b| {
+            if let Some(t) = hit::solid(p0, p1, b) {
+                h.f32(t);
+                for v in hit::solid_normal(p0, p1, t, b) {
+                    h.f32(v);
+                }
+            }
+        });
+    }
+    println!("kit {:016x}", h.0);
 
     // Shots from those spots: aim, spread (secret picks are just numbers
     // here), bloom over bursts, flights against the terrain, cover and a
@@ -207,7 +287,7 @@ fn main() {
         for v in [f.pos[0], f.pos[1], f.pos[2], f.vel[0], f.vel[1], f.vel[2]] {
             h.f32(v);
         }
-        h.u64(hit::line_clear(&world, origin, target) as u64);
+        h.u64(hit::line_clear(&world, origin, target, (k % 3) as u8) as u64);
     }
     // The rifle's rounds over bursts, reloads by hand and by themselves, and
     // a reserve running out (respawning full now and then).

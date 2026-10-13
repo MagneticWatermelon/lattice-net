@@ -20,7 +20,9 @@ pub(crate) fn walk(w: &World, l: &crate::world::Lane, backward: bool) -> Result<
     // under the route's own height.
     s.z = w.ground(start[0], start[1], start[2].max(s.z) + 1.0, 1.5).max(s.z);
     let mut next = 1;
-    let budget = (l.length() / 9.0 * 1.6 + 30.0) / DT;
+    // Sprinting along it, and up lifts and down drop shafts at 5 m/s or so.
+    let climb: f32 = l.path.windows(2).map(|w| ((w[1][2] - w[0][2]).abs() - (w[0][0] - w[1][0]).abs() - (w[0][1] - w[1][1]).abs()).max(0.0)).sum();
+    let budget = (l.length() / 9.0 * 1.6 + climb / 5.0 + 30.0) / DT;
     let mut best = (f32::MAX, 0u32);
     for i in 0..budget as u32 {
         let Some((mx, my)) = l.steer([s.pos[0], s.pos[1], s.z], &mut next, backward) else {
@@ -35,7 +37,7 @@ pub(crate) fn walk(w: &World, l: &crate::world::Lane, backward: bool) -> Result<
             best = (d, next as u32);
             best.0 = d;
         }
-        s = step(w, s, Input { move_x: mx, move_y: my, yaw: 0, pitch: 0, buttons: BUTTON_SPRINT });
+        s = step(w, s, Input { move_x: mx, move_y: my, yaw: 0, pitch: 0, buttons: BUTTON_SPRINT }, 0);
     }
     let w_next = l.waypoint(next.min(l.path.len() - 1), backward);
     Err(format!("stuck at ({:.0}, {:.0}, {:.1}) heading for waypoint {next}/{} at ({:.0}, {:.0}, {:.1})", s.pos[0], s.pos[1], s.z, l.path.len(), w_next[0], w_next[1], w_next[2]))
@@ -106,6 +108,9 @@ fn every_route_walks_end_to_end() {
     let mut failed = Vec::new();
     for (i, l) in w.lanes().iter().enumerate() {
         for backward in [false, true] {
+            if backward && l.one_way {
+                continue;
+            }
             if let Err(e) = walk(&w, l, backward) {
                 let (a, b) = (w.sites()[l.a as usize], w.sites()[l.b as usize]);
                 failed.push(format!("route {i} {:?} {} -> {:?} {} ({}): {e}", a.kind, l.a, b.kind, l.b, if backward { "back" } else { "forth" }));
@@ -115,7 +120,9 @@ fn every_route_walks_end_to_end() {
     for f in &failed {
         eprintln!("{f}");
     }
-    assert!(failed.is_empty(), "{} of {} walks failed", failed.len(), 2 * w.lanes().len());
+    let walks: usize = w.lanes().iter().map(|l| if l.one_way { 1 } else { 2 }).sum();
+    eprintln!("{walks} walks, {} of them one way (lifts, drop shafts)", w.lanes().iter().filter(|l| l.one_way).count());
+    assert!(failed.is_empty(), "{} of {walks} walks failed", failed.len());
 }
 
 #[test]
@@ -171,8 +178,10 @@ fn stairs_climb() {
         ground: Vec::new(),
         lanes: Vec::new(),
         points: Vec::new(),
+        holes: Vec::new(),
+        volumes: Vec::new(),
     });
-    let l = crate::world::Lane { a: 0, b: 0, path: path.iter().zip(&zs).map(|(p, z)| [p[0] as f32, p[1] as f32, *z as f32]).collect() };
+    let l = crate::world::Lane { a: 0, b: 0, path: path.iter().zip(&zs).map(|(p, z)| [p[0] as f32, p[1] as f32, *z as f32]).collect(), one_way: false };
     let up = walk(&w, &l, false);
     assert!(up.is_ok(), "up: {up:?}");
     let down = walk(&w, &l, true);
@@ -183,4 +192,64 @@ fn stairs_climb() {
 fn kiln_builds_the_same_bits_twice() {
     let (a, b) = (generate(), generate());
     assert_eq!(a.digest(), b.digest());
+}
+
+#[test]
+fn tunnels_run_under_the_ground_from_holes() {
+    use crate::world::Kind;
+    let w = kiln();
+    // Each sector's two Tunnel mouths joined by a lane that goes under the
+    // ground, its floor at least 7.5 m under it all the way.
+    let mouths: Vec<usize> = w.sites().iter().enumerate().filter(|(_, s)| s.kind == SiteKind::TunnelMouth).map(|(i, _)| i).collect();
+    let tunnels: Vec<_> = w.lanes().iter().filter(|l| mouths.contains(&(l.a as usize)) && mouths.contains(&(l.b as usize))).collect();
+    assert_eq!(tunnels.len(), 3, "one tunnel a sector");
+    for l in tunnels {
+        let under: Vec<&[f32; 3]> = l.path.iter().filter(|p| w.under(p[0], p[1], p[2]) && !w.hole(p[0], p[1])).collect();
+        assert!(under.len() * 8 > 1000, "{} m of it under the ground", under.len() * 8);
+        for p in &under {
+            assert!(w.terrain(p[0], p[1]) - p[2] >= 7.5, "deep enough at {p:?}");
+        }
+        // It starts and ends down a hole.
+        let holes = l.path.iter().filter(|p| w.hole(p[0], p[1])).count();
+        assert!(holes >= 6, "{holes} waypoints in the trenches");
+    }
+    // Every hole is a trench's: lined by walls, a ramp in it.
+    let mut cells = 0;
+    for cy in 0..crate::world::CELLS {
+        for cx in 0..crate::world::CELLS {
+            if w.hole_cell(cx, cy) {
+                cells += 1;
+                let (x, y) = ((cx as f32 + 0.5) * 4.0, (cy as f32 + 0.5) * 4.0);
+                let floor = w.ground(x, y, w.terrain(x, y) + 1.0, 1.5);
+                assert!(floor > w.terrain(x, y) - 14.0, "a ramp under the hole at ({x}, {y})");
+            }
+        }
+    }
+    assert_eq!(cells, 6 * 20, "two cells across, ten along, two mouths a sector");
+    let _ = Kind::Shield;
+}
+
+#[test]
+fn landing_spawn_rooms_shield_their_own() {
+    use crate::world::Kind;
+    let w = kiln();
+    for (i, s) in w.sites().iter().enumerate().filter(|(_, s)| s.kind == SiteKind::Landing) {
+        let shields: Vec<_> = w.boxes().iter().filter(|b| b.kind == Kind::Shield && (b.center[0] - s.center[0]).abs().max((b.center[1] - s.center[1]).abs()) < 80.0).collect();
+        assert_eq!(shields.len(), 2, "two doors at Landing {i}");
+        for b in shields {
+            assert_eq!(b.pass, s.sector, "its faction's");
+            // Through the door from outside: its faction in, the others not.
+            let out = b.world_dir([1.0, 0.0]);
+            let n = if b.half[0] < b.half[1] { out } else { b.world_dir([0.0, 1.0]) };
+            for f in 0..3u8 {
+                let start = [b.center[0] + n[0] * 4.0, b.center[1] + n[1] * 4.0];
+                let mut m = MoveState::standing(&w, start);
+                for _ in 0..60 {
+                    m = step(&w, m, Input { move_x: (-n[0] * 127.0) as i8, move_y: (-n[1] * 127.0) as i8, ..Default::default() }, f);
+                }
+                let through = (m.pos[0] - b.center[0]) * n[0] + (m.pos[1] - b.center[1]) * n[1] < -1.0;
+                assert_eq!(through, f == s.sector, "faction {f} at Landing {i}'s door: {m:?}");
+            }
+        }
+    }
 }

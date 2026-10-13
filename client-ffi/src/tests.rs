@@ -511,3 +511,31 @@ fn put_text_for_tests(s: &str, buf: &mut [u8]) -> i32 {
     crate::api::tests_set_error(e.to_str().unwrap());
     unsafe { lt_last_error(buf.as_mut_ptr(), buf.len() as i32) }
 }
+
+#[test]
+fn the_kit_world_has_its_turned_boxes_volumes_and_holes() {
+    use lattice_game::kit;
+    unsafe {
+        let w = lt_world_new(kit::KIT);
+        let mut info = LtWorldInfo::default();
+        lt_world_info(w, &mut info);
+        assert_eq!(info.volumes, 3, "a lift, a drop shaft, a spring");
+        assert_eq!(info.holes, 24, "two trenches, two cells across and six along");
+        let mut vols = vec![LtVolume::default(); info.volumes as usize];
+        assert_eq!(lt_world_volumes(w, vols.as_mut_ptr(), info.volumes as i32), 3);
+        assert_eq!(vols[0].force, lattice_game::world::Force::Lift as u8);
+        assert!(vols[1].vel.z < 0.0);
+        let mut boxes = vec![LtBox::default(); info.boxes as usize];
+        lt_world_boxes(w, boxes.as_mut_ptr(), info.boxes as i32);
+        let turned = boxes[0];
+        assert!((turned.axis_x - 30f32.to_radians().cos()).abs() < 1e-6 && turned.half_along == 10.0, "{turned:?}");
+        assert!(boxes.iter().any(|b| b.low != b.max.z), "a wedge");
+        assert!(boxes.iter().any(|b| b.pass != lattice_game::world::SOLID && b.kind == lattice_game::world::Kind::Shield as u8), "a shield");
+        // The first trench's cells, as holes; beside them, none.
+        let (cx, cy) = ((kit::TUNNEL_IN.0 / 4.0) as i32, (996.0 / 4.0) as i32);
+        let mut cells = [0u8; 8];
+        assert_eq!(lt_world_holes(w, cx - 1, cy - 1, 4, 2, cells.as_mut_ptr()), 8);
+        assert_eq!(cells, [0, 0, 0, 0, 0, 1, 1, 1], "row cy-1: none; row cy: from cx");
+        lt_world_free(w);
+    }
+}

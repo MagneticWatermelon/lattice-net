@@ -17,7 +17,7 @@ Numbers marked as existing come from the code (`game/`, `client-core/`, `sim/`) 
 3. **The Unity project lives on the Windows side, in its own repository.** This repo builds the plugin and the generated C# bindings, then copies them over. (§18)
 4. **Bring the Unity client to the Bevy client's level (U0–U2) before vehicles (M4).** (§20)
 5. **Continents are authored in Unity and exported as a continent package** that both the server and the client load. The procedural world becomes the first package. (§16)
-6. **Collision grows before the first authored base:** ceilings, rotated boxes, ramps and faction shields. (§6.1)
+6. **Collision grows before the first authored base:** ceilings, rotated boxes, ramps and faction shields (built: C1, with holes and force volumes, §6.1).
 7. **An original setting:** the planet Tessel, its lattice, and three factions (the Ordinate, the Free Compact, the Resonance). (§2)
 8. **Six classes, sidegrade progression, and one resource (Mass).** (§4, §8)
 9. **Lattice transit time** stops cross-map redeploys. Factions are capped per continent, and surges lock continents. (§3)
@@ -195,10 +195,11 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 | crouch (while `BUTTON_CROUCH` is held; exists since 2026-10-12) | 3 m/s; height 1.2 m, eyes at 1.15 m; no sprint or jump; the cone ×0.75 |
 
 - Movement is deterministic. Prediction matches the server bit for bit, and it's checked (exists).
-- Crouched, a player passes under cover whose underside is above 1.2 m. Standing up there pushes them out of it, as walking into it would: there are no ceilings yet; with them (C1) standing up needs headroom.
+- Crouched, a player passes under cover whose underside is above 1.2 m, and stays crouched there until there's room to stand (C1, exists since 2026-10-13).
+- **Ceilings** (C1, exists): a jump stops at a box's underside; a walk won't step up under one too low (the head's height over the new ground); under the terrain's surface (in a tunnel) the surface is a ceiling too.
+- **Force volumes** (K1, exists): a lift carries up at its speed (30 m/s² to it; tall lifts 30 m/s, short ones 20, slowing to 4 m/s over their last stretch so riders bob over the top and step off); a drop shaft slows a fall to 6 m/s; a spring throws whoever stands on it. The stick steers in all of them as in the air.
 - **Proposed additions,** each a change to `movement.rs` and predicted like the rest:
   - **fall damage** past 8 m;
-  - **ceilings:** jumping into one stops you, which interiors need;
   - **jump jets** for the Skirmisher: fuel-limited vertical thrust;
   - **an Exo body:** radius 0.6 m, height 2.4 m, 4 m/s.
 - **Not proposed:** prone (it breaks hitboxes and crowds), mantling (later, if levels want it), slides.
@@ -307,17 +308,17 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 
 Everything that blocks movement or shots must exist in the shared world (`game/src/world.rs`): the server simulates against it, and the client predicts with it.
 
-**Today (exists):** a heightmap (4 m samples, heights in cm) and axis-aligned boxes. A box's top can be stood on, and its body blocks only between its bottom and its top. So:
-- **It works today:** walls, crates, stacked containers, multi-floor buildings made of thin floor slabs and thin walls, and stairs made of boxes with risers of 0.4 m or less.
-- **It doesn't work yet:**
-  - buildings turned other than by quarter turns;
-  - ramps;
-  - ceilings: jumping into a slab pushes you sideways instead of stopping you;
-  - shields that block only one faction;
-  - doors.
+**Today (exists):** a heightmap (4 m samples, heights in cm), with holes, and boxes. A box's top can be stood on, and its body blocks only between its bottom and its top. **C1 (exists since 2026-10-13, K1):**
+- **boxes turned** about the vertical (`CoverBox::turned`: an axis, half-sizes along and across it);
+- **wedges** (`CoverBox::wedge`): a box whose top rises evenly along its axis, walked up like the ground (ramps; authors keep them under 45°);
+- **ceilings:** an underside stops a jump, a walk up under one too low, and standing up (§4.1);
+- **shields** (`CoverBox::shield`, `Kind::Shield`): block every faction's movement, shots and sight but their own, and are never stood on. Static for now (a Landing's spawn room is its sector's faction's); owned by a site's holder with U5;
+- **holes in the heightmap** (a bit per 4 m cell): the terrain is a shell open at its holes. Over a hole there's no ground; under the surface (feet more than 2 m below it) the surface is a ceiling and boxes are the floor, and moving under it is only from under it or from a hole, with room for the body. Shots cross the surface only through holes. Every hole's edges must be lined with walls below the surface (or the void under it shows);
+- **force volumes** (`Volume`: lifts, drop shafts, springs; §4.1).
+
+All of it in `movement.rs` and `hit.rs`, deterministic and checked Linux against Windows (`scripts/determinism.sh` on the kit's test level, `lattice_game::kit`, and on Kiln), tested against shots, sight and tracers too. Walls, crates, buildings, stairs, ramps, interiors with ceilings, tunnels, shielded doors and lifts all work. **It doesn't work yet:** doors that open; a spawn room's shields changing hands (U5); timed volumes (K4's clockwork).
 
 **Next steps:**
-- **C1 (proposed, before the first authored base):** ceilings, boxes rotated about the vertical axis, wedges (ramps) and faction-filtered shield volumes. All of them deterministic, and all tested against shots too.
 - **C2 (only if needed):** convex hulls or static triangle meshes, behind a deterministic BVH.
 
 ### 6.2 Dimensions from the game's constants
@@ -723,11 +724,11 @@ continent package (.lcp) ----> the server:        World::load(package)
 
 - **The package holds what the game needs, nothing visual:**
   - heights: u16 cm on the 4 m grid, maybe 2 m later;
-  - collision primitives: boxes now, rotated boxes and wedges with C1;
+  - collision primitives: boxes, turned boxes, wedges and shields (C1), holes, force volumes;
   - gameplay markup: sites, control points, spawn rooms and spawn spots, terminals, vehicle pads, shield volumes, Landings, lanes, region borders, no-deploy zones.
 - **Designers mark gameplay objects in Unity** with components (`LatticeCollider`, `ControlPoint`, `SpawnRoom`, and so on).
 - **The exporter refuses to export a broken map.** It checks:
-  - that boxes are axis-aligned, until C1;
+  - that ramps are walkable (wedges under 45°) and every hole's edge is walled;
   - §6.2's dimensions;
   - reachability: every control point can be reached from every spawn room.
 - **The procedural world becomes a package too.** `world.rs` writes Harrow v0 as one, so the server and the client load every continent the same way.
@@ -801,7 +802,7 @@ continent package (.lcp) ----> the server:        World::load(package)
 | **U6: classes** (crouch and the rifle's rounds built, 2026-10-12) | the six classes, their tools and abilities. Built: crouch (Ctrl held, C toggled; the view eases down; soldiers kneel or crouch-walk, the crowd from baked crouched poses) and the rifle's rounds (a first-person reload that swaps its ammo cell, timed by the predicted reload; the HUD's rounds; handling sounds, near soldiers' reloads heard) | crouched heads drawn on their hitbox; prediction exact. **Measured:** a crouched fight (`--autotarget --crouch`, 1,000 bots): 0 corrections, 0 ammo corrections, 6 reloads; frame p99 4.7 ms, no managed allocations |
 | **U7: vehicles** (M4) | ground, then air | |
 | **U8: the first authored continent** | the exporter and package; *proposed* ([docs/kiln.md](kiln.md)): prove them on Kiln's blockout rather than rebuilding Harrow by hand (it stays procedural) | |
-| **Kiln** ([docs/kiln.md](kiln.md): K0 blockout, K1 collision kit, K2 great sites, K3 bases and tunnels, K4 the living world, K5 art) | **K0 built** (2026-10-13): the whole continent in rough shapes, generated (`game/src/kiln/`), every site as boxes, 114 lanes | **K0 met:** every route walked end to end by the game's movement (312 walks) and by 228 bots over the server, 0 corrections; Landing to the Hollow 3 lanes and ~353 s in every sector (within 0.2%), every kind of site within 8.8% of the same walk from its Landing |
+| **Kiln** ([docs/kiln.md](kiln.md): K0 blockout, K1 collision kit, K2 great sites, K3 bases and tunnels, K4 the living world, K5 art) | **K0 and K1 built** (2026-10-13): the whole continent in rough shapes, generated (`game/src/kiln/`), every site as boxes, 117 lanes; C1, holes and force volumes, used by Kiln (square decks, lifts and drop shafts, a tunnel a sector, shielded spawn rooms) | **K0 met:** every route walked end to end by the game's movement and by bots over the server, 0 corrections; Landing to the Hollow ~353 s in every sector (within 0.2%), every kind of site within 7.2% of the same walk from its Landing. **K1 met:** `scripts/determinism.sh` agrees Linux/Windows on the kit's level and on Kiln, both with tunnels, lifts and vents |
 | after that | squads, platoons and outfits; progression; surges and rotation; more continents | |
 
 **Recommended order change: build U0–U2 before M4.** Vehicles need a client, and building them in Bevy first would be thrown away.
@@ -812,7 +813,7 @@ continent package (.lcp) ----> the server:        World::load(package)
 |---|---|---|
 | U0–U3 | none | none |
 | U4 | the deploy flow (no body until deployed), death recap, reward events, a continent-wide fight list every 5 s | Deploy (C→S reliable); Recap, Reward, Fights (S→C) |
-| U5 | territory: sites, capture, lanes, spawn rooms, Landings; collision C1 (ceilings, rotated boxes, wedges, faction shields) | Territory (reliable: the full state at join, then changes); site state for nearby sites at 1–2 Hz |
+| U5 | territory: sites, capture, lanes, spawn rooms, Landings; shields owned by their site's holder (C1's shields exist, static) | Territory (reliable: the full state at join, then changes); site state for nearby sites at 1–2 Hz |
 | U6 | classes and loadouts; crouch (built); ammo and reloads (built for the rifle); jump jets; Exo bodies; cloak in interest; healing and revives; deployables (proximity checks on the shared grid); spotting; appearance | more input buttons and a weapon slot (+1 B per input); wider near and far flags; appearance records for entities entering a client's near or mid set; deployables (reliable, static); the spotted list |
 | U7 | vehicles (M4): physics, seats, interest by size, faster far updates for aircraft | vehicle states, seat changes |
 | U8 | continent packages | Welcome v2: continent id and content hash |

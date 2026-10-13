@@ -944,7 +944,7 @@ impl InputQueue {
             self.starved_run = 0;
             (input, Step::Applied)
         } else if self.last_seq == 0 {
-            body.state = step(world, body.state, Input::default()); // (dead or not, it stands)
+            body.state = step(world, body.state, Input::default(), faction(e)); // (dead or not, it stands)
             return Step::Waiting;
         } else {
             // The input for `next` is late or lost: a stand-in takes its seq, and
@@ -960,7 +960,7 @@ impl InputQueue {
         // down, then a shot in this input (in `fire`), then its reload button.
         self.ammo.tick();
         let before = body.state;
-        body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input });
+        body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input }, faction(e));
         self.steps[next as usize % STEP_RING] = (next, step_no, before, body.state);
         // A body keeps the aim it died with: the dead player's own camera
         // still turns (on its client), but a corpse doesn't spin for others.
@@ -1018,7 +1018,7 @@ fn in_sight(world: &World, history: &History, shooter: u16, target: u16) -> bool
     let eye = if a.crouched { weapon::CROUCH_EYE_HEIGHT } else { weapon::EYE_HEIGHT };
     let chest = lattice_game::hit::chest(b.crouched);
     let (p0, p1) = ([a.pos[0], a.pos[1], a.pos[2] + eye], [b.pos[0], b.pos[1], b.pos[2] + chest]);
-    lattice_game::hit::line_clear(world, p0, p1)
+    lattice_game::hit::line_clear(world, p0, p1, faction(shooter))
 }
 
 /// A projectile that ended this tick: where it was in the list, how, and
@@ -1639,9 +1639,9 @@ impl SimServer {
         // Most ticks of a spread-out crowd push nobody: skip the second pass.
         if pushed > 0 {
             let world = &*self.world;
-            self.bodies.par_iter_mut().zip(self.pushes.par_iter()).with_min_len(256).for_each(|(b, &push)| {
+            self.bodies.par_iter_mut().zip(self.pushes.par_iter()).enumerate().with_min_len(256).for_each(|(e, (b, &push))| {
                 if b.alive && push != [0.0; 2] {
-                    b.state = movement::nudge(world, b.state, push);
+                    b.state = movement::nudge(world, b.state, push, faction(e as u16));
                     b.pushes = b.pushes.wrapping_add(1);
                 }
             });

@@ -15,14 +15,17 @@
 //! Everything a sector has is laid out once, in the sector's own frame
 //! (`Frame`: its axis along +x, the rift on its counterclockwise side at
 //! +60 degrees), and turned into place, so the sectors are the same but for
-//! their outer biomes. Bridges and decks are axis-aligned boxes (until C1's
-//! rotated boxes), so they run east-west or north-south, whichever crosses
-//! their rift squarer.
+//! their outer biomes. Bridges and decks are turned boxes (C1), square to
+//! their rift.
 //!
-//! What K0 leaves out (docs/kiln.md, build plan): tunnels and caves (heightmap
-//! holes and ceilings, K1), lifts, vent lifts, drop shafts and lattice
-//! springs (force volumes, K1): every climb here is a ramp or a short stair.
-//! The living world (K4) and art (K5).
+//! K1 (the collision kit): lifts carry players to the Heartwell's gallery,
+//! the Geodes' crests, the Spans' decks from their pylons, the rift ledges'
+//! rims and the Vent outposts' ledges, with drop shafts beside them for the
+//! way down; each sector's two Tunnel mouths are joined by a tube under the
+//! ground, down ramps through holes in it; each Landing's spawn room has
+//! doorways shielded for its faction. What's still to come (docs/kiln.md,
+//! build plan): the great sites in graybox (K2), the bases, outposts and the
+//! rest of the Undervein (K3), the living world (K4) and art (K5).
 //!
 //! Generation uses f64 arithmetic and `libm` only (no platform math), in a
 //! fixed order, so every machine builds the same bits.
@@ -31,7 +34,7 @@ mod build;
 mod land;
 mod lanes;
 
-use crate::world::{Continent, CoverBox, Lane, Parts, Point, Site, SiteKind, World, KILN, NO_SECTOR, TERRAIN_N, TERRAIN_RES};
+use crate::world::{Continent, CoverBox, Lane, Parts, Point, Site, SiteKind, Volume, World, KILN, NO_SECTOR, TERRAIN_N, TERRAIN_RES};
 
 pub use land::{CROWN, DECK, HOLLOW_FLOOR, MESA_FLATS, PLAIN, RIM_TOP, SALT};
 
@@ -211,17 +214,16 @@ impl Rift {
         add(CENTER, add(scale(self.dir, along), scale(self.normal, across)))
     }
 
-    /// The axis-aligned direction that crosses it squarest (toward sector
-    /// `j + 1`), and how much longer a crossing that way is than a square one.
+    /// The direction that crosses it square (toward sector `j + 1`): its
+    /// normal, now that decks can be turned (C1); and how much longer a
+    /// crossing that way is than a square one (none).
     pub fn crossing(&self) -> ([f64; 2], f64) {
-        let cands = [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
-        let best = cands.iter().copied().fold(cands[0], |b, c| if dot(c, self.normal) > dot(b, self.normal) + 1e-9 { c } else { b });
-        (best, 1.0 / dot(best, self.normal))
+        (self.normal, 1.0)
     }
 
-    /// The points where an axis-aligned crossing centered on the axis at
-    /// `along` meets its banks `out` m beyond its floor's edge: (on sector
-    /// `j`'s side, on sector `j + 1`'s).
+    /// The points where a crossing centered on the axis at `along` meets its
+    /// banks `out` m beyond its floor's edge: (on sector `j`'s side, on
+    /// sector `j + 1`'s).
     pub fn crossing_ends(&self, along: f64, out: f64) -> ([f64; 2], [f64; 2]) {
         let (c, stretch) = self.crossing();
         let t = (Self::half_width(along) + out) * stretch;
@@ -335,7 +337,7 @@ pub(crate) fn plan_sites() -> Vec<Plan> {
             sites.push(plan(kind, f.polar(r, deg), 30.0));
         }
         // The Span: its bridgeheads' plateaus (90 m squares at the rift's
-        // edge, along its axis-aligned crossing), and the floor under its deck.
+        // edge, along its crossing), and the floor under its deck.
         let (cross, _) = ccw.crossing();
         let (near, far) = ccw.crossing_ends(SPAN_ALONG, 6.0);
         sites[s::SPAN].anchors = vec![sub(near, scale(cross, 45.0)), add(far, scale(cross, 45.0)), ccw.at(SPAN_ALONG, 0.0)];
@@ -367,6 +369,14 @@ pub(crate) struct Kiln {
     pub mesas: Vec<([f64; 2], f64)>,
     /// Every lane's path in plan (world xy), for keeping mesas and boxes clear.
     pub corridors: Vec<Vec<[f64; 2]>>,
+    /// Holes in the terrain, a bit per height cell (`World`'s layout).
+    pub holes: Vec<u64>,
+    /// Lifts, drop shafts and springs.
+    pub volumes: Vec<Volume>,
+    /// The Tunnel mouths' chambers, and the tunnels' lanes (kept apart from
+    /// the rest: nothing on the ground over them is cleared for them).
+    pub chambers: Vec<build::Chamber>,
+    pub tunnels: Vec<lanes::Route>,
 }
 
 /// A road or a ramp is here.
@@ -447,6 +457,10 @@ pub(crate) fn build_kiln() -> Kiln {
         internal: Vec::new(),
         mesas: Vec::new(),
         corridors: Vec::new(),
+        holes: Vec::new(),
+        volumes: Vec::new(),
+        chambers: Vec::new(),
+        tunnels: Vec::new(),
     };
     tick("base");
     // Where the lanes will run, before anything is placed beside them.
@@ -468,12 +482,19 @@ pub(crate) fn build_kiln() -> Kiln {
     build::hollow(&mut kiln); tick("build::hollow");
     let decks = lanes::stamp(&mut kiln, &routes); tick("lanes::stamp");
     build::sites(&mut kiln); tick("build::sites");
+    build::tunnels(&mut kiln); tick("build::tunnels");
     build::scatter(&mut kiln); tick("build::scatter");
-    let paths: Vec<Vec<[f64; 2]>> =
-        routes.iter().chain(kiln.internal.iter()).map(|r| r.legs.iter().flat_map(|l| l.path.iter().copied()).collect()).collect();
+    // (A tunnel's lane only on the surface: to its mouths.)
+    let paths: Vec<Vec<[f64; 2]>> = routes
+        .iter()
+        .chain(kiln.internal.iter())
+        .map(|r| r.legs.iter().flat_map(|l| l.path.iter().copied()).collect())
+        .chain(kiln.tunnels.iter().flat_map(|r| [r.legs[0].path.clone(), r.legs[2].path.clone()]))
+        .collect();
     build::clear_lanes(&mut kiln, &paths); tick("build::clear_lanes");
     land::ground(&mut kiln); tick("land::ground");
     let mut all = lanes::finish(&kiln, &routes, &decks);
+    all.extend(lanes::finish(&kiln, &kiln.tunnels, &[]));
     all.extend(lanes::finish(&kiln, &kiln.internal, &[]));
     kiln.lanes = all;
     kiln
@@ -512,6 +533,8 @@ impl Kiln {
         ground: kiln.ground,
         lanes: kiln.lanes,
         points: kiln.points,
+        holes: kiln.holes,
+        volumes: kiln.volumes,
     })
     }
 }
