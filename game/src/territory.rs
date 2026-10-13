@@ -53,6 +53,38 @@ pub const FULL: u32 = 255 << 10;
 pub const POINT_RADIUS: f32 = 8.0;
 pub const POINT_HEIGHT: f32 = 4.0;
 
+/// Whether a site of this kind is spawned at (it has a spawn room): the
+/// Landings, the bases, the great sites (GDD §3.4).
+pub fn spawns_at(kind: SiteKind) -> bool {
+    kind == SiteKind::Landing || kind == SiteKind::Hollow || kind.base() || kind.major()
+}
+
+/// Where at each site someone spawning there stands (U4's deploy screen
+/// will pick the site; the server's `--spawn sites` does now): its routes'
+/// waypoints on the ground within it, near its center first (empty for a
+/// site no one spawns at).
+pub fn spawn_points(w: &World) -> Vec<Vec<[f32; 2]>> {
+    w.sites()
+        .iter()
+        .map(|s| {
+            if !spawns_at(s.kind) {
+                return Vec::new();
+            }
+            let mut v: Vec<(f32, [f32; 2])> = w
+                .lanes()
+                .iter()
+                .flat_map(|l| l.path.iter())
+                .map(|p| (((p[0] - s.center[0]) * (p[0] - s.center[0]) + (p[1] - s.center[1]) * (p[1] - s.center[1])).sqrt(), p))
+                .filter(|(d, p)| *d <= s.half.min(120.0) && (p[2] - w.terrain(p[0], p[1])).abs() < 1.0)
+                .map(|(d, p)| (d, [p[0], p[1]]))
+                .collect();
+            v.sort_by(|a, b| a.0.total_cmp(&b.0));
+            v.dedup_by(|a, b| (a.1[0] - b.1[0]).abs() < 4.0 && (a.1[1] - b.1[1]).abs() < 4.0);
+            v.into_iter().take(24).map(|(_, p)| p).collect()
+        })
+        .collect()
+}
+
 /// Seconds to flip a site, uncontested (GDD §3.3).
 pub fn flip_secs(kind: SiteKind) -> u32 {
     match kind {

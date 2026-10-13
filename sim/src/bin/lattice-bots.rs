@@ -54,6 +54,10 @@ lattice-bots: M1 bot swarm
   --seed N             [1]
   --world W            build this world before the bots join (kiln, kit, harrow or a seed), so
                        their first Welcome doesn't stall a thread building it
+  --capture            each bot takes sites: to the nearest few its faction may attack
+                       or must defend, by the world's routes, and holds a point there
+                       (with lattice-server --spawn sites); the summary lists fight
+                       sizes by kind of site (needs --world)
   --run-lanes          each bot walks the lane the server spawned it at an end of
                        (lattice-server --spawn lanes), sprinting, and reports its time:
                        the summary lists lanes walked and Kiln's fairness (docs/kiln.md, K0)
@@ -115,6 +119,8 @@ struct Totals {
     class_n: [u64; 3],
     /// Lane walkers (`--run-lanes`): (lane, backward, seconds once walked).
     lanes: Vec<(u16, bool, Option<f32>)>,
+    /// Bots in each site now (alive, within it).
+    sites: Vec<u32>,
     class_rtt: [f64; 3],
     /// Tracked bots: others' shots seen as tracers, and distant fights' cell
     /// entries, the shots they counted and the ambient shots made.
@@ -127,6 +133,12 @@ struct Totals {
 impl Totals {
     fn add(&mut self, o: &Totals) {
         self.lanes.extend_from_slice(&o.lanes);
+        if self.sites.len() < o.sites.len() {
+            self.sites.resize(o.sites.len(), 0);
+        }
+        for (a, b) in self.sites.iter_mut().zip(&o.sites) {
+            *a += b;
+        }
         self.started += o.started;
         self.connected += o.connected;
         self.welcomed += o.welcomed;
@@ -275,6 +287,8 @@ struct Bot {
     port: Option<u16>,
     /// Walks a lane (`--run-lanes`).
     run_lanes: bool,
+    /// Takes sites (`--capture`).
+    capture: bool,
     /// Near (least, most) and mid render delays.
     delays: (Duration, Duration, Duration),
     /// Bound up front, before the clock starts: creating thousands of sockets
@@ -313,6 +327,7 @@ impl Bot {
             brain.set_trigger(self.trigger);
             brain.set_fight(self.fight);
             brain.set_run_lanes(self.run_lanes);
+            brain.set_capture(self.capture);
             self.brain = Some(brain);
         }
         let (sock, client) = self.net.as_mut().unwrap();
@@ -377,6 +392,12 @@ impl Bot {
         let Some(brain) = &self.brain else { return };
         if let Some(l) = brain.lane_result() {
             t.lanes.push(l);
+        }
+        if let Some(s) = brain.site_now() {
+            if t.sites.len() <= s {
+                t.sites.resize(s + 1, 0);
+            }
+            t.sites[s] += 1;
         }
         t.started += 1;
         t.failed += self.failed as u64;
@@ -493,6 +514,7 @@ fn main() -> std::io::Result<()> {
     let key: HexKey = a.get("token-key", HexKey::default());
     let summary_path: Option<String> = a.opt("summary");
     let run_lanes = a.flag("run-lanes");
+    let capture = a.flag("capture");
     // Built once here, shared by every bot (the cache keeps it while we hold it).
     let world = a.opt::<String>("world").map(|w| {
         let id = match w.as_str() {
@@ -552,6 +574,7 @@ fn main() -> std::io::Result<()> {
                 trigger: ((i * 37) % 100) < (fire_share * 100.0).round() as usize,
                 fight: (fight_every > 0 && i % fight_every == 0).then_some(FightConfig { aim_error, ..FightConfig::default() }),
                 run_lanes,
+                capture,
                 class: class_of(i),
                 port: port_of(i),
                 sock: sockets[i].take(),
@@ -676,10 +699,21 @@ fn main() -> std::io::Result<()> {
     let mut all_joins = Vec::new();
     let mut all_latency = Latency::new();
     let mut last = start;
+    // Fight sizes: per site, the most bots in it at once, and the sum and
+    // count of the samples it had any.
+    let mut fights: Vec<(u32, u64, u64)> = Vec::new();
     while Instant::now() < end {
         std::thread::sleep(report.min(end.saturating_duration_since(Instant::now())));
         let now = Instant::now();
         let (cur, mut joins, latency) = snapshot(&shared);
+        if fights.len() < cur.sites.len() {
+            fights.resize(cur.sites.len(), (0, 0, 0));
+        }
+        for (f, &n) in fights.iter_mut().zip(&cur.sites) {
+            if n > 0 {
+                *f = (f.0.max(n), f.1 + n as u64, f.2 + 1);
+            }
+        }
         print_window(now - start, (now - last).as_secs_f64(), &cur, &prev, &mut joins, &latency);
         all_joins.extend(joins);
         all_latency.merge(&latency);
@@ -696,27 +730,58 @@ fn main() -> std::io::Result<()> {
         summary_values(&total, duration.as_secs_f64(), &mut all_joins.clone(), &all_latency).write(&path)?;
     }
     print_summary(&total, duration.as_secs_f64(), &mut all_joins, &all_latency);
+    if !fights.is_empty() {
+        print_fights(&fights, world.as_deref(), duration.as_secs_f64());
+    }
     if run_lanes {
         print_lanes(&total, world.as_deref());
     }
     Ok(())
 }
 
+/// Fight sizes (Kiln's K3: "measure fight sizes at several populations"):
+/// by kind of site, the busiest moment at each (the median and the most
+/// over the sites of that kind) and how many were there on average while
+/// anyone was.
+fn print_fights(fights: &[(u32, u64, u64)], world: Option<&lattice_game::world::World>, secs: f64) {
+    let Some(world) = world else { return };
+    println!("\n== fight sizes (bots in a site, sampled each report over {secs:.0} s) ==");
+    let mut kinds: Vec<lattice_game::world::SiteKind> = world.sites().iter().map(|s| s.kind).collect();
+    kinds.sort_by_key(|k| *k as u8);
+    kinds.dedup();
+    for kind in kinds {
+        let at: Vec<&(u32, u64, u64)> = world.sites().iter().zip(fights.iter().chain(std::iter::repeat(&(0, 0, 0)))).filter(|(s, _)| s.kind == kind).map(|(_, f)| f).collect();
+        let mut peaks: Vec<u32> = at.iter().map(|f| f.0).collect();
+        peaks.sort_unstable();
+        let (sum, n) = at.iter().fold((0u64, 0u64), |(s, n), f| (s + f.1, n + f.2));
+        let busy = at.iter().filter(|f| f.0 > 0).count();
+        println!(
+            "  {kind:?}: {} sites, {busy} with anyone; most at once median {} max {}; {:.1} on average while anyone was",
+            at.len(),
+            peaks[peaks.len() / 2],
+            peaks.last().copied().unwrap_or(0),
+            if n > 0 { sum as f64 / n as f64 } else { 0.0 }
+        );
+    }
+}
+
 /// The lane walkers' results: every lane walked both ways, and how fair
 /// the times make Kiln (its Landings' walks to the Hollow, each kind of
 /// site's walk from its Landing, sector by sector).
 fn print_lanes(t: &Totals, world: Option<&lattice_game::world::World>) {
-    let walked = t.lanes.iter().filter(|l| l.2.is_some()).count();
+    // (A one-way lane, up a lift or down a drop shaft, isn't walked backward.)
+    let one_way = |lane: u16| world.and_then(|w| w.lanes().get(lane as usize)).is_some_and(|l| l.one_way);
+    let walks: Vec<&(u16, bool, Option<f32>)> = t.lanes.iter().filter(|l| !(l.1 && one_way(l.0))).collect();
+    let walked = walks.iter().filter(|l| l.2.is_some()).count();
     println!("\n== lanes ==");
-    println!("  walkers {} walked their lane {} ", t.lanes.len(), walked);
-    for &(lane, back, secs) in &t.lanes {
+    println!("  walkers {} walked their lane {walked} (of {} walks a lane goes)", t.lanes.len(), walks.len());
+    for &&(lane, back, secs) in &walks {
         if secs.is_none() {
             println!("  lane {lane} {}: not walked", if back { "backward" } else { "forward" });
         }
     }
     let Some(world) = world else { return };
-    let lanes = world.lanes().iter().filter(|l| l.a != l.b).count();
-    println!("  of the world's {lanes} lanes x 2 ways: {} walked", walked);
+    println!("  of the world's {} lanes", world.lanes().iter().filter(|l| l.a != l.b).count());
     if world.continent != lattice_game::world::Continent::Kiln {
         return;
     }

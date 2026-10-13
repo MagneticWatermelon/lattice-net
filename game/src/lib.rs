@@ -14,6 +14,7 @@ pub mod hit;
 pub mod kiln;
 pub mod kit;
 pub mod movement;
+pub mod nav;
 pub mod reach;
 pub mod msg;
 pub mod territory;

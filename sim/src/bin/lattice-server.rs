@@ -35,8 +35,11 @@ const USAGE: &str = "\
 lattice-server: M1 movement-only authoritative server
 
   --bind ADDR          [0.0.0.0:40000]
-  --spawn MODE         uniform | hotspots | blob | line:<meters> | disk:<meters>   [uniform]
+  --spawn MODE         uniform | hotspots | blob | lanes | sites | line:<meters> | disk:<meters>   [uniform]
                        disk: everyone in one disk of that radius (the density limit)
+                       sites: at a held site on its faction's front, then after each
+                       death at the held site nearest where it died (for
+                       lattice-bots --capture)
   --max-clients N      [10000]
   --near-radius M      near tier: 30 Hz, accumulator [150]
   --near-per-tick N    near entities sent per client per tick [64]
@@ -1216,6 +1219,7 @@ fn summary_values(
     kv.put("despawns", c.despawns);
     kv.put("deaths", c.deaths);
     kv.put("respawns", c.respawns);
+    kv.put("site_flips", c.site_flips);
     for (k, v) in [
         ("shots", c.shots),
         ("shots_late", c.shots_late),
@@ -1473,12 +1477,13 @@ fn print_summary(
         println!("  {:<10} {:>8} {:>8} {:>8}", col_name(i), ms(s.p50), ms(s.p99), ms(s.max));
     }
     println!(
-        "  overruns {over} | spawns {} despawns {} ({} joins deferred) | deaths {} respawns {} | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
+        "  overruns {over} | spawns {} despawns {} ({} joins deferred) | deaths {} respawns {} | sites taken {} | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
         c.spawns,
         c.despawns,
         sim.net().deferred_accepts(),
         c.deaths,
         c.respawns,
+        c.site_flips,
         c.repeated,
         c.frozen,
         c.late_inputs,

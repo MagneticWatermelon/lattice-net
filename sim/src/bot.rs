@@ -2,7 +2,11 @@
 //! a wander AI instead of a keyboard. Transport-agnostic: feed it the messages
 //! a `lattice_net::Client` delivers and send the input batches it returns.
 
+use std::sync::Arc;
 use std::time::Instant;
+
+use lattice_game::nav::Nav;
+use lattice_game::territory::{self, Territory};
 
 pub use lattice_client_core::{ClientConfig, ClientCore, ClientStats, Entities, InputTiming};
 
@@ -25,6 +29,8 @@ pub struct BotBrain {
     reload_once: bool,
     /// Walks the lane it was spawned at an end of (`set_run_lanes`).
     run_lanes: bool,
+    /// Takes sites (`set_capture`).
+    campaign: Option<Campaign>,
     seed: u64,
 }
 
@@ -50,7 +56,7 @@ impl BotBrain {
     }
 
     pub fn with_config(seed: u64, cfg: ClientConfig) -> Self {
-        Self { core: ClientCore::new(cfg), ai: Wander::new(seed), trigger: false, fighter: None, ads: false, reload_once: false, run_lanes: false, seed }
+        Self { core: ClientCore::new(cfg), ai: Wander::new(seed), trigger: false, fighter: None, ads: false, reload_once: false, run_lanes: false, campaign: None, seed }
     }
 
     /// Fights: aims at the nearest enemy it draws and fires in bursts. It
@@ -86,6 +92,31 @@ impl BotBrain {
     /// at (`lattice-server --spawn lanes`).
     pub fn set_run_lanes(&mut self, on: bool) {
         self.run_lanes = on;
+    }
+
+    /// Takes sites (K3, with `lattice-server --spawn sites`): goes to the
+    /// nearest few its faction may attack or must defend, by the world's
+    /// routes (`lattice_game::nav`), and holds a point there.
+    pub fn set_capture(&mut self, on: bool) {
+        self.campaign = on.then(|| Campaign::new(self.seed));
+    }
+
+    /// The site it's in now (within its half size and 20 m), alive.
+    pub fn site_now(&self) -> Option<usize> {
+        let world = self.core.world()?;
+        if self.core.welcome().is_none() || self.core.is_dead() {
+            return None;
+        }
+        let s = self.core.predicted();
+        world.sites().iter().position(|site| {
+            let (dx, dy) = (site.center[0] - s.pos[0], site.center[1] - s.pos[1]);
+            dx * dx + dy * dy <= (site.half + 20.0) * (site.half + 20.0)
+        })
+    }
+
+    /// The site it's going to take or keep, if it takes sites.
+    pub fn objective(&self) -> Option<usize> {
+        self.campaign.as_ref().and_then(|c| c.site)
     }
 
     /// The lane it walks, which way, and how long it took (s) once there.
@@ -180,9 +211,19 @@ impl BotBrain {
             }
         }
         let world = self.core.world().cloned();
+        if let (Some(c), Some(world), Some(t)) = (&mut self.campaign, &world, self.core.territory()) {
+            c.plan(world, t, self.core.predicted(), self.core.faction(), self.core.step(), self.ai.steps);
+        }
         let ai = &mut self.ai;
+        let campaign = &mut self.campaign;
         let out = self.core.step_inputs(now, |s, w| {
-            let mut input = ai.think(s, w, world.as_deref());
+            let mut input = match campaign.as_mut().filter(|c| c.site.is_some()) {
+                Some(c) => {
+                    ai.steps += 1;
+                    c.steer(s, ai.steps)
+                }
+                None => ai.think(s, w, world.as_deref()),
+            };
             if ads {
                 input.buttons = (input.buttons | BUTTON_ADS) & !BUTTON_SPRINT;
             }
@@ -262,6 +303,152 @@ impl Wander {
             yaw: (self.heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16,
             pitch: 0,
             buttons: if self.sprint { BUTTON_SPRINT } else { 0 } | if self.rng.chance(1.0 / 90.0) { BUTTON_JUMP } else { 0 },
+        }
+    }
+}
+
+/// Taking sites: the objective (a site its faction may attack, or one of
+/// its own under attack), a point of it, and the way there: down the
+/// world's graph (`Nav`) node by node, then straight to the point, where it
+/// stands. A new objective when that one's taken or kept, and now and then.
+struct Campaign {
+    rng: Rng,
+    nav: Option<Arc<Nav>>,
+    site: Option<usize>,
+    point: [f32; 3],
+    /// The node it's heading for (None: find the nearest).
+    next: Option<u32>,
+    /// It's past the graph's end: straight to the point.
+    straight: bool,
+    chosen: u32,
+    last: [f32; 3],
+    /// Unsticking: where it was a while ago, and steps left sidestepping.
+    mark: ([f32; 3], u32),
+    dodge: (u32, f32),
+}
+
+/// How often a bot takes stock of the fronts, and how long it stays on one
+/// at most before it may look again (steps).
+const REPLAN: u32 = 60;
+const STAY: u32 = 30 * 180;
+
+impl Campaign {
+    fn new(seed: u64) -> Self {
+        Self { rng: Rng::new(seed ^ 0xCA97), nav: None, site: None, point: [0.0; 3], next: None, straight: false, chosen: 0, last: [0.0; 3], mark: ([0.0; 3], 0), dodge: (0, 0.0) }
+    }
+
+    /// Whether faction `f` would go to site `s`: one it may attack, or one
+    /// of its own someone's taking.
+    fn wanted(t: &Territory, s: usize, f: u8, step: u32) -> bool {
+        let st = &t.sites[s];
+        t.attackable(s, f, step) || (st.owner_at(step) == f && st.attacker != territory::NONE && st.attacker != f)
+    }
+
+    /// Takes stock: keeps its objective while it's still wanted (for a few
+    /// minutes), else picks among the nearest three by the graph (its own
+    /// under attack counted nearer).
+    fn plan(&mut self, world: &Arc<lattice_game::world::World>, t: &Territory, me: MoveState, f: u8, step: u32, steps: u32) {
+        let nav = self.nav.get_or_insert_with(|| Nav::shared(world)).clone();
+        let pos = [me.pos[0], me.pos[1], me.z];
+        if steps.is_multiple_of(60) && std::env::var_os("LATTICE_BOT_TRACE").is_some() {
+            let next = self.next.map(|n| nav.node(n));
+            eprintln!("bot f{f} at ({:.0}, {:.0}, {:.1}) site {:?} point {:?} next {next:?} straight {} cost {:?}", pos[0], pos[1], pos[2], self.site, self.point, self.straight, self.site.zip(self.next).map(|(s, n)| nav.cost(s, n)));
+        }
+        // Respawned, or thrown far: find the way again.
+        let moved = (pos[0] - self.last[0]).abs() + (pos[1] - self.last[1]).abs();
+        if moved > 30.0 {
+            (self.next, self.straight) = (None, false);
+        }
+        self.last = pos;
+        // Still wanted, and not there for long: keep it. Else look again,
+        // every couple of seconds.
+        if self.site.is_some_and(|s| Self::wanted(t, s, f, step)) && steps.wrapping_sub(self.chosen) < STAY {
+            return;
+        }
+        if !steps.is_multiple_of(REPLAN) {
+            return;
+        }
+        let mut options: Vec<(f32, usize)> = (0..t.len())
+            .filter(|&s| Self::wanted(t, s, f, step))
+            .filter_map(|s| {
+                let n = nav.nearest(pos, s)?;
+                let ours = t.sites[s].owner_at(step) == f;
+                Some((nav.cost(s, n) * if ours { 0.6 } else { 1.0 }, s))
+            })
+            .collect();
+        options.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let pick = match self.rng.unit() {
+            u if u < 0.5 => 0,
+            u if u < 0.8 => 1,
+            _ => 2,
+        };
+        let Some(&(_, s)) = options.get(pick.min(options.len().saturating_sub(1))) else {
+            self.site = None;
+            return;
+        };
+        if self.site != Some(s) {
+            let pts = t.points(s);
+            self.point = pts[(self.rng.next_u64() % pts.len().max(1) as u64) as usize];
+            (self.next, self.straight) = (None, false);
+        }
+        self.site = Some(s);
+        self.chosen = steps;
+    }
+
+    /// One input toward the objective.
+    fn steer(&mut self, s: &MoveState, steps: u32) -> Input {
+        let (Some(site), Some(nav)) = (self.site, self.nav.clone()) else { return Input::default() };
+        let pos = [s.pos[0], s.pos[1], s.z];
+        let flat = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1])).sqrt();
+        let p = self.point;
+        // On the point: stand there (fighters fight).
+        if flat(pos, p) < 3.0 && (pos[2] - p[2]).abs() < 3.0 {
+            return Input::default();
+        }
+        // Stuck (not moved in 3 s): sidestep a little, jumping, and look for the way again.
+        if steps.wrapping_sub(self.mark.1) >= 90 {
+            if flat(pos, self.mark.0) < 1.0 && s.grounded {
+                self.dodge = (30, self.rng.range(0.0, std::f32::consts::TAU));
+                (self.next, self.straight) = (None, false);
+            }
+            self.mark = (pos, steps);
+        }
+        if self.dodge.0 > 0 {
+            self.dodge.0 -= 1;
+            let (sin, cos) = self.dodge.1.sin_cos();
+            return Input { move_x: (cos * 127.0) as i8, move_y: (sin * 127.0) as i8, buttons: if self.dodge.0 == 25 { BUTTON_JUMP } else { 0 }, ..Input::default() };
+        }
+        if self.next.is_none() && !self.straight {
+            self.next = nav.nearest(pos, site);
+            self.straight = self.next.is_none();
+        }
+        let target = match self.next {
+            Some(n) => {
+                let q = nav.node(n);
+                if flat(pos, q) < 1.5 && (pos[2] - q[2]).abs() < 2.5 {
+                    self.next = nav.toward(site, n);
+                    if self.next.is_none() {
+                        self.straight = true;
+                    }
+                    self.next.map_or(p, |m| nav.node(m))
+                } else if flat(pos, q) < 1.5 {
+                    // Right under it or over it: carried there (a lift, a drop shaft).
+                    return Input::default();
+                } else {
+                    q
+                }
+            }
+            None => p,
+        };
+        let (dx, dy) = (target[0] - pos[0], target[1] - pos[1]);
+        let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+        let heading = dy.atan2(dx);
+        Input {
+            move_x: (dx / d * 127.0) as i8,
+            move_y: (dy / d * 127.0) as i8,
+            yaw: (heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16,
+            pitch: 0,
+            buttons: BUTTON_SPRINT,
         }
     }
 }

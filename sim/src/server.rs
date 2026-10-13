@@ -171,6 +171,11 @@ pub enum SpawnMode {
     /// from its far end if k is odd), for bots that walk and time them
     /// (`lattice-bots --run-lanes`).
     Lanes,
+    /// Where the lattice says (U5, ahead of U4's deploy screen): at its
+    /// faction's Landing, and after a death at the site its faction holds
+    /// that's nearest where it died (`territory::spawn_points`), for bots
+    /// that take sites (`lattice-bots --capture`).
+    Sites,
 }
 
 impl std::str::FromStr for SpawnMode {
@@ -181,12 +186,13 @@ impl std::str::FromStr for SpawnMode {
             "hotspots" => Ok(Self::Hotspots),
             "blob" => Ok(Self::Blob),
             "lanes" => Ok(Self::Lanes),
+            "sites" => Ok(Self::Sites),
             _ => {
                 let arg = |prefix: &str| s.strip_prefix(prefix).and_then(|v| v.parse::<f32>().ok()).filter(|v| *v > 0.0);
                 match (arg("line:"), arg("disk:")) {
                     (Some(spacing), _) => Ok(Self::Line(spacing)),
                     (_, Some(radius)) => Ok(Self::Disk(radius)),
-                    _ => Err(format!("unknown spawn mode {s:?} (uniform|hotspots|blob|line:<meters>|disk:<meters>)")),
+                    _ => Err(format!("unknown spawn mode {s:?} (uniform|hotspots|blob|lanes|sites|line:<meters>|disk:<meters>)")),
                 }
             }
         }
@@ -1147,6 +1153,11 @@ pub struct SimServer {
     /// Who holds what (U5), updated twice a second; who holds each site at
     /// this tick's steps (two at 20 Hz), for the shields.
     territory: Territory,
+    /// Where at each site someone spawns (`SpawnMode::Sites`).
+    spawn_points: Vec<Vec<[f32; 2]>>,
+    /// A lane's start under the ground (a tunnel's, `SpawnMode::Lanes`): the
+    /// height of its floor, for the spawn being made.
+    spawn_floor: Option<f32>,
     owners: [Vec<u8>; 2],
     /// The step of the last territory update.
     territory_step: u32,
@@ -1195,6 +1206,8 @@ impl SimServer {
         Self {
             world: World::shared(cfg.world),
             territory: Territory::with_speed(&World::shared(cfg.world), cfg.capture_speed.max(1)),
+            spawn_points: territory::spawn_points(&World::shared(cfg.world)),
+            spawn_floor: None,
             owners: [Vec::new(), Vec::new()],
             territory_step: 0,
             pushes: Vec::new(),
@@ -2171,14 +2184,22 @@ impl SimServer {
     /// sent to play, on their faction's side of it (120 degrees apart),
     /// standing, at full health.
     fn respawn_due(&mut self, step_no: u32) {
-        for (e, b) in self.bodies.iter_mut().enumerate() {
+        for e in 0..self.bodies.len() {
+            let b = &self.bodies[e];
             if !b.alive || b.respawn_at.is_none_or(|at| at > step_no) {
                 continue;
             }
-            let side = faction(e as u16) as f32 * std::f32::consts::TAU / FACTIONS as f32;
-            let (s, c) = side.sin_cos();
-            let center = [b.anchor[0] + c * b.radius * 0.5, b.anchor[1] + s * b.radius * 0.5];
-            let p = self.rng.in_disk(center, b.radius * 0.3);
+            let at_site = (self.cfg.spawn == SpawnMode::Sites).then(|| self.site_spawn(faction(e as u16), Some(self.bodies[e].state.pos))).flatten();
+            let b = &mut self.bodies[e];
+            let p = match at_site {
+                Some((_, p)) => p,
+                None => {
+                    let side = faction(e as u16) as f32 * std::f32::consts::TAU / FACTIONS as f32;
+                    let (s, c) = side.sin_cos();
+                    let center = [b.anchor[0] + c * b.radius * 0.5, b.anchor[1] + s * b.radius * 0.5];
+                    self.rng.in_disk(center, b.radius * 0.3)
+                }
+            };
             let p = [p[0].clamp(1.0, WORLD_SIZE - 1.0), p[1].clamp(1.0, WORLD_SIZE - 1.0)];
             b.state = MoveState::standing(&self.world, p);
             (b.health, b.respawn_at, b.life, b.reloading) = (MAX_HEALTH, None, b.life.wrapping_add(1), false);
@@ -2192,9 +2213,12 @@ impl SimServer {
             0 => NO_SQUAD,
             n => (self.counters.spawns / n as u64) as u32,
         };
-        let (spawn, anchor, radius) = self.pick_spawn(squad);
         // Factions take turns: by squad, or by player without squads.
         let side = if squad == NO_SQUAD { self.counters.spawns } else { squad as u64 } % FACTIONS as u64;
+        let (spawn, anchor, radius) = match (self.cfg.spawn == SpawnMode::Sites).then(|| self.site_spawn(side as u8, None)).flatten() {
+            Some((_, p)) => (p, p, 30.0),
+            None => self.pick_spawn(squad),
+        };
         let e = match self.free[side as usize].pop() {
             Some(e) => e,
             None => loop {
@@ -2211,9 +2235,13 @@ impl SimServer {
             },
         };
         let i = e as usize;
+        let state = match self.spawn_floor.take() {
+            Some(z) => MoveState::standing_at(&self.world, spawn, z),
+            None => MoveState::standing(&self.world, spawn),
+        };
         self.bodies[i] = Body {
             alive: true,
-            state: MoveState::standing(&self.world, spawn),
+            state,
             squad,
             spawned: self.tick,
             anchor,
@@ -2297,6 +2325,31 @@ impl SimServer {
         }
     }
 
+    /// Where faction `f` spawns (`SpawnMode::Sites`): at a site it holds
+    /// with somewhere to stand, the nearest `near` (none: on a front, one
+    /// linked to a site it doesn't hold, as a player deploying would; else
+    /// its Landing); the site and the spot, a step or two from a route.
+    fn site_spawn(&mut self, f: u8, near: Option<[f32; 2]>) -> Option<(usize, [f32; 2])> {
+        let sites = self.world.sites();
+        let held = |i: usize| self.territory.sites.get(i).is_some_and(|s| s.owner_at(self.step) == f) && !self.spawn_points[i].is_empty();
+        let pick = match near {
+            Some(p) => (0..sites.len()).filter(|&i| held(i)).min_by(|&a, &b| {
+                let d = |i: usize| (sites[i].center[0] - p[0]).powi(2) + (sites[i].center[1] - p[1]).powi(2);
+                d(a).total_cmp(&d(b))
+            }),
+            None => {
+                let front: Vec<usize> = (0..sites.len()).filter(|&i| held(i) && self.territory.links(i).iter().any(|&j| self.territory.sites[j as usize].owner_at(self.step) != f)).collect();
+                match front.len() {
+                    0 => (0..sites.len()).find(|&i| held(i) && sites[i].kind == lattice_game::world::SiteKind::Landing && sites[i].sector == f).or_else(|| (0..sites.len()).find(|&i| held(i))),
+                    n => Some(front[(self.rng.next_u64() % n as u64) as usize]),
+                }
+            }
+        }?;
+        let pts = &self.spawn_points[pick];
+        let at = pts[(self.rng.next_u64() % pts.len() as u64) as usize];
+        Some((pick, self.rng.in_disk(at, 2.0)))
+    }
+
     /// Returns (spawn point, wander anchor, wander radius).
     fn pick_spawn(&mut self, squad: u32) -> ([f32; 2], [f32; 2], f32) {
         const HOTSPOTS: [[f32; 2]; 3] = [[2048.0, 2048.0], [6144.0, 2048.0], [4096.0, 6144.0]];
@@ -2312,6 +2365,8 @@ impl SimServer {
                     // The anchor is its other end: start and end name the lane.
                     let back = !k.is_multiple_of(2);
                     let (w, e) = (l.waypoint(0, back), l.waypoint(0, !back));
+                    // A tunnel's start: on its floor, not the ground over it.
+                    self.spawn_floor = (w[2] < self.world.terrain(w[0], w[1]) - 2.0).then_some(w[2]);
                     return ([w[0], w[1]], [e[0], e[1]], 1.0);
                 }
                 (CENTER, 200.0)
