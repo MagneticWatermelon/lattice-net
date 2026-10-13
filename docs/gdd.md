@@ -111,8 +111,8 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 
 - **A continent is one map on one server process** (decided): an 8,192 m square (exists: `WORLD_SIZE`), with up to 10,000 players (decided ceiling).
 - **The wire formats bound the map:** 8,192 m across (512 m cells, 4 bits per axis) and heights of 0–655.35 m (exists). A bigger map or higher ground needs a protocol change.
-- **Launch with one continent, Harrow (proposed).** It's the temperate hills of the procedural world that exists (world seed 1): about 90 m of relief, 16 walled bases and 35 outposts.
-- **Plan for four:** Harrow, Kiln (desert canyons), Rime (arctic) and Mire (marsh and jungle), with 2–3 open at a time.
+- **Launch with one continent, Kiln (proposed, [docs/kiln.md](kiln.md)).** A desert of canyons, mesas and glass: three rifts meeting in a central crater, five layers from tunnels to spires 600 m up, 67 sites. Its blockout (K0) exists: `lattice-server --world kiln` (world id `world::KILN`). **Harrow** stays the procedural test map: the temperate hills from world seed 1, about 90 m of relief, 16 walled bases and 35 outposts (exists).
+- **Plan for four:** Kiln, Harrow, Rime (arctic) and Mire (marsh and jungle), with 2–3 open at a time.
 - **Design for 2,000–6,000 players per continent as the usual case, and 10,000 as the peak (proposed).** A continent with 300 players must still be fun: open fewer continents (§3.6), don't spread players thin.
 
 ### 3.2 Regions, sites and lanes
@@ -190,7 +190,7 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 | acceleration, on the ground / in the air | 60 / 20 m/s² |
 | jump | 4.5 m/s, ~0.68 m high; gravity 15 m/s² |
 | step up / step down | 0.45 / 0.6 m |
-| steepest walkable slope | 45° |
+| steepest walkable slope | 45°: steeper is a wall, in the air too, and on a cliff (a 4 m height cell spanning more than 6 m, `World::cliff`) no move rises at all within a jump of the ground, so cliffs can't be climbed slantwise or jumped up a step at a time (exists since 2026-10-13, for Kiln) |
 | collider | a cylinder: radius 0.4 m, height 1.8 m |
 | crouch (while `BUTTON_CROUCH` is held; exists since 2026-10-12) | 3 m/s; height 1.2 m, eyes at 1.15 m; no sprint or jump; the cone ×0.75 |
 
@@ -476,7 +476,7 @@ The whole client-side network stack exists in Rust. The bots and the Bevy client
 
 | message | channel | when, and what |
 |---|---|---|
-| Welcome | reliable | once: entity id, spawn, world seed |
+| Welcome | reliable | once: entity id, spawn, the world's id (`world::KILN`, or a seed for Harrow) and its digest (a client that builds a different world knows: `world_mismatch`) |
 | Snapshot | unreliable | every tick: own state (full f32, stance), acked input, queue depth, pace, levels, health, life, rounds (magazine, reserve, reload) |
 | Near | unreliable | every tick: up to 64 entities within 150 m (plus squad and contacts), as deltas against acked baselines |
 | Entities | unreliable | mid (500 m, 10 Hz) and far (1.5 km, 2 Hz) blobs, 11 B each |
@@ -731,7 +731,7 @@ continent package (.lcp) ----> the server:        World::load(package)
   - §6.2's dimensions;
   - reachability: every control point can be reached from every spawn room.
 - **The procedural world becomes a package too.** `world.rs` writes Harrow v0 as one, so the server and the client load every continent the same way.
-- **Welcome sends a continent id and a content hash instead of a world seed** (a protocol change). On a mismatch, the client asks the player to update.
+- **Welcome sends a continent id and a content hash.** Exists for generated worlds (2026-10-13): the world's id and `World::digest`; a client whose world differs flags it (`world_mismatch`, `LtStats`). For packages the id becomes the package's. On a mismatch, the client asks the player to update (proposed).
 - **Art and collision come from the same scene,** so they can't drift apart.
 
 ## 17. Shell, services and sessions
@@ -800,7 +800,8 @@ continent package (.lcp) ----> the server:        World::load(package)
 | **U5: territory** | sites, points, the capture panel, lanes on the map, spawn rooms | needs §21's server work |
 | **U6: classes** (crouch and the rifle's rounds built, 2026-10-12) | the six classes, their tools and abilities. Built: crouch (Ctrl held, C toggled; the view eases down; soldiers kneel or crouch-walk, the crowd from baked crouched poses) and the rifle's rounds (a first-person reload that swaps its ammo cell, timed by the predicted reload; the HUD's rounds; handling sounds, near soldiers' reloads heard) | crouched heads drawn on their hitbox; prediction exact. **Measured:** a crouched fight (`--autotarget --crouch`, 1,000 bots): 0 corrections, 0 ammo corrections, 6 reloads; frame p99 4.7 ms, no managed allocations |
 | **U7: vehicles** (M4) | ground, then air | |
-| **U8: the first authored continent** | the exporter and package; Harrow rebuilt by hand | |
+| **U8: the first authored continent** | the exporter and package; *proposed* ([docs/kiln.md](kiln.md)): prove them on Kiln's blockout rather than rebuilding Harrow by hand (it stays procedural) | |
+| **Kiln** ([docs/kiln.md](kiln.md): K0 blockout, K1 collision kit, K2 great sites, K3 bases and tunnels, K4 the living world, K5 art) | **K0 built** (2026-10-13): the whole continent in rough shapes, generated (`game/src/kiln/`), every site as boxes, 114 lanes | **K0 met:** every route walked end to end by the game's movement (312 walks) and by 228 bots over the server, 0 corrections; Landing to the Hollow 3 lanes and ~353 s in every sector (within 0.2%), every kind of site within 8.8% of the same walk from its Landing |
 | after that | squads, platoons and outfits; progression; surges and rotation; more continents | |
 
 **Recommended order change: build U0–U2 before M4.** Vehicles need a client, and building them in Bevy first would be thrown away.

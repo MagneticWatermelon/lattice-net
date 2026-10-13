@@ -44,7 +44,7 @@ use crate::session::dev_token;
 /// 2: `LT_CONFIG_NET_THREAD`.
 /// 3: crouch and the rifle's rounds (`LtOwn`, `LT_BUTTON_CROUCH`,
 /// `LT_BUTTON_RELOAD`, `LT_FLAG_CROUCHED`, `LT_FLAG_RELOADING`).
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]
@@ -492,6 +492,10 @@ ffi_fns! {
                 samples: TERRAIN_N as u32,
                 boxes: w.boxes().len() as u32,
                 sites: w.sites().len() as u32,
+                continent: w.continent as u8,
+                lanes: w.lanes().len() as u32,
+                lane_points: w.lanes().iter().map(|l| l.path.len() as u32).sum(),
+                points: w.points().len() as u32,
             };
         }
     }
@@ -529,9 +533,72 @@ ffi_fns! {
     fn lt_world_sites(w: *const LtWorld, out: *mut LtSite, cap: i32) -> i32 {
         let Some(w) = world(w) else { return 0 };
         for (o, s) in slice(out, cap).iter_mut().zip(w.sites()) {
-            *o = LtSite { x: s.center[0], y: s.center[1], half: s.half, level: s.level, base: s.base as u8 };
+            *o = LtSite { x: s.center[0], y: s.center[1], half: s.half, level: s.level, base: s.base as u8, kind: s.kind as u8, sector: s.sector };
         }
         w.sites().len() as i32
+    }
+
+    /// Every route (lanes, and ways inside sites): fills `out` (up to `cap`),
+    /// returns how many there are. Their points are `lt_world_lane_points`.
+    fn lt_world_lanes(w: *const LtWorld, out: *mut LtLane, cap: i32) -> i32 {
+        let Some(w) = world(w) else { return 0 };
+        let mut first = 0u32;
+        let all: Vec<LtLane> = w
+            .lanes()
+            .iter()
+            .map(|l| {
+                let lane = LtLane { a: l.a, b: l.b, first, count: l.path.len() as u32 };
+                first += l.path.len() as u32;
+                lane
+            })
+            .collect();
+        for (o, l) in slice(out, cap).iter_mut().zip(&all) {
+            *o = *l;
+        }
+        all.len() as i32
+    }
+
+    /// Every route's points, one route after another (feet height in z):
+    /// fills `out` (up to `cap`), returns how many there are.
+    fn lt_world_lane_points(w: *const LtWorld, out: *mut LtVec3, cap: i32) -> i32 {
+        let Some(w) = world(w) else { return 0 };
+        let mut n = 0;
+        let out = slice(out, cap);
+        for p in w.lanes().iter().flat_map(|l| l.path.iter()) {
+            if let Some(o) = out.get_mut(n) {
+                *o = (*p).into();
+            }
+            n += 1;
+        }
+        n as i32
+    }
+
+    /// Every control point: fills `out` (up to `cap`), returns how many.
+    fn lt_world_points(w: *const LtWorld, out: *mut LtPoint, cap: i32) -> i32 {
+        let Some(w) = world(w) else { return 0 };
+        for (o, p) in slice(out, cap).iter_mut().zip(w.points()) {
+            *o = LtPoint { pos: p.pos.into(), site: p.site };
+        }
+        w.points().len() as i32
+    }
+
+    /// What the ground is (`LT_GROUND_*`) at the `nx` × `ny` samples from
+    /// sample (`x0`, `y0`), row by row, into `out`. Returns how many it wrote.
+    fn lt_world_materials(w: *const LtWorld, x0: i32, y0: i32, nx: i32, ny: i32, out: *mut u8) -> i32 {
+        let Some(w) = world(w) else { return 0 };
+        if out.is_null() || nx <= 0 || ny <= 0 {
+            return 0;
+        }
+        let out = std::slice::from_raw_parts_mut(out, nx as usize * ny as usize);
+        let last = TERRAIN_N as i32 - 1;
+        for iy in 0..ny {
+            let sy = (y0 + iy).clamp(0, last) as usize;
+            for ix in 0..nx {
+                let sx = (x0 + ix).clamp(0, last) as usize;
+                out[(iy * nx + ix) as usize] = w.ground_at(sx, sy).unwrap_or(255);
+            }
+        }
+        nx * ny
     }
 
     /// The terrain's height at (`x`, `y`), as movement samples it.

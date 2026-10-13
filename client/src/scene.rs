@@ -107,7 +107,7 @@ pub fn build_world(
         return;
     }
     let Some(w) = net.0.core.welcome() else { return };
-    let world = World::shared(w.world_seed);
+    let world = World::shared(w.world);
     scene.terrain_mat = mats.add(StandardMaterial { base_color: Color::WHITE, perceptual_roughness: 0.95, ..default() });
     for cy in 0..CHUNKS {
         for cx in 0..CHUNKS {

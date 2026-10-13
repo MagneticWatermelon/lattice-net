@@ -151,7 +151,12 @@ pub fn spawn_cover(commands: &mut Commands, models: &Models, world: &World, unit
         let base = to_bevy((b.min[0] + b.max[0]) / 2.0, (b.min[1] + b.max[1]) / 2.0, b.bottom);
         let building = matches!(b.kind, Kind::Command | Kind::Bunker | Kind::Post);
         let range = if building { BUILDING_RANGE } else { PROP_RANGE };
-        let (mesh, mat) = &models.props[b.kind as usize];
+        let center = to_bevy((b.min[0] + b.max[0]) / 2.0, (b.min[1] + b.max[1]) / 2.0, (b.bottom + b.top) / 2.0);
+        // Kiln's blockout volumes have no model: their plain box at every distance.
+        let Some((mesh, mat)) = models.props.get(b.kind as usize) else {
+            commands.spawn((Mesh3d(unit.clone()), MeshMaterial3d(plain[0].clone()), Transform::from_translation(center).with_scale(Vec3::new(sx, h, sy))));
+            continue;
+        };
         let tiles = if b.kind == Kind::Wall { (len / (h * WALL_ASPECT)).round().max(1.0) as usize } else { 1 };
         let tile = len / tiles as f32;
         for i in 0..tiles {
@@ -161,7 +166,6 @@ pub fn spawn_cover(commands: &mut Commands, models: &Models, world: &World, unit
         }
         // The plain box, for the distance.
         let low = matches!(b.kind, Kind::Crate | Kind::Sandbags);
-        let center = to_bevy((b.min[0] + b.max[0]) / 2.0, (b.min[1] + b.max[1]) / 2.0, (b.bottom + b.top) / 2.0);
         commands.spawn((
             Mesh3d(unit.clone()),
             MeshMaterial3d(plain[low as usize].clone()),

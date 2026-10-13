@@ -52,6 +52,11 @@ lattice-bots: M1 bot swarm
                        login service) [the public dev key]
   --server-id N        the server id tokens are minted for [1]
   --seed N             [1]
+  --world W            build this world before the bots join (kiln, harrow or a seed), so
+                       their first Welcome doesn't stall a thread building it
+  --run-lanes          each bot walks the lane the server spawned it at an end of
+                       (lattice-server --spawn lanes), sprinting, and reports its time:
+                       the summary lists lanes walked and Kiln's fairness (docs/kiln.md, K0)
   --summary PATH       write the end-of-run results as key=value lines (scripts/baseline.sh)";
 
 /// Cumulative per-thread totals; the main thread sums threads and diffs windows.
@@ -108,6 +113,8 @@ struct Totals {
     class_hits: [u64; 3],
     class_kills: [u64; 3],
     class_n: [u64; 3],
+    /// Lane walkers (`--run-lanes`): (lane, backward, seconds once walked).
+    lanes: Vec<(u16, bool, Option<f32>)>,
     class_rtt: [f64; 3],
     /// Tracked bots: others' shots seen as tracers, and distant fights' cell
     /// entries, the shots they counted and the ambient shots made.
@@ -119,6 +126,7 @@ struct Totals {
 
 impl Totals {
     fn add(&mut self, o: &Totals) {
+        self.lanes.extend_from_slice(&o.lanes);
         self.started += o.started;
         self.connected += o.connected;
         self.welcomed += o.welcomed;
@@ -265,6 +273,8 @@ struct Bot {
     fight: Option<FightConfig>,
     class: Option<usize>,
     port: Option<u16>,
+    /// Walks a lane (`--run-lanes`).
+    run_lanes: bool,
     /// Near (least, most) and mid render delays.
     delays: (Duration, Duration, Duration),
     /// Bound up front, before the clock starts: creating thousands of sockets
@@ -302,6 +312,7 @@ impl Bot {
             brain.set_sink(self.sink);
             brain.set_trigger(self.trigger);
             brain.set_fight(self.fight);
+            brain.set_run_lanes(self.run_lanes);
             self.brain = Some(brain);
         }
         let (sock, client) = self.net.as_mut().unwrap();
@@ -364,6 +375,9 @@ impl Bot {
 
     fn add_to(&self, t: &mut Totals) {
         let Some(brain) = &self.brain else { return };
+        if let Some(l) = brain.lane_result() {
+            t.lanes.push(l);
+        }
         t.started += 1;
         t.failed += self.failed as u64;
         if let Some((_, client)) = &self.net {
@@ -478,6 +492,19 @@ fn main() -> std::io::Result<()> {
     let full_every: usize = a.get::<usize>("full-every", 1).max(1);
     let key: HexKey = a.get("token-key", HexKey::default());
     let summary_path: Option<String> = a.opt("summary");
+    let run_lanes = a.flag("run-lanes");
+    // Built once here, shared by every bot (the cache keeps it while we hold it).
+    let world = a.opt::<String>("world").map(|w| {
+        let id = match w.as_str() {
+            "kiln" => lattice_game::world::KILN,
+            "harrow" => 1,
+            n => n.parse().unwrap_or_else(|_| panic!("--world: kiln, harrow or a number, not {n:?}")),
+        };
+        let t = Instant::now();
+        let w = lattice_game::world::World::shared(id);
+        eprintln!("world {id:#x} built in {:.2} s", t.elapsed().as_secs_f32());
+        w
+    });
     let login = Login { token_key: key.0, server_id: a.get("server-id", 1) };
     a.finish();
     if key.is_dev() {
@@ -523,6 +550,7 @@ fn main() -> std::io::Result<()> {
                 delays,
                 trigger: ((i * 37) % 100) < (fire_share * 100.0).round() as usize,
                 fight: (fight_every > 0 && i % fight_every == 0).then_some(FightConfig { aim_error, ..FightConfig::default() }),
+                run_lanes,
                 class: class_of(i),
                 port: port_of(i),
                 sock: sockets[i].take(),
@@ -667,7 +695,36 @@ fn main() -> std::io::Result<()> {
         summary_values(&total, duration.as_secs_f64(), &mut all_joins.clone(), &all_latency).write(&path)?;
     }
     print_summary(&total, duration.as_secs_f64(), &mut all_joins, &all_latency);
+    if run_lanes {
+        print_lanes(&total, world.as_deref());
+    }
     Ok(())
+}
+
+/// The lane walkers' results: every lane walked both ways, and how fair
+/// the times make Kiln (its Landings' walks to the Hollow, each kind of
+/// site's walk from its Landing, sector by sector).
+fn print_lanes(t: &Totals, world: Option<&lattice_game::world::World>) {
+    let walked = t.lanes.iter().filter(|l| l.2.is_some()).count();
+    println!("\n== lanes ==");
+    println!("  walkers {} walked their lane {} ", t.lanes.len(), walked);
+    for &(lane, back, secs) in &t.lanes {
+        if secs.is_none() {
+            println!("  lane {lane} {}: not walked", if back { "backward" } else { "forward" });
+        }
+    }
+    let Some(world) = world else { return };
+    let lanes = world.lanes().iter().filter(|l| l.a != l.b).count();
+    println!("  of the world's {lanes} lanes x 2 ways: {} walked", walked);
+    if world.continent != lattice_game::world::Continent::Kiln {
+        return;
+    }
+    let time = |i: usize, back: bool| t.lanes.iter().find(|l| l.0 as usize == i && l.1 == back).and_then(|l| l.2);
+    let f = lattice_game::kiln::fairness(world, &time);
+    for (k, (secs, n)) in f.hollow.iter().enumerate() {
+        println!("  sector {k}: Landing to the Hollow {secs:.1} s over {n} lanes");
+    }
+    println!("  each site's walk from its Landing differs across sectors by at most {:.1}% (site {})", (f.spread - 1.0) * 100.0, f.worst_site);
 }
 
 /// The summary's numbers as key=value lines, for `--summary`.

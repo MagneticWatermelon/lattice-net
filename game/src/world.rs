@@ -1,16 +1,25 @@
-//! The world, built from a seed identically on the server and every client:
-//! a heightmap, bases and outposts on flattened ground, and a scatter of
-//! cover boxes.
+//! The world, built from its id identically on the server and every client:
+//! a heightmap, sites on it, and cover boxes.
 //!
-//! Generation is integer-only (hashed value noise in fixed point), and
-//! sampling uses a fixed sequence of f32 operations (Rust doesn't contract
-//! to FMA), so every machine gets the same bits. Movement (`movement.rs`)
-//! samples this world on both sides, so prediction stays bit-exact.
+//! An id names a continent: `KILN` is the desert continent (`crate::kiln`,
+//! built to its design), and any other id is a seed for Harrow, the
+//! procedural hills (bases and outposts on flattened ground, and a scatter of
+//! cover boxes).
+//!
+//! Harrow's generation is integer-only (hashed value noise in fixed point),
+//! Kiln's uses basic f64 arithmetic and `libm`, and sampling uses a fixed
+//! sequence of f32 operations (Rust doesn't contract to FMA), so every
+//! machine gets the same bits. Movement (`movement.rs`) samples this world on
+//! both sides, so prediction stays bit-exact.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::movement::WORLD_SIZE;
+
+/// The world id of Kiln, the desert continent ("KILN" in ASCII). Any other
+/// id is a seed for Harrow.
+pub const KILN: u64 = 0x4B49_4C4E;
 
 /// Heightmap sample spacing, in meters.
 pub const TERRAIN_RES: f32 = 4.0;
@@ -18,6 +27,8 @@ pub const TERRAIN_RES: f32 = 4.0;
 pub const TERRAIN_N: usize = (WORLD_SIZE / TERRAIN_RES) as usize + 1;
 /// Heights are stored in centimeters.
 const CM: f32 = 0.01;
+/// A height cell that spans more than this is a cliff (`World::cliff`).
+pub const CLIFF_RISE: f32 = 6.0;
 /// Spacing of the cover lattice (a box per cell, sometimes) and its index.
 const COVER_CELL: f32 = 32.0;
 const COVER_DIM: usize = (WORLD_SIZE / COVER_CELL) as usize;
@@ -128,31 +139,213 @@ pub enum Kind {
     /// A base's command building.
     Command = 5,
     Bunker = 6,
+    /// A blockout volume: a building, a wall, a tower, a deck (Kiln's sites
+    /// until they have art).
+    Block = 7,
+    /// Natural rock: boulders, hoodoos, outcrops, reefs, arches.
+    Rock = 8,
+    /// Glass and crystal: fulgurite spikes, a Geode's crystals.
+    Crystal = 9,
+    /// The bones of the Dry Sea's megafauna.
+    Bone = 10,
 }
 
-/// A base or an outpost: a square of flattened ground with its buildings.
+/// Which generator made a world: how it's drawn, and what its sites mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Continent {
+    Harrow = 0,
+    Kiln = 1,
+}
+
+/// What a site is (GDD §3.2, §6.4). Harrow has bases and outposts; Kiln has
+/// its design's seven kinds, its bases' and outposts' kinds among them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SiteKind {
+    Base = 0,
+    Outpost = 1,
+    /// A faction's home: can't be taken.
+    Landing = 2,
+    /// Kiln's central crater, where the three rifts meet.
+    Hollow = 3,
+    /// A bridge fortress halfway along a rift.
+    Span = 4,
+    /// A fortress built into a rift wall.
+    Cliffhold = 5,
+    /// A crystal dome in a sector's mesa country.
+    Geode = 6,
+    MesaCitadel = 7,
+    SlotHold = 8,
+    RiftLedge = 9,
+    Cenote = 10,
+    ReefWarren = 11,
+    Ossuary = 12,
+    GlassVault = 13,
+    Arch = 14,
+    Vent = 15,
+    TunnelMouth = 16,
+    SpirePerch = 17,
+    WellShrine = 18,
+    Wreck = 19,
+}
+
+impl SiteKind {
+    /// Kiln's major facilities and the Hollow (Landings aren't: they can't be taken).
+    pub fn major(self) -> bool {
+        matches!(self, SiteKind::Hollow | SiteKind::Span | SiteKind::Cliffhold | SiteKind::Geode)
+    }
+
+    /// A base (2-3 points) rather than an outpost (1) or a great site.
+    pub fn base(self) -> bool {
+        matches!(
+            self,
+            SiteKind::Base
+                | SiteKind::MesaCitadel
+                | SiteKind::SlotHold
+                | SiteKind::RiftLedge
+                | SiteKind::Cenote
+                | SiteKind::ReefWarren
+                | SiteKind::Ossuary
+                | SiteKind::GlassVault
+        )
+    }
+}
+
+/// A site: a base, an outpost, a great site or a Landing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Site {
     pub center: [f32; 2],
-    /// Half the side of its flat square (the ground blends back to the hills
-    /// over `SITE_BLEND` around it).
+    /// Half its size. Harrow's are squares flattened to `level` (the ground
+    /// blends back to the hills over `SITE_BLEND` around them).
     pub half: f32,
-    /// The height it's flattened to.
+    /// The height of its main ground.
     pub level: f32,
     pub base: bool,
+    pub kind: SiteKind,
+    /// The sector it's in (Kiln: 0-2, the factions' starting thirds); `NO_SECTOR`
+    /// for the Hollow and on Harrow.
+    pub sector: u8,
+}
+
+pub const NO_SECTOR: u8 = u8::MAX;
+
+/// A route between two sites (`a` != `b`: a lane of the lattice, GDD §3.2), or
+/// inside one (`a` == `b`: e.g. from a rim gate down to a crater's floor). Its
+/// path is waypoints to walk, feet heights included; walking it straight from
+/// one to the next gets there (`kiln`'s tests walk them all).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lane {
+    pub a: u16,
+    pub b: u16,
+    pub path: Vec<[f32; 3]>,
+}
+
+impl Lane {
+    /// Its length along the path, horizontally.
+    pub fn length(&self) -> f32 {
+        self.path.windows(2).map(|w| ((w[1][0] - w[0][0]) * (w[1][0] - w[0][0]) + (w[1][1] - w[0][1]) * (w[1][1] - w[0][1])).sqrt()).sum()
+    }
+
+    /// Waypoint `i` walking it forward, or backward from its end.
+    pub fn waypoint(&self, i: usize, backward: bool) -> [f32; 3] {
+        self.path[if backward { self.path.len() - 1 - i } else { i }]
+    }
+
+    /// Walking the lane: the stick (world x, y in -127..127) toward the next
+    /// waypoint from `pos`, moving `next` on past those within reach; None at
+    /// its end. What the tests and the bots that time lanes walk by.
+    pub fn steer(&self, pos: [f32; 3], next: &mut usize, backward: bool) -> Option<(i8, i8)> {
+        let n = self.path.len();
+        while *next < n {
+            let w = self.waypoint(*next, backward);
+            let (dx, dy) = (w[0] - pos[0], w[1] - pos[1]);
+            let d = (dx * dx + dy * dy).sqrt();
+            // At its height (a stair's turns pass over the same corners).
+            let level = (pos[2] - w[2]).abs() < 2.5;
+            // Reached, or passed (beside the next leg already), but only
+            // where the path runs on nearly straight: a sharp turn (a stair's
+            // corner, a deck's end) is turned at its point.
+            let passed = level && *next + 1 < n && *next > 0 && {
+                let u = self.waypoint(*next + 1, backward);
+                let p = self.waypoint(*next - 1, backward);
+                let (sx, sy) = (u[0] - w[0], u[1] - w[1]);
+                let (ix, iy) = (w[0] - p[0], w[1] - p[1]);
+                let straight = sx * ix + sy * iy > 0.9 * (sx * sx + sy * sy).sqrt() * (ix * ix + iy * iy).sqrt();
+                straight && (pos[0] - w[0]) * sx + (pos[1] - w[1]) * sy > 0.0 && d < 6.0
+            };
+            if (d < 1.5 && level) || passed {
+                *next += 1;
+                continue;
+            }
+            return Some(((dx / d * 127.0) as i8, (dy / d * 127.0) as i8));
+        }
+        None
+    }
+}
+
+/// A control point: where standing holds a site's tap (GDD §3.3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Point {
+    pub pos: [f32; 3],
+    pub site: u16,
+}
+
+/// What the ground is made of at a height sample, for drawing (Kiln's
+/// layers each have their own: its design's "readable at a glance").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Ground {
+    Sand = 0,
+    /// The Glasslands' fused glass.
+    Glass = 1,
+    /// The Dry Sea's salt flats.
+    Salt = 2,
+    /// Banded red and ochre rock: mesas, cliffs.
+    Ochre = 3,
+    /// Dark basalt and scree: the rift floors and the Hollow's.
+    Basalt = 4,
+    /// Pale, wind-polished stone: the Crown and the Spire layer.
+    Pale = 5,
+    /// A lane's road.
+    Road = 6,
+    /// A site's ground.
+    Pad = 7,
+    /// Loose scree and gravel on steep slopes.
+    Scree = 8,
 }
 
 pub struct World {
     pub seed: u64,
+    pub continent: Continent,
     heights: Vec<u16>,
     sites: Vec<Site>,
     boxes: Vec<CoverBox>,
     /// Boxes overlapping each cover cell: `box_items[box_start[c]..box_start[c + 1]]`.
     box_start: Vec<u32>,
     box_items: Vec<u32>,
+    /// `Ground` per height sample, for drawing (empty on Harrow: it's drawn
+    /// from its slopes).
+    ground: Vec<u8>,
+    lanes: Vec<Lane>,
+    points: Vec<Point>,
+    digest: OnceLock<u64>,
 }
 
-fn hash(seed: u64, octave: u64, x: i64, y: i64) -> u64 {
+/// What a generator makes, for `World::from_parts`.
+pub struct Parts {
+    pub id: u64,
+    pub continent: Continent,
+    /// Centimeters, `TERRAIN_N` × `TERRAIN_N`, row by row (y north).
+    pub heights: Vec<u16>,
+    pub sites: Vec<Site>,
+    pub boxes: Vec<CoverBox>,
+    pub ground: Vec<u8>,
+    pub lanes: Vec<Lane>,
+    pub points: Vec<Point>,
+}
+
+pub(crate) fn hash(seed: u64, octave: u64, x: i64, y: i64) -> u64 {
     let mut h = seed
         ^ octave.wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ (x as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
@@ -165,13 +358,13 @@ fn hash(seed: u64, octave: u64, x: i64, y: i64) -> u64 {
 }
 
 /// Smoothstep in Q16: t in [0, 65536].
-fn smooth(t: i64) -> i64 {
+pub(crate) fn smooth(t: i64) -> i64 {
     (((t * t) >> 16) * (3 * 65536 - 2 * t)) >> 16
 }
 
 /// Value noise of one octave at sample (x, y): wavelength `w` samples,
 /// result in [0, 65535].
-fn octave(seed: u64, o: u64, w: i64, x: i64, y: i64) -> i64 {
+pub(crate) fn octave(seed: u64, o: u64, w: i64, x: i64, y: i64) -> i64 {
     let (cx, cy) = (x.div_euclid(w), y.div_euclid(w));
     let (sx, sy) = (smooth((x.rem_euclid(w) << 16) / w), smooth((y.rem_euclid(w) << 16) / w));
     let v = |dx: i64, dy: i64| (hash(seed, o, cx + dx, cy + dy) >> 48) as i64;
@@ -207,22 +400,64 @@ impl World {
                 });
             }
         });
-        let mut world = Self { seed, heights, sites: Vec::new(), boxes: Vec::new(), box_start: Vec::new(), box_items: Vec::new() };
+        let mut world = Self {
+            seed,
+            continent: Continent::Harrow,
+            heights,
+            sites: Vec::new(),
+            boxes: Vec::new(),
+            box_start: Vec::new(),
+            box_items: Vec::new(),
+            ground: Vec::new(),
+            lanes: Vec::new(),
+            points: Vec::new(),
+            digest: OnceLock::new(),
+        };
         world.place_sites();
         world.place_cover();
         world
     }
 
-    /// One shared copy per seed per process: the bots of a swarm and the
+    /// The world with id `id`: Kiln for `KILN`, else Harrow from that seed.
+    pub fn build(id: u64) -> Self {
+        if id == KILN {
+            crate::kiln::generate()
+        } else {
+            Self::generate(id)
+        }
+    }
+
+    /// A world from a generator's parts (cover indexed here).
+    pub fn from_parts(p: Parts) -> Self {
+        assert_eq!(p.heights.len(), TERRAIN_N * TERRAIN_N);
+        assert!(p.ground.is_empty() || p.ground.len() == TERRAIN_N * TERRAIN_N);
+        let mut world = Self {
+            seed: p.id,
+            continent: p.continent,
+            heights: p.heights,
+            sites: p.sites,
+            boxes: p.boxes,
+            box_start: Vec::new(),
+            box_items: Vec::new(),
+            ground: p.ground,
+            lanes: p.lanes,
+            points: p.points,
+            digest: OnceLock::new(),
+        };
+        world.index_cover();
+        world
+    }
+
+    /// One shared copy per id per process: the bots of a swarm and the
     /// server's tests all use the same world without regenerating it.
-    pub fn shared(seed: u64) -> Arc<World> {
+    pub fn shared(id: u64) -> Arc<World> {
         static CACHE: OnceLock<Mutex<HashMap<u64, Weak<World>>>> = OnceLock::new();
         let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
-        if let Some(w) = cache.get(&seed).and_then(Weak::upgrade) {
+        if let Some(w) = cache.get(&id).and_then(Weak::upgrade) {
             return w;
         }
-        let w = Arc::new(World::generate(seed));
-        cache.insert(seed, Arc::downgrade(&w));
+        let w = Arc::new(World::build(id));
+        cache.insert(id, Arc::downgrade(&w));
         w
     }
 
@@ -278,7 +513,11 @@ impl World {
         for i in 0..self.sites.len() {
             self.build_site(i);
         }
-        // Static index: every box under every cover cell it overlaps.
+        self.index_cover();
+    }
+
+    /// The static index: every box under every cover cell it overlaps.
+    fn index_cover(&mut self) {
         let mut cells: Vec<Vec<u32>> = vec![Vec::new(); COVER_DIM * COVER_DIM];
         for (i, b) in self.boxes.iter().enumerate() {
             let c = |v: f32| ((v / COVER_CELL) as usize).min(COVER_DIM - 1);
@@ -298,6 +537,49 @@ impl World {
 
     pub fn boxes(&self) -> &[CoverBox] {
         &self.boxes
+    }
+
+    /// Routes along the lattice's lanes, and inside sites (none on Harrow).
+    pub fn lanes(&self) -> &[Lane] {
+        &self.lanes
+    }
+
+    /// Control points (none on Harrow yet).
+    pub fn points(&self) -> &[Point] {
+        &self.points
+    }
+
+    /// What the ground is at sample (ix, iy), as a `Ground`; None where the
+    /// world doesn't say (Harrow).
+    pub fn ground_at(&self, ix: usize, iy: usize) -> Option<u8> {
+        self.ground.get(iy * TERRAIN_N + ix).copied()
+    }
+
+    /// Whether (x, y) is on a cliff: its height cell spans more than
+    /// `CLIFF_RISE` (no slope a player walks spans that in one 4 m cell).
+    pub fn cliff(&self, x: f32, y: f32) -> bool {
+        let last = (TERRAIN_N - 1) as f32;
+        let fx = (x.clamp(0.0, WORLD_SIZE) / TERRAIN_RES).min(last);
+        let fy = (y.clamp(0.0, WORLD_SIZE) / TERRAIN_RES).min(last);
+        let (ix, iy) = ((fx as usize).min(TERRAIN_N - 2), (fy as usize).min(TERRAIN_N - 2));
+        let h = [self.heights[iy * TERRAIN_N + ix], self.heights[iy * TERRAIN_N + ix + 1], self.heights[(iy + 1) * TERRAIN_N + ix], self.heights[(iy + 1) * TERRAIN_N + ix + 1]];
+        let (lo, hi) = h.iter().fold((u16::MAX, 0u16), |(l, m), &v| (l.min(v), m.max(v)));
+        (hi - lo) as f32 * CM > CLIFF_RISE
+    }
+
+    /// The terrain's slope at (x, y): its gradient, rise per meter along x
+    /// and along y, of the bilinear patch there (as `terrain` samples it).
+    pub fn gradient(&self, x: f32, y: f32) -> [f32; 2] {
+        let last = (TERRAIN_N - 1) as f32;
+        let fx = (x.clamp(0.0, WORLD_SIZE) / TERRAIN_RES).min(last);
+        let fy = (y.clamp(0.0, WORLD_SIZE) / TERRAIN_RES).min(last);
+        let (ix, iy) = ((fx as usize).min(TERRAIN_N - 2), (fy as usize).min(TERRAIN_N - 2));
+        let (tx, ty) = (fx - ix as f32, fy - iy as f32);
+        let (h00, h10) = (self.sample(ix, iy), self.sample(ix + 1, iy));
+        let (h01, h11) = (self.sample(ix, iy + 1), self.sample(ix + 1, iy + 1));
+        let dx = ((h10 - h00) * (1.0 - ty) + (h11 - h01) * ty) / TERRAIN_RES;
+        let dy = ((h01 - h00) * (1.0 - tx) + (h11 - h10) * tx) / TERRAIN_RES;
+        [dx, dy]
     }
 
     /// Bases and outposts.
@@ -374,7 +656,8 @@ impl World {
         }
         for &(c, half, level, base) in &sites {
             self.flatten(c, half, level);
-            self.sites.push(Site { center: c, half, level: level as f32 * CM, base });
+            let kind = if base { SiteKind::Base } else { SiteKind::Outpost };
+            self.sites.push(Site { center: c, half, level: level as f32 * CM, base, kind, sector: NO_SECTOR });
         }
     }
 
@@ -464,8 +747,13 @@ impl World {
         g
     }
 
-    /// A digest of the terrain and cover, to check two machines built the same world.
+    /// A digest of the terrain, cover and sites, to check two machines built
+    /// the same world (computed once).
     pub fn digest(&self) -> u64 {
+        *self.digest.get_or_init(|| self.compute_digest())
+    }
+
+    fn compute_digest(&self) -> u64 {
         let mut h = 0xCBF2_9CE4_8422_2325u64;
         let mut eat = |v: u64| {
             h ^= v;
@@ -479,6 +767,26 @@ impl World {
                 eat(v.to_bits() as u64);
             }
             eat(b.kind as u64 | (b.facing as u64) << 8);
+        }
+        for s in &self.sites {
+            for v in [s.center[0], s.center[1], s.half, s.level] {
+                eat(v.to_bits() as u64);
+            }
+            eat(s.kind as u64 | (s.sector as u64) << 8);
+        }
+        for l in &self.lanes {
+            eat(l.a as u64 | (l.b as u64) << 16);
+            for p in &l.path {
+                for v in p {
+                    eat(v.to_bits() as u64);
+                }
+            }
+        }
+        for p in &self.points {
+            for v in p.pos {
+                eat(v.to_bits() as u64);
+            }
+            eat(p.site as u64);
         }
         h
     }

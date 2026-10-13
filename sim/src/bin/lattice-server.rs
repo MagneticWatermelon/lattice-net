@@ -98,7 +98,9 @@ lattice-server: M1 movement-only authoritative server
                        login service) [the public dev key]
   --server-id N        the server id tokens are minted for [1]
   --seed N             spawn RNG seed [1]
-  --world-seed N       the world's terrain and cover (clients build it from the Welcome) [1]
+  --world W            the continent: kiln (the desert, docs/kiln.md), or harrow or a number
+                       (Harrow's hills from that seed); clients build it from the Welcome [1]
+  --world-seed N       the same as --world N
   --no-separation      don't push overlapping players apart (for comparisons)
   --deaths-per-sec R   kill R random players a second, to exercise death and respawn
                        until there are weapons (they respawn after 5 s) [0]
@@ -568,6 +570,15 @@ struct NetCounters {
     send_syscalls: AtomicU64,
 }
 
+/// A world id from `--world`: a continent's name, or a seed for Harrow.
+fn parse_world(w: &str) -> u64 {
+    match w {
+        "kiln" => lattice_game::world::KILN,
+        "harrow" => 1,
+        n => n.parse().unwrap_or_else(|_| panic!("--world: kiln, harrow or a number, not {n:?}")),
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let mut a = Args::parse(USAGE);
     let bind: SocketAddr = a.get("bind", "0.0.0.0:40000".parse().unwrap());
@@ -602,7 +613,7 @@ fn main() -> std::io::Result<()> {
             LadderConfig { enabled, high: a.get("ladder-high", d.high), low: a.get("ladder-low", d.low) }
         },
         seed: a.get("seed", 1),
-        world_seed: a.get("world-seed", 1),
+        world: a.opt::<String>("world").map(|w| parse_world(&w)).unwrap_or_else(|| a.get("world-seed", 1)),
         separation: !a.flag("no-separation"),
         deaths_per_sec: a.get("deaths-per-sec", 0.0),
         immortal: a.flag("immortal"),

@@ -163,14 +163,11 @@ pub fn step(world: &World, s: MoveState, input: Input) -> MoveState {
             n.vel[i] = 0.0;
         }
     }
-    if n.grounded {
-        let rise = world.terrain(n.pos[0], n.pos[1]) - world.terrain(s.pos[0], s.pos[1]);
-        let run = ((n.pos[0] - s.pos[0]) * (n.pos[0] - s.pos[0]) + (n.pos[1] - s.pos[1]) * (n.pos[1] - s.pos[1])).sqrt();
-        if rise > MAX_SLOPE * run {
-            n.pos = s.pos;
-            n.vel = [0.0; 2];
-        }
-    }
+    // A slope too steep to walk up is a wall where it rises past the feet:
+    // walking, and in the air too (landing on it would climb a cliff a jump
+    // at a time); not under someone on a deck above it.
+    let feet = if n.grounded { s.z } else { s.z + n.vz * DT };
+    n.pos = terrain_move(world, s.pos, n.pos, feet, &mut n.vel);
     collide(world, &mut n);
 
     // Vertical: follow the ground while walking, fall and land otherwise.
@@ -203,6 +200,9 @@ pub fn step(world: &World, s: MoveState, input: Input) -> MoveState {
 pub fn nudge(world: &World, s: MoveState, delta: [f32; 2]) -> MoveState {
     let mut n = s;
     n.pos = [(s.pos[0] + delta[0]).clamp(0.0, WORLD_SIZE), (s.pos[1] + delta[1]).clamp(0.0, WORLD_SIZE)];
+    // Never up a cliff: a crowd at its foot would push its edge up it.
+    let mut vel = n.vel;
+    n.pos = terrain_move(world, s.pos, n.pos, s.z, &mut vel);
     collide(world, &mut n);
     if n.grounded {
         let g = world.ground(n.pos[0], n.pos[1], n.z, STEP_UP);
@@ -214,6 +214,56 @@ pub fn nudge(world: &World, s: MoveState, delta: [f32; 2]) -> MoveState {
         }
     }
     n
+}
+
+/// Whether moving from `from` to `to` climbs terrain steeper than
+/// `MAX_SLOPE` where it rises past the feet (at `feet`): a wall. Steeper
+/// along the move; or any rise at all from ground that steep onto ground
+/// that steep, so a slope too steep can't be climbed slantwise either (a
+/// slide along a cliff while jumping at it would creep up it). (Falling
+/// past a cliff's foot lands there; on a box above it, it's not in the way.)
+fn steep(world: &World, from: [f32; 2], to: [f32; 2], feet: f32) -> bool {
+    let t = world.terrain(to[0], to[1]);
+    let rise = t - world.terrain(from[0], from[1]);
+    // Not a climb, or the ground's well under the feet (a deck over it).
+    if rise <= 0.0 || t + 1.0 <= feet {
+        return false;
+    }
+    let run = ((to[0] - from[0]) * (to[0] - from[0]) + (to[1] - from[1]) * (to[1] - from[1])).sqrt();
+    // On the ground (or within a jump of it), on a cliff any rise at all is
+    // a wall, slantwise too and with the feet still above it: else a slide
+    // along a cliff, or each jump at it, would creep a little higher up it.
+    let on_terrain = feet < world.terrain(from[0], from[1]) + 1.0;
+    (rise > MAX_SLOPE * run && t > feet) || (on_terrain && world.cliff(from[0], from[1]) && world.cliff(to[0], to[1]))
+}
+
+/// Where a move from `from` toward `to` ends against the terrain: all the
+/// way, or, into a slope too steep (`steep`), slid along it (the part of the
+/// move up the slope taken away, from the move and from `vel`), or not at
+/// all if that's still a climb.
+fn terrain_move(world: &World, from: [f32; 2], to: [f32; 2], feet: f32, vel: &mut [f32; 2]) -> [f32; 2] {
+    if !steep(world, from, to, feet) {
+        return to;
+    }
+    let g = world.gradient(to[0], to[1]);
+    let len = (g[0] * g[0] + g[1] * g[1]).sqrt();
+    if len > 0.0 {
+        let (nx, ny) = (g[0] / len, g[1] / len);
+        let d = [to[0] - from[0], to[1] - from[1]];
+        let into = d[0] * nx + d[1] * ny;
+        if into > 0.0 {
+            let slid = [(to[0] - into * nx).clamp(0.0, WORLD_SIZE), (to[1] - into * ny).clamp(0.0, WORLD_SIZE)];
+            if !steep(world, from, slid, feet) {
+                let v = vel[0] * nx + vel[1] * ny;
+                if v > 0.0 {
+                    *vel = [vel[0] - v * nx, vel[1] - v * ny];
+                }
+                return slid;
+            }
+        }
+    }
+    *vel = [0.0; 2];
+    from
 }
 
 /// Pushes the player's circle out of every cover box their body overlaps in
@@ -395,6 +445,56 @@ mod tests {
             }
         }
         assert!(slid > 1.0, "slid {slid} m along the wall");
+    }
+
+    /// On Kiln, a rift's wall: (a point on its floor at its foot, the
+    /// direction into the wall).
+    fn rift_wall() -> (Arc<World>, [f32; 2], [f32; 2]) {
+        let w = World::shared(crate::world::KILN);
+        let rift = crate::kiln::Rift::new(0);
+        // Out along the floor toward the wall until the ground starts to rise.
+        let mut across = 0.0;
+        let base = w.terrain(rift.at(3200.0, 0.0)[0] as f32, rift.at(3200.0, 0.0)[1] as f32);
+        loop {
+            let p = rift.at(3200.0, -across);
+            if w.terrain(p[0] as f32, p[1] as f32) > base + 3.0 {
+                break;
+            }
+            across += 1.0;
+        }
+        let p = rift.at(3200.0, -(across - 12.0));
+        let into = [-rift.normal[0] as f32, -rift.normal[1] as f32];
+        (w, [p[0] as f32, p[1] as f32], into)
+    }
+
+    #[test]
+    fn cliffs_are_walls_even_to_jumps() {
+        let (w, foot, into) = rift_wall();
+        let mut s = MoveState::standing(&w, foot);
+        let start = s.z;
+        let push = Input { move_x: (into[0] * 127.0) as i8, move_y: (into[1] * 127.0) as i8, ..Default::default() };
+        // Walking into the wall, then jumping at it for 20 s: never up it.
+        for i in 0..600 {
+            let jump = if i > 60 { BUTTON_JUMP } else { 0 };
+            s = step(&w, s, Input { buttons: BUTTON_SPRINT | jump, ..push });
+            assert!(s.z < start + 12.0, "climbed the wall to {} (from {start})", s.z);
+        }
+        let t = w.terrain(s.pos[0], s.pos[1]);
+        assert!(s.z - t < 1.0 || !s.grounded, "standing on the ground at the wall's foot: z {} terrain {t}", s.z);
+    }
+
+    #[test]
+    fn slides_along_cliffs() {
+        let (w, foot, into) = rift_wall();
+        let mut s = MoveState::standing(&w, foot);
+        // Diagonally into the wall: along it, not stopped.
+        let along = [into[1], -into[0]];
+        let d = [(into[0] + along[0]) * 0.7, (into[1] + along[1]) * 0.7];
+        for _ in 0..150 {
+            s = step(&w, s, Input { move_x: (d[0] * 127.0) as i8, move_y: (d[1] * 127.0) as i8, ..Default::default() });
+        }
+        let moved = (s.pos[0] - foot[0]) * along[0] + (s.pos[1] - foot[1]) * along[1];
+        assert!(moved > 10.0, "slid {moved} m along the wall in 5 s");
     }
 
     #[test]

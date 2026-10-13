@@ -23,6 +23,8 @@ pub struct BotBrain {
     ads: bool,
     /// Presses reload with its next input (`reload`).
     reload_once: bool,
+    /// Walks the lane it was spawned at an end of (`set_run_lanes`).
+    run_lanes: bool,
     seed: u64,
 }
 
@@ -36,6 +38,9 @@ pub enum Moves {
     /// Runs side to side along y at run speed, turning every `period` steps:
     /// the hard case for lag compensation.
     Strafe { period: u32 },
+    /// Walks the world's lane `lane` (from its far end if `backward`),
+    /// sprinting, then stands (`BotBrain::lane_result`).
+    Lane { lane: u16, backward: bool },
 }
 
 impl BotBrain {
@@ -45,7 +50,7 @@ impl BotBrain {
     }
 
     pub fn with_config(seed: u64, cfg: ClientConfig) -> Self {
-        Self { core: ClientCore::new(cfg), ai: Wander::new(seed), trigger: false, fighter: None, ads: false, reload_once: false, seed }
+        Self { core: ClientCore::new(cfg), ai: Wander::new(seed), trigger: false, fighter: None, ads: false, reload_once: false, run_lanes: false, seed }
     }
 
     /// Fights: aims at the nearest enemy it draws and fires in bursts. It
@@ -75,6 +80,20 @@ impl BotBrain {
 
     pub fn set_moves(&mut self, m: Moves) {
         self.ai.moves = m;
+    }
+
+    /// Walks a lane once welcomed: the one whose end the server spawned it
+    /// at (`lattice-server --spawn lanes`).
+    pub fn set_run_lanes(&mut self, on: bool) {
+        self.run_lanes = on;
+    }
+
+    /// The lane it walks, which way, and how long it took (s) once there.
+    pub fn lane_result(&self) -> Option<(u16, bool, Option<f32>)> {
+        match self.ai.moves {
+            Moves::Lane { lane, backward } => Some((lane, backward, self.ai.lane_secs)),
+            _ => None,
+        }
     }
 
     pub fn core(&self) -> &ClientCore {
@@ -147,9 +166,23 @@ impl BotBrain {
         let ammo = self.core.ammo();
         let reload = self.fighter.is_some() && !engaged && ammo.reload == 0 && ammo.mag < lattice_game::weapon::MAGAZINE / 3;
         let mut reload_once = std::mem::take(&mut self.reload_once);
+        if self.run_lanes && self.ai.moves == Moves::Wander {
+            if let (Some(w), Some(world)) = (self.core.welcome(), self.core.world()) {
+                // The lane we were spawned at one end of, its other end our anchor.
+                let near = |p: [f32; 3], at: [f32; 2]| (p[0] - at[0]).abs() < 0.5 && (p[1] - at[1]).abs() < 0.5;
+                let found = world.lanes().iter().enumerate().filter(|(_, l)| l.a != l.b).find_map(|(i, l)| {
+                    [false, true].into_iter().find(|&back| near(l.waypoint(0, back), w.spawn) && near(l.waypoint(0, !back), w.anchor)).map(|back| (i, back))
+                });
+                if let Some((lane, backward)) = found {
+                    self.ai.moves = Moves::Lane { lane: lane as u16, backward };
+                    (self.ai.lane_next, self.ai.lane_from) = (1, self.ai.steps);
+                }
+            }
+        }
+        let world = self.core.world().cloned();
         let ai = &mut self.ai;
         let out = self.core.step_inputs(now, |s, w| {
-            let mut input = ai.think(s, w);
+            let mut input = ai.think(s, w, world.as_deref());
             if ads {
                 input.buttons = (input.buttons | BUTTON_ADS) & !BUTTON_SPRINT;
             }
@@ -176,18 +209,36 @@ struct Wander {
     sprint: bool,
     moves: Moves,
     steps: u32,
+    /// Walking a lane: the next waypoint, the step it started at, the time
+    /// it took once at its end.
+    lane_next: usize,
+    lane_from: u32,
+    lane_secs: Option<f32>,
 }
 
 impl Wander {
     fn new(seed: u64) -> Self {
         let mut rng = Rng::new(seed);
-        Self { heading: rng.range(0.0, std::f32::consts::TAU), rng, sprint: false, moves: Moves::Wander, steps: 0 }
+        Self { heading: rng.range(0.0, std::f32::consts::TAU), rng, sprint: false, moves: Moves::Wander, steps: 0, lane_next: 1, lane_from: 0, lane_secs: None }
     }
 
-    fn think(&mut self, s: &MoveState, w: &Welcome) -> Input {
+    fn think(&mut self, s: &MoveState, w: &Welcome, world: Option<&lattice_game::world::World>) -> Input {
         self.steps += 1;
         match self.moves {
             Moves::Wander => {}
+            Moves::Lane { lane, backward } => {
+                let Some(l) = world.and_then(|w| w.lanes().get(lane as usize)) else { return Input::default() };
+                return match l.steer([s.pos[0], s.pos[1], s.z], &mut self.lane_next, backward) {
+                    Some((x, y)) => {
+                        let yaw = ((y as f32).atan2(x as f32).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16;
+                        Input { move_x: x, move_y: y, yaw, pitch: 0, buttons: BUTTON_SPRINT }
+                    }
+                    None => {
+                        self.lane_secs.get_or_insert((self.steps - self.lane_from) as f32 / crate::movement::TICK_HZ as f32);
+                        Input::default()
+                    }
+                };
+            }
             // Stands, facing its heading.
             Moves::Hold => return Input { yaw: (self.heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16, ..Input::default() },
             Moves::Strafe { period } => {

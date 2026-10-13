@@ -106,6 +106,9 @@ impl Default for ClientConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct ClientStats {
+    /// The server's world differs from the one we built from its id (its
+    /// Welcome's digest): an older or newer generator than the server's.
+    pub world_mismatch: bool,
     pub snapshots: u64,
     /// Snapshots that arrived after a newer one and were ignored.
     pub stale_snapshots: u64,
@@ -686,7 +689,10 @@ impl ClientCore {
         }
         match msg::decode_server_msg(data) {
             Ok(ServerMsg::Welcome(w)) if self.welcome.is_none() => {
-                let world = World::shared(w.world_seed);
+                let world = World::shared(w.world);
+                // A different generator than the server's: say so (it would
+                // mispredict wherever the two differ).
+                self.stats.world_mismatch = world.digest() != w.world_digest;
                 // The server starts us exactly here too.
                 self.state = MoveState::standing(&world, w.spawn);
                 self.ammo = Ammo::FULL;
@@ -1221,7 +1227,7 @@ mod tests {
     fn a_frame_loop_makes_30_inputs_a_second_and_draws_its_player_smoothly() {
         let t0 = Instant::now();
         let mut c = ClientCore::default();
-        let w = Welcome { entity: 1, spawn: [4096.0, 4096.0], anchor: [4096.0, 4096.0], radius: 100.0, world_seed: 7, rules: 0 };
+        let w = Welcome { entity: 1, spawn: [4096.0, 4096.0], anchor: [4096.0, 4096.0], radius: 100.0, world: 7, world_digest: 0, rules: 0 };
         c.on_message(&msg::encode_welcome(&w), t0);
         let frame = Duration::from_secs_f64(1.0 / 144.0);
         let run = Input { move_x: 127, ..Default::default() };

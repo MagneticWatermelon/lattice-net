@@ -166,6 +166,10 @@ pub enum SpawnMode {
     /// Everyone in one disk of this radius at the center: the density limit
     /// (a 25 m disk is everyone on one capture point).
     Disk(f32),
+    /// Player k starts at an end of one of the world's lanes (lane k / 2,
+    /// from its far end if k is odd), for bots that walk and time them
+    /// (`lattice-bots --run-lanes`).
+    Lanes,
 }
 
 impl std::str::FromStr for SpawnMode {
@@ -175,6 +179,7 @@ impl std::str::FromStr for SpawnMode {
             "uniform" => Ok(Self::Uniform),
             "hotspots" => Ok(Self::Hotspots),
             "blob" => Ok(Self::Blob),
+            "lanes" => Ok(Self::Lanes),
             _ => {
                 let arg = |prefix: &str| s.strip_prefix(prefix).and_then(|v| v.parse::<f32>().ok()).filter(|v| *v > 0.0);
                 match (arg("line:"), arg("disk:")) {
@@ -204,7 +209,8 @@ pub struct SimConfig {
     pub seed: u64,
     /// The world (terrain and cover) everyone plays in; sent in the Welcome so
     /// clients build the same one.
-    pub world_seed: u64,
+    /// The world's id (`World::shared`): `world::KILN`, or a seed for Harrow.
+    pub world: u64,
     /// Push overlapping players apart (soft separation). Off only for comparisons.
     pub separation: bool,
     /// Test aid until there are weapons: kill this many random living
@@ -253,7 +259,7 @@ impl Default for SimConfig {
             preallocate: false,
             ladder: LadderConfig::default(),
             seed: 1,
-            world_seed: 1,
+            world: 1,
             separation: true,
             deaths_per_sec: 0.0,
             immortal: false,
@@ -1173,7 +1179,7 @@ impl SimServer {
         let (ladder, interest) = (Ladder::new(cfg.ladder.clone()), cfg.interest.clone());
         let spread_secret = cfg.spread_secret;
         Self {
-            world: World::shared(cfg.world_seed),
+            world: World::shared(cfg.world),
             pushes: Vec::new(),
             net,
             shard_clients: (0..cfg.shards).map(|_| Vec::new()).collect(),
@@ -2164,7 +2170,7 @@ impl SimServer {
         self.slot_of[i] = Some((k as u16, (self.shard_clients[k].len() - 1) as u32));
         self.counters.spawns += 1;
         let rules = if self.unlimited_rounds() { msg::RULE_UNLIMITED_ROUNDS } else { 0 };
-        let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius, world_seed: self.cfg.world_seed, rules });
+        let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius, world: self.cfg.world, world_digest: self.world.digest(), rules });
         let _ = self.net.send(client, Channel::Reliable, welcome);
     }
 
@@ -2216,6 +2222,16 @@ impl SimServer {
             SpawnMode::Hotspots if k < 2400 => (HOTSPOTS[k as usize % 3], 150.0),
             SpawnMode::Blob if k < 3000 => (CENTER, 200.0),
             SpawnMode::Disk(radius) => (CENTER, radius),
+            SpawnMode::Lanes => {
+                let lanes: Vec<_> = self.world.lanes().iter().filter(|l| l.a != l.b).collect();
+                if let Some(l) = lanes.get((k / 2) as usize % lanes.len().max(1)) {
+                    // The anchor is its other end: start and end name the lane.
+                    let back = !k.is_multiple_of(2);
+                    let (w, e) = (l.waypoint(0, back), l.waypoint(0, !back));
+                    return ([w[0], w[1]], [e[0], e[1]], 1.0);
+                }
+                (CENTER, 200.0)
+            }
             SpawnMode::Line(spacing) => {
                 let p = [(1000.0 + k as f32 * spacing).min(WORLD_SIZE), WORLD_SIZE / 2.0];
                 return (p, p, 1.0);

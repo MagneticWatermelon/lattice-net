@@ -5,6 +5,9 @@
 //!   cargo run --release -p lattice-game --example determinism [seed]
 //!
 //! - **world:** the terrain and every cover box the client builds itself;
+//! - **kiln:** Kiln, the desert continent, as the client builds it (heights,
+//!   boxes, sites, lanes, points, what its ground is made of), and players
+//!   walking its lanes and pressing into its cliffs;
 //! - **movement:** players walking, sprinting, jumping, crouching and aiming
 //!   down sights over the map for thousands of steps, pushed now and then
 //!   and dead for a while: the prediction the client and server must agree on;
@@ -20,7 +23,7 @@ use lattice_game::hit;
 use lattice_game::movement::{dead_input, nudge, step, Input, MoveState, BUTTON_ADS, BUTTON_CROUCH, BUTTON_JUMP, BUTTON_RELOAD, BUTTON_SPRINT};
 use lattice_game::msg;
 use lattice_game::weapon::{aim, angles, muzzle, spread, Ammo, Bloom, Flight};
-use lattice_game::world::World;
+use lattice_game::world::{World, KILN, TERRAIN_N};
 use lattice_net::wire::Writer;
 
 /// FNV-1a over everything fed to it.
@@ -124,6 +127,38 @@ fn main() {
         }
     }
     println!("movement {:016x}", h.0);
+
+    // Kiln: everything the generator makes (f64 and libm), then players on
+    // its lanes, sprinting, jumping at random, now and then turned into a
+    // wall or a cliff.
+    let kiln = World::shared(KILN);
+    let mut h = Hash::new();
+    h.u64(kiln.digest());
+    for y in 0..TERRAIN_N {
+        for x in 0..TERRAIN_N {
+            h.u64(kiln.ground_at(x, y).unwrap_or(255) as u64);
+        }
+    }
+    println!("kiln {:016x}", h.0);
+    let mut h = Hash::new();
+    for (i, l) in kiln.lanes().iter().enumerate() {
+        let back = i % 2 == 1;
+        let w0 = l.waypoint(0, back);
+        let mut s = MoveState::standing(&kiln, [w0[0], w0[1]]);
+        let mut next = 1;
+        for k in 0..900 {
+            let (mx, my) = l.steer([s.pos[0], s.pos[1], s.z], &mut next, back).unwrap_or((0, 0));
+            let wild = rng.below(10) == 0;
+            let input = if wild {
+                Input { move_x: (rng.below(255) as i32 - 127) as i8, move_y: (rng.below(255) as i32 - 127) as i8, buttons: BUTTON_JUMP | BUTTON_SPRINT, ..Input::default() }
+            } else {
+                Input { move_x: mx, move_y: my, buttons: if k % 37 == 0 { BUTTON_JUMP } else { BUTTON_SPRINT }, ..Input::default() }
+            };
+            s = step(&kiln, s, input);
+            h.state(&s);
+        }
+    }
+    println!("kiln-move {:016x}", h.0);
 
     // Shots from those spots: aim, spread (secret picks are just numbers
     // here), bloom over bursts, flights against the terrain, cover and a

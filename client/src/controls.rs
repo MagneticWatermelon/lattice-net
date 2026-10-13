@@ -284,7 +284,7 @@ pub fn tracers(
     mut gizmos: Gizmos<TracerGizmos>,
 ) {
     let Some(w) = net.0.core.welcome() else { return };
-    let world = lattice_game::world::World::shared(w.world_seed);
+    let world = lattice_game::world::World::shared(w.world);
     let core = &net.0.core;
     // Others' shots start as their shooters are drawn firing (their rifles
     // kick and flash then); ours re-aim along the server's word.

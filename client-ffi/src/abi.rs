@@ -270,10 +270,14 @@ ffi_structs! {
         /// largest such pop (mm), per tier.
         pub pops: [u64; 3],
         pub pop_max_mm: [u32; 3],
+        /// 1: the server's world differs from the one we built from its id
+        /// (its Welcome's digest): an older or newer plugin than the server.
+        pub world_mismatch: u8,
     }
 
     /// The world's size and contents.
     pub struct LtWorldInfo {
+        /// Its id: `LT_WORLD_KILN`, or a seed for Harrow.
         pub seed: u64,
         /// Of the terrain and cover: two machines with the same digest built
         /// the same world.
@@ -286,6 +290,12 @@ ffi_structs! {
         pub samples: u32,
         pub boxes: u32,
         pub sites: u32,
+        /// `LT_CONTINENT_*`: which generator made it (how it's drawn).
+        pub continent: u8,
+        /// Routes (`lt_world_lanes`), all their points, control points.
+        pub lanes: u32,
+        pub lane_points: u32,
+        pub points: u32,
     }
 
     /// A cover box: blocks movement and shots.
@@ -300,16 +310,35 @@ ffi_structs! {
         pub facing: u8,
     }
 
-    /// A base or an outpost: a square of flattened ground.
+    /// A site: a base, an outpost, a great site or a Landing.
     pub struct LtSite {
         pub x: f32,
         pub y: f32,
-        /// Half the side of its flat square.
+        /// Half its size (Harrow's: the side of its flat square).
         pub half: f32,
-        /// The height it's flattened to.
+        /// The height of its main ground.
         pub level: f32,
-        /// A walled base (else an outpost).
+        /// A base (else an outpost or a great site).
         pub base: u8,
+        /// `LT_SITE_*`.
+        pub kind: u8,
+        /// Its sector, 0-2 (Kiln's factions' starting thirds); 255: none.
+        pub sector: u8,
+    }
+
+    /// A route: a lane between two sites (`a` != `b`), or a way inside one.
+    /// Its points are `count` of `lt_world_lane_points` from `first`.
+    pub struct LtLane {
+        pub a: u16,
+        pub b: u16,
+        pub first: u32,
+        pub count: u32,
+    }
+
+    /// A control point: holding it holds the site's tap.
+    pub struct LtPoint {
+        pub pos: LtVec3,
+        pub site: u16,
     }
 
     /// Where a segment first hits the ground or cover.
@@ -366,6 +395,43 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_COVER_POST", lattice_game::world::Kind::Post as i64, "A guard post by a base's gate."),
     ("LT_COVER_COMMAND", lattice_game::world::Kind::Command as i64, "A base's command building."),
     ("LT_COVER_BUNKER", lattice_game::world::Kind::Bunker as i64, "A bunker."),
+    ("LT_COVER_BLOCK", lattice_game::world::Kind::Block as i64, "A blockout volume: a building, wall, tower or deck (Kiln's sites until they have art)."),
+    ("LT_COVER_ROCK", lattice_game::world::Kind::Rock as i64, "Natural rock: a boulder, a hoodoo, a crag, an arch."),
+    ("LT_COVER_CRYSTAL", lattice_game::world::Kind::Crystal as i64, "Glass and crystal: fulgurite spikes, a Geode's crystals."),
+    ("LT_COVER_BONE", lattice_game::world::Kind::Bone as i64, "The Dry Sea's bones."),
+    ("LT_WORLD_KILN", lattice_game::world::KILN as i64, "Kiln's world id (any other is a seed for Harrow)."),
+    ("LT_CONTINENT_HARROW", lattice_game::world::Continent::Harrow as i64, "Harrow, the procedural hills."),
+    ("LT_CONTINENT_KILN", lattice_game::world::Continent::Kiln as i64, "Kiln, the desert continent."),
+    ("LT_GROUND_NONE", 255, "The world doesn't say what the ground is (Harrow)."),
+    ("LT_GROUND_SAND", lattice_game::world::Ground::Sand as i64, "Sand."),
+    ("LT_GROUND_GLASS", lattice_game::world::Ground::Glass as i64, "The Glasslands' fused glass."),
+    ("LT_GROUND_SALT", lattice_game::world::Ground::Salt as i64, "The Dry Sea's salt."),
+    ("LT_GROUND_OCHRE", lattice_game::world::Ground::Ochre as i64, "Banded red and ochre rock: mesas and cliffs."),
+    ("LT_GROUND_BASALT", lattice_game::world::Ground::Basalt as i64, "Dark basalt: the rift floors and the Hollow's."),
+    ("LT_GROUND_PALE", lattice_game::world::Ground::Pale as i64, "Pale stone: the Crown and the Spire layer."),
+    ("LT_GROUND_ROAD", lattice_game::world::Ground::Road as i64, "A lane's road."),
+    ("LT_GROUND_PAD", lattice_game::world::Ground::Pad as i64, "A site's ground."),
+    ("LT_GROUND_SCREE", lattice_game::world::Ground::Scree as i64, "Scree and gravel on steep slopes."),
+    ("LT_SITE_BASE", lattice_game::world::SiteKind::Base as i64, "Harrow's walled base."),
+    ("LT_SITE_OUTPOST", lattice_game::world::SiteKind::Outpost as i64, "Harrow's open outpost."),
+    ("LT_SITE_LANDING", lattice_game::world::SiteKind::Landing as i64, "A faction's Landing (can't be taken)."),
+    ("LT_SITE_HOLLOW", lattice_game::world::SiteKind::Hollow as i64, "Kiln's central crater."),
+    ("LT_SITE_SPAN", lattice_game::world::SiteKind::Span as i64, "A bridge fortress across a rift."),
+    ("LT_SITE_CLIFFHOLD", lattice_game::world::SiteKind::Cliffhold as i64, "A fortress in a rift wall."),
+    ("LT_SITE_GEODE", lattice_game::world::SiteKind::Geode as i64, "A crystal dome."),
+    ("LT_SITE_MESA_CITADEL", lattice_game::world::SiteKind::MesaCitadel as i64, "A walled town on a mesa."),
+    ("LT_SITE_SLOT_HOLD", lattice_game::world::SiteKind::SlotHold as i64, "A base across a knot of slot canyons."),
+    ("LT_SITE_RIFT_LEDGE", lattice_game::world::SiteKind::RiftLedge as i64, "A base on a ledge halfway down a rift wall."),
+    ("LT_SITE_CENOTE", lattice_game::world::SiteKind::Cenote as i64, "A base round a cenote."),
+    ("LT_SITE_REEF_WARREN", lattice_game::world::SiteKind::ReefWarren as i64, "A base in a petrified reef."),
+    ("LT_SITE_OSSUARY", lattice_game::world::SiteKind::Ossuary as i64, "A base in a colossal skeleton."),
+    ("LT_SITE_GLASS_VAULT", lattice_game::world::SiteKind::GlassVault as i64, "A base round a buried vault."),
+    ("LT_SITE_ARCH", lattice_game::world::SiteKind::Arch as i64, "An outpost under a natural arch."),
+    ("LT_SITE_VENT", lattice_game::world::SiteKind::Vent as i64, "An outpost at a vent."),
+    ("LT_SITE_TUNNEL_MOUTH", lattice_game::world::SiteKind::TunnelMouth as i64, "An outpost at a tunnel's mouth."),
+    ("LT_SITE_SPIRE_PERCH", lattice_game::world::SiteKind::SpirePerch as i64, "An outpost on a spire."),
+    ("LT_SITE_WELL_SHRINE", lattice_game::world::SiteKind::WellShrine as i64, "An outpost at a small well."),
+    ("LT_SITE_WRECK", lattice_game::world::SiteKind::Wreck as i64, "An outpost in a crashed lattice ship."),
     ("LT_NOBODY", 0xFFFF, "No shooter (a distant fight's shot from no one drawn)."),
     (
         "LT_CONFIG_NET_THREAD",

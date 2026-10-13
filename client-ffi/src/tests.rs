@@ -195,7 +195,7 @@ fn two_sessions_join_see_each_other_and_fight_through_the_c_api() {
         assert!(!w.is_null());
         let mut info = LtWorldInfo::default();
         lt_world_info(w, &mut info);
-        assert_eq!(info.seed, server.sim.config().world_seed);
+        assert_eq!(info.seed, server.sim.config().world);
         assert_eq!(info.samples as usize, lattice_game::world::TERRAIN_N);
         let mut h = [0f32; 6];
         assert_eq!(lt_world_heights(w, 1000, 1000, 3, 2, h.as_mut_ptr()), 6);

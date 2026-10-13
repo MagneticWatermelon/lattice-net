@@ -11,6 +11,7 @@ pub mod delta;
 pub mod events;
 pub mod faction;
 pub mod hit;
+pub mod kiln;
 pub mod movement;
 pub mod msg;
 pub mod tier;

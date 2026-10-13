@@ -7,7 +7,7 @@
 //!                           near render step when the input was made (1/64 steps, wrapping; see
 //!                           RENDER_UNITS); mid and far entities were drawn `mid_lag` (1/8 steps) earlier.
 //!                           BUTTON_FIRE: a shot follows (weapon::Shot), at most one per input
-//! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32 | world_seed:8
+//! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32 | world:8 | world_digest:8 | rules:1
 //! S->C unreliable  Snapshot tag | server_tick:4 | step:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
 //!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 stance:1 (grounded, crouched) | pushes:1 | health:1 | life:1
 //!                           | ammo mag:1 reserve:2 reload:1
@@ -230,8 +230,12 @@ pub struct Welcome {
     /// The bot wanders within `radius` of `anchor` (scenario hotspot/blob center).
     pub anchor: [f32; 2],
     pub radius: f32,
-    /// The client builds the same world from it (`World::shared`).
-    pub world_seed: u64,
+    /// The world's id: the client builds the same world from it
+    /// (`World::shared`: a continent's id, like `world::KILN`, or a seed for Harrow).
+    pub world: u64,
+    /// The server's world's `World::digest`: a client that builds a different
+    /// one (an older or newer generator) knows, instead of mispredicting.
+    pub world_digest: u64,
     /// The server's rules that prediction must follow (`RULE_*`).
     pub rules: u8,
 }
@@ -248,7 +252,8 @@ pub fn encode_welcome(m: &Welcome) -> Vec<u8> {
     for v in [m.spawn[0], m.spawn[1], m.anchor[0], m.anchor[1], m.radius] {
         w.u32(v.to_bits());
     }
-    w.u64(m.world_seed);
+    w.u64(m.world);
+    w.u64(m.world_digest);
     w.u8(m.rules);
     w.into_inner()
 }
@@ -339,10 +344,11 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             let spawn = [read_f32(&mut r)?, read_f32(&mut r)?];
             let anchor = [read_f32(&mut r)?, read_f32(&mut r)?];
             let radius = read_f32(&mut r)?;
-            let world_seed = r.u64()?;
+            let world = r.u64()?;
+            let world_digest = r.u64()?;
             let rules = r.u8()?;
             r.finish()?;
-            Ok(ServerMsg::Welcome(Welcome { entity, spawn, anchor, radius, world_seed, rules }))
+            Ok(ServerMsg::Welcome(Welcome { entity, spawn, anchor, radius, world, world_digest, rules }))
         }
         MSG_SNAPSHOT => {
             let server_tick = r.u32()?;
@@ -521,7 +527,7 @@ mod tests {
 
     #[test]
     fn welcome_snapshot_and_entities_roundtrip() {
-        let w = Welcome { entity: 7, spawn: [1.5, 2.5], anchor: [4096.0, 4096.0], radius: 200.0, world_seed: u64::MAX - 3, rules: RULE_UNLIMITED_ROUNDS };
+        let w = Welcome { entity: 7, spawn: [1.5, 2.5], anchor: [4096.0, 4096.0], radius: 200.0, world: u64::MAX - 3, world_digest: 0x1234_5678_9ABC_DEF0, rules: RULE_UNLIMITED_ROUNDS };
         assert!(matches!(decode_server_msg(&encode_welcome(&w)), Ok(ServerMsg::Welcome(x)) if x == w));
 
         let h = SnapshotHeader {

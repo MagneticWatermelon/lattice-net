@@ -468,6 +468,7 @@ impl Handle {
             streaks,
             pops: self.pops,
             pop_max_mm: self.pop_max,
+            world_mismatch: st.world_mismatch as u8,
         }
     }
 
