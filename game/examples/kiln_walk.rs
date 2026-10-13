@@ -14,8 +14,12 @@ fn main() {
     let (a, b) = (w.sites()[l.a as usize], w.sites()[l.b as usize]);
     println!("lane {i}: {:?} {} -> {:?} {}, {:.0} m, {} waypoints", a.kind, l.a, b.kind, l.b, l.length(), l.path.len());
     let s0 = l.waypoint(0, back);
-    let mut s = MoveState::standing(&w, [s0[0], s0[1]]);
-    s.z = w.ground(s0[0], s0[1], s0[2].max(s.z) + 1.0, 1.5).max(s.z);
+    let mut s = if s0[2] < w.terrain(s0[0], s0[1]) - 2.0 {
+        MoveState::standing_at(&w, [s0[0], s0[1]], s0[2])
+    } else {
+        let s = MoveState::standing(&w, [s0[0], s0[1]]);
+        MoveState { z: w.ground(s0[0], s0[1], s0[2].max(s.z) + 1.0, 1.5).max(s.z), ..s }
+    };
     let mut next = 1;
     for t in 0..(30 * 600) {
         let Some((mx, my)) = l.steer([s.pos[0], s.pos[1], s.z], &mut next, back) else {

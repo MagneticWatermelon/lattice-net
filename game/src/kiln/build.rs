@@ -9,10 +9,10 @@
 //! budget), or lifts (force volumes, K1) with drop shafts beside them.
 
 use super::land::{self, face_offset, fbm, mesa, mound, pad, Rng, DECK, HOLLOW_FLOOR, SALT, TERRACES, TERRACE_CLIFF};
-use crate::world::CELLS;
+use super::deep::{self, drop_down, keep_clear, lift_up};
 use super::lanes::{stamp_ramp, Leg, LegKind, Route, ROAD_HALF};
 use super::*;
-use crate::world::{CoverBox, Force, Kind, Point, Volume};
+use crate::world::{CoverBox, Kind, Point};
 
 /// The rift ledges' shelves: on the Crown's wall, and in the outer plains'.
 pub(crate) const LEDGE_CCW_Z: f64 = 250.0;
@@ -99,13 +99,13 @@ fn axis_near(deg: f64) -> [f64; 2] {
 }
 
 /// A box: a world rectangle from `bottom` to `top`.
-fn bx(min: [f64; 2], max: [f64; 2], bottom: f64, top: f64, kind: Kind, facing: u8) -> CoverBox {
+pub(crate) fn bx(min: [f64; 2], max: [f64; 2], bottom: f64, top: f64, kind: Kind, facing: u8) -> CoverBox {
     CoverBox::new([min[0] as f32, min[1] as f32], [max[0] as f32, max[1] as f32], bottom as f32, top as f32, kind, facing)
 }
 
 /// A box centered at `c`, `half` m along `u` (a unit vector) and across it,
 /// from `bottom` to `top`: turned to `u` (C1), unless that's along an axis.
-fn oriented(c: [f64; 2], half: [f64; 2], u: [f64; 2], bottom: f64, top: f64, kind: Kind) -> CoverBox {
+pub(crate) fn oriented(c: [f64; 2], half: [f64; 2], u: [f64; 2], bottom: f64, top: f64, kind: Kind) -> CoverBox {
     if u[1] == 0.0 {
         bx(sub(c, half), add(c, half), bottom, top, kind, 0)
     } else if u[0] == 0.0 {
@@ -117,7 +117,7 @@ fn oriented(c: [f64; 2], half: [f64; 2], u: [f64; 2], bottom: f64, top: f64, kin
 }
 
 /// A box along the segment `a`-`b`, `half` m to either side of it.
-fn strip(a: [f64; 2], b: [f64; 2], half: f64, bottom: f64, top: f64, kind: Kind) -> CoverBox {
+pub(crate) fn strip(a: [f64; 2], b: [f64; 2], half: f64, bottom: f64, top: f64, kind: Kind) -> CoverBox {
     let l = dist(a, b);
     oriented(scale(add(a, b), 0.5), [l / 2.0, half], scale(sub(b, a), 1.0 / l), bottom, top, kind)
 }
@@ -231,250 +231,6 @@ fn stairs_at(k: &mut Kiln, c: [f64; 2], side: f64, z0: f64, z1: f64, toward: [f6
         out.push(bx([p[0].min(q[0]), p[1].min(q[1])], [p[0].max(q[0]), p[1].max(q[1])], b.bottom as f64, b.top as f64, b.kind, b.facing));
     }
     (path.into_iter().map(turn).collect(), zs)
-}
-
-/// A lift's speed up (m/s), and a short one's or its top's: slow enough
-/// that a rider leaves it bobbing just over where it goes.
-const LIFT_FAST: f64 = 20.0;
-const LIFT_TALL: f64 = 30.0;
-const LIFT_SLOW: f64 = 4.0;
-/// A drop shaft's fall (m/s).
-const DROP_SPEED: f64 = 6.0;
-
-/// A lift (K1): an updraft in the square column of half-side `half` at `c`,
-/// from its foot at `z0` to `z1` (the deck or ledge it serves): fast, then
-/// slowing over its last stretch so a rider bobs just over `z1` and steps
-/// off; and a one-way route for `site` from `from` (on the ground by its
-/// foot) up it to `to` (on top). Tall lifts (over 200 m) run faster.
-#[allow(clippy::too_many_arguments)]
-fn lift_up(k: &mut Kiln, site: usize, c: [f64; 2], half: f64, z0: f64, z1: f64, from: [f64; 2], to: [f64; 2]) {
-    let fast = if z1 - z0 > 200.0 { LIFT_TALL } else { LIFT_FAST };
-    // Room to slow from `fast` to `LIFT_SLOW` at gravity's rate, and a little.
-    let slow = (fast * fast - LIFT_SLOW * LIFT_SLOW) / (2.0 * 15.0) + 3.0;
-    let column = |lo: f64, hi: f64, v: f64| Volume {
-        min: [(c[0] - half) as f32, (c[1] - half) as f32, lo as f32],
-        max: [(c[0] + half) as f32, (c[1] + half) as f32, hi as f32],
-        force: Force::Lift,
-        vel: [0.0, 0.0, v as f32],
-    };
-    if z1 - z0 > slow + 4.0 {
-        k.volumes.push(column(z0 - 1.0, z1 - slow, fast));
-        k.volumes.push(column(z1 - slow, z1 + 1.5, LIFT_SLOW));
-    } else {
-        k.volumes.push(column(z0 - 1.0, z1 + 1.5, LIFT_SLOW.max(6.0)));
-    }
-    // Walked: to just outside its foot, into it (and held there, carried),
-    // then off at the top.
-    let out = add(c, scale(sub(from, c), (half + 1.5) / dist(from, c)));
-    let legs = vec![
-        Leg { kind: LegKind::Road, path: vec![from, out], z: None },
-        Leg { kind: LegKind::Road, path: vec![out, c, to], z: Some(vec![z0, z1 + 1.0, z1]) },
-    ];
-    k.internal.push(Route { a: site, b: site, legs, one_way: true });
-}
-
-/// A drop shaft (K1): a column of half-side `half` at `c` that slows a fall
-/// to `DROP_SPEED`, from over `z0` (where it's stepped into) down to `z1`;
-/// and a one-way route for `site` from `from` (up top) down it to `to`.
-/// `edge` is where the top's floor ends beside it, stepped off from.
-#[allow(clippy::too_many_arguments)]
-fn drop_down(k: &mut Kiln, site: usize, c: [f64; 2], half: f64, z0: f64, z1: f64, from: [f64; 2], edge: [f64; 2], to: [f64; 2]) {
-    k.volumes.push(Volume {
-        min: [(c[0] - half) as f32, (c[1] - half) as f32, (z1 - 1.0) as f32],
-        max: [(c[0] + half) as f32, (c[1] + half) as f32, (z0 + 3.0) as f32],
-        force: Force::Drop,
-        vel: [0.0, 0.0, -DROP_SPEED as f32],
-    });
-    let legs = vec![Leg { kind: LegKind::Road, path: vec![from, edge, c, to], z: Some(vec![z0, z0, z1, z1]) }];
-    k.internal.push(Route { a: site, b: site, legs, one_way: true });
-}
-
-/// A Tunnel mouth's way under the ground (K1): its trench's head on the
-/// surface, its axis, the chamber its ramp comes down into.
-#[derive(Debug, Clone)]
-pub(crate) struct Chamber {
-    pub site: usize,
-    /// The trench's head (on a cell's edge) and its axis (along a world axis).
-    pub top: [f64; 2],
-    pub e: [f64; 2],
-    /// The ramp's foot, the chamber's center (a 16 m square past it).
-    pub foot: [f64; 2],
-    pub center: [f64; 2],
-    /// The ground's level round the mouth, and the chamber's floor.
-    pub surface: f64,
-    pub floor: f64,
-}
-
-/// The trench's length (10 cells: a 12 m drop at 0.3), the chamber's half-side
-/// and how far its floor is under the ground; how far under it a tube's floor
-/// stays (its ceiling's top 2.5 m under it, at the least).
-const TRENCH: f64 = 40.0;
-const CHAMBER: f64 = 8.0;
-const DEPTH: f64 = 12.0;
-const TUBE_DEPTH: f64 = 8.0;
-/// A tube's half-width inside its walls, its headroom, its steepest grade.
-const TUBE: f64 = 3.0;
-const TUBE_HIGH: f64 = 4.5;
-const TUBE_GRADE: f64 = 0.25;
-
-/// Digs site `i`'s Tunnel mouth: the ground round it leveled, holes in it
-/// over the trench, the ramp down and its walls, the chamber's floor and
-/// ceiling (its walls wait for the tube, `tunnels`).
-fn mouth(k: &mut Kiln, i: usize) -> Chamber {
-    let (top, e) = (k.sites[i].anchors[0], sub(k.sites[i].anchors[1], k.sites[i].anchors[0]));
-    let n = [-e[1], e[0]];
-    let foot = add(top, scale(e, TRENCH));
-    let center = add(foot, scale(e, CHAMBER));
-    let surface = k.mean(add(top, scale(e, TRENCH / 2.0)), 26.0);
-    let corners = [sub(sub(top, scale(e, 4.0)), scale(n, 12.0)), add(add(center, scale(e, CHAMBER + 4.0)), scale(n, 12.0))];
-    let (min, max) = ([corners[0][0].min(corners[1][0]), corners[0][1].min(corners[1][1])], [corners[0][0].max(corners[1][0]), corners[0][1].max(corners[1][1])]);
-    land::pad_rect(k, min, max, surface, 24.0);
-    let floor = surface - DEPTH;
-    // The holes: the trench's cells (two across, ten along).
-    if k.holes.is_empty() {
-        k.holes = vec![0; (CELLS * CELLS).div_ceil(64)];
-    }
-    let res = TERRAIN_RES as f64;
-    for a in 0..(TRENCH / res) as usize {
-        for b in [-1.0, 0.0] {
-            let q = add(add(top, scale(e, (a as f64 + 0.5) * res)), scale(n, (b + 0.5) * res));
-            let (cx, cy) = ((q[0] / res).floor() as usize, (q[1] / res).floor() as usize);
-            let j = cy * CELLS + cx;
-            k.holes[j / 64] |= 1 << (j % 64);
-        }
-    }
-    let mid = scale(add(top, foot), 0.5);
-    let ramp = CoverBox::turned([mid[0] as f32, mid[1] as f32], [(TRENCH / 2.0) as f32, 4.0], [-e[0] as f32, -e[1] as f32], (floor - 1.0) as f32, surface as f32, Kind::Block, 0);
-    k.fixed.push(ramp.wedge(floor as f32));
-    for side in [-1.0, 1.0] {
-        k.fixed.push(strip(add(top, scale(n, side * 4.3)), add(foot, scale(n, side * 4.3)), 0.3, floor - 1.0, surface, Kind::Block));
-    }
-    k.fixed.push(oriented(center, [CHAMBER, CHAMBER], e, floor - 1.0, floor, Kind::Block));
-    k.fixed.push(oriented(center, [CHAMBER + 0.6, CHAMBER + 0.6], e, floor + 5.0, floor + 5.6, Kind::Block));
-    Chamber { site: i, top, e, foot, center, surface, floor }
-}
-
-/// The tube between each sector's two Tunnel mouths (K1, the Undervein's
-/// first): 6 m wide, its floor following the land at least `TUBE_DEPTH` under it
-/// (no steeper than `TUBE_GRADE`), in 8 m segments of turned boxes (floor,
-/// walls, ceiling); the chambers' walls, open to the trench and the tube;
-/// and its lane, from one outpost to the other.
-pub(crate) fn tunnels(k: &mut Kiln) {
-    for s in 0..3 {
-        let find = |site: usize| k.chambers.iter().find(|c| c.site == site).cloned().expect("a Tunnel mouth's chamber");
-        let (a, b) = (find(super::site(s, s::O + 5)), find(super::site(s, s::O + 11)));
-        tube(k, &a, &b);
-    }
-}
-
-fn tube(k: &mut Kiln, a: &Chamber, b: &Chamber) {
-    let l = dist(a.center, b.center);
-    let u = scale(sub(b.center, a.center), 1.0 / l);
-    let v = [-u[1], u[0]];
-    // From a meter inside one chamber's wall to a meter inside the other's.
-    let exit = |d: [f64; 2]| CHAMBER / d[0].abs().max(d[1].abs());
-    let (s0, s1) = (exit(u) - 1.0, l - exit(u) + 1.0);
-    let n = ((s1 - s0) / 8.0).ceil() as usize;
-    let at = |j: usize| add(a.center, scale(u, s0 + (s1 - s0) * j as f64 / n as f64));
-    // The ground over each point (its lowest across the tube's width), and
-    // the floor: level from one chamber's floor to the other's, but dipped
-    // where the ground does (keeping TUBE_DEPTH under it), no steeper than
-    // TUBE_GRADE.
-    let ground: Vec<f64> = (0..=n)
-        .map(|j| {
-            let p = at(j);
-            [-4.0, 0.0, 4.0].iter().flat_map(|&x| [-4.0, 0.0, 4.0].map(|y| k.height(add(add(p, scale(v, x)), scale(u, y))))).fold(f64::MAX, f64::min)
-        })
-        .collect();
-    let step = (s1 - s0) / n as f64;
-    let floor: Vec<f64> = (0..=n)
-        .map(|j| {
-            let cone = (0..=n).map(|i| ground[i] - TUBE_DEPTH + TUBE_GRADE * step * (i as f64 - j as f64).abs()).fold(f64::MAX, f64::min);
-            cone.min(lerp(a.floor, b.floor, j as f64 / n as f64))
-        })
-        .collect();
-    for j in 0..n {
-        let (p, q) = (at(j), at(j + 1));
-        let (z0, z1) = (floor[j], floor[j + 1]);
-        let (lo, hi) = (z0.min(z1), z0.max(z1));
-        let mid = scale(add(p, q), 0.5);
-        if hi - lo < 1e-6 {
-            k.fixed.push(strip(p, q, TUBE, lo - 1.0, lo, Kind::Block));
-        } else {
-            // A wedge rising toward its higher end.
-            let up = if z1 > z0 { u } else { scale(u, -1.0) };
-            let w = CoverBox::turned([mid[0] as f32, mid[1] as f32], [(step / 2.0 + 0.05) as f32, TUBE as f32], [up[0] as f32, up[1] as f32], (lo - 1.0) as f32, hi as f32, Kind::Block, 0);
-            k.fixed.push(w.wedge(lo as f32));
-        }
-        for side in [-1.0, 1.0] {
-            let off = scale(v, side * (TUBE + 0.3));
-            k.fixed.push(strip(sub(add(p, off), scale(u, 0.3)), add(add(q, off), scale(u, 0.3)), 0.3, lo - 1.0, hi + TUBE_HIGH + 0.6, Kind::Block));
-        }
-        k.fixed.push(strip(sub(p, scale(u, 0.3)), add(q, scale(u, 0.3)), TUBE + 0.6, hi + TUBE_HIGH, hi + TUBE_HIGH + 0.6, Kind::Block));
-    }
-    for (c, out) in [(a, u), (b, scale(u, -1.0))] {
-        chamber_walls(k, c, out);
-    }
-    // The lane: the outposts' centers, down one trench, along the tube, up the other.
-    let (ca, cb) = (k.sites[a.site].center, k.sites[b.site].center);
-    let mut path = vec![a.top, a.foot, a.center];
-    let mut z = vec![a.surface, a.floor, a.floor];
-    for (j, &f) in floor.iter().enumerate() {
-        path.push(at(j));
-        z.push(f);
-    }
-    path.extend([b.center, b.foot, b.top]);
-    z.extend([b.floor, b.floor, b.surface]);
-    let legs = vec![
-        Leg { kind: LegKind::Road, path: vec![ca, a.top], z: None },
-        Leg { kind: LegKind::Road, path, z: Some(z) },
-        Leg { kind: LegKind::Road, path: vec![b.top, cb], z: None },
-    ];
-    k.tunnels.push(Route { a: a.site, b: b.site, legs, one_way: false });
-}
-
-/// A chamber's walls, open to its trench and to its tube (leaving along `out`).
-fn chamber_walls(k: &mut Kiln, c: &Chamber, out: [f64; 2]) {
-    let n = [-c.e[1], c.e[0]];
-    for normal in [c.e, scale(c.e, -1.0), n, scale(n, -1.0)] {
-        let along = [-normal[1], normal[0]];
-        let mut gaps: Vec<(f64, f64)> = Vec::new();
-        if dot(normal, c.e) < -0.5 {
-            gaps.push((-4.0, 4.0)); // the trench
-        }
-        let o = dot(out, normal);
-        if o >= out[0].abs().max(out[1].abs()) - 1e-9 && o > 0.0 {
-            // Where the tube crosses this side: its walls' outer faces, and a little.
-            let x = dot(scale(out, CHAMBER / o), along);
-            let w = (TUBE + 0.6) / o + 0.3;
-            gaps.push((x - w, x + w));
-        }
-        gaps.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap());
-        let mut from = -CHAMBER - 0.6;
-        let wall = |k: &mut Kiln, f: f64, t: f64| {
-            if t - f > 0.2 {
-                let side = add(c.center, scale(normal, CHAMBER + 0.3));
-                k.fixed.push(strip(add(side, scale(along, f)), add(side, scale(along, t)), 0.3, c.floor - 1.0, c.floor + 5.6, Kind::Block));
-            }
-        };
-        for (g0, g1) in gaps {
-            wall(k, from, g0);
-            from = from.max(g1);
-        }
-        wall(k, from, CHAMBER + 0.6);
-    }
-}
-
-/// Keeps scattered cover off the ground within `r` of `c` (a lift's foot).
-fn keep_clear(k: &mut Kiln, c: [f64; 2], r: f64) {
-    let (x0, x1, y0, y1) = Kiln::samples(sub(c, [r, r]), add(c, [r, r]));
-    for iy in y0..=y1 {
-        for ix in x0..=x1 {
-            if dist(Kiln::pos(ix, iy), c) <= r {
-                k.mask[iy * TERRAIN_N + ix] |= MASK_CLEAR;
-            }
-        }
-    }
 }
 
 /// Sets the land along `path` to the heights `z` at its points (a road's
@@ -956,7 +712,52 @@ pub(crate) fn sites(k: &mut Kiln) {
                     drop_down(k, 0, down, 2.5, 550.0, z_down, at(d - 5.0, 4.0), at(d - 0.8, 4.0), at(d + 20.0, 4.0));
                     keep_clear(k, at(d + 10.0, 0.0), 16.0);
                 }
-                // The spawn room at its foot, and cover on the floor.
+                // The Heart chamber (K2, the Deep): under the Heartwell's
+                // foot, 40 m under the floor; a shaft down to it beside the
+                // spire on each rift's side (a lift up, a drop shaft down),
+                // and a tunnel from each rift's mouth (down a trench in the
+                // floor short of its plaza).
+                let heart_floor = HOLLOW_FLOOR - 40.0;
+                let shafts: Vec<([f64; 2], [f64; 2])> = (0..3)
+                    .map(|j| {
+                        let d = unit(90.0 + 120.0 * j as f64 + 35.0);
+                        // Out until the shaft (8 m across) clears the spire's foot (30 m half-side).
+                        let mut r = 30.0;
+                        loop {
+                            let q = deep::snap(add(c, scale(d, r)));
+                            if (q[0] - c[0]).abs().max((q[1] - c[1]).abs()) >= 35.0 {
+                                break (q, d);
+                            }
+                            r += 1.0;
+                        }
+                    })
+                    .collect();
+                let corners: Vec<[f64; 2]> = shafts.iter().map(|s| s.0).collect();
+                let heart = deep::chamber(k, 0, c, 44.0, 12.0, heart_floor, HOLLOW_FLOOR, &corners);
+                for &(corner, d) in &shafts {
+                    let side = deep::axis_of([-d[1], d[0]]);
+                    deep::shaft(k, 0, corner, heart, side, sub(corner, scale(d, 10.0)), add(corner, scale(d, 10.0)));
+                }
+                for j in 0..3 {
+                    let rift = Rift::new(j);
+                    let top = deep::snap(rift.at(400.0, 0.0));
+                    let m = deep::mouth_at(k, 0, top, deep::axis_of(scale(rift.dir, -1.0)));
+                    deep::tube(k, m, heart, deep::Ends::Inside { from: Some(rift.at(560.0, 0.0)), to: None });
+                }
+                // The owner's spawn room at the spire's foot (no shields: the
+                // Hollow has no owner until U5's territory).
+                deep::room(k, add(c, [0.0, 39.0]), [0.0, 1.0], 7.0, 8.0, 5.0, HOLLOW_FLOOR, None);
+                // Lifts and drop shafts up each terrace's cliff, on each
+                // sector's side clear of its switchbacks.
+                for s in 0..3 {
+                    let u = unit(Frame::axis_deg(s) - 11.0);
+                    let t = [-u[1], u[0]];
+                    for (i, &(start, _)) in TERRACES.iter().enumerate() {
+                        let lo = if i == 0 { HOLLOW_FLOOR } else { TERRACES[i - 1].1 };
+                        deep::cliff_lifts(k, 0, &|sd, d| add(add(c, scale(u, d)), scale(t, sd)), start - 20.0, lo, 30.0);
+                    }
+                }
+                // Cover on the floor round each rift's plaza.
                 for d in 0..3 {
                     let rift = Rift::new(d);
                     let plaza = rift.at(560.0, 0.0);
@@ -966,7 +767,7 @@ pub(crate) fn sites(k: &mut Kiln) {
                         out.push(stand(k, q, [rng.range(3.0, 8.0), rng.range(1.0, 3.0)], rng.range(1.0, 2.4), Kind::Block, (j % 4) as u8));
                     }
                 }
-                points.push([c[0] + 40.0, c[1], HOLLOW_FLOOR]);
+                points.push([c[0], c[1], heart_floor]);
                 points.push([c[0] + 12.5, c[1] + 12.5, 550.0]);
                 for s in 0..3 {
                     let fr = Frame::new(s);
@@ -994,21 +795,10 @@ pub(crate) fn sites(k: &mut Kiln) {
                     })
                     .unwrap_or(Frame::axis_deg(p.sector as usize));
                 let u = unit(room_dir);
-                let v = [-u[1], u[0]];
                 let q = add(c, scale(u, 36.0));
                 let floor = k.mean(q, 12.0);
                 pad(k, q, 14.0, floor, 8.0);
-                let (hu, hv, high) = (7.0, 10.0, 5.0);
-                let at = |a: f64, b: f64| add(add(q, scale(u, a)), scale(v, b));
-                for s in [-1.0, 1.0] {
-                    // The ends: a wall each side of the door, the door shielded.
-                    fixed.push(strip(at(s * hu, -hv), at(s * hu, -2.0), 0.4, floor - 0.3, floor + high, Kind::Block));
-                    fixed.push(strip(at(s * hu, 2.0), at(s * hu, hv), 0.4, floor - 0.3, floor + high, Kind::Block));
-                    fixed.push(strip(at(s * hu, -2.0), at(s * hu, 2.0), 0.2, floor - 0.3, floor + high, Kind::Shield).shield(p.sector));
-                    // The sides.
-                    fixed.push(strip(at(-hu, s * hv), at(hu, s * hv), 0.4, floor - 0.3, floor + high, Kind::Block));
-                }
-                fixed.push(oriented(q, [hu + 0.4, hv + 0.4], u, floor + high, floor + high + 0.6, Kind::Block));
+                deep::room(k, q, u, 7.0, 10.0, 5.0, floor, Some(p.sector));
                 keep_clear(k, q, 16.0);
                 for j in 0..6 {
                     let q = add(c, scale(unit(axis + 60.0 * j as f64 + 30.0), 70.0));
@@ -1024,9 +814,38 @@ pub(crate) fn sites(k: &mut Kiln) {
                 let (near, far) = rift.crossing_ends(SPAN_ALONG, 6.0);
                 let half = 12.0;
                 // The deck, the gallery under it (floor, walls with windows).
-                fixed.push(strip(near, far, half, DECK - 2.0, DECK, Kind::Block));
-                fixed.push(strip(near, far, half - 1.0, DECK - 9.5, DECK - 8.0, Kind::Block));
+                // Near each end of the deck, off its middle, a stairwell: a
+                // ramp down through it into the gallery (K2).
                 let l = dist(near, far);
+                let u = scale(sub(far, near), 1.0 / l);
+                let at = |s: f64, a: f64| add(add(near, scale(u, s)), scale(v, a));
+                let wells = [(40.0, 54.0), (l - 54.0, l - 40.0)];
+                let mut from = 0.0;
+                for &(s0, s1) in &wells {
+                    fixed.push(strip(at(from, 0.0), at(s0, 0.0), half, DECK - 2.0, DECK, Kind::Block));
+                    fixed.push(strip(at(s0, -11.0), at(s1, -11.0), 1.0, DECK - 2.0, DECK, Kind::Block));
+                    fixed.push(strip(at(s0, 4.0), at(s1, 4.0), 8.0, DECK - 2.0, DECK, Kind::Block));
+                    from = s1;
+                }
+                fixed.push(strip(at(from, 0.0), at(l, 0.0), half, DECK - 2.0, DECK, Kind::Block));
+                fixed.push(strip(near, far, half - 1.0, DECK - 9.5, DECK - 8.0, Kind::Block));
+                for (s_top, dir) in [(40.0, 1.0), (l - 40.0, -1.0)] {
+                    // From the deck's level at the well's end down 8 m (a third) into the gallery.
+                    let c = at(s_top + dir * 12.0, -7.0);
+                    let rise = scale(u, -dir);
+                    let ramp = CoverBox::turned([c[0] as f32, c[1] as f32], [12.0, 3.0], [rise[0] as f32, rise[1] as f32], (DECK - 8.5) as f32, DECK as f32, Kind::Block, 0);
+                    fixed.push(ramp.wedge((DECK - 8.0) as f32));
+                }
+                let mid_s = l / 2.0;
+                let gallery = Leg {
+                    kind: LegKind::Road,
+                    path: vec![at(30.0, 0.0), at(38.0, -7.0), at(66.0, -7.0), at(mid_s, 0.0), at(l - 80.0, 0.0), at(l - 66.0, -7.0), at(l - 38.0, -7.0), at(l - 30.0, 0.0)],
+                    z: Some(vec![DECK, DECK, DECK - 8.0, DECK - 8.0, DECK - 8.0, DECK - 8.0, DECK, DECK]),
+                };
+                k.internal.push(Route { a: i, b: i, legs: vec![gallery], one_way: false });
+                // The owner's spawn room in the gallery over one pylon: its
+                // door onto the gallery shielded for the Span's sector's faction.
+                deep::room(k, at(mid_s + 70.0, -6.0), v, 4.0, 8.0, 5.0, DECK - 8.0, Some(p.sector));
                 let n = (l / 16.0) as usize;
                 for j in 0..n {
                     let t0 = j as f64 / n as f64;
@@ -1090,6 +909,35 @@ pub(crate) fn sites(k: &mut Kiln) {
                     }
                     let q = add(near, scale(sub(far, near), 0.5 + shift));
                     fixed.push(oriented(q, [12.0, half + 8.0], cross, DECK + rise - 6.0, DECK + rise, Kind::Block));
+                    // A perch on its crown (K2): a lift up from the deck past
+                    // one end of it, a drop shaft down past the other.
+                    let qs = l * (0.5 + shift);
+                    deep::lift_rect(k, i, at(qs + 15.5, -7.0), [2.5, 2.5], DECK, DECK + rise, at(qs + 30.0, -7.0), at(qs + 5.0, -7.0), false);
+                    deep::drop_rect(k, i, at(qs - 15.5, -7.0), [2.5, 2.5], DECK + rise, DECK, at(qs - 5.0, -7.0), at(qs - 12.8, -7.0), at(qs - 30.0, -7.0), (false, false));
+                }
+                // The wall tunnels (K2, the Deep): from the rift's floor down a
+                // trench short of each wall, under it to a chamber under its
+                // bridgehead, and a shaft up into the bridgehead (a lift, a
+                // drop shaft), off its lanes and gatehouses.
+                let w = Rift::half_width(SPAN_ALONG);
+                for (sgn, head) in [(-1.0, p.anchors[0]), (1.0, p.anchors[1])] {
+                    let top = deep::snap(rift.at(SPAN_ALONG + 40.0, sgn * (w - 75.0)));
+                    let e = deep::axis_of(scale(cross, sgn));
+                    let m = deep::mouth_at(k, i, top, e);
+                    let dir = (0..8)
+                        .map(|j| unit(45.0 * j as f64))
+                        .filter(|d| dot(*d, v).abs() < 0.8)
+                        .fold(([1.0, 0.0], f64::MIN), |best, d| {
+                            let c = land::clearance(k, add(head, scale(d, 22.0))).0;
+                            if c > best.1 + 1e-9 { (d, c) } else { best }
+                        })
+                        .0;
+                    let spot = deep::snap(add(head, scale(dir, 22.0)));
+                    let floor = k.chambers[m].floor;
+                    let ch = deep::chamber(k, i, spot, 8.0, 5.0, floor, DECK, &[spot]);
+                    let below = add(spot, scale(deep::axis_of(sub(top, spot)), 6.0));
+                    deep::shaft(k, i, spot, ch, deep::axis_of([-dir[1], dir[0]]), below, add(spot, scale(dir, 12.0)));
+                    deep::tube(k, m, ch, deep::Ends::Inside { from: Some(sub(top, scale(e, 12.0))), to: Some(below) });
                 }
                 // Gatehouses on both bridgeheads.
                 for head in [p.anchors[0], p.anchors[1]] {
@@ -1121,10 +969,51 @@ pub(crate) fn sites(k: &mut Kiln) {
                         out.push(stand(k, rift.at(a, -(w + 14.0 * t as f64 - 12.5)), [5.0, 5.0], 1.1, Kind::Block, 0));
                     }
                 }
+                // K2: the two lift shafts, up from the floor in front of the
+                // wall to bridges over the terraces onto the summit.
+                let fl = Rift::floor(CLIFFHOLD_ALONG);
+                let summit = k.height(rift.at(CLIFFHOLD_ALONG, -(w + 150.0)));
+                for a in [CLIFFHOLD_ALONG - 100.0, CLIFFHOLD_ALONG + 100.0] {
+                    deep::cliff_lifts(k, i, &|s, d| rift.at(a + s, -(w + d)), -30.0, fl, summit - fl - 8.0);
+                }
+                // A lift up the keep's tower to its top (the only high point
+                // for a kilometer), a drop shaft down its other side.
+                let tower = fixed.last().unwrap().top as f64;
+                let (east, west) = (add(keep, [14.5, 0.0]), sub(keep, [14.5, 0.0]));
+                lift_up(k, i, east, 2.5, k.height(east), tower, add(keep, [30.0, 0.0]), add(keep, [5.0, 0.0]));
+                drop_down(k, i, west, 2.5, tower, k.height(west), sub(keep, [5.0, 0.0]), sub(keep, [11.8, 0.0]), sub(keep, [30.0, 0.0]));
+                // The spawn room mid-wall, on the fourth terrace, its doors
+                // shielded for its sector's faction.
+                let room_at = rift.at(CLIFFHOLD_ALONG - 100.0, -(w + 51.0));
+                deep::room(k, room_at, rift.dir, 8.0, 4.0, 5.0, k.height(room_at), Some(p.sector));
+                // The deep gallery: a hall 30 m under the summit, a shaft down
+                // to it from the summit, and an approach tunnel from the plains
+                // behind (down a trench), where both keep clear of the lanes.
+                let mut best = (rift.at(CLIFFHOLD_ALONG, -(w + 180.0)), f64::MIN);
+                for a in [40.0, -20.0, -60.0, 100.0] {
+                    for d in [170.0, 200.0] {
+                        let q = rift.at(CLIFFHOLD_ALONG + a, -(w + d));
+                        let back = rift.at(CLIFFHOLD_ALONG + a, -(w + d + 150.0));
+                        let c = land::clearance(k, q).0.min(land::clearance(k, back).0);
+                        if c > best.1 + 1e-9 {
+                            best = (q, c);
+                        }
+                    }
+                }
+                let hall_at = deep::snap(best.0);
+                let hall_floor = summit - 30.0;
+                let hall = deep::chamber(k, i, hall_at, 14.0, 8.0, hall_floor, summit, &[hall_at]);
+                let outward = scale(rift.normal, -1.0);
+                let below = add(hall_at, scale(deep::axis_of(rift.normal), 8.0));
+                deep::shaft(k, i, hall_at, hall, deep::axis_of(rift.dir), below, add(hall_at, scale(deep::axis_of(outward), 12.0)));
+                let top = deep::snap(add(hall_at, scale(outward, 150.0)));
+                let e = deep::axis_of(sub(hall_at, top));
+                let m = deep::mouth_at(k, i, top, e);
+                deep::tube(k, m, hall, deep::Ends::Inside { from: Some(sub(top, scale(e, 12.0))), to: Some(below) });
                 points.push(on(k, gate));
                 points.push(on(k, rift.at(CLIFFHOLD_ALONG - 80.0, -(w + 14.0 * 3.5))));
                 points.push(on(k, add(keep, [0.0, 16.0])));
-                points.push(on(k, rift.at(CLIFFHOLD_ALONG + 90.0, -(w + 14.0 * 1.5))));
+                points.push([below[0], below[1], hall_floor]);
             }
             SiteKind::Geode => {
                 // Crystals on the terraces, and in each crack's mouth (infantry only).
@@ -1156,7 +1045,35 @@ pub(crate) fn sites(k: &mut Kiln) {
                         out.push(stand(k, q, [rng.range(2.0, 4.0), rng.range(2.0, 4.0)], rng.range(3.0, 9.0), Kind::Crystal, 0));
                     }
                 }
-                points.push(on(k, c));
+                // K2: the well chamber (the Deep) 24 m under the floor, a
+                // shaft down to it in the floor's middle; and crystal ledges
+                // on the terrace walls with lattice springs up them (floor to
+                // a ledge to the middle terrace; the middle to a ledge to the
+                // upper), where the ramps down aren't (as `geode` lays them).
+                let floor = lvl - 100.0;
+                let well = deep::snap(c);
+                let well_floor = floor - 24.0;
+                let ch = deep::chamber(k, i, well, 14.0, 8.0, well_floor, floor, &[well]);
+                let a0 = p.dirs.first().copied().unwrap_or(0.0) + 25.0;
+                let span1 = 50.0 / RAMP_GRADE / 75.0 * 180.0 / std::f64::consts::PI * 1.04;
+                let a1 = a0 + span1 + 12.0;
+                let span2 = 50.0 / RAMP_GRADE / 42.0 * 180.0 / std::f64::consts::PI * 1.04;
+                let out_dir = unit(a1 + span2 + 40.0);
+                let below = add(well, scale(deep::axis_of(out_dir), 8.0));
+                deep::shaft(k, i, well, ch, deep::axis_of([-out_dir[1], out_dir[0]]), below, add(well, scale(out_dir, 12.0)));
+                for (deg, (r_pad, r_ledge, r_up, r_land), (z0, z1, z2)) in [
+                    (a1 + span2 + 72.0, (29.5, 36.5, 39.5, 46.5), (floor, floor + 25.0, floor + 50.0)),
+                    (a0 + span1 + 122.0, (61.5, 68.5, 71.5, 79.0), (floor + 50.0, floor + 75.0, floor + 100.0)),
+                ] {
+                    let u = unit(deg);
+                    let at = |r: f64| add(c, scale(u, r));
+                    // The ledge: from the wall 9 m in, 10 m wide.
+                    fixed.push(oriented(at(r_ledge + 1.0), [4.5, 5.0], u, z1 - 2.0, z1, Kind::Crystal));
+                    deep::spring(k, i, at(r_pad), z0, z1, at(r_pad - 8.0), at(r_ledge - 1.0));
+                    deep::spring(k, i, at(r_up), z1, z2, at(r_up - 4.5), at(r_land));
+                    deep::keep_clear(k, at(r_pad), 8.0);
+                }
+                points.push([below[0], below[1], well_floor]);
                 points.push(on(k, p.anchors[1]));
                 let top = at(114.0, 3.5);
                 points.push([top[0], top[1], crest]);
@@ -1176,23 +1093,8 @@ pub(crate) fn sites(k: &mut Kiln) {
                 // over the face to it, a drop shaft beside it (K1), between
                 // the buildings and the tower: where the shelf's flat ends
                 // (the wall's foot) and where the rim's begins, found.
-                let (lift_a, drop_a, mid_a) = (along - 13.0, along - 21.0, along - 17.0);
-                let at = |a: f64, d: f64| r.at(a, side * (w + d));
-                let mut foot = 0.0;
-                while foot < 80.0 && [lift_a, mid_a, drop_a].iter().all(|&a| k.height(at(a, foot + 1.0)) < lvl + 0.3) {
-                    foot += 1.0;
-                }
-                let mut rim_d = foot + 4.0;
-                while rim_d < foot + 150.0 && !(k.height(at(mid_a, rim_d)) > lvl + 20.0 && (k.height(at(mid_a, rim_d + 4.0)) - k.height(at(mid_a, rim_d))).abs() < 1.5) {
-                    rim_d += 1.0;
-                }
-                rim_d += 6.0;
-                let rim = [-6.0, 0.0, 6.0].iter().map(|&o| k.height(at(mid_a + o, rim_d))).fold(f64::MIN, f64::max);
-                let col = foot - 4.0;
-                fixed.push(strip(at(mid_a, col + 4.8), at(mid_a, rim_d), 7.0, rim - 2.0, rim, Kind::Block));
-                lift_up(k, i, at(lift_a, col), 2.5, lvl, rim, at(lift_a, col - 18.0), at(lift_a, col + 12.0));
-                drop_down(k, i, at(drop_a, col), 2.5, rim, lvl, at(drop_a, col + 12.0), at(drop_a, col + 5.2), at(drop_a, col - 18.0));
-                keep_clear(k, at(mid_a, rim_d), 12.0);
+                let mid_a = along - 17.0;
+                deep::cliff_lifts(k, i, &|s, d| r.at(mid_a + s, side * (w + d)), 0.0, lvl, 20.0);
                 points.push(on(k, r.at(along - 45.0, side * (w + 5.0))));
                 points.push(on(k, r.at(along + 45.0, side * (w + 5.0))));
                 if big {
@@ -1373,7 +1275,8 @@ pub(crate) fn sites(k: &mut Kiln) {
                 points.push(on(k, vent));
             }
             SiteKind::TunnelMouth => {
-                let ch = mouth(k, i);
+                let ci = deep::mouth(k, i);
+                let ch = k.chambers[ci].clone();
                 let (top, e) = (ch.top, ch.e);
                 let n = [-e[1], e[0]];
                 // A canopy over the trench's head on posts, a barrier by the outpost.
@@ -1383,7 +1286,6 @@ pub(crate) fn sites(k: &mut Kiln) {
                 }
                 out.push(stand(k, add(c, scale(unit(axis - 90.0), 16.0)), [10.0, 1.2], 1.1, Kind::Block, 0));
                 points.push([top[0], top[1], ch.surface]);
-                k.chambers.push(ch);
             }
             SiteKind::SpirePerch => {
                 // A hoodoo with a fortified foot; stairs to its top.

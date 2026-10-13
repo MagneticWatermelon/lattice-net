@@ -1,0 +1,489 @@
+//! Kiln's connectors and its Deep (K1, K2): lifts and drop shafts, lattice
+//! springs, rooms, and what's under the ground: chambers, the tubes between
+//! them, trenches down to them through holes in the terrain, and shafts.
+//!
+//! Everything under the ground is boxes inside the terrain's shell (`World`'s
+//! holes): a chamber is a floor, a ceiling and walls with openings where
+//! trenches, tubes and shafts come in; a tube is turned boxes in 8 m
+//! segments. Chambers are axis-aligned, so the holes over trenches and
+//! shafts are whole height cells and their walls line them exactly.
+
+use super::build::{oriented, strip};
+use super::land;
+use super::lanes::{Leg, LegKind, Route};
+use super::*;
+use crate::world::{CoverBox, Force, Kind, Volume, CELLS};
+
+/// A lift's speed up (m/s), a tall one's, and its top's: slow enough that a
+/// rider leaves it bobbing just over where it goes.
+const LIFT_FAST: f64 = 20.0;
+const LIFT_TALL: f64 = 30.0;
+const LIFT_SLOW: f64 = 4.0;
+/// A drop shaft's fall (m/s).
+const DROP_SPEED: f64 = 6.0;
+/// Gravity (movement's).
+const G: f64 = 15.0;
+
+/// A trench's length (10 cells: a 12 m drop at 0.3), a Tunnel mouth's
+/// chamber's half-side and how far its floor is under the ground; how far
+/// under the ground a tube's floor stays (its ceiling's top 2.5 m under it,
+/// at the least).
+const TRENCH: f64 = 40.0;
+const CHAMBER: f64 = 8.0;
+const DEPTH: f64 = 12.0;
+const TUBE_DEPTH: f64 = 8.0;
+/// A tube's half-width inside its walls, its headroom, its steepest grade.
+const TUBE: f64 = 3.0;
+const TUBE_HIGH: f64 = 4.5;
+const TUBE_GRADE: f64 = 0.25;
+/// A shaft's half-side: two height cells across.
+const SHAFT: f64 = 4.0;
+
+/// A lift (K1): an updraft in the square column of half-side `half` at `c`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lift_up(k: &mut Kiln, site: usize, c: [f64; 2], half: f64, z0: f64, z1: f64, from: [f64; 2], to: [f64; 2]) {
+    lift_rect(k, site, c, [half, half], z0, z1, from, to, true);
+}
+
+/// A lift: an updraft in the column of half-sizes `half` at `c`, from its
+/// foot at `z0` to `z1` (the deck or ledge it serves): fast, then slowing
+/// over its last stretch so a rider bobs just over `z1` and steps off; and a
+/// one-way route for `site` from `from` (by its foot: on the ground if
+/// `on_ground`, else at `z0`, a deck or a chamber's floor) up it to `to` (on
+/// top, at `z1`). Tall lifts (over 200 m) run faster.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lift_rect(k: &mut Kiln, site: usize, c: [f64; 2], half: [f64; 2], z0: f64, z1: f64, from: [f64; 2], to: [f64; 2], on_ground: bool) {
+    let fast = if z1 - z0 > 200.0 { LIFT_TALL } else { LIFT_FAST };
+    // Room to slow from `fast` to `LIFT_SLOW` at gravity's rate, and a little.
+    let slow = (fast * fast - LIFT_SLOW * LIFT_SLOW) / (2.0 * G) + 3.0;
+    let column = |lo: f64, hi: f64, v: f64| Volume {
+        min: [(c[0] - half[0]) as f32, (c[1] - half[1]) as f32, lo as f32],
+        max: [(c[0] + half[0]) as f32, (c[1] + half[1]) as f32, hi as f32],
+        force: Force::Lift,
+        vel: [0.0, 0.0, v as f32],
+    };
+    if z1 - z0 > slow + 4.0 {
+        k.volumes.push(column(z0 - 1.0, z1 - slow, fast));
+        k.volumes.push(column(z1 - slow, z1 + 1.5, LIFT_SLOW));
+    } else {
+        k.volumes.push(column(z0 - 1.0, z1 + 1.5, LIFT_SLOW.max(6.0)));
+    }
+    // Walked: to just outside its foot, into it (and held there, carried),
+    // then off at the top.
+    let reach = half[0].min(half[1]) + 1.5;
+    let out = add(c, scale(sub(from, c), reach / dist(from, c)));
+    let legs = vec![
+        Leg { kind: LegKind::Road, path: vec![from, out], z: (!on_ground).then(|| vec![z0, z0]) },
+        Leg { kind: LegKind::Road, path: vec![out, c, to], z: Some(vec![z0, z1 + 1.0, z1]) },
+    ];
+    k.internal.push(Route { a: site, b: site, legs, one_way: true });
+}
+
+/// A drop shaft (K1): a square column of half-side `half` at `c`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drop_down(k: &mut Kiln, site: usize, c: [f64; 2], half: f64, z0: f64, z1: f64, from: [f64; 2], edge: [f64; 2], to: [f64; 2]) {
+    drop_rect(k, site, c, [half, half], z0, z1, from, edge, to, (false, true));
+}
+
+/// A drop shaft: a column of half-sizes `half` at `c` that slows a fall to
+/// `DROP_SPEED`, from over `z0` (where it's stepped into) down to `z1`; and
+/// a one-way route for `site` from `from` (up top) down it to `to`. `edge`
+/// is where the top's floor ends beside it, stepped off from. `on_ground`:
+/// whether the top and the bottom are the ground (else at `z0`, `z1`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drop_rect(k: &mut Kiln, site: usize, c: [f64; 2], half: [f64; 2], z0: f64, z1: f64, from: [f64; 2], edge: [f64; 2], to: [f64; 2], on_ground: (bool, bool)) {
+    k.volumes.push(Volume {
+        min: [(c[0] - half[0]) as f32, (c[1] - half[1]) as f32, (z1 - 1.0) as f32],
+        max: [(c[0] + half[0]) as f32, (c[1] + half[1]) as f32, (z0 + 3.0) as f32],
+        force: Force::Drop,
+        vel: [0.0, 0.0, -DROP_SPEED as f32],
+    });
+    let legs = vec![
+        Leg { kind: LegKind::Road, path: vec![from, edge], z: (!on_ground.0).then(|| vec![z0, z0]) },
+        Leg { kind: LegKind::Road, path: vec![edge, c], z: Some(vec![z0, z1]) },
+        Leg { kind: LegKind::Road, path: vec![c, to], z: (!on_ground.1).then(|| vec![z1, z1]) },
+    ];
+    k.internal.push(Route { a: site, b: site, legs, one_way: true });
+}
+
+/// A lattice spring (K2): a pad at `pad` (its floor at `z0`) that throws
+/// whoever stands on it straight up, to 5 m over `z1`, beside a ledge at
+/// `z1` whose nearest edge is a couple of meters off; and a one-way route
+/// for `site` from `from` onto the pad, up, and over onto `to` (on the ledge).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spring(k: &mut Kiln, site: usize, pad: [f64; 2], z0: f64, z1: f64, from: [f64; 2], to: [f64; 2]) {
+    // Under 8 m, the landing is one waypoint: a midpoint (lanes are walked
+    // in 8 m steps) would hold a walker still over it, braking in the air.
+    debug_assert!(dist(pad, to) < 8.0);
+    let vz = libm::sqrt(2.0 * G * (z1 + 5.0 - z0));
+    let h = 1.5;
+    k.volumes.push(Volume {
+        min: [(pad[0] - h) as f32, (pad[1] - h) as f32, (z0 - 0.5) as f32],
+        max: [(pad[0] + h) as f32, (pad[1] + h) as f32, (z0 + 0.5) as f32],
+        force: Force::Spring,
+        vel: [0.0, 0.0, vz as f32],
+    });
+    // Onto the pad, held over it while thrown up, then across near the top.
+    let legs = vec![Leg { kind: LegKind::Road, path: vec![from, pad, pad, to], z: Some(vec![z0, z0, z1 + 2.0, z1]) }];
+    k.internal.push(Route { a: site, b: site, legs, one_way: true });
+}
+
+/// A lift up a cliff with a drop shaft beside it (K1, K2), found from the
+/// ground along a line out from a lower flat (`at(side, d)`: the point
+/// `side` m to the side of it and `d` m out): the column on the lower flat
+/// at the cliff's foot (searched from `d0`, the flat at `lo`), a walkway
+/// over the face to the first flat at least `rise` m higher. The lift is
+/// at side +4, the drop shaft at -4.
+pub(crate) fn cliff_lifts(k: &mut Kiln, site: usize, at: &dyn Fn(f64, f64) -> [f64; 2], d0: f64, lo: f64, rise: f64) {
+    let mut foot = d0;
+    while foot < d0 + 120.0 && [-4.0, 0.0, 4.0].iter().all(|&s| k.height(at(s, foot + 1.0)) < lo + 0.3) {
+        foot += 1.0;
+    }
+    let mut top_d = foot + 4.0;
+    while top_d < foot + 200.0 && !(k.height(at(0.0, top_d)) > lo + rise && (k.height(at(0.0, top_d + 4.0)) - k.height(at(0.0, top_d))).abs() < 1.5) {
+        top_d += 1.0;
+    }
+    top_d += 6.0;
+    let top = [-6.0, 0.0, 6.0].iter().map(|&s| k.height(at(s, top_d))).fold(f64::MIN, f64::max);
+    let col = foot - 4.0;
+    k.fixed.push(strip(at(0.0, col + 4.8), at(0.0, top_d), 7.0, top - 2.0, top, Kind::Block));
+    lift_up(k, site, at(4.0, col), 2.5, lo, top, at(4.0, col - 18.0), at(4.0, col + 12.0));
+    drop_down(k, site, at(-4.0, col), 2.5, top, lo, at(-4.0, col + 12.0), at(-4.0, col + 5.2), at(-4.0, col - 18.0));
+    keep_clear(k, at(0.0, top_d), 12.0);
+}
+
+/// Keeps scattered cover off the ground within `r` of `c` (a lift's foot).
+pub(crate) fn keep_clear(k: &mut Kiln, c: [f64; 2], r: f64) {
+    let (x0, x1, y0, y1) = Kiln::samples(sub(c, [r, r]), add(c, [r, r]));
+    for iy in y0..=y1 {
+        for ix in x0..=x1 {
+            if dist(Kiln::pos(ix, iy), c) <= r {
+                k.mask[iy * TERRAIN_N + ix] |= MASK_CLEAR;
+            }
+        }
+    }
+}
+
+/// A room (C1): walls round a `2 hu` × `2 hv` footprint at `q` (its ends
+/// across `u`), a door in the middle of each end, a roof `high` over `floor`;
+/// the doors shielded for `shield`'s faction, if any.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn room(k: &mut Kiln, q: [f64; 2], u: [f64; 2], hu: f64, hv: f64, high: f64, floor: f64, shield: Option<u8>) {
+    let v = [-u[1], u[0]];
+    let at = |a: f64, b: f64| add(add(q, scale(u, a)), scale(v, b));
+    for s in [-1.0, 1.0] {
+        k.fixed.push(strip(at(s * hu, -hv), at(s * hu, -2.0), 0.4, floor - 0.3, floor + high, Kind::Block));
+        k.fixed.push(strip(at(s * hu, 2.0), at(s * hu, hv), 0.4, floor - 0.3, floor + high, Kind::Block));
+        if let Some(f) = shield {
+            k.fixed.push(strip(at(s * hu, -2.0), at(s * hu, 2.0), 0.2, floor - 0.3, floor + high, Kind::Shield).shield(f));
+        }
+        k.fixed.push(strip(at(-hu, s * hv), at(hu, s * hv), 0.4, floor - 0.3, floor + high, Kind::Block));
+    }
+    k.fixed.push(oriented(q, [hu + 0.4, hv + 0.4], u, floor + high, floor + high + 0.6, Kind::Block));
+}
+
+/// A chamber under the ground (K1, K2): an axis-aligned room, its walls
+/// left open where a trench, tubes and shafts come in (`walls`, once they're
+/// all known).
+#[derive(Debug, Clone)]
+pub(crate) struct Chamber {
+    pub site: usize,
+    /// A Tunnel mouth's: its trench's head (on a cell's edge), its axis
+    /// (along a world axis) and its ramp's foot. Else the center, (1, 0), the center.
+    pub top: [f64; 2],
+    pub e: [f64; 2],
+    pub foot: [f64; 2],
+    pub trench: bool,
+    pub center: [f64; 2],
+    /// Its half-side and its headroom.
+    pub half: f64,
+    pub high: f64,
+    /// The ground's level over it, and its floor.
+    pub surface: f64,
+    pub floor: f64,
+    /// The directions tubes leave it in.
+    pub outs: Vec<[f64; 2]>,
+}
+
+fn set_hole(k: &mut Kiln, cx: usize, cy: usize) {
+    if k.holes.is_empty() {
+        k.holes = vec![0; (CELLS * CELLS).div_ceil(64)];
+    }
+    let j = cy * CELLS + cx;
+    k.holes[j / 64] |= 1 << (j % 64);
+}
+
+/// An axis-aligned slab over [min, max] from `z0` to `z1`, with the squares
+/// (center, half-side) in `openings` left out (a ceiling under shafts).
+fn slab(k: &mut Kiln, min: [f64; 2], max: [f64; 2], z0: f64, z1: f64, openings: &[([f64; 2], f64)]) {
+    let mut xs = vec![min[0], max[0]];
+    let mut ys = vec![min[1], max[1]];
+    for &(c, h) in openings {
+        xs.extend([c[0] - h, c[0] + h]);
+        ys.extend([c[1] - h, c[1] + h]);
+    }
+    let clip = |v: &mut Vec<f64>, lo: f64, hi: f64| {
+        v.retain(|&x| x >= lo && x <= hi);
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.dedup();
+    };
+    clip(&mut xs, min[0], max[0]);
+    clip(&mut ys, min[1], max[1]);
+    for j in 0..ys.len() - 1 {
+        // Runs of open cells along x, merged.
+        let mut run: Option<f64> = None;
+        for i in 0..xs.len() {
+            let solid = i + 1 < xs.len() && {
+                let m = [(xs[i] + xs[i + 1]) / 2.0, (ys[j] + ys[j + 1]) / 2.0];
+                !openings.iter().any(|&(c, h)| (m[0] - c[0]).abs() < h && (m[1] - c[1]).abs() < h)
+            };
+            match (solid, run) {
+                (true, None) => run = Some(xs[i]),
+                (false, Some(x0)) => {
+                    k.fixed.push(super::build::bx([x0, ys[j]], [xs[i], ys[j + 1]], z0, z1, Kind::Block, 0));
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A chamber of half-side `half` and headroom `high` at `center` (snapped to
+/// cells' corners by the caller where shafts open into it), its floor at
+/// `floor` under ground at `surface`; its ceiling left open over the shafts
+/// at `shafts` (cells' corners). Returns its index in `k.chambers`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn chamber(k: &mut Kiln, site: usize, center: [f64; 2], half: f64, high: f64, floor: f64, surface: f64, shafts: &[[f64; 2]]) -> usize {
+    k.fixed.push(super::build::bx(sub(center, [half, half]), add(center, [half, half]), floor - 1.0, floor, Kind::Block, 0));
+    let openings: Vec<([f64; 2], f64)> = shafts.iter().map(|&c| (c, SHAFT)).collect();
+    let h = half + 0.6;
+    slab(k, sub(center, [h, h]), add(center, [h, h]), floor + high, floor + high + 0.6, &openings);
+    k.chambers.push(Chamber { site, top: center, e: [1.0, 0.0], foot: center, trench: false, center, half, high, surface, floor, outs: Vec::new() });
+    k.chambers.len() - 1
+}
+
+/// Digs site `i`'s Tunnel mouth (its anchors: the trench's head, and a step
+/// along its axis). Returns the chamber's index.
+pub(crate) fn mouth(k: &mut Kiln, i: usize) -> usize {
+    let (top, e) = (k.sites[i].anchors[0], sub(k.sites[i].anchors[1], k.sites[i].anchors[0]));
+    mouth_at(k, i, top, e)
+}
+
+/// A mouth for `site` (K1): the ground round it leveled, holes in it over a
+/// trench from `top` (a cell's edge) along `e` (a world axis), the ramp down
+/// and its walls, and the chamber it comes down into. Returns its index.
+pub(crate) fn mouth_at(k: &mut Kiln, site: usize, top: [f64; 2], e: [f64; 2]) -> usize {
+    let n = [-e[1], e[0]];
+    let foot = add(top, scale(e, TRENCH));
+    let center = add(foot, scale(e, CHAMBER));
+    let surface = k.mean(add(top, scale(e, TRENCH / 2.0)), 26.0);
+    let corners = [sub(sub(top, scale(e, 4.0)), scale(n, 12.0)), add(add(center, scale(e, CHAMBER + 4.0)), scale(n, 12.0))];
+    let (min, max) = ([corners[0][0].min(corners[1][0]), corners[0][1].min(corners[1][1])], [corners[0][0].max(corners[1][0]), corners[0][1].max(corners[1][1])]);
+    land::pad_rect(k, min, max, surface, 24.0);
+    let floor = surface - DEPTH;
+    // The holes: the trench's cells (two across, ten along).
+    let res = TERRAIN_RES as f64;
+    for a in 0..(TRENCH / res) as usize {
+        for b in [-1.0, 0.0] {
+            let q = add(add(top, scale(e, (a as f64 + 0.5) * res)), scale(n, (b + 0.5) * res));
+            set_hole(k, (q[0] / res).floor() as usize, (q[1] / res).floor() as usize);
+        }
+    }
+    let mid = scale(add(top, foot), 0.5);
+    let ramp = CoverBox::turned([mid[0] as f32, mid[1] as f32], [(TRENCH / 2.0) as f32, 4.0], [-e[0] as f32, -e[1] as f32], (floor - 1.0) as f32, surface as f32, Kind::Block, 0);
+    k.fixed.push(ramp.wedge(floor as f32));
+    for side in [-1.0, 1.0] {
+        k.fixed.push(strip(add(top, scale(n, side * 4.3)), add(foot, scale(n, side * 4.3)), 0.3, floor - 1.0, surface, Kind::Block));
+    }
+    k.fixed.push(oriented(center, [CHAMBER, CHAMBER], e, floor - 1.0, floor, Kind::Block));
+    k.fixed.push(oriented(center, [CHAMBER + 0.6, CHAMBER + 0.6], e, floor + 5.0, floor + 5.6, Kind::Block));
+    k.chambers.push(Chamber { site, top, e, foot, trench: true, center, half: CHAMBER, high: 5.0, surface, floor, outs: Vec::new() });
+    k.chambers.len() - 1
+}
+
+/// A shaft (K2) from the ground down into chamber `ch`: the 2 × 2 height
+/// cells round `corner` (a cells' corner, over the chamber, its ceiling open
+/// there) cut out and walled from the chamber's ceiling up to the ground; a
+/// lift up one half, a drop shaft down the other (`side`: the lift's half,
+/// a unit vector along a world axis); one-way routes up and down between
+/// `below` (on the chamber's floor) and `above` (on the ground by the hole).
+pub(crate) fn shaft(k: &mut Kiln, site: usize, corner: [f64; 2], ch: usize, side: [f64; 2], below: [f64; 2], above: [f64; 2]) {
+    // Level ground round its mouth, so its walls are flush all round.
+    let level = k.mean(corner, 8.0);
+    land::pad(k, corner, 10.0, level, 10.0);
+    let res = TERRAIN_RES as f64;
+    let (cx, cy) = ((corner[0] / res).round() as usize, (corner[1] / res).round() as usize);
+    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        set_hole(k, cx + dx - 1, cy + dy - 1);
+    }
+    let c = k.chambers[ch].clone();
+    let surface = [[-SHAFT, -SHAFT], [SHAFT, -SHAFT], [-SHAFT, SHAFT], [SHAFT, SHAFT], [0.0, 0.0]].iter().map(|&o| k.height(add(corner, o))).fold(f64::MIN, f64::max);
+    let ceiling = c.floor + c.high;
+    for (a, b) in [([-1.0, -1.0], [1.0, -1.0]), ([1.0, -1.0], [1.0, 1.0]), ([1.0, 1.0], [-1.0, 1.0]), ([-1.0, 1.0], [-1.0, -1.0])] {
+        let (p, q) = (add(corner, scale(a, SHAFT + 0.3)), add(corner, scale(b, SHAFT + 0.3)));
+        k.fixed.push(strip(p, q, 0.3, ceiling, surface, Kind::Block));
+    }
+    // The halves: the lift's toward `side`, the drop shaft's away.
+    let half = if side[0] != 0.0 { [SHAFT / 2.0 - 0.1, SHAFT - 0.1] } else { [SHAFT - 0.1, SHAFT / 2.0 - 0.1] };
+    let (up, down) = (add(corner, scale(side, SHAFT / 2.0)), sub(corner, scale(side, SHAFT / 2.0)));
+    lift_rect(k, site, up, half, c.floor, surface, below, above, false);
+    let edge = sub(corner, scale(side, SHAFT + 0.8));
+    drop_rect(k, site, down, half, surface, c.floor, sub(edge, scale(side, 6.0)), edge, below, (true, false));
+    keep_clear(k, corner, 14.0);
+}
+
+/// Where tube routes start and end on the ground.
+pub(crate) enum Ends {
+    /// A lane between two sites' centers (their Tunnel mouths).
+    Lane,
+    /// A route inside `site`, from `from` on the ground (down chamber `a`'s
+    /// trench) to chamber `b` (or its trench's head, if it has one), or to
+    /// `to` in it (beside a shaft at its center).
+    Inside { from: Option<[f64; 2]>, to: Option<[f64; 2]> },
+}
+
+/// The tube between chambers `a` and `b` (K1, K2): 6 m wide, its floor level
+/// from one chamber's floor to the other's but dipped where the ground does
+/// (keeping `TUBE_DEPTH` under it, no steeper than `TUBE_GRADE`), in 8 m
+/// segments of turned boxes (floor, walls, ceiling); and its route.
+pub(crate) fn tube(k: &mut Kiln, a: usize, b: usize, ends: Ends) {
+    let (ca, cb) = (k.chambers[a].clone(), k.chambers[b].clone());
+    let l = dist(ca.center, cb.center);
+    let u = scale(sub(cb.center, ca.center), 1.0 / l);
+    let v = [-u[1], u[0]];
+    // From a meter inside one chamber's wall to a meter inside the other's.
+    let exit = |half: f64| half / u[0].abs().max(u[1].abs());
+    let (s0, s1) = (exit(ca.half) - 1.0, l - exit(cb.half) + 1.0);
+    let n = ((s1 - s0) / 8.0).ceil() as usize;
+    let at = |j: usize| add(ca.center, scale(u, s0 + (s1 - s0) * j as f64 / n as f64));
+    let ground: Vec<f64> = (0..=n)
+        .map(|j| {
+            let p = at(j);
+            [-4.0, 0.0, 4.0].iter().flat_map(|&x| [-4.0, 0.0, 4.0].map(|y| k.height(add(add(p, scale(v, x)), scale(u, y))))).fold(f64::MAX, f64::min)
+        })
+        .collect();
+    let step = (s1 - s0) / n as f64;
+    let floor: Vec<f64> = (0..=n)
+        .map(|j| {
+            let cone = (0..=n).map(|i| ground[i] - TUBE_DEPTH + TUBE_GRADE * step * (i as f64 - j as f64).abs()).fold(f64::MAX, f64::min);
+            cone.min(lerp(ca.floor, cb.floor, j as f64 / n as f64))
+        })
+        .collect();
+    for j in 0..n {
+        let (p, q) = (at(j), at(j + 1));
+        let (z0, z1) = (floor[j], floor[j + 1]);
+        let (lo, hi) = (z0.min(z1), z0.max(z1));
+        let mid = scale(add(p, q), 0.5);
+        if hi - lo < 1e-6 {
+            // (Overlapping the next by a little: abutting exactly, a point on
+            // the seam could round to neither.)
+            k.fixed.push(strip(sub(p, scale(u, 0.05)), add(q, scale(u, 0.05)), TUBE, lo - 1.0, lo, Kind::Block));
+        } else {
+            // A wedge rising toward its higher end.
+            let up = if z1 > z0 { u } else { scale(u, -1.0) };
+            let w = CoverBox::turned([mid[0] as f32, mid[1] as f32], [(step / 2.0 + 0.05) as f32, TUBE as f32], [up[0] as f32, up[1] as f32], (lo - 1.0) as f32, hi as f32, Kind::Block, 0);
+            k.fixed.push(w.wedge(lo as f32));
+        }
+        for side in [-1.0, 1.0] {
+            let off = scale(v, side * (TUBE + 0.3));
+            k.fixed.push(strip(sub(add(p, off), scale(u, 0.3)), add(add(q, off), scale(u, 0.3)), 0.3, lo - 1.0, hi + TUBE_HIGH + 0.6, Kind::Block));
+        }
+        k.fixed.push(strip(sub(p, scale(u, 0.3)), add(q, scale(u, 0.3)), TUBE + 0.6, hi + TUBE_HIGH, hi + TUBE_HIGH + 0.6, Kind::Block));
+    }
+    k.chambers[a].outs.push(u);
+    k.chambers[b].outs.push(scale(u, -1.0));
+    // The route: down a's trench (if it has one), along the tube, up b's.
+    let (mut path, mut z) = if ca.trench { (vec![ca.top, ca.foot, ca.center], vec![ca.surface, ca.floor, ca.floor]) } else { (vec![ca.center], vec![ca.floor]) };
+    for (j, &f) in floor.iter().enumerate() {
+        path.push(at(j));
+        z.push(f);
+    }
+    let to_inside = match ends {
+        Ends::Inside { to, .. } => to,
+        Ends::Lane => None,
+    };
+    path.push(to_inside.unwrap_or(cb.center));
+    z.push(cb.floor);
+    if cb.trench && to_inside.is_none() {
+        path.extend([cb.foot, cb.top]);
+        z.extend([cb.floor, cb.surface]);
+    }
+    let (from, to, ra, rb) = match ends {
+        Ends::Lane => (Some(k.sites[ca.site].center), Some(k.sites[cb.site].center), ca.site, cb.site),
+        Ends::Inside { from, .. } => (from.filter(|_| ca.trench), None, ca.site, ca.site),
+    };
+    let mut legs = Vec::new();
+    if let Some(f) = from {
+        legs.push(Leg { kind: LegKind::Road, path: vec![f, path[0]], z: None });
+    }
+    let last = *path.last().unwrap();
+    legs.push(Leg { kind: LegKind::Road, path, z: Some(z) });
+    if let Some(t) = to {
+        legs.push(Leg { kind: LegKind::Road, path: vec![last, t], z: None });
+    }
+    k.tunnels.push(Route { a: ra, b: rb, legs, one_way: false });
+}
+
+/// The tube between each sector's two Tunnel mouths (K1, the Undervein's
+/// first); then every chamber's walls.
+pub(crate) fn tunnels(k: &mut Kiln) {
+    for s in 0..3 {
+        let find = |site: usize| k.chambers.iter().position(|c| c.site == site && c.trench).expect("a Tunnel mouth's chamber");
+        let (a, b) = (find(super::site(s, s::O + 5)), find(super::site(s, s::O + 11)));
+        tube(k, a, b, Ends::Lane);
+    }
+    for i in 0..k.chambers.len() {
+        walls(k, i);
+    }
+}
+
+/// A chamber's walls, open to its trench and its tubes.
+fn walls(k: &mut Kiln, i: usize) {
+    let c = k.chambers[i].clone();
+    let n = [-c.e[1], c.e[0]];
+    for normal in [c.e, scale(c.e, -1.0), n, scale(n, -1.0)] {
+        let along = [-normal[1], normal[0]];
+        let mut gaps: Vec<(f64, f64)> = Vec::new();
+        if c.trench && dot(normal, c.e) < -0.5 {
+            gaps.push((-4.0, 4.0)); // the trench
+        }
+        for &out in &c.outs {
+            let o = dot(out, normal);
+            if o >= out[0].abs().max(out[1].abs()) - 1e-9 && o > 0.0 {
+                // Where the tube crosses this side: its walls' outer faces, and a little.
+                let x = dot(scale(out, c.half / o), along);
+                let w = (TUBE + 0.6) / o + 0.3;
+                gaps.push((x - w, x + w));
+            }
+        }
+        gaps.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap());
+        let mut from = -c.half - 0.6;
+        let wall = |k: &mut Kiln, f: f64, t: f64| {
+            if t - f > 0.2 {
+                let side = add(c.center, scale(normal, c.half + 0.3));
+                k.fixed.push(strip(add(side, scale(along, f)), add(side, scale(along, t)), 0.3, c.floor - 1.0, c.floor + c.high + 0.6, Kind::Block));
+            }
+        };
+        for (g0, g1) in gaps {
+            wall(k, from, g0);
+            from = from.max(g1);
+        }
+        wall(k, from, c.half + 0.6);
+    }
+}
+
+/// The world axis nearest the direction `d`.
+pub(crate) fn axis_of(d: [f64; 2]) -> [f64; 2] {
+    if d[0].abs() >= d[1].abs() {
+        [d[0].signum(), 0.0]
+    } else {
+        [0.0, d[1].signum()]
+    }
+}
+
+/// `p` snapped to the nearest height cells' corner.
+pub(crate) fn snap(p: [f64; 2]) -> [f64; 2] {
+    let r = TERRAIN_RES as f64;
+    [(p[0] / r).round() * r, (p[1] / r).round() * r]
+}

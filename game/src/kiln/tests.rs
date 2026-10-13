@@ -15,10 +15,14 @@ fn kiln() -> Arc<World> {
 /// it took, or where it got stuck.
 pub(crate) fn walk(w: &World, l: &crate::world::Lane, backward: bool) -> Result<f32, String> {
     let start = l.waypoint(0, backward);
-    let mut s = MoveState::standing(w, [start[0], start[1]]);
     // On whatever's there (a stair's top, a deck): the highest surface
-    // under the route's own height.
-    s.z = w.ground(start[0], start[1], start[2].max(s.z) + 1.0, 1.5).max(s.z);
+    // under the route's own height; under the ground (a chamber), its floor.
+    let mut s = if start[2] < w.terrain(start[0], start[1]) - 2.0 {
+        MoveState::standing_at(w, [start[0], start[1]], start[2])
+    } else {
+        let s = MoveState::standing(w, [start[0], start[1]]);
+        MoveState { z: w.ground(start[0], start[1], start[2].max(s.z) + 1.0, 1.5).max(s.z), ..s }
+    };
     let mut next = 1;
     // Sprinting along it, and up lifts and down drop shafts at 5 m/s or so.
     let climb: f32 = l.path.windows(2).map(|w| ((w[1][2] - w[0][2]).abs() - (w[0][0] - w[1][0]).abs() - (w[0][1] - w[1][1]).abs()).max(0.0)).sum();
@@ -213,19 +217,26 @@ fn tunnels_run_under_the_ground_from_holes() {
         let holes = l.path.iter().filter(|p| w.hole(p[0], p[1])).count();
         assert!(holes >= 6, "{holes} waypoints in the trenches");
     }
-    // Every hole is a trench's: lined by walls, a ramp in it.
-    let mut cells = 0;
+    // Every hole is a trench's (a ramp in it) or a shaft's (a lift or a drop
+    // shaft in it, a chamber's floor under it): never a fall to the world's bottom.
+    let (mut cells, mut shafts) = (0, 0);
     for cy in 0..crate::world::CELLS {
         for cx in 0..crate::world::CELLS {
             if w.hole_cell(cx, cy) {
                 cells += 1;
                 let (x, y) = ((cx as f32 + 0.5) * 4.0, (cy as f32 + 0.5) * 4.0);
-                let floor = w.ground(x, y, w.terrain(x, y) + 1.0, 1.5);
-                assert!(floor > w.terrain(x, y) - 14.0, "a ramp under the hole at ({x}, {y})");
+                let t = w.terrain(x, y);
+                let floor = w.ground(x, y, t + 1.0, 1.5);
+                if floor > t - 14.0 {
+                    continue; // a trench's ramp
+                }
+                shafts += 1;
+                assert!(floor > 1.0 && w.volume_at(x, y, t - 3.0).is_some(), "a shaft at ({x}, {y}): floor {floor}");
             }
         }
     }
-    assert_eq!(cells, 6 * 20, "two cells across, ten along, two mouths a sector");
+    eprintln!("{cells} hole cells, {shafts} of them shafts'");
+    assert!(cells >= 6 * 20 && (cells - shafts) % 20 == 0 && shafts % 4 == 0);
     let _ = Kind::Shield;
 }
 

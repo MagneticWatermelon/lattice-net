@@ -23,14 +23,21 @@
 //! rims and the Vent outposts' ledges, with drop shafts beside them for the
 //! way down; each sector's two Tunnel mouths are joined by a tube under the
 //! ground, down ramps through holes in it; each Landing's spawn room has
-//! doorways shielded for its faction. What's still to come (docs/kiln.md,
-//! build plan): the great sites in graybox (K2), the bases, outposts and the
-//! rest of the Undervein (K3), the living world (K4) and art (K5).
+//! doorways shielded for its faction.
+//!
+//! K2 (the great sites in graybox, `deep`): the Hollow's Heart chamber under
+//! the Heartwell with tunnels from the rift mouths and shafts from the floor,
+//! lifts up its terraces; the Spans' galleries, arch perches and wall tunnels
+//! up into their bridgeheads; the Cliffholds' lift towers, keep and deep
+//! gallery; the Geodes' well chambers and lattice springs. What's still to
+//! come (docs/kiln.md, build plan): the bases, outposts and the rest of the
+//! Undervein (K3), the living world (K4) and art (K5).
 //!
 //! Generation uses f64 arithmetic and `libm` only (no platform math), in a
 //! fixed order, so every machine builds the same bits.
 
 mod build;
+mod deep;
 mod land;
 mod lanes;
 
@@ -375,7 +382,7 @@ pub(crate) struct Kiln {
     pub volumes: Vec<Volume>,
     /// The Tunnel mouths' chambers, and the tunnels' lanes (kept apart from
     /// the rest: nothing on the ground over them is cleared for them).
-    pub chambers: Vec<build::Chamber>,
+    pub chambers: Vec<deep::Chamber>,
     pub tunnels: Vec<lanes::Route>,
 }
 
@@ -482,14 +489,14 @@ pub(crate) fn build_kiln() -> Kiln {
     build::hollow(&mut kiln); tick("build::hollow");
     let decks = lanes::stamp(&mut kiln, &routes); tick("lanes::stamp");
     build::sites(&mut kiln); tick("build::sites");
-    build::tunnels(&mut kiln); tick("build::tunnels");
+    deep::tunnels(&mut kiln); tick("deep::tunnels");
     build::scatter(&mut kiln); tick("build::scatter");
     // (A tunnel's lane only on the surface: to its mouths.)
     let paths: Vec<Vec<[f64; 2]>> = routes
         .iter()
         .chain(kiln.internal.iter())
         .map(|r| r.legs.iter().flat_map(|l| l.path.iter().copied()).collect())
-        .chain(kiln.tunnels.iter().flat_map(|r| [r.legs[0].path.clone(), r.legs[2].path.clone()]))
+        .chain(kiln.tunnels.iter().flat_map(|r| r.legs.iter().filter(|l| l.z.is_none()).map(|l| l.path.clone())))
         .collect();
     build::clear_lanes(&mut kiln, &paths); tick("build::clear_lanes");
     land::ground(&mut kiln); tick("land::ground");
