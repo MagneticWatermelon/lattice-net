@@ -422,6 +422,12 @@ pub struct Lane {
 }
 
 impl Lane {
+    /// Whether it runs mostly under the ground: a tunnel (Kiln's Undervein)
+    /// under a lane of the lattice, not one of its own.
+    pub fn tunnel(&self, w: &World) -> bool {
+        self.path.iter().filter(|p| w.under(p[0], p[1], p[2])).count() * 3 > self.path.len()
+    }
+
     /// Its length along the path, horizontally.
     pub fn length(&self) -> f32 {
         self.path.windows(2).map(|w| ((w[1][0] - w[0][0]) * (w[1][0] - w[0][0]) + (w[1][1] - w[0][1]) * (w[1][1] - w[0][1])).sqrt()).sum()

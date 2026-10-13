@@ -83,19 +83,36 @@ fn main() {
         }
     }
     // Lanes: the lattice's veins (internal routes thinner, lighter).
+    // (Tunnels, K3: orange, thick, over the rest.)
+    for pass in [false, true] {
     for l in w.lanes() {
-        let c = if l.a == l.b { [255, 255, 160] } else { [40, 200, 255] };
         for s in l.path.windows(2) {
+            let under = w.under(s[0][0], s[0][1], s[0][2]) && w.under(s[1][0], s[1][1], s[1][2]);
+            if under != pass {
+                continue;
+            }
+            let c = if under {
+                [255, 120, 30]
+            } else if l.a == l.b {
+                [255, 255, 160]
+            } else {
+                [40, 200, 255]
+            };
             let (a, b) = (to_px(s[0][0], s[0][1]), to_px(s[1][0], s[1][1]));
             let n = ((b.0 - a.0).abs().max((b.1 - a.1).abs())).max(1);
             for i in 0..=n {
                 let (x, y) = (a.0 + (b.0 - a.0) * i / n, a.1 + (b.1 - a.1) * i / n);
                 put(x, y, c);
-                if l.a != l.b && m > 1.5 {
+                if (l.a != l.b && m > 1.5) || under {
                     put(x + 1, y, c);
+                }
+                if under {
+                    put(x, y + 1, c);
+                    put(x + 1, y + 1, c);
                 }
             }
         }
+    }
     }
     // Sites: a ring; control points: dots.
     for s in w.sites() {

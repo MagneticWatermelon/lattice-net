@@ -40,6 +40,7 @@ mod build;
 mod deep;
 mod land;
 mod lanes;
+mod under;
 
 use crate::world::{Continent, CoverBox, Lane, Parts, Point, Site, SiteKind, Volume, World, KILN, NO_SECTOR, TERRAIN_N, TERRAIN_RES};
 
@@ -384,6 +385,13 @@ pub(crate) struct Kiln {
     /// the rest: nothing on the ground over them is cleared for them).
     pub chambers: Vec<deep::Chamber>,
     pub tunnels: Vec<lanes::Route>,
+    /// The tubes dug (K3).
+    pub bores: Vec<deep::Bored>,
+    /// The bases' spawn rooms (K3): site, center (its shaft's corner), its
+    /// long axis, its floor.
+    pub rooms: Vec<(usize, [f64; 2], [f64; 2], f64)>,
+    /// What the generator couldn't fit (the tests want none).
+    pub notes: Vec<String>,
 }
 
 /// A road or a ramp is here.
@@ -468,6 +476,9 @@ pub(crate) fn build_kiln() -> Kiln {
         volumes: Vec::new(),
         chambers: Vec::new(),
         tunnels: Vec::new(),
+        bores: Vec::new(),
+        rooms: Vec::new(),
+        notes: Vec::new(),
     };
     tick("base");
     // Where the lanes will run, before anything is placed beside them.
@@ -490,7 +501,7 @@ pub(crate) fn build_kiln() -> Kiln {
     let decks = lanes::stamp(&mut kiln, &routes); tick("lanes::stamp");
     build::sites(&mut kiln); tick("build::sites");
     build::spawn_rooms(&mut kiln); tick("build::spawn_rooms");
-    deep::tunnels(&mut kiln); tick("deep::tunnels");
+    under::build(&mut kiln); tick("under::build");
     build::scatter(&mut kiln); tick("build::scatter");
     // (A tunnel's lane only on the surface: to its mouths.)
     let paths: Vec<Vec<[f64; 2]>> = routes
@@ -563,7 +574,8 @@ pub struct Fairness {
 pub fn fairness(world: &World, time: &dyn Fn(usize, bool) -> Option<f32>) -> Fairness {
     let n = world.sites().len();
     let mut edges: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
-    for (i, l) in world.lanes().iter().enumerate().filter(|(_, l)| l.a != l.b) {
+    // (The lattice's own lanes: not the tunnels under them.)
+    for (i, l) in world.lanes().iter().enumerate().filter(|(_, l)| l.a != l.b && !l.tunnel(world)) {
         if let Some(t) = time(i, false) {
             edges[l.a as usize].push((l.b as usize, t));
         }

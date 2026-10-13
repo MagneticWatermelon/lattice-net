@@ -16,10 +16,21 @@ use crate::territory::{POINT_HEIGHT, POINT_RADIUS};
 use crate::world::{Lane, SiteKind, World};
 
 /// Walks lane `l` (backward from its end if `backward`), sprinting, never
-/// jumping, as faction 0 with the sites held as at the start: the time it
-/// took, or where it got stuck.
+/// jumping, with the sites held as at the start, as faction 0 (a route
+/// inside a site: as its holder, whom its own shields let through, such as
+/// a spawn room's covered exit's): the time it took, or where it got stuck.
 pub fn walk(w: &World, l: &Lane, backward: bool) -> Result<f32, String> {
-    walk_as(w, l, backward, 0.into())
+    walk_as(w, l, backward, walker(w, l).into())
+}
+
+/// Who `walk` walks a lane as.
+pub fn walker(w: &World, l: &Lane) -> u8 {
+    let holder = w.sites().get(l.a as usize).map_or(0, |s| s.sector);
+    if l.a == l.b && holder < 3 {
+        holder
+    } else {
+        0
+    }
 }
 
 /// `walk`, as `who`.

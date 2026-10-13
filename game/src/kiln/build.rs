@@ -375,7 +375,7 @@ pub(crate) fn shape_site(k: &mut Kiln, i: usize) -> f64 {
             stamp_ramp(k, &full, g, floor);
             let bottom = add(c, scale(unit(a0 + span + 30.0), 18.0));
             internal(k, i, vec![vec![entry, full[0]], full.clone(), vec![*full.last().unwrap(), bottom]]);
-            k.sites[i].anchors = vec![entry, path[n / 2], bottom];
+            k.sites[i].anchors = vec![entry, path[n / 2], bottom, *full.last().unwrap()];
             g
         }
         SiteKind::ReefWarren => {
@@ -1006,6 +1006,9 @@ pub(crate) fn sites(k: &mut Kiln) {
                 let outward = scale(rift.normal, -1.0);
                 let below = add(hall_at, scale(deep::axis_of(rift.normal), 8.0));
                 deep::shaft(k, i, hall_at, hall, deep::axis_of(rift.dir), below, add(hall_at, scale(deep::axis_of(outward), 12.0)));
+                // (Routes through it stand clear of the shaft, on the rift's side.)
+                k.chambers[hall].stand = below;
+                k.chambers[hall].blocked.push((deep::axis_of(outward), 0.5));
                 let top = deep::snap(add(hall_at, scale(outward, 150.0)));
                 let e = deep::axis_of(sub(hall_at, top));
                 let m = deep::mouth_at(k, i, top, e);
@@ -1061,6 +1064,9 @@ pub(crate) fn sites(k: &mut Kiln) {
                 let out_dir = unit(a1 + span2 + 40.0);
                 let below = add(well, scale(deep::axis_of(out_dir), 8.0));
                 deep::shaft(k, i, well, ch, deep::axis_of([-out_dir[1], out_dir[0]]), below, add(well, scale(out_dir, 12.0)));
+                // (Routes through it stand clear of the shaft: K3's approach tunnel.)
+                k.chambers[ch].stand = below;
+                k.chambers[ch].blocked.push((scale(deep::axis_of(out_dir), -1.0), 0.5));
                 for (deg, (r_pad, r_ledge, r_up, r_land), (z0, z1, z2)) in [
                     (a1 + span2 + 72.0, (29.5, 36.5, 39.5, 46.5), (floor, floor + 25.0, floor + 50.0)),
                     (a0 + span1 + 122.0, (61.5, 68.5, 71.5, 79.0), (floor + 50.0, floor + 75.0, floor + 100.0)),
@@ -1361,16 +1367,24 @@ pub(crate) fn sites(k: &mut Kiln) {
 pub(crate) fn spawn_rooms(k: &mut Kiln) {
     const HU: f64 = 7.0;
     const HV: f64 = 5.0;
-    // Out to the baffles, and the padding's blend past that.
-    let reach = HU + deep::BAFFLE + 1.0;
     let blend = 3.0;
     for i in 0..k.sites.len() {
         let p = k.sites[i].clone();
         if !(p.kind.base() || p.kind == SiteKind::Geode) {
             continue;
         }
+        // A base's is longer, a shaft down its middle (its covered exit, K3:
+        // `under`), and square to the map's axes, the shaft's hole whole cells.
+        let base = p.kind.base();
+        let hu = if base { HU + 3.0 } else { HU };
+        // Out to the baffles, and the padding's blend past that.
+        let reach = hu + deep::BAFFLE + 1.0;
         let fd = free_dir(&p);
         let fits = |k: &Kiln, q: [f64; 2]| -> Result<(), &'static str> {
+            // Out of a cenote's pit (its cavern's trench is there, K3).
+            if p.kind == SiteKind::Cenote && dist(q, p.center) < PIT_R + 15.0 {
+                return Err("pit");
+            }
             // Off the lanes and the ways inside sites.
             let inside = k.internal.iter().flat_map(|r| &r.legs).flat_map(|l| l.path.windows(2)).map(|w| seg_dist(q, w[0], w[1]).0).fold(f64::MAX, f64::min);
             if land::clearance(k, q).0.min(inside) < reach + 2.0 {
@@ -1411,11 +1425,12 @@ pub(crate) fn spawn_rooms(k: &mut Kiln) {
             if hi - lo <= 2.5 { Ok(()) } else { Err("slope") }
         };
         let mut placed = None;
-        'search: for r in [0.55, 0.7, 0.45, 0.4, 0.85, 1.0, 1.15] {
+        'search: for r in [0.55, 0.7, 0.45, 0.4, 0.85, 1.0, 1.15, 1.3, 1.45] {
             let r = (p.half * r).max(28.0);
             for step in 0..36 {
                 let a = fd + if step % 2 == 0 { 1.0 } else { -1.0 } * ((step + 1) / 2) as f64 * 10.0;
                 let q = add(p.center, scale(unit(a), r));
+                let q = if base { deep::snap(q) } else { q };
                 if fits(k, q).is_ok() {
                     placed = Some((q, a));
                     break 'search;
@@ -1426,8 +1441,12 @@ pub(crate) fn spawn_rooms(k: &mut Kiln) {
         let Some((q, a)) = placed else { continue };
         let floor = k.mean(q, reach);
         pad(k, q, reach, floor, blend);
-        deep::spawn_room(k, q, unit(a + 90.0), HU, HV, floor, i, p.sector);
+        let u = if base { deep::axis_of(unit(a + 90.0)) } else { unit(a + 90.0) };
+        deep::spawn_room(k, q, u, hu, HV, floor, i, p.sector);
         deep::keep_clear(k, q, reach + 2.0);
+        if base {
+            k.rooms.push((i, q, u, floor));
+        }
     }
 }
 

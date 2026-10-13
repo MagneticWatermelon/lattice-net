@@ -52,12 +52,16 @@ fn kiln_is_built_to_its_design() {
     assert!(f > 75.0 && f < 95.0, "the rift's floor at the Span: {f}");
     let top = w.boxes().iter().map(|b| b.top).fold(0.0f32, f32::max);
     assert!((top - 610.0).abs() < 1.0 && top < 655.0, "the Heartwell's top {top}");
-    // About 110 lanes, 2-4 a site (more at the great sites).
+    // About 110 lanes, 2-4 a site (more at the great sites): links between
+    // sites (a tunnel under a lane links what the lane does).
     let lanes: Vec<_> = w.lanes().iter().filter(|l| l.a != l.b).collect();
-    eprintln!("{} lanes, {} routes inside sites", lanes.len(), w.lanes().len() - lanes.len());
-    assert!(lanes.len() >= 100 && lanes.len() <= 125, "{}", lanes.len());
+    let mut links: Vec<(u16, u16)> = lanes.iter().map(|l| (l.a.min(l.b), l.a.max(l.b))).collect();
+    links.sort_unstable();
+    links.dedup();
+    eprintln!("{} links, {} routes between sites ({} of them tunnels), {} inside sites", links.len(), lanes.len(), lanes.iter().filter(|l| l.tunnel(&w)).count(), w.lanes().len() - lanes.len());
+    assert!(links.len() >= 100 && links.len() <= 125, "{}", links.len());
     for (i, s) in sites.iter().enumerate() {
-        let n = lanes.iter().filter(|l| l.a as usize == i || l.b as usize == i).count();
+        let n = links.iter().filter(|l| l.0 as usize == i || l.1 as usize == i).count();
         let (lo, hi) = match s.kind {
             SiteKind::Hollow => (6, 6),
             SiteKind::Landing => (3, 3),
@@ -295,6 +299,8 @@ fn every_base_and_great_site_has_a_spawn_room_that_sees_no_point() {
     let w = kiln();
     let sites = w.sites();
     let shields: Vec<_> = w.boxes().iter().filter(|b| b.kind == Kind::Shield && b.site != NO_SITE).copied().collect();
+    // (Its doors: not the shields at the foot of its covered exit, K3.)
+    let doors_of: Vec<_> = shields.iter().filter(|b| b.bottom > w.terrain(b.center[0], b.center[1]) - 4.0).copied().collect();
     for (i, s) in sites.iter().enumerate() {
         let wants = s.kind.base() || s.kind.major() || s.kind == SiteKind::Landing;
         let has = shields.iter().any(|b| b.site as usize == i);
@@ -303,7 +309,7 @@ fn every_base_and_great_site_has_a_spawn_room_that_sees_no_point() {
     // From a step inside each door (under its roof), at eye height, no point
     // of its site is in sight (GDD §6.3): the baffles and walls hide them.
     let mut doors = 0;
-    for b in shields.iter().filter(|b| {
+    for b in doors_of.iter().filter(|b| {
         let k = sites[b.site as usize].kind;
         k.base() || k == SiteKind::Geode
     }) {
@@ -319,4 +325,127 @@ fn every_base_and_great_site_has_a_spawn_room_that_sees_no_point() {
         doors += 1;
     }
     assert_eq!(doors, 2 * (18 + 3), "two doors at each base and Geode");
+}
+
+#[test]
+#[ignore]
+fn dump_tunnels() {
+    // KILN_SITE=N cargo test -p lattice-game --release dump_tunnels -- --ignored --nocapture
+    let site: usize = std::env::var("KILN_SITE").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let k = build_kiln();
+    for (i, c) in k.chambers.iter().enumerate().filter(|(_, c)| c.site == site) {
+        eprintln!("chamber {i}: center ({:.0}, {:.0}) stand ({:.0}, {:.0}) half {} high {} floor {:.1} surface {:.1} trench {} outs {:?}", c.center[0], c.center[1], c.stand[0], c.stand[1], c.half, c.high, c.floor, c.surface, c.trench, c.outs);
+    }
+    for b in k.bores.iter().filter(|b| k.chambers[b.4 .0].site == site || k.chambers[b.4 .1].site == site) {
+        eprintln!("bore {:?}: ({:.0}, {:.0}) -> ({:.0}, {:.0}) z {:.1}-{:.1}", b.4, b.0[0], b.0[1], b.1[0], b.1[1], b.2, b.3);
+    }
+    for (i, r) in k.tunnels.iter().enumerate().filter(|(_, r)| r.a == site || r.b == site) {
+        eprintln!("tunnel {i} {} -> {} one way {}", r.a, r.b, r.one_way);
+        for l in &r.legs {
+            let pts: Vec<String> = l.path.iter().enumerate().map(|(j, p)| format!("({:.0},{:.0},{})", p[0], p[1], l.z.as_ref().map_or("g".to_string(), |z| format!("{:.1}", z[j])))).collect();
+            eprintln!("   {}", pts.join(" "));
+        }
+    }
+    for p in k.points.iter().filter(|p| p.site as usize == site) {
+        eprintln!("point {:?}", p.pos);
+    }
+}
+
+#[test]
+fn every_base_has_its_tunnels() {
+    use crate::world::{Kind, NO_SITE};
+    // K3 (docs/kiln.md, "Tunnels"): under every base, its undercroft and a
+    // shaft up from it; its spawn room's covered exit, shielded at its inner
+    // end for whoever holds the site; an approach tunnel from outside it.
+    let w = kiln();
+    let sites = w.sites();
+    let owners: Vec<u8> = sites.iter().map(|s| s.sector).collect();
+    for (i, s) in sites.iter().enumerate().filter(|(_, s)| s.kind.base()) {
+        let under = |p: &[f32; 3]| w.terrain(p[0], p[1]) - p[2] > 8.0;
+        let routes: Vec<&crate::world::Lane> = w.lanes().iter().filter(|l| l.a as usize == i && l.b as usize == i).collect();
+        // A lift up from under the ground to it.
+        let up = routes.iter().any(|l| l.one_way && under(&l.path[0]) && !under(l.path.last().unwrap()));
+        assert!(up, "{:?} {i}: no shaft up from its undercroft", s.kind);
+        // The covered exit's shield, under the ground, its holder's.
+        let foot: Vec<_> = w.boxes().iter().filter(|b| b.kind == Kind::Shield && b.site == i as u16 && b.bottom < w.terrain(b.center[0], b.center[1]) - 8.0).collect();
+        assert!(!foot.is_empty() && foot.iter().all(|b| b.site != NO_SITE && b.pass == s.sector), "{:?} {i}: its covered exit's shield", s.kind);
+        // Walked by its holder (the route tests walk it so), never by the others.
+        let crosses = |l: &crate::world::Lane, b: &crate::world::CoverBox| {
+            l.path.windows(2).any(|s| {
+                (0..=40).any(|j| {
+                    let t = j as f32 / 40.0;
+                    let p = [s[0][0] + (s[1][0] - s[0][0]) * t, s[0][1] + (s[1][1] - s[0][1]) * t, s[0][2] + (s[1][2] - s[0][2]) * t];
+                    b.covers(p[0], p[1]) && p[2] > b.bottom - 1.0 && p[2] < b.top
+                })
+            })
+        };
+        let exits: Vec<_> = routes.iter().filter(|l| foot.iter().any(|b| crosses(l, b))).collect();
+        assert!(!exits.is_empty(), "{:?} {i}: no route through its covered exit", s.kind);
+        for l in &exits {
+            assert!(crate::reach::walk_as(&w, l, false, s.sector.into()).is_ok());
+            let other = (s.sector + 1) % 3;
+            assert!(crate::reach::walk_as(&w, l, false, crate::movement::Mover { faction: other, owners: &owners }).is_err(), "{:?} {i}: faction {other} through its covered exit", s.kind);
+        }
+        // An approach tunnel: from the ground well outside it, mostly under the ground.
+        let approach = routes.iter().any(|l| {
+            let p = l.path[0];
+            let (dx, dy) = (p[0] - s.center[0], p[1] - s.center[1]);
+            (dx * dx + dy * dy).sqrt() > s.half + 60.0 && l.tunnel(&w)
+        });
+        assert!(approach, "{:?} {i}: no approach tunnel", s.kind);
+    }
+}
+
+#[test]
+fn the_undervein_runs_under_the_lanes_and_the_rifts() {
+    let w = kiln();
+    let mut pairs: Vec<(u16, u16)> = w.lanes().iter().filter(|l| l.a != l.b && l.tunnel(&w)).map(|l| (l.a.min(l.b), l.a.max(l.b))).collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    // About 12 tubes between sites (docs/kiln.md): each sector's three, two under each rift.
+    eprintln!("{} tunnels between sites", pairs.len());
+    assert_eq!(pairs.len(), 15);
+    // Each under a lane: what it links, a lane on the ground links too
+    // (but between two Tunnel mouths, K1's: the tube is their lane).
+    for &(a, b) in &pairs {
+        let mouths = [a, b].iter().all(|&s| w.sites()[s as usize].kind == SiteKind::TunnelMouth);
+        assert!(mouths || w.lanes().iter().any(|l| (l.a.min(l.b), l.a.max(l.b)) == (a, b) && !l.tunnel(&w)), "the tunnel from {a} to {b} isn't under a lane");
+    }
+    // Two under each rift's floor.
+    for j in 0..3 {
+        let rift = Rift::new(j);
+        let under: Vec<_> = pairs
+            .iter()
+            .filter(|&&(a, b)| {
+                w.lanes().iter().filter(|l| (l.a.min(l.b), l.a.max(l.b)) == (a, b)).any(|l| {
+                    l.path.iter().any(|p| {
+                        let (along, across) = rift.coords([p[0] as f64, p[1] as f64]);
+                        across.abs() < Rift::half_width(along) - 30.0 && (p[2] as f64) < Rift::floor(along) - 8.0
+                    })
+                })
+            })
+            .collect();
+        assert_eq!(under.len(), 2, "rift {j}: {under:?}");
+    }
+}
+
+#[test]
+fn tunnels_have_no_dead_ends() {
+    // Every chamber has two ways out at the least: tubes, shafts, a trench.
+    let k = build_kiln();
+    for (i, c) in k.chambers.iter().enumerate() {
+        let ways = c.trench as usize + c.outs.len() + c.shafts;
+        assert!(ways >= 2, "chamber {i} of site {} at ({:.0}, {:.0}, {:.0}): {ways} way out", c.site, c.center[0], c.center[1], c.floor);
+    }
+    eprintln!("{} chambers, {} tubes", k.chambers.len(), k.bores.len());
+}
+
+#[test]
+fn every_tunnel_fits() {
+    // What the generator couldn't place (an undercroft, a shaft, a mouth).
+    let k = build_kiln();
+    for n in &k.notes {
+        eprintln!("{n}");
+    }
+    assert!(k.notes.is_empty(), "{} things the generator couldn't fit", k.notes.len());
 }
