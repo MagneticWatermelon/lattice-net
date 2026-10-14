@@ -1904,23 +1904,26 @@ pub(crate) fn lay_lips(k: &mut Kiln) {
     k.boxes.extend(rails);
     // Lips laid one after another, each starting where the last ended (a
     // ring's edges), are joined as one lip's pieces are; and a ring closed.
-    let mut carry: Option<([f64; 2], [f64; 2])> = None;
-    let mut head: Option<([f64; 2], [f64; 2])> = None;
+    // (Chained by where they are: a lip starting where the last ended
+    // continues it, whatever pieces either laid near that corner.)
+    let mut prev: Option<[f64; 2]> = None;
+    let mut carry: Option<[f64; 2]> = None;
+    let mut head: Option<([f64; 2], Option<[f64; 2]>)> = None;
     for l in std::mem::take(&mut k.lips) {
         let open = |m: [f64; 2]| l.open.is_some_and(|(p, q, r)| seg_dist(m, p, q).0 < r);
-        let chained = carry.is_some_and(|(o, _)| dist(o, l.a) < 1e-6);
-        let (first, last) = lay_lip(k, &l, &open, if chained { carry.map(|c| c.1) } else { None });
+        let chained = prev.is_some_and(|o| dist(o, l.a) < 1e-6);
+        let (first, last) = lay_lip(k, &l, &open, if chained { carry } else { None });
         if !chained {
-            head = first.map(|f| (l.a, f));
+            head = Some((l.a, first));
         }
-        if let (Some((a, f)), Some(e)) = (head, last) {
+        if let (Some((a, Some(f))), Some(e)) = (head, last) {
             if dist(a, l.b) < 1e-6 && dist(e, f) > 0.05 {
                 let z = if l.z.is_nan() { k.height(e) } else { l.z };
                 let join = strip(e, f, 0.25, z - 0.6, z + 1.1, Kind::Block);
                 if l.keep { k.fixed.push(join) } else { k.boxes.push(join) }
             }
         }
-        carry = last.map(|e| (l.b, e));
+        (prev, carry) = (Some(l.b), last);
     }
 }
 
@@ -1942,8 +1945,10 @@ fn lay_lip(k: &mut Kiln, l: &Lip, open: &dyn Fn([f64; 2]) -> bool, before: Optio
     let mut pieces = Vec::new();
     // (The last piece's index and far end, if it ran to it: joined to the
     // next's near end, as pieces set in by different amounts leave a gap.)
-    let mut last: Option<(isize, [f64; 2])> = before.map(|e| (-1, e));
-    let mut first = None;
+    let mut last: Option<(isize, [f64; 2])> = None;
+    // The first piece's near end, and the last's far end, of those laid.
+    let mut first: Option<[f64; 2]> = None;
+    let mut end: Option<[f64; 2]> = None;
     for j in 0..n as isize {
         let ju = j as usize;
         let (p0, q0) = (at(ju), at(ju + 1));
@@ -1965,11 +1970,19 @@ fn lay_lip(k: &mut Kiln, l: &Lip, open: &dyn Fn([f64; 2]) -> bool, before: Optio
                     pieces.push(strip(end, p, 0.25, z - 0.6, z + 1.1, Kind::Block));
                 }
             }
-            pieces.push(strip(p, q, 0.25, z - 0.6 - (z_at(p) - z_at(q)).abs(), z + 1.1, Kind::Block));
-            if j == 0 && s0 == 0 {
-                first = Some(p);
+            // The lip before this one (a ring's last edge, round a corner):
+            // joined to this one's first piece, however far in from the
+            // corner both are (beside a corner's drop a piece can't be set
+            // in level, and none is laid: its corner was open).
+            if first.is_none() && s0 == 0 {
+                if let Some(e) = before.filter(|&e| dist(e, a) < CORNER && dist(p, a) < CORNER && dist(e, p) > 0.05) {
+                    pieces.push(strip(e, p, 0.25, z - 0.6, z + 1.1, Kind::Block));
+                }
             }
+            pieces.push(strip(p, q, 0.25, z - 0.6 - (z_at(p) - z_at(q)).abs(), z + 1.1, Kind::Block));
+            first = first.or(Some(p));
             last = (s1 == m).then_some((j, q));
+            end = (s1 == m).then_some(q);
         }
     }
     if l.keep {
@@ -1977,8 +1990,12 @@ fn lay_lip(k: &mut Kiln, l: &Lip, open: &dyn Fn([f64; 2]) -> bool, before: Optio
     } else {
         k.boxes.extend(pieces);
     }
-    (first, last.filter(|&(i, _)| i == n as isize - 1).map(|(_, q)| q))
+    (first.filter(|&p| dist(p, a) < CORNER), end.filter(|&q| dist(q, b) < CORNER))
 }
+
+/// How far from a corner a lip's first or last piece may be and still be
+/// joined round it to the next lip's.
+const CORNER: f64 = 13.0;
 
 /// A wedge along `a`-`b`, its top `za` at `a` and `zb` at `b` (rising
 /// along its axis, C1), `half` m to either side, from `bottom`.

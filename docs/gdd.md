@@ -156,7 +156,8 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 - **Lattice transit time (proposed).** Spawning takes 6 s, plus 2 s per lane between the region you died in and the spawn's, up to 20 s. Reinforcing a fight nearby is quick; crossing the continent in one jump isn't. This is our answer to redeploy-side.
 - **Spawn rooms are shielded.** Enemies can't walk in or shoot through the shield. That needs faction-filtered collision (§6.1).
 - **Spawning is budgeted.** Daybreak's 2023 profiling found that zone entry and spawn cost, not bandwidth, killed PlanetSide 2's big fights. Cap spawns per tick the way the server already caps accepts (`max_accepts_per_tick`), so a mass redeploy waits a second instead of spiking the tick.
-- **Respawn today (exists)** is a load-test rule: 5 s after death, the server puts you back into the scenario's fight. The game replaces it with the deploy screen (§9.2) and medic revives (§4.4).
+- **Respawn without deploying (exists)** is a load-test rule: 5 s after death, the server puts you back into the scenario's fight.
+- **Deploying (exists since 2026-10-14, U4; the server's `--deploy`, `msg::RULE_DEPLOY`):** a player joins with no body and deploys at a site its faction may spawn at (held, a spawn room, its meter not past halfway to an attacker; `Territory::spawnable`), appearing at a spot in the site's spawn room (`World::spawn_rooms`, `territory::spawn_points`) after lattice transit (6 s from orbit; 6 s + 2 s a lane from the region it died in, at most 20 s; `Territory::transit_steps`), at most 40 deploys a tick. The dead stay dead until they deploy again; a corpse stays 30 s (the revive window), and deploying releases it. A spawn lost in transit is refused, and the player picks another.
 
 ### 3.5 Resources: Mass
 
@@ -238,7 +239,7 @@ Whoever holds the wells decides who comes back, and where. That's the war. It ne
 
 - **The body stays where it fell** (exists): the dead don't move, aren't pushed and don't block, and corpses keep their aim.
 - **A medic can revive you within 30 s.** You stand up at your body with 50 health. A revive is a life event, like a respawn: never a correction (exists: the life counter).
-- **The death recap (proposed message)** shows who killed you, with what, from how far, how much health they had left, and the damage you took in your last 5 s. The server builds it from its own hit records.
+- **The death recap (exists since 2026-10-14, U4; `MSG_RECAP`)** shows who killed you, with what, from how far, how much health they had left, and the damage you took in your last 5 s, by who dealt it. The server builds it from its own hit records.
 - **After death,** wait for a revive or release to the deploy screen.
 
 ### 4.5 Weapons
@@ -374,7 +375,7 @@ All of it in `movement.rs` and `hit.rs`, deterministic and checked Linux against
 - **Sidegrades, not upgrades.**
   - Unlocks are options with tradeoffs, and a new player's default gear is competitive.
   - A class's full power ceiling should take ~10 hours to reach, not hundreds.
-- **XP for everything that wins fights:** kills, assists, revives, heals, repairs, resupply, spawns on your Anchor, captures, defense. Rewards arrive as reliable events, so the UI shows "+100 Revive" at once.
+- **XP for everything that wins fights:** kills, assists, revives, heals, repairs, resupply, spawns on your Anchor, captures, defense. Rewards arrive as reliable events, so the UI shows "+100 Revive" at once. *Exists (2026-10-14, U4):* the reward events (`Event::Reward`) for a kill (100, +25 a headshot), an assist (50), a site taken (500, an outpost 250) and held (100), the session's total in the session log; nothing spends XP yet.
 - **Characters are bound to a faction.** An account can have one character per faction. Switching factions has a cooldown, which deters spying.
 - **Monetization (open):** if any, cosmetics only. Never power.
 
@@ -392,12 +393,12 @@ All of it in `movement.rs` and `hit.rs`, deterministic and checked Linux against
 
 | screen | what's on it |
 |---|---|
-| deploy | the continent map, your squad, spawn options with their transit times, the loadout, recommended fights |
-| map (M) | regions and owners, lanes, where the fighting is, squad and platoon, waypoints |
+| deploy | the continent map, your squad, spawn options with their transit times, the loadout, recommended fights. *Exists in Unity (U4) but the squad* |
+| map (M) | regions and owners, lanes, where the fighting is, squad and platoon, waypoints. *Exists in Unity (U4): regions, the lattice's links (fronts two-toned), sites with their meters, fights (the server's `MSG_FIGHTS` every 5 s), us* |
 | loadout | class, weapons, attachments, tools, cosmetics |
-| death | the recap, revive status, release |
+| death | the recap, revive status, release. *Exists in Unity (U4) but the revive status* |
 | social | squad, platoon, outfit, chat, voice |
-| settings | video presets (a "Battle" preset that guarantees the frame time), FOV, sensitivity per zoom level, keys, IFF and colorblind modes, audio, the net graph |
+| settings | video presets (a "Battle" preset that guarantees the frame time), FOV, sensitivity per zoom level, keys, IFF and colorblind modes, audio, the net graph. *Exists in Unity (U4): mouse and sights sensitivity, FOV, render scale, vsync, volume, IFF, the net graph* |
 
 ### 9.3 HUD
 
@@ -412,7 +413,7 @@ All of it in `movement.rs` and `hit.rs`, deterministic and checked Linux against
   - ability and grenades;
   - a compass with squadmates, waypoints and spotted enemies;
   - a minimap with every friendly the client knows about within 500 m (free, from the entity store);
-  - a reward ticker;
+  - a reward ticker (exists in Unity since U4);
   - a connection warning: over 100 ms RTT, "shots may need leading";
   - a server-load icon, shown when the ladder level is above 0.
 
@@ -750,9 +751,9 @@ continent package (.lcp) ----> the server:        World::load(package)
 
 **Details:**
 - **The token's 32 B of user data carries the character id and faction.** The login service seals it, so the client can't change who it is. The server already receives the token's user data (exists: `ServerEvent::Connected`).
-- **Deploying (a proposed protocol change):**
-  - On the deploy screen, a connected player is a dead entity with no body. The input clock keeps running, as it does for a dead player today.
-  - `Deploy { spawn, loadout }` (reliable) puts the player into the world, as a life event.
+- **Deploying (exists since 2026-10-14, U4; §3.4):**
+  - On the deploy screen, a connected player is a dead entity with no body (`SnapshotHeader::away`). The input clock keeps running, as it does for a dead player.
+  - `Deploy { site, kit }` (reliable, `MSG_DEPLOY`) puts the player into the world after lattice transit, as a life event; the answer is an event (`Deploying { site, at }` or `Refused { site, reason }`).
 - **Playtests keep invites** (`--invite FILE`, exists). The Unity client reads the same file, and spends one token per launch.
 - **Disconnects:** a replaced connection (the same user connected elsewhere) says so. A timeout offers to reconnect with a new token.
 - **Services needed (none exist yet):** login and token minting, characters and loadouts, the war service (continents, surges, queues), chat, voice.
@@ -797,8 +798,8 @@ continent package (.lcp) ----> the server:        World::load(package)
 | **U1: walk** (the Bevy client's M3c; built, 2026-10-12) | terrain, props, soldiers by band, cameras (first person, chase, spectator), net graph, ghosts, tier colors | M3c's bars: 0 corrections walking alone; smoothness per tier matches the Bevy client on the same link (near ≥ 99%; mid within a point of Bevy's); render time never goes backwards; frame p99 under the refresh interval with a 1k blob in view on the Windows desktop; smooth by eye. **Frame bar met** (2026-10-12): p99 4.6 ms with 1,000 bots fighting in view, against a 180 Hz display's 5.56 ms (IL2CPP player; the static props through one BatchRendererGroup) |
 | **U2: fight** (the Bevy client's M3d) | firing, aiming down sights, cone, recoil, tracers (own re-aimed), hit markers, damage direction, death and respawn, kill feed, distant fights, battle audio | an honest Unity client is never trimmed or held (`rewinds_trimmed` and `renders_held` 0 in the session log); a 300-bot fight within budget; you play it and it feels right |
 | **U3: net thread** (built, 2026-10-12) | the session on a plugin thread | with the main thread frozen for 100, 300 and 1,000 ms: no resyncs or trims (like the Bevy client's freeze tests); a 10 s scene load keeps the connection. **Met** (§12.3) |
-| **U4: shell** | login or invite, deploy screen, map, loadout (stubbed), settings, death recap | |
-| **U5: territory** (the rules, the capture panel and spawn rooms built, 2026-10-13) | sites, points, the capture panel, lanes on the map, spawn rooms. Built: the server's territory (§3.3), shields owned by their site's holder, the plugin's `lt_territory`; in Unity the capture panel and flip banners, every point drawn in its holder's color with a beam of light, sites' shields in their holder's. Left: lanes on the map (U4's map) and spawning in spawn rooms (U4's deploy screen) | every site can be captured and every client agrees, prediction exact (`sim` and the plugin's tests: a site flipped by a player on its point, 0 corrections); Unity with 300 bots capturing at 60× speed: flips drawn, 0 managed allocations |
+| **U4: shell** (built, 2026-10-14) | login or invite, deploy screen, map, loadout (stubbed), settings, death recap. Built: the server's deploy flow (§3.4, §17), recaps, rewards, fights; plugin API v9; in Unity the title (server or invite), the deploy screen, the death screen, the map (M), the menu and settings (Esc), the reward ticker | the deploy flow predicts exactly (`players_deploy_into_their_spawn_rooms_and_every_life_is_exact`, `deploying_through_the_c_api`: 0 corrections and 0 resyncs through deaths and deploys). **Measured:** the Unity player against a deploying Kiln server with 150 capture bots: deployed, died, recapped and redeployed three times, 0 corrections, 0 resyncs |
+| **U5: territory** (the rules, the capture panel and spawn rooms built, 2026-10-13) | sites, points, the capture panel, lanes on the map, spawn rooms. Built: the server's territory (§3.3), shields owned by their site's holder, the plugin's `lt_territory`; in Unity the capture panel and flip banners, every point drawn in its holder's color with a beam of light, sites' shields in their holder's. Built since (2026-10-14, with U4): the lattice's links on the map, deploying into spawn rooms (and bots walking out of them, `nav`) | every site can be captured and every client agrees, prediction exact (`sim` and the plugin's tests: a site flipped by a player on its point, 0 corrections); Unity with 300 bots capturing at 60× speed: flips drawn, 0 managed allocations |
 | **U6: classes** (crouch and the rifle's rounds built, 2026-10-12) | the six classes, their tools and abilities. Built: crouch (Ctrl held, C toggled; the view eases down; soldiers kneel or crouch-walk, the crowd from baked crouched poses) and the rifle's rounds (a first-person reload that swaps its ammo cell, timed by the predicted reload; the HUD's rounds; handling sounds, near soldiers' reloads heard) | crouched heads drawn on their hitbox; prediction exact. **Measured:** a crouched fight (`--autotarget --crouch`, 1,000 bots): 0 corrections, 0 ammo corrections, 6 reloads; frame p99 4.7 ms, no managed allocations |
 | **U7: vehicles** (M4) | ground, then air | |
 | **U8: the first authored continent** | the exporter and package; *proposed* ([docs/kiln.md](kiln.md)): prove them on Kiln's blockout rather than rebuilding Harrow by hand (it stays procedural) | |
@@ -812,7 +813,7 @@ continent package (.lcp) ----> the server:        World::load(package)
 | for | server work | protocol |
 |---|---|---|
 | U0–U3 | none | none |
-| U4 | the deploy flow (no body until deployed), death recap, reward events, a continent-wide fight list every 5 s | Deploy (C→S reliable); Recap, Reward, Fights (S→C) |
+| U4 | the deploy flow (no body until deployed), death recap, reward events, a continent-wide fight list every 5 s (built, 2026-10-14) | Deploy (C→S reliable); Recap, Reward, Fights (S→C) (built) |
 | U5 | territory: sites, capture, lanes, spawn rooms, Landings; shields owned by their site's holder (built, 2026-10-13) | Territory (reliable: the full state at join, then changes; built, every site's fight to everyone when it changes: 67 sites are little) |
 | U6 | classes and loadouts; crouch (built); ammo and reloads (built for the rifle); jump jets; Exo bodies; cloak in interest; healing and revives; deployables (proximity checks on the shared grid); spotting; appearance | more input buttons and a weapon slot (+1 B per input); wider near and far flags; appearance records for entities entering a client's near or mid set; deployables (reliable, static); the spotted list |
 | U7 | vehicles (M4): physics, seats, interest by size, faster far updates for aircraft | vehicle states, seat changes |

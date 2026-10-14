@@ -102,7 +102,13 @@ impl BotBrain {
         }
         let Some(t) = core.territory() else { return };
         let (f, step) = (core.faction(), core.server_step());
-        let mut options: Vec<(u32, usize)> = (0..t.len()).filter_map(|i| core.spawn_option(i).ok().map(|s| (s, i))).collect();
+        // (Where the graph has a way out of the spawn room: a bot can't find
+        // its own.)
+        let nav = core.world().map(|w| (Nav::shared(w), w.clone()));
+        let mut options: Vec<(u32, usize)> = (0..t.len())
+            .filter(|&i| nav.as_ref().is_none_or(|(n, w)| n.has_way_out(w, i)))
+            .filter_map(|i| core.spawn_option(i).ok().map(|s| (s, i)))
+            .collect();
         if core.shell.died_in.is_none() {
             let fronts: Vec<(u32, usize)> = options.iter().copied().filter(|&(_, i)| t.links(i).iter().any(|&j| t.sites[j as usize].owner_at(step) != f)).collect();
             if !fronts.is_empty() {

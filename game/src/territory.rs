@@ -98,7 +98,7 @@ pub fn spawn_points(w: &World) -> Vec<Vec<[f32; 3]>> {
 /// anywhere within `SPAWN_SCATTER` of it (clear of the walls and of cover,
 /// on the floor, not over its covered exit's shaft) and nothing that moves
 /// people within 2 m.
-fn room_spots(w: &World, r: &crate::world::SpawnRoom) -> Vec<[f32; 3]> {
+pub(crate) fn room_spots(w: &World, r: &crate::world::SpawnRoom) -> Vec<[f32; 3]> {
     use crate::movement::{MoveState, RADIUS};
     let v = [-r.axis[1], r.axis[0]];
     let keep = SPAWN_SCATTER + RADIUS + 0.1;
