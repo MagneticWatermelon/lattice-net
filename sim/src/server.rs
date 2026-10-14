@@ -239,6 +239,12 @@ pub struct SimConfig {
     /// Test aid: territory's meters move this many times faster (1: the
     /// GDD's minutes; `territory::Territory::with_speed`).
     pub capture_speed: u32,
+    /// Players deploy (U4, GDD §17; `msg::RULE_DEPLOY`, a world with
+    /// territory only): they join with no body and ask to deploy at a site
+    /// their faction may spawn at, appearing in its spawn room after lattice
+    /// transit; the dead stay dead (their bodies a while) until they deploy
+    /// again. Off: the spawn mode places everyone and the dead respawn.
+    pub deploy: bool,
     /// Where in Kiln's day the server starts (`clock`): its first game step
     /// is this many minutes into a cycle (0: a day's start). Clients need no
     /// telling: the clock is the step's.
@@ -284,6 +290,7 @@ impl Default for SimConfig {
             immortal: false,
             unlimited_rounds: false,
             capture_speed: 1,
+            deploy: false,
             clock_minutes: 0.0,
             cone_of_fire: true,
             spread_secret: None,
@@ -306,6 +313,15 @@ pub struct Counters {
     /// Of them, from falls (`movement::fall_damage`).
     pub fall_deaths: u64,
     pub respawns: u64,
+    /// Deploys (`SimConfig::deploy`): asked for and refused, made, and
+    /// waits for the per-tick budget (`DEPLOYS_PER_TICK`).
+    pub deploys_asked: u64,
+    pub deploys_refused: u64,
+    pub deploys: u64,
+    pub deploys_waited: u64,
+    /// Recaps sent, and XP rewarded.
+    pub recaps: u64,
+    pub xp: u64,
     pub inputs_applied: u64,
     /// Entity-ticks where the next input hadn't arrived. Each consumes that seq
     /// with a stand-in: the last input for `GRACE_TICKS`, then a frozen one.
@@ -434,6 +450,15 @@ struct Body {
     /// Players it hit or was hit by recently: near-tier for each other until
     /// the tick given ("interaction"). `NO_CONTACT` is empty.
     contacts: [(u16, u32); CONTACTS],
+    /// No body (`SimConfig::deploy`): not yet deployed, or gone from its
+    /// corpse. Dead too; in no grid, so no one sees it or counts it.
+    away: bool,
+    /// Deploying: at which site, and the step it appears there.
+    deploy: Option<(u16, u32)>,
+    /// When it last died, and the site whose region it fell in (lattice
+    /// transit counts lanes from there; none: never deployed).
+    died_at: u32,
+    died_in: Option<u16>,
 }
 
 impl Default for Body {
@@ -457,9 +482,32 @@ impl Default for Body {
             fallen: 0,
             left_ground: [0.0; 3],
             contacts: [(NO_CONTACT, 0); CONTACTS],
+            away: false,
+            deploy: None,
+            died_at: 0,
+            died_in: None,
         }
     }
 }
+
+/// Damage a player took (`SimServer::damage_log`): from whom (`events::NOBODY`
+/// for a fall or a test's), how much, a headshot, when.
+#[derive(Debug, Clone, Copy)]
+struct Taken {
+    from: u16,
+    amount: u8,
+    head: bool,
+    step: u32,
+}
+
+/// Deploys made in one tick at most: a mass redeploy waits a tick or two
+/// instead of spiking it (GDD §3.4: spawn cost killed PlanetSide 2's fights).
+const DEPLOYS_PER_TICK: u32 = 40;
+/// A corpse no one revived goes after this long (30 s, GDD §4.4's revive
+/// window): it has no body then, and isn't drawn.
+const CORPSE_STEPS: u32 = 30 * 30;
+/// The regions' lookup cells (`SimServer::regions`): 64 m.
+const REGION_CELL: f32 = 64.0;
 
 impl Body {
     fn dead(&self) -> bool {
@@ -589,6 +637,9 @@ pub struct Session {
     pub hits: u64,
     pub kills: u64,
     pub deaths: u64,
+    /// Its deploys, and the XP it earned (U4).
+    pub deploys: u64,
+    pub xp: u64,
     /// The transport's RTT: summed over its messages, and the highest, in ms.
     pub rtt_sum_ms: f64,
     pub rtt_samples: u64,
@@ -646,8 +697,8 @@ impl SessionRecord {
         };
         let rtt_mean = if s.rtt_samples > 0 { s.rtt_sum_ms / s.rtt_samples as f64 } else { 0.0 };
         format!(
-            "{{\"event\":\"{event}\",\"user\":{},\"entity\":{},\"joined_unix\":{},\"secs\":{:.1},\"inputs\":{},\"stand_ins\":{},\"late\":{},\"shots\":{},\"held\":{},\"trimmed\":{},\"refused\":{},\"hits\":{},\"kills\":{},\"deaths\":{},\"rtt_mean_ms\":{:.1},\"rtt_max_ms\":{:.1},\"windows\":{},\"windows_flagged\":{},\"window\":{},\"total\":{}}}",
-            s.user, self.entity, s.joined_unix, s.secs, s.inputs, s.stand_ins, s.late, s.shots, s.held, s.trimmed, s.refused, s.hits, s.kills, s.deaths,
+            "{{\"event\":\"{event}\",\"user\":{},\"entity\":{},\"joined_unix\":{},\"secs\":{:.1},\"inputs\":{},\"stand_ins\":{},\"late\":{},\"shots\":{},\"held\":{},\"trimmed\":{},\"refused\":{},\"hits\":{},\"kills\":{},\"deaths\":{},\"deploys\":{},\"xp\":{},\"rtt_mean_ms\":{:.1},\"rtt_max_ms\":{:.1},\"windows\":{},\"windows_flagged\":{},\"window\":{},\"total\":{}}}",
+            s.user, self.entity, s.joined_unix, s.secs, s.inputs, s.stand_ins, s.late, s.shots, s.held, s.trimmed, s.refused, s.hits, s.kills, s.deaths, s.deploys, s.xp,
             rtt_mean, s.rtt_max_ms, s.windows, s.windows_flagged, dips(self.window), dips(self.total)
         )
     }
@@ -1145,8 +1196,8 @@ pub struct SimServer {
     fires: Vec<Fire>,
     /// Free entity ids, per faction (`faction::faction(id)`).
     free: [Vec<u16>; FACTIONS as usize],
-    /// Damage to apply after this tick's movement: (entity, amount).
-    pending_damage: Vec<(u16, u8)>,
+    /// Damage to apply after this tick's movement: (entity, amount, from).
+    pending_damage: Vec<(u16, u8, u16)>,
     /// Fractional random deaths carried between ticks (`deaths_per_sec`).
     death_acc: f64,
     by_client: HashMap<ClientId, u16>,
@@ -1160,6 +1211,20 @@ pub struct SimServer {
     /// Per shard: connects (with the connect token's user id) and
     /// disconnects (`None`), in the order the transport reported them.
     lifecycle: Vec<Vec<(ClientId, Option<u64>)>>,
+    /// Per shard: requests on the reliable channel (Deploy), in order.
+    requests: Vec<Vec<(ClientId, Vec<u8>)>>,
+    /// Players deploy (`SimConfig::deploy`, on a world with territory).
+    deploying: bool,
+    /// What each player took in its last `RECAP_STEPS` (for its recap and
+    /// its killer's assists).
+    damage_log: Vec<Vec<Taken>>,
+    /// Recaps to send with this tick's news: (victim, message).
+    recaps: Vec<(u16, Vec<u8>)>,
+    /// The site whose region each `REGION_CELL` cell is in (empty: no sites).
+    regions: Vec<u16>,
+    /// Shots fired in each site's region since the last Fights, and its step.
+    site_shots: Vec<u32>,
+    fights_step: u32,
     /// Session log lines since the last `take_session_records`.
     session_records: Vec<SessionRecord>,
     /// Input waits (arrival -> applied) since the last `take_input_wait`, in 0.1 ms.
@@ -1184,8 +1249,9 @@ pub struct SimServer {
     /// Who holds what (U5), updated twice a second; who holds each site at
     /// this tick's steps (two at 20 Hz), for the shields.
     territory: Territory,
-    /// Where at each site someone spawns (`SpawnMode::Sites`).
-    spawn_points: Vec<Vec<[f32; 2]>>,
+    /// Where at each site someone spawns (`SpawnMode::Sites`, deploys):
+    /// spots in its spawn room, feet.
+    spawn_points: Vec<Vec<[f32; 3]>>,
     /// A lane's start under the ground (a tunnel's, `SpawnMode::Lanes`): the
     /// height of its floor, for the spawn being made.
     spawn_floor: Option<f32>,
@@ -1250,6 +1316,13 @@ impl SimServer {
             squad_anchor: HashMap::new(),
             snapshots: vec![Vec::new(); cfg.shards],
             lifecycle: vec![Vec::new(); cfg.shards],
+            requests: vec![Vec::new(); cfg.shards],
+            deploying: cfg.deploy && !World::shared(cfg.world).lanes().is_empty(),
+            damage_log: Vec::new(),
+            recaps: Vec::new(),
+            regions: regions(&World::shared(cfg.world)),
+            site_shots: vec![0; World::shared(cfg.world).sites().len()],
+            fights_step: first_step,
             session_records: Vec::new(),
             input_wait: Histogram::new(INPUT_WAIT_CAP),
             rewind: [Histogram::new(REWIND_CAP_MS), Histogram::new(REWIND_CAP_MS)],
@@ -1515,7 +1588,8 @@ impl SimServer {
             .par_iter_mut()
             .zip(inbound.par_iter_mut())
             .zip(self.lifecycle.par_iter_mut())
-            .map(|((shard, bucket), lifecycle)| {
+            .zip(self.requests.par_iter_mut())
+            .map(|(((shard, bucket), lifecycle), requests)| {
                 let t0 = Instant::now();
                 let mut n = [0u64; 3];
                 let mut handle = |ev, arrived, (jitter, rtt)| match ev {
@@ -1526,6 +1600,7 @@ impl SimServer {
                             inputs[e as usize].lock().unwrap().receive(e, &data, arrived, dead, judge, &mut n);
                         }
                     }
+                    ServerEvent::Message { client, channel: Channel::Reliable, data } if data.first() == Some(&msg::MSG_DEPLOY) => requests.push((client, data.to_vec())),
                     ServerEvent::Message { .. } => n[2] += 1,
                     ServerEvent::Connected { client, user_id, .. } => lifecycle.push((client, Some(user_id))),
                     ServerEvent::Disconnected { client, .. } => lifecycle.push((client, None)),
@@ -1572,6 +1647,9 @@ impl SimServer {
             }
             events.clear();
             self.lifecycle[k] = events; // keep the allocation
+            for (client, data) in std::mem::take(&mut self.requests[k]) {
+                self.request_deploy(client, &data);
+            }
         }
         lap(1);
 
@@ -1663,7 +1741,7 @@ impl SimServer {
 
         // 5. spatial grid, and the due-set views networking queries
         let (bodies, tick) = (&self.bodies, self.tick);
-        let alive = || bodies.iter().enumerate().filter(|(_, b)| b.alive).map(|(i, b)| (i as u32, b.state.pos));
+        let alive = || bodies.iter().enumerate().filter(|(_, b)| b.alive && !b.away).map(|(i, b)| (i as u32, b.state.pos));
         self.grid.rebuild(alive());
         let (mid_period, far_period) = (self.interest.mid_period, self.interest.far_period);
         self.mid_grid.rebuild(alive().filter(|&(i, _)| due(i as u16, tick, mid_period)));
@@ -1736,6 +1814,9 @@ impl SimServer {
         // flips (announced now, in effect `FLIP_DELAY` steps on).
         if self.step >= self.territory_step + territory::UPDATE_STEPS && !self.territory.is_empty() {
             self.territory_phase();
+        }
+        if self.step >= self.fights_step + events::FIGHTS_STEPS && !self.territory.is_empty() {
+            self.fights_phase();
         }
         if (tick + 1).is_multiple_of(activity::WINDOW) {
             self.counters.activity_cells += self.activity.finish(self.step) as u64;
@@ -1924,6 +2005,9 @@ impl SimServer {
         self.next_projectile += fires.len() as u64;
         for (f, (p, cut)) in fires.iter().zip(made) {
             self.activity.add(f.shooter, f.origin, f.yaw);
+            if let Some(i) = region_at(&self.regions, [f.origin[0], f.origin[1]]) {
+                self.site_shots[i] += 1;
+            }
             if self.fired.len() == 4096 {
                 self.fired.pop_front();
             }
@@ -2005,7 +2089,7 @@ impl SimServer {
                     // The shooter saw it alive, in the life it hit; if it has
                     // died (or respawned) since, no damage.
                     let same_life = self.bodies[target as usize].life == life;
-                    let (damage, killed) = match same_life.then(|| self.hurt(target, full)).flatten() {
+                    let (damage, killed) = match same_life.then(|| self.hurt(target, full, shooter, head, events::CAUSE_RIFLE)).flatten() {
                         Some(killed) => (full, killed),
                         None => (0, false),
                     };
@@ -2074,8 +2158,40 @@ impl SimServer {
             );
         }
         let mut changed = Vec::new();
+        let attackers: Vec<u8> = self.territory.sites.iter().map(|s| s.attacker).collect();
         let flipped = self.territory.update(self.step, dt, &mut |i, p| counts[i][p], &mut changed);
         self.counters.site_flips += flipped.len() as u64;
+        // XP: whoever's on a site's points when it falls to them; and whoever
+        // of its holders is on them when an attack drains away.
+        for &i in &changed {
+            let i = i as usize;
+            let s = self.territory.sites[i];
+            let (to, xp, kind) = if flipped.contains(&(i as u16)) {
+                let outpost = !territory::spawns_at(self.world.sites()[i].kind);
+                (s.owner, if outpost { events::XP_CAPTURE_OUTPOST } else { events::XP_CAPTURE }, events::REWARD_CAPTURE)
+            } else if attackers[i] != territory::NONE && s.attacker == territory::NONE && s.meter == 0 {
+                (s.owner_at(self.step), events::XP_DEFEND, events::REWARD_DEFEND)
+            } else {
+                continue;
+            };
+            if to == territory::NONE {
+                continue;
+            }
+            let mut on = Vec::new();
+            for q in self.territory.points(i) {
+                self.grid.for_each_within([q[0], q[1]], territory::POINT_RADIUS, |j, _, _| {
+                    let b = &self.bodies[j as usize];
+                    if faction(j as u16) == to && b.alive && !b.dead() && (b.state.z - q[2]).abs() <= territory::POINT_HEIGHT {
+                        on.push(j as u16);
+                    }
+                });
+            }
+            on.sort_unstable();
+            on.dedup();
+            for j in on {
+                self.reward(j, kind, xp, i as u16);
+            }
+        }
         let mut msgs = Vec::new();
         if !flipped.is_empty() {
             msgs.push(self.territory.encode_owners(self.step, Some(&flipped)));
@@ -2099,9 +2215,16 @@ impl SimServer {
         &self.territory
     }
 
-    /// The outbox as one reliable message per client, bucketed by shard.
+    /// The outbox as one reliable message per client, bucketed by shard;
+    /// and the recaps.
     fn post_news(&mut self) {
         self.reliable_out.resize_with(self.shard_count(), Vec::new);
+        for (e, m) in std::mem::take(&mut self.recaps) {
+            if let Some(Some(client)) = self.client_of.get(e as usize).copied() {
+                self.counters.recaps += 1;
+                self.reliable_out[self.net.shard_of_client(client)].push((client, m));
+            }
+        }
         if self.outbox.is_empty() {
             return;
         }
@@ -2119,24 +2242,187 @@ impl SimServer {
         self.outbox = outbox;
     }
 
-    /// Takes `amount` of health from `e` now: whether that killed it (it
-    /// respawns `RESPAWN_STEPS` from now), or `None` if it wasn't alive to
-    /// take it.
-    fn hurt(&mut self, e: u16, amount: u8) -> Option<bool> {
+    /// Takes `amount` of health from `e` now, dealt by `from` (`NOBODY`: a
+    /// fall, a test) with a headshot or not, by `cause` (`events::CAUSE_*`):
+    /// whether that killed it (it respawns `RESPAWN_STEPS` from now, or
+    /// deploys again), or `None` if it wasn't alive to take it.
+    fn hurt(&mut self, e: u16, amount: u8, from: u16, head: bool, cause: u8) -> Option<bool> {
         let step_no = self.step;
+        let deploying = self.deploying;
+        let pos = self.bodies.get(e as usize)?.state.pos;
         let b = self.bodies.get_mut(e as usize).filter(|b| b.alive && !b.dead())?;
         if b.invulnerable {
             return Some(false);
         }
-        b.health = b.health.saturating_sub(amount);
+        // (What it lost: a kill's last hit counts only the health left.)
+        let dealt = amount.min(b.health);
+        b.health -= dealt;
+        let log = &mut self.damage_log[e as usize];
+        log.retain(|t| t.step + events::RECAP_STEPS > step_no);
+        log.push(Taken { from, amount: dealt, head, step: step_no });
         if b.health > 0 {
             return Some(false);
         }
-        b.respawn_at = Some(step_no + RESPAWN_STEPS);
+        b.respawn_at = (!deploying).then_some(step_no + RESPAWN_STEPS);
         b.life = b.life.wrapping_add(1);
+        // (Exactly as its client finds it: the deploy screen's transit times are the server's.)
+        (b.died_at, b.died_in) = (step_no, territory::region_of(&self.world, pos).map(|i| i as u16));
         self.counters.deaths += 1;
         self.inputs[e as usize].get_mut().unwrap().session.deaths += 1;
+        self.died(e, from, head, cause);
         Some(true)
+    }
+
+    /// `e` was just killed by `from`: its recap (GDD §4.4), the killer's XP
+    /// and the assists'.
+    fn died(&mut self, e: u16, from: u16, head: bool, cause: u8) {
+        let log = std::mem::take(&mut self.damage_log[e as usize]);
+        let mut lines: Vec<(u16, u16, u8, u8)> = Vec::new();
+        for t in &log {
+            match lines.iter_mut().find(|l| l.0 == t.from) {
+                Some(l) => {
+                    l.1 = l.1.saturating_add(t.amount as u16);
+                    l.2 = l.2.saturating_add(1);
+                    l.3 = l.3.saturating_add(t.head as u8);
+                }
+                None => lines.push((t.from, t.amount as u16, 1, t.head as u8)),
+            }
+        }
+        lines.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let me = self.bodies[e as usize].state;
+        let killer = (from != events::NOBODY).then(|| self.bodies.get(from as usize)).flatten().filter(|b| b.alive);
+        let distance = killer.map_or(0.0, |k| {
+            let s = k.state;
+            ((s.pos[0] - me.pos[0]).powi(2) + (s.pos[1] - me.pos[1]).powi(2) + (s.z - me.z).powi(2)).sqrt()
+        });
+        let recap = events::Recap {
+            killer: from,
+            cause,
+            head,
+            distance: (distance * 10.0).round().min(u16::MAX as f32) as u16,
+            killer_health: killer.map_or(0, |k| k.health),
+            lines: lines.iter().copied().take(events::RECAP_LINES).collect(),
+        };
+        self.recaps.push((e, events::encode_recap(&recap)));
+        if from != events::NOBODY {
+            self.reward(from, events::REWARD_KILL, events::XP_KILL + if head { events::XP_HEAD } else { 0 }, e);
+        }
+        for &(j, ..) in &lines {
+            if j != from && j != events::NOBODY && j != e {
+                self.reward(j, events::REWARD_ASSIST, events::XP_ASSIST, e);
+            }
+        }
+    }
+
+    /// XP for `e` (a `REWARD_*`, about an entity or a site): an event, and
+    /// its session's total.
+    fn reward(&mut self, e: u16, kind: u8, xp: u16, about: u16) {
+        if !self.bodies.get(e as usize).is_some_and(|b| b.alive) {
+            return;
+        }
+        self.outbox.push((e, Event::Reward { kind, xp, about }));
+        self.inputs[e as usize].get_mut().unwrap().session.xp += xp as u64;
+        self.counters.xp += xp as u64;
+    }
+
+    /// A client asks to deploy at a site (`RULE_DEPLOY`): if it's dead or
+    /// has no body and its faction may spawn there, it goes (a corpse is
+    /// released) and appears after lattice transit, counted in lanes from
+    /// where it died; else it's told why not.
+    fn request_deploy(&mut self, client: ClientId, data: &[u8]) {
+        let Some(&e) = self.by_client.get(&client) else { return };
+        let Ok((site, _kit)) = msg::decode_deploy(data) else {
+            self.counters.bad_messages += 1;
+            return;
+        };
+        self.counters.deploys_asked += 1;
+        let b = self.bodies[e as usize];
+        let refused = if !self.deploying {
+            Err(territory::REFUSED_INVALID)
+        } else if !b.dead() {
+            Err(territory::REFUSED_ALIVE)
+        } else {
+            self.territory.spawnable(site as usize, faction(e), self.step)
+        };
+        if let Err(reason) = refused {
+            self.counters.deploys_refused += 1;
+            self.outbox.push((e, Event::Refused { site, reason }));
+            return;
+        }
+        let at = self.step + self.territory.transit_steps(b.died_in.map(|r| r as usize), site as usize);
+        let b = &mut self.bodies[e as usize];
+        b.deploy = Some((site, at));
+        b.away = true;
+        self.outbox.push((e, Event::Deploying { site, at }));
+    }
+
+    /// Deploys due by `step` (`SimConfig::deploy`), up to the tick's budget:
+    /// each appears at a spot in its site's spawn room, if its faction may
+    /// still spawn there (else it's told it lost the spawn). And corpses no
+    /// one revived go.
+    fn deploys_due(&mut self, step_no: u32) {
+        let mut budget = DEPLOYS_PER_TICK;
+        for e in 0..self.bodies.len() {
+            let b = &mut self.bodies[e];
+            if !b.alive {
+                continue;
+            }
+            if b.dead() && !b.away && step_no >= b.died_at + CORPSE_STEPS {
+                b.away = true;
+            }
+            let Some((site, _)) = b.deploy.filter(|&(_, at)| at <= step_no) else { continue };
+            if budget == 0 {
+                self.counters.deploys_waited += 1;
+                continue;
+            }
+            let pts = &self.spawn_points[site as usize];
+            if let Err(reason) = self.territory.spawnable(site as usize, faction(e as u16), step_no).and(if pts.is_empty() { Err(territory::REFUSED_NO_SPAWN) } else { Ok(()) }) {
+                self.bodies[e].deploy = None;
+                self.counters.deploys_refused += 1;
+                self.outbox.push((e as u16, Event::Refused { site, reason }));
+                continue;
+            }
+            budget -= 1;
+            let spot = pts[(self.rng.next_u64() % pts.len() as u64) as usize];
+            let p = self.rng.in_disk([spot[0], spot[1]], territory::SPAWN_SCATTER);
+            let b = &mut self.bodies[e];
+            b.state = MoveState::standing_at(&self.world, p, spot[2]);
+            (b.health, b.respawn_at, b.life, b.reloading, b.away, b.deploy) = (MAX_HEALTH, None, b.life.wrapping_add(1), false, false, None);
+            (b.anchor, b.radius) = (p, 30.0);
+            self.damage_log[e].clear();
+            let q = self.inputs[e].get_mut().unwrap();
+            q.ammo = Ammo::FULL;
+            q.session.deploys += 1;
+            self.counters.deploys += 1;
+        }
+    }
+
+    /// Fights (every `FIGHTS_STEPS`, to everyone): at each site, who's there
+    /// of each faction, and its region's shots a second since the last.
+    fn fights_phase(&mut self) {
+        let secs = (self.step - self.fights_step) as f32 / TICK_HZ as f32;
+        self.fights_step = self.step;
+        let mut fights = Vec::new();
+        for (i, s) in self.world.sites().iter().enumerate() {
+            let r = (s.half * 1.2).clamp(50.0, 250.0);
+            let mut n = [0u32; 3];
+            self.grid.for_each_within(s.center, r, |j, _, _| {
+                let b = &self.bodies[j as usize];
+                if b.alive && !b.dead() {
+                    n[faction(j as u16) as usize] += 1;
+                }
+            });
+            let shots = std::mem::take(&mut self.site_shots[i]);
+            if n != [0; 3] || shots > 0 {
+                let heat = (shots as f32 / secs.max(1.0)).round().min(255.0) as u8;
+                fights.push(events::Fight { site: i as u16, players: n.map(|c| c.min(255) as u8), heat });
+            }
+        }
+        let m = events::encode_fights(self.step, &fights);
+        self.reliable_out.resize_with(self.shard_count(), Vec::new);
+        for client in self.client_of.iter().flatten() {
+            self.reliable_out[self.net.shard_of_client(*client)].push((*client, m.clone()));
+        }
     }
 
     /// Test aid: hits on `entity` land but deal no damage.
@@ -2182,7 +2468,13 @@ impl SimServer {
     /// dead player takes none). Weapons come in M3d.2; tests and
     /// `deaths_per_sec` use this.
     pub fn damage(&mut self, entity: u16, amount: u8) {
-        self.pending_damage.push((entity, amount));
+        self.pending_damage.push((entity, amount, events::NOBODY));
+    }
+
+    /// Test aid: `damage`, as if `from` dealt it with the rifle (its recap
+    /// names it, and it earns the kill or the assist).
+    pub fn damage_by(&mut self, entity: u16, amount: u8, from: u16) {
+        self.pending_damage.push((entity, amount, from));
     }
 
     /// (health, dead) of a connected player.
@@ -2201,19 +2493,19 @@ impl SimServer {
             for _ in 0..16 {
                 let e = (self.rng.next_u64() % n) as u16;
                 if self.bodies[e as usize].alive && !self.bodies[e as usize].dead() {
-                    self.pending_damage.push((e, MAX_HEALTH));
+                    self.pending_damage.push((e, MAX_HEALTH, events::NOBODY));
                     break;
                 }
             }
         }
         let _ = step_no;
-        for (e, amount) in std::mem::take(&mut self.pending_damage) {
-            self.hurt(e, amount);
+        for (e, amount, from) in std::mem::take(&mut self.pending_damage) {
+            self.hurt(e, amount, from, false, events::CAUSE_RIFLE);
         }
         // Falls (movement took them; hits came first).
         for e in 0..self.bodies.len() {
             let fallen = std::mem::take(&mut self.bodies[e].fallen);
-            if fallen > 0 && self.hurt(e as u16, fallen.min(255) as u8) == Some(true) {
+            if fallen > 0 && self.hurt(e as u16, fallen.min(255) as u8, events::NOBODY, false, events::CAUSE_FALL) == Some(true) {
                 self.counters.fall_deaths += 1;
             }
         }
@@ -2223,6 +2515,9 @@ impl SimServer {
     /// sent to play, on their faction's side of it (120 degrees apart),
     /// standing, at full health.
     fn respawn_due(&mut self, step_no: u32) {
+        if self.deploying {
+            return self.deploys_due(step_no);
+        }
         for e in 0..self.bodies.len() {
             let b = &self.bodies[e];
             if !b.alive || b.respawn_at.is_none_or(|at| at > step_no) {
@@ -2231,7 +2526,7 @@ impl SimServer {
             let at_site = (self.cfg.spawn == SpawnMode::Sites).then(|| self.site_spawn(faction(e as u16), Some(self.bodies[e].state.pos))).flatten();
             let b = &mut self.bodies[e];
             let p = match at_site {
-                Some((_, p)) => p,
+                Some((_, p)) => [p[0], p[1]],
                 None => {
                     let side = faction(e as u16) as f32 * std::f32::consts::TAU / FACTIONS as f32;
                     let (s, c) = side.sin_cos();
@@ -2240,8 +2535,12 @@ impl SimServer {
                 }
             };
             let p = [p[0].clamp(1.0, WORLD_SIZE - 1.0), p[1].clamp(1.0, WORLD_SIZE - 1.0)];
-            b.state = MoveState::standing(&self.world, p);
+            b.state = match at_site {
+                Some((_, q)) => MoveState::standing_at(&self.world, p, q[2]),
+                None => MoveState::standing(&self.world, p),
+            };
             (b.health, b.respawn_at, b.life, b.reloading) = (MAX_HEALTH, None, b.life.wrapping_add(1), false);
+            self.damage_log[e].clear();
             self.inputs[e].get_mut().unwrap().ammo = Ammo::FULL;
             self.counters.respawns += 1;
         }
@@ -2254,9 +2553,18 @@ impl SimServer {
         };
         // Factions take turns: by squad, or by player without squads.
         let side = if squad == NO_SQUAD { self.counters.spawns } else { squad as u64 } % FACTIONS as u64;
-        let (spawn, anchor, radius) = match (self.cfg.spawn == SpawnMode::Sites).then(|| self.site_spawn(side as u8, None)).flatten() {
-            Some((_, p)) => (p, p, 30.0),
-            None => self.pick_spawn(squad),
+        // Deploying, it waits with no body at its Landing (as if at its
+        // spawn room's door) until it deploys somewhere.
+        let landing = self.deploying.then(|| self.territory.landing(side as u8)).flatten().and_then(|i| self.spawn_points[i].first().copied());
+        let (spawn, anchor, radius) = match landing {
+            Some(p) => ([p[0], p[1]], [p[0], p[1]], 1.0),
+            None => match (self.cfg.spawn == SpawnMode::Sites).then(|| self.site_spawn(side as u8, None)).flatten() {
+                Some((_, p)) => {
+                    self.spawn_floor = Some(p[2]);
+                    ([p[0], p[1]], [p[0], p[1]], 30.0)
+                }
+                None => self.pick_spawn(squad),
+            },
         };
         let e = match self.free[side as usize].pop() {
             Some(e) => e,
@@ -2267,6 +2575,7 @@ impl SimServer {
                 self.pushes.push([0.0; 2]);
                 self.inputs.push(Mutex::new(InputQueue { cone: self.cfg.cone_of_fire, unlimited: self.unlimited_rounds(), ..InputQueue::default() }));
                 self.far_blobs.push([0; FAR_BLOB]);
+                self.damage_log.push(Vec::new());
                 if faction(id) as u64 == side {
                     break id;
                 }
@@ -2278,9 +2587,13 @@ impl SimServer {
             Some(z) => MoveState::standing_at(&self.world, spawn, z),
             None => MoveState::standing(&self.world, spawn),
         };
+        self.damage_log[i].clear();
+        let away = landing.is_some();
         self.bodies[i] = Body {
             alive: true,
             state,
+            away,
+            health: if away { 0 } else { MAX_HEALTH },
             squad,
             spawned: self.tick,
             anchor,
@@ -2316,8 +2629,9 @@ impl SimServer {
         }
         self.slot_of[i] = Some((k as u16, (self.shard_clients[k].len() - 1) as u32));
         self.counters.spawns += 1;
-        let rules = if self.unlimited_rounds() { msg::RULE_UNLIMITED_ROUNDS } else { 0 };
-        let welcome = msg::encode_welcome(&Welcome { entity: e, spawn, anchor, radius, world: self.cfg.world, world_digest: self.world.digest(), rules });
+        let rules = if self.unlimited_rounds() { msg::RULE_UNLIMITED_ROUNDS } else { 0 } | if self.deploying { msg::RULE_DEPLOY } else { 0 };
+        let s = self.bodies[i].state;
+        let welcome = msg::encode_welcome(&Welcome { entity: e, spawn: s.pos, spawn_z: s.z, anchor, radius, world: self.cfg.world, world_digest: self.world.digest(), rules });
         let _ = self.net.send(client, Channel::Reliable, welcome);
         // Who holds what, and every site's fight.
         if !self.territory.is_empty() {
@@ -2370,7 +2684,7 @@ impl SimServer {
     /// with somewhere to stand, the nearest `near` (none: on a front, one
     /// linked to a site it doesn't hold, as a player deploying would; else
     /// its Landing); the site and the spot, a step or two from a route.
-    fn site_spawn(&mut self, f: u8, near: Option<[f32; 2]>) -> Option<(usize, [f32; 2])> {
+    fn site_spawn(&mut self, f: u8, near: Option<[f32; 2]>) -> Option<(usize, [f32; 3])> {
         let sites = self.world.sites();
         let held = |i: usize| self.territory.sites.get(i).is_some_and(|s| s.owner_at(self.step) == f) && !self.spawn_points[i].is_empty();
         let pick = match near {
@@ -2388,7 +2702,8 @@ impl SimServer {
         }?;
         let pts = &self.spawn_points[pick];
         let at = pts[(self.rng.next_u64() % pts.len() as u64) as usize];
-        Some((pick, self.rng.in_disk(at, 2.0)))
+        let p = self.rng.in_disk([at[0], at[1]], territory::SPAWN_SCATTER);
+        Some((pick, [p[0], p[1], at[2]]))
     }
 
     /// Returns (spawn point, wander anchor, wander radius).
@@ -2426,6 +2741,31 @@ impl SimServer {
         };
         (self.rng.in_disk(anchor, radius), anchor, radius)
     }
+}
+
+/// The site whose region (`territory::region_of`) each `REGION_CELL`
+/// cell's center is in, row by row (empty: a world without sites).
+fn regions(w: &World) -> Vec<u16> {
+    if w.sites().is_empty() {
+        return Vec::new();
+    }
+    let n = (WORLD_SIZE / REGION_CELL) as usize;
+    (0..n * n)
+        .map(|c| {
+            let p = [((c % n) as f32 + 0.5) * REGION_CELL, ((c / n) as f32 + 0.5) * REGION_CELL];
+            territory::region_of(w, p).unwrap_or(0) as u16
+        })
+        .collect()
+}
+
+/// The site whose region `pos` is in, by `regions`' cells.
+fn region_at(regions: &[u16], pos: [f32; 2]) -> Option<usize> {
+    if regions.is_empty() {
+        return None;
+    }
+    let n = (WORLD_SIZE / REGION_CELL) as usize;
+    let c = |v: f32| ((v.max(0.0) / REGION_CELL) as usize).min(n - 1);
+    Some(regions[c(pos[1]) * n + c(pos[0])] as usize)
 }
 
 /// Everything assembly reads, shared by all shard tasks.
@@ -2521,7 +2861,7 @@ impl View<'_> {
         // Squadmates are near-tier at any distance.
         if let Some(members) = self.squads.get(&me.squad) {
             for &j in members {
-                if j != e {
+                if j != e && !self.bodies[j as usize].away {
                     let d = self.dist2(me.state.pos, j).sqrt();
                     sc.near.push(NearCandidate {
                         entity: j,
@@ -2534,7 +2874,7 @@ impl View<'_> {
         }
         // Combat contacts (who it hit, who hit it) too, for a few seconds.
         for &(j, until) in &me.contacts {
-            if j != NO_CONTACT && until > tick && j != e && self.bodies[j as usize].alive && sc.stamp[j as usize] != epoch {
+            if j != NO_CONTACT && until > tick && j != e && self.bodies[j as usize].alive && !self.bodies[j as usize].away && sc.stamp[j as usize] != epoch {
                 let d = self.dist2(me.state.pos, j).sqrt();
                 sc.near.push(NearCandidate { entity: j, base: near_base(d, true), seed_age: interest::seed_age(j, tick, d, cfg, fresh) });
                 sc.stamp[j as usize] = epoch;
@@ -2702,6 +3042,7 @@ impl View<'_> {
                 health: me.health,
                 life: me.life,
                 ammo,
+                away: me.away,
             },
         );
         let mut bytes = w.len() + near_bytes + shots_bytes;

@@ -333,11 +333,15 @@ impl Handle {
                     dir: 0,
                     a: target,
                     b: 0,
+                    value: 0,
                 },
-                Event::Hurt { from, amount, dir } => LtEvent { kind: EVENT_HURT, flags: 0, amount, dir, a: from, b: 0 },
+                Event::Hurt { from, amount, dir } => LtEvent { kind: EVENT_HURT, flags: 0, amount, dir, a: from, b: 0, value: 0 },
                 Event::Kill { killer, victim, head } => {
-                    LtEvent { kind: EVENT_KILL, flags: if head { EVENT_HEAD } else { 0 }, amount: 0, dir: 0, a: killer, b: victim }
+                    LtEvent { kind: EVENT_KILL, flags: if head { EVENT_HEAD } else { 0 }, amount: 0, dir: 0, a: killer, b: victim, value: 0 }
                 }
+                Event::Deploying { site, at } => LtEvent { kind: EVENT_DEPLOYING, flags: 0, amount: 0, dir: 0, a: site, b: 0, value: at },
+                Event::Refused { site, reason } => LtEvent { kind: EVENT_REFUSED, flags: 0, amount: reason, dir: 0, a: site, b: 0, value: 0 },
+                Event::Reward { kind, xp, about } => LtEvent { kind: EVENT_REWARD, flags: kind, amount: 0, dir: 0, a: about, b: 0, value: xp as u32 },
             });
         }
         let own = core.welcome().map(|w| w.entity);
@@ -431,6 +435,88 @@ impl Handle {
             };
         }
         t.sites.len()
+    }
+
+    /// Asks to deploy at `site` with loadout `kit` (U4): false if the
+    /// server doesn't deploy or we aren't connected.
+    pub fn deploy(&mut self, site: u16, kit: u8) -> bool {
+        match self.session.core.deploy(site, kit) {
+            Some(m) => self.session.send_reliable(m),
+            None => false,
+        }
+    }
+
+    /// The shell's state (`lt_shell`).
+    pub fn shell(&mut self) -> LtShell {
+        let now = self.clock();
+        let core = &self.session.core;
+        let sh = &core.shell;
+        // The server's step now, as the render clock tracks it.
+        let step = core.render_clock().newest_at(now).unwrap_or(core.server_step() as f64);
+        let (site, at) = sh.deploying.unwrap_or((lattice_game::world::NO_SITE, 0));
+        let (refused_site, reason) = sh.refused.unwrap_or((lattice_game::world::NO_SITE, 0));
+        LtShell {
+            deploys: core.deploys() as u8,
+            away: sh.away as u8,
+            deploying: sh.deploying.is_some() as u8,
+            refused_reason: reason,
+            deploy_site: site,
+            refused_site,
+            deploy_secs: if sh.deploying.is_some() { ((at as f64 - step) / TICK_HZ as f64).max(0.0) as f32 } else { 0.0 },
+            refusals: sh.refusals,
+            recaps: sh.recaps,
+            rewards: sh.rewards,
+            xp: sh.xp.min(u32::MAX as u64) as u32,
+            died_in: sh.died_in.map_or(lattice_game::world::NO_SITE, |s| s as u16),
+            reserved: 0,
+            fights_step: sh.fights_step,
+        }
+    }
+
+    /// Every site as a spawn (as many as fit): whether we may deploy there
+    /// and its transit; returns how many sites there are.
+    pub fn spawn_options(&self, out: &mut [LtSpawnOption]) -> usize {
+        let core = &self.session.core;
+        let n = core.territory().map_or(0, |t| t.len());
+        for (i, o) in out.iter_mut().enumerate().take(n) {
+            *o = match core.spawn_option(i) {
+                Ok(steps) => LtSpawnOption { site: i as u16, ok: 1, reason: 0, transit_secs: steps as f32 / TICK_HZ as f32 },
+                Err(reason) => LtSpawnOption { site: i as u16, ok: 0, reason, transit_secs: 0.0 },
+            };
+        }
+        n
+    }
+
+    /// The newest death recap into `out`; returns how many have come (0:
+    /// none yet, `out` untouched).
+    pub fn recap(&self, out: &mut LtRecap) -> u32 {
+        let sh = &self.session.core.shell;
+        let Some(r) = &sh.recap else { return 0 };
+        let mut o = LtRecap {
+            killer: r.killer,
+            killer_faction: if r.killer == lattice_game::events::NOBODY { u8::MAX } else { faction(r.killer) },
+            cause: r.cause,
+            head: r.head as u8,
+            killer_health: r.killer_health,
+            lines: r.lines.len().min(8) as u8,
+            reserved: 0,
+            distance: r.distance as f32 / 10.0,
+            ..LtRecap::default()
+        };
+        for (i, &(from, damage, hits, heads)) in r.lines.iter().take(8).enumerate() {
+            (o.from[i], o.damage[i], o.hits[i], o.heads[i]) = (from, damage, hits, heads);
+        }
+        *out = o;
+        sh.recaps
+    }
+
+    /// The newest fights (as many as fit); returns how many there are.
+    pub fn fights(&self, out: &mut [LtFight]) -> usize {
+        let f = &self.session.core.shell.fights;
+        for (o, x) in out.iter_mut().zip(f) {
+            *o = LtFight { site: x.site, players: x.players, heat: x.heat };
+        }
+        f.len()
     }
 
     pub fn set_others_muzzle(&mut self, offset: [f32; 3]) {

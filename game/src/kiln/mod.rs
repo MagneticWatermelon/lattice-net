@@ -392,6 +392,8 @@ pub(crate) struct Kiln {
     /// The bases' spawn rooms (K3): site, center (its shaft's corner), its
     /// long axis, its floor.
     pub rooms: Vec<(usize, [f64; 2], [f64; 2], f64)>,
+    /// Every spawn room (`deep::room` with a shield), for the world (U4).
+    pub spawn_rooms: Vec<crate::world::SpawnRoom>,
     /// What the generator couldn't fit (the tests want none).
     pub notes: Vec<String>,
     /// The clockwork's routes (K4): over a living bridge, down a sandfall,
@@ -489,6 +491,7 @@ pub(crate) fn build_kiln() -> Kiln {
         bores: Vec::new(),
         openings: Vec::new(),
         rooms: Vec::new(),
+        spawn_rooms: Vec::new(),
         notes: Vec::new(),
         clockwork: Vec::new(),
         lips: Vec::new(),
@@ -578,6 +581,7 @@ impl Kiln {
         points: kiln.points,
         holes: kiln.holes,
         volumes: kiln.volumes,
+        rooms: kiln.spawn_rooms,
     })
     }
 }

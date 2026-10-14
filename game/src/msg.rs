@@ -7,9 +7,12 @@
 //!                           near render step when the input was made (1/64 steps, wrapping; see
 //!                           RENDER_UNITS); mid and far entities were drawn `mid_lag` (1/8 steps) earlier.
 //!                           BUTTON_FIRE: a shot follows (weapon::Shot), at most one per input
-//! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | anchor:2×f32 | radius:f32 | world:8 | world_digest:8 | rules:1
+//! C->S reliable    Deploy   tag | site:2 | kit:1           (U4, with `RULE_DEPLOY`): into the world at a
+//!                           site, or out of a dead body and to it (the reply is an Event:
+//!                           Deploying or Refused)
+//! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | spawn_z:f32 | anchor:2×f32 | radius:f32 | world:8 | world_digest:8 | rules:1
 //! S->C unreliable  Snapshot tag | server_tick:4 | step:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
-//!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 stance:1 (grounded, crouched) | pushes:1 | health:1 | life:1
+//!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 stance:1 (grounded, crouched, away) | pushes:1 | health:1 | life:1
 //!                           | ammo mag:1 reserve:2 reload:1
 //! S->C unreliable  Near     see delta.rs: deltas against acked baselines, one per tick, tagged
 //! S->C unreliable  Activity distant fights' firing per 128 m cell, once per 0.5 s window (see activity.rs)
@@ -44,6 +47,7 @@ pub const MSG_INPUT: u8 = 1;
 pub const MSG_WELCOME: u8 = 2;
 pub const MSG_SNAPSHOT: u8 = 3;
 pub const MSG_ENTITIES: u8 = 4;
+pub const MSG_DEPLOY: u8 = 10;
 
 pub const INPUT_REDUNDANCY: usize = 3;
 /// Mid- and far-tier blob.
@@ -226,7 +230,10 @@ pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input, Option<RenderTim
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Welcome {
     pub entity: u16,
+    /// Where it stands (feet): exactly as the server has it, so prediction
+    /// starts where the server does (a deck, a room under the ground).
     pub spawn: [f32; 2],
+    pub spawn_z: f32,
     /// The bot wanders within `radius` of `anchor` (scenario hotspot/blob center).
     pub anchor: [f32; 2],
     pub radius: f32,
@@ -244,12 +251,37 @@ pub struct Welcome {
 /// fights, where nobody dies to be refilled): full again after every step,
 /// on the server and in prediction.
 pub const RULE_UNLIMITED_ROUNDS: u8 = 1;
+/// `Welcome::rules` bit (U4, GDD §17): players deploy. They join with no
+/// body (`SnapshotHeader::away`), and enter the world by asking to deploy
+/// at a site (`encode_deploy`); the dead stay dead until they deploy again.
+/// Without it, the server spawns everyone at once and respawns the dead.
+pub const RULE_DEPLOY: u8 = 2;
+
+/// A Deploy: into the world at `site` with loadout `kit`.
+pub fn encode_deploy(site: u16, kit: u8) -> Vec<u8> {
+    let mut w = Writer::with_capacity(4);
+    w.u8(MSG_DEPLOY);
+    w.u16(site);
+    w.u8(kit);
+    w.into_inner()
+}
+
+/// (site, kit) of a Deploy.
+pub fn decode_deploy(data: &[u8]) -> Result<(u16, u8), DecodeError> {
+    let mut r = Reader::new(data);
+    if r.u8()? != MSG_DEPLOY {
+        return Err(DecodeError::Invalid);
+    }
+    let (site, kit) = (r.u16()?, r.u8()?);
+    r.finish()?;
+    Ok((site, kit))
+}
 
 pub fn encode_welcome(m: &Welcome) -> Vec<u8> {
     let mut w = Writer::with_capacity(32);
     w.u8(MSG_WELCOME);
     w.u16(m.entity);
-    for v in [m.spawn[0], m.spawn[1], m.anchor[0], m.anchor[1], m.radius] {
+    for v in [m.spawn[0], m.spawn[1], m.spawn_z, m.anchor[0], m.anchor[1], m.radius] {
         w.u32(v.to_bits());
     }
     w.u64(m.world);
@@ -292,11 +324,15 @@ pub struct SnapshotHeader {
     pub life: u8,
     /// The rifle's rounds after `ack_seq`: predicted, like `own`.
     pub ammo: Ammo,
+    /// No body (`RULE_DEPLOY`): not yet deployed, or released from a dead
+    /// one. Dead too (`health` 0); nobody else sees us.
+    pub away: bool,
 }
 
 /// `SnapshotHeader::own`'s stance byte.
 const STANCE_GROUNDED: u8 = 1;
 const STANCE_CROUCHED: u8 = 2;
+const STANCE_AWAY: u8 = 4;
 
 pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
     w.u8(MSG_SNAPSHOT);
@@ -311,7 +347,7 @@ pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
     for v in [h.own.pos[0], h.own.pos[1], h.own.vel[0], h.own.vel[1], h.own.z, h.own.vz] {
         w.u32(v.to_bits());
     }
-    w.u8(if h.own.grounded { STANCE_GROUNDED } else { 0 } | if h.own.crouched { STANCE_CROUCHED } else { 0 });
+    w.u8(if h.own.grounded { STANCE_GROUNDED } else { 0 } | if h.own.crouched { STANCE_CROUCHED } else { 0 } | if h.away { STANCE_AWAY } else { 0 });
     w.u8(h.pushes);
     w.u8(h.health);
     w.u8(h.life);
@@ -342,13 +378,14 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
         MSG_WELCOME => {
             let entity = r.u16()?;
             let spawn = [read_f32(&mut r)?, read_f32(&mut r)?];
+            let spawn_z = read_f32(&mut r)?;
             let anchor = [read_f32(&mut r)?, read_f32(&mut r)?];
             let radius = read_f32(&mut r)?;
             let world = r.u64()?;
             let world_digest = r.u64()?;
             let rules = r.u8()?;
             r.finish()?;
-            Ok(ServerMsg::Welcome(Welcome { entity, spawn, anchor, radius, world, world_digest, rules }))
+            Ok(ServerMsg::Welcome(Welcome { entity, spawn, spawn_z, anchor, radius, world, world_digest, rules }))
         }
         MSG_SNAPSHOT => {
             let server_tick = r.u32()?;
@@ -361,7 +398,7 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             let vel = [read_f32(&mut r)?, read_f32(&mut r)?];
             let (z, vz) = (read_f32(&mut r)?, read_f32(&mut r)?);
             let stance = r.u8()?;
-            if stance & !(STANCE_GROUNDED | STANCE_CROUCHED) != 0 {
+            if stance & !(STANCE_GROUNDED | STANCE_CROUCHED | STANCE_AWAY) != 0 {
                 return Err(DecodeError::Invalid);
             }
             let own = MoveState { pos, vel, z, vz, grounded: stance & STANCE_GROUNDED != 0, crouched: stance & STANCE_CROUCHED != 0 };
@@ -382,6 +419,7 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
                 health,
                 life,
                 ammo,
+                away: stance & STANCE_AWAY != 0,
             }))
         }
         MSG_ENTITIES => {
@@ -517,6 +555,12 @@ mod tests {
     }
 
     #[test]
+    fn deploys_roundtrip() {
+        assert_eq!(decode_deploy(&encode_deploy(66, 3)), Ok((66, 3)));
+        assert!(decode_deploy(&encode_deploy(66, 3)[..3]).is_err());
+    }
+
+    #[test]
     fn render_times_wrap_and_measure_age() {
         assert_eq!(render_age(1000, render_units(997.5)), 2.5);
         // Across the u16 wrap (1024 steps of 1/64).
@@ -527,7 +571,7 @@ mod tests {
 
     #[test]
     fn welcome_snapshot_and_entities_roundtrip() {
-        let w = Welcome { entity: 7, spawn: [1.5, 2.5], anchor: [4096.0, 4096.0], radius: 200.0, world: u64::MAX - 3, world_digest: 0x1234_5678_9ABC_DEF0, rules: RULE_UNLIMITED_ROUNDS };
+        let w = Welcome { entity: 7, spawn: [1.5, 2.5], spawn_z: 63.25, anchor: [4096.0, 4096.0], radius: 200.0, world: u64::MAX - 3, world_digest: 0x1234_5678_9ABC_DEF0, rules: RULE_UNLIMITED_ROUNDS };
         assert!(matches!(decode_server_msg(&encode_welcome(&w)), Ok(ServerMsg::Welcome(x)) if x == w));
 
         let h = SnapshotHeader {
@@ -544,6 +588,7 @@ mod tests {
             health: 37,
             life: 255,
             ammo: Ammo { mag: 17, reserve: 1000, reload: 81 },
+            away: true,
         };
         let mut wr = Writer::default();
         write_snapshot(&mut wr, &h);

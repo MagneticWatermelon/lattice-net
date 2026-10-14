@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use lattice_game::activity;
 use lattice_game::delta;
-use lattice_game::events::{self, Event, SeenShot};
+use lattice_game::events::{self, Event, Fight, Recap, SeenShot};
 use lattice_game::clock::Live;
 use lattice_game::movement::{dead_input, stand_in, step, Input, MoveState, Mover, NO_FACTION, TICK_HZ};
 use lattice_game::territory::{self, Territory};
@@ -188,6 +188,32 @@ pub struct ClientStats {
     pub client_level: u8,
 }
 
+/// What the game's shell shows (U4): deploying, the death recap, the
+/// continent's fights, our XP. Kept from the server's news.
+#[derive(Debug, Clone, Default)]
+pub struct Shell {
+    /// No body (`msg::RULE_DEPLOY`): not deployed yet, or gone from our
+    /// corpse. From the newest snapshot.
+    pub away: bool,
+    /// Where we're deploying, and the step we appear there (the server's word).
+    pub deploying: Option<(u16, u32)>,
+    /// The last deploy refused: (site, `territory::REFUSED_*`), and how many.
+    pub refused: Option<(u16, u8)>,
+    pub refusals: u32,
+    /// The site whose region we last died in: lattice transit counts lanes
+    /// from there (None: never deployed).
+    pub died_in: Option<usize>,
+    /// The newest recap, and how many have come.
+    pub recap: Option<Recap>,
+    pub recaps: u32,
+    /// The newest Fights, and its step.
+    pub fights: Vec<Fight>,
+    pub fights_step: u32,
+    /// XP this session, and how many rewards it came in.
+    pub xp: u64,
+    pub rewards: u32,
+}
+
 /// When one of our inputs was first seen acked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InputTiming {
@@ -335,6 +361,8 @@ pub struct ClientCore {
     /// Sink mode: entity messages are only counted, and no latency samples
     /// are kept. Inputs, prediction and pacing still run.
     sink: bool,
+    /// Deploying, recaps, fights, XP (U4).
+    pub shell: Shell,
     pub stats: ClientStats,
 }
 
@@ -413,8 +441,40 @@ impl ClientCore {
             own_offset: [0.0; 3],
             own_offset_at: None,
             sink: false,
+            shell: Shell::default(),
             stats: ClientStats::default(),
         }
+    }
+
+    /// Whether the server has us deploy (`msg::RULE_DEPLOY`).
+    pub fn deploys(&self) -> bool {
+        self.welcome.is_some_and(|w| w.rules & msg::RULE_DEPLOY != 0)
+    }
+
+    /// A Deploy to send on the reliable channel: to deploy at `site` with
+    /// loadout `kit`. None if the server doesn't deploy. The server answers
+    /// with an event (`Shell::deploying`, or `Shell::refused`).
+    pub fn deploy(&mut self, site: u16, kit: u8) -> Option<Vec<u8>> {
+        self.deploys().then(|| msg::encode_deploy(site, kit))
+    }
+
+    /// Whether we may deploy at `site` now, as our copy of the territory
+    /// has it, and how many steps of lattice transit it would take; else
+    /// why not (`territory::REFUSED_*`). The server decides: this is what
+    /// the deploy screen shows.
+    pub fn spawn_option(&self, site: usize) -> Result<u32, u8> {
+        let t = self.territory.as_ref().ok_or(territory::REFUSED_INVALID)?;
+        if !self.deploys() {
+            return Err(territory::REFUSED_INVALID);
+        }
+        let step = self.server_own.map_or(0, |(_, s)| s);
+        t.spawnable(site, self.faction(), step)?;
+        Ok(t.transit_steps(self.shell.died_in, site))
+    }
+
+    /// The newest step the server has told us of.
+    pub fn server_step(&self) -> u32 {
+        self.server_own.map_or(0, |(_, s)| s)
     }
 
     pub fn welcome(&self) -> Option<&Welcome> {
@@ -660,14 +720,34 @@ impl ClientCore {
                 };
                 for ev in evs {
                     let st = &mut self.stats;
+                    let sh = &mut self.shell;
                     match ev {
                         Event::Hit { killed, .. } => (st.hits_confirmed, st.kills_confirmed) = (st.hits_confirmed + 1, st.kills_confirmed + killed as u64),
                         Event::Hurt { amount, .. } => (st.hurts, st.damage_taken) = (st.hurts + 1, st.damage_taken + amount as u64),
                         Event::Kill { .. } => st.kills_heard += 1,
+                        Event::Deploying { site, at } => (sh.deploying, sh.refused) = (Some((site, at)), None),
+                        Event::Refused { site, reason } => {
+                            (sh.deploying, sh.refused, sh.refusals) = (None, Some((site, reason)), sh.refusals + 1);
+                        }
+                        Event::Reward { xp, .. } => (sh.xp, sh.rewards) = (sh.xp + xp as u64, sh.rewards + 1),
                     }
                     if self.keep_news {
                         self.news.push(ev);
                     }
+                }
+                return;
+            }
+            Some(&events::MSG_RECAP) => {
+                match events::decode_recap(data) {
+                    Ok(r) => (self.shell.recap, self.shell.recaps) = (Some(r), self.shell.recaps + 1),
+                    Err(_) => self.stats.bad_messages += 1,
+                }
+                return;
+            }
+            Some(&events::MSG_FIGHTS) => {
+                match events::decode_fights(data) {
+                    Ok((step, f)) => (self.shell.fights_step, self.shell.fights) = (step, f),
+                    Err(_) => self.stats.bad_messages += 1,
                 }
                 return;
             }
@@ -739,7 +819,7 @@ impl ClientCore {
                 // mispredict wherever the two differ).
                 self.stats.world_mismatch = world.digest() != w.world_digest;
                 // The server starts us exactly here too.
-                self.state = MoveState::standing(&world, w.spawn);
+                self.state = MoveState { pos: w.spawn, z: w.spawn_z, vel: [0.0; 2], vz: 0.0, grounded: true, crouched: false };
                 self.ammo = Ammo::FULL;
                 self.unlimited = w.rules & msg::RULE_UNLIMITED_ROUNDS != 0;
                 self.territory = Some(Territory::new(&world));
@@ -785,6 +865,13 @@ impl ClientCore {
         }
         let life_changed = h.life != self.last_life;
         (self.last_life, self.health) = (h.life, h.health);
+        self.shell.away = h.away;
+        if life_changed && h.health == 0 {
+            // We died: lattice transit counts from this region.
+            self.shell.died_in = self.world.as_ref().and_then(|w| territory::region_of(w, h.own.pos));
+        } else if life_changed {
+            self.shell.deploying = None;
+        }
         self.render_clock.on_snapshot(h.step, self.pace, now);
 
         if h.ack_seq == 0 {
@@ -1282,7 +1369,7 @@ mod tests {
     fn a_frame_loop_makes_30_inputs_a_second_and_draws_its_player_smoothly() {
         let t0 = Instant::now();
         let mut c = ClientCore::default();
-        let w = Welcome { entity: 1, spawn: [4096.0, 4096.0], anchor: [4096.0, 4096.0], radius: 100.0, world: 7, world_digest: 0, rules: 0 };
+        let w = Welcome { entity: 1, spawn: [4096.0, 4096.0], spawn_z: 0.0, anchor: [4096.0, 4096.0], radius: 100.0, world: 7, world_digest: 0, rules: 0 };
         c.on_message(&msg::encode_welcome(&w), t0);
         let frame = Duration::from_secs_f64(1.0 / 144.0);
         let run = Input { move_x: 127, ..Default::default() };

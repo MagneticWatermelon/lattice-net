@@ -554,10 +554,87 @@ fn the_kit_world_has_its_turned_boxes_volumes_and_holes() {
 }
 
 #[test]
+fn deploying_through_the_c_api() {
+    let _alone = QUIET.write().unwrap_or_else(|e| e.into_inner());
+    use lattice_game::events::NOBODY;
+    // Kiln, players deploying (U4). (Built first: see `territory_through_the_c_api`.)
+    let _kiln = lattice_game::world::World::shared(lattice_game::world::KILN);
+    let start = Instant::now();
+    let cfg = SimConfig { world: lattice_game::world::KILN, spawn: SpawnMode::Uniform, deploy: true, ..Default::default() };
+    let mut server = LoopServer::with(cfg, start);
+    let id = server.sim.config().identity.clone();
+    let key = hex(&id.token_key);
+    let mut a = Client::connect(&server.addr().to_string(), 1, &key, id.server_id);
+    let frame = Duration::from_micros(8333);
+    let mut next = start;
+    let shell = |a: &Client| {
+        let mut sh = LtShell::default();
+        unsafe { lt_shell(a.s, &mut sh) };
+        sh
+    };
+    let run = |a: &mut Client, server: &mut LoopServer, next: &mut Instant, secs: f32, until: &dyn Fn(&Client) -> bool| {
+        let end = Instant::now() + Duration::from_secs_f32(secs);
+        while Instant::now() < end && !until(a) {
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            a.frame(None, false);
+            server.run(Instant::now());
+            *next += frame;
+        }
+    };
+    run(&mut a, &mut server, &mut next, 5.0, &|a| a.own.welcomed == 1 && shell(a).deploys == 1);
+    let sh = shell(&a);
+    assert_eq!((sh.deploys, sh.away, a.own.dead, sh.died_in), (1, 1, 1, lattice_game::world::NO_SITE), "joined with no body");
+    let us = a.own.faction;
+    let t = server.sim.territory();
+    let (home, enemy) = (t.landing(us).unwrap(), t.landing((us + 1) % 3).unwrap());
+    let mut opts = vec![LtSpawnOption::default(); 128];
+    let n = unsafe { lt_spawn_options(a.s, opts.as_mut_ptr(), opts.len() as i32) } as usize;
+    assert_eq!(n, server.sim.world().sites().len());
+    assert_eq!((opts[home].ok, opts[home].transit_secs), (1, 6.0), "our Landing, from orbit");
+    assert_eq!((opts[enemy].ok, opts[enemy].reason), (0, lattice_game::territory::REFUSED_NOT_HELD));
+    // Asking for theirs is refused; ours is granted.
+    assert_eq!(unsafe { lt_deploy(a.s, enemy as u16, 0) }, 1);
+    run(&mut a, &mut server, &mut next, 2.0, &|a| shell(a).refusals > 0);
+    assert_eq!((shell(&a).refused_site, shell(&a).refused_reason), (enemy as u16, lattice_game::territory::REFUSED_NOT_HELD));
+    assert!(a.events.iter().any(|e| e.kind == EVENT_REFUSED && e.a == enemy as u16));
+    assert_eq!(unsafe { lt_deploy(a.s, home as u16, 0) }, 1);
+    run(&mut a, &mut server, &mut next, 2.0, &|a| shell(a).deploying == 1);
+    let sh = shell(&a);
+    assert_eq!(sh.deploy_site, home as u16);
+    assert!(sh.deploy_secs > 5.0 && sh.deploy_secs <= 6.0, "transit {}", sh.deploy_secs);
+    assert!(a.events.iter().any(|e| e.kind == EVENT_DEPLOYING && e.a == home as u16 && e.value > 0));
+    // We appear in its spawn room.
+    run(&mut a, &mut server, &mut next, 8.0, &|a| a.own.dead == 0);
+    assert_eq!((a.own.dead, shell(&a).away, shell(&a).deploying), (0, 0, 0), "deployed");
+    let room = server.sim.world().spawn_rooms().iter().find(|r| r.site as usize == home).copied().unwrap();
+    let d = ((a.own.pos.x - room.center[0]).powi(2) + (a.own.pos.y - room.center[1]).powi(2)).sqrt();
+    assert!(d < room.half[0].max(room.half[1]) + 0.5, "in our Landing's spawn room ({d} m from its center)");
+    // Killed (by a test's damage: no one), a recap comes.
+    server.sim.damage(a.own.entity, 100);
+    run(&mut a, &mut server, &mut next, 2.0, &|a| shell(a).recaps > 0);
+    let mut r = LtRecap::default();
+    assert_eq!(unsafe { lt_recap(a.s, &mut r) }, 1);
+    assert_eq!((r.killer, r.lines, r.from[0], r.damage[0]), (NOBODY, 1, NOBODY, 100));
+    assert_eq!((a.own.dead, shell(&a).away, shell(&a).died_in), (1, 0, home as u16), "a corpse, where it fell");
+    // Deploying again releases it.
+    assert_eq!(unsafe { lt_deploy(a.s, home as u16, 0) }, 1);
+    run(&mut a, &mut server, &mut next, 2.0, &|a| shell(a).deploying == 1);
+    assert_eq!(shell(&a).away, 1, "released: no body");
+    run(&mut a, &mut server, &mut next, 8.0, &|a| a.own.dead == 0);
+    assert_eq!(a.own.dead, 0, "back");
+    let st = a.stats();
+    assert_eq!((st.corrections, st.resyncs), (0, 0), "prediction stayed exact through every life");
+    unsafe { lt_close(a.s) };
+}
+
+#[test]
 fn territory_through_the_c_api() {
     let _alone = QUIET.write().unwrap_or_else(|e| e.into_inner());
     use lattice_game::territory::NONE;
     // Kiln, its meters 120 times faster: the Hollow (5 min) flips in 2.5 s.
+    // (Built first: the server's ticks run from `start`, and would catch up
+    // on the build's time in bursts, starving our inputs.)
+    let _kiln = lattice_game::world::World::shared(lattice_game::world::KILN);
     let start = Instant::now();
     let cfg = SimConfig { world: lattice_game::world::KILN, spawn: SpawnMode::Uniform, capture_speed: 120, ..Default::default() };
     let mut server = LoopServer::with(cfg, start);
@@ -604,6 +681,6 @@ fn territory_through_the_c_api() {
     let took = flipped_at.expect("the Hollow flipped to us") - teleported.unwrap();
     assert!(meter_seen > 0.5, "the meter climbed ({meter_seen})");
     assert!(took.as_secs_f32() < 5.0, "in {took:?}");
-    assert_eq!(a.stats().corrections, 0, "prediction stayed exact");
+    assert_eq!((a.stats().corrections, a.stats().resyncs), (0, 0), "prediction stayed exact");
     unsafe { lt_close(a.s) };
 }

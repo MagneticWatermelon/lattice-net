@@ -156,6 +156,7 @@ fn stairs_climb() {
         points: Vec::new(),
         holes: Vec::new(),
         volumes: Vec::new(),
+        rooms: Vec::new(),
     });
     let l = crate::world::Lane { a: 0, b: 0, path: path.iter().zip(&zs).map(|(p, z)| [p[0] as f32, p[1] as f32, *z as f32]).collect(), one_way: false, when: 0 };
     let up = walk(&w, &l, false);

@@ -113,6 +113,10 @@ lattice-server: M1 movement-only authoritative server
                        nobody dies to be refilled, rounds are unlimited)
   --capture-speed N    territory's meters move N times faster: sites flip in seconds,
                        not minutes (tests) [1]
+  --deploy             players deploy (U4; Kiln): they join with no body and ask to
+                       deploy at a site their faction holds, appearing in its spawn
+                       room after lattice transit; the dead deploy again (clients and
+                       bots are told, and do)
   --clock T            start Kiln's two-hour day T minutes in, or at day, dusk, night or
                        dawn (its first game step; clients follow the step) [day]
   --unlimited-rounds   the rifle never runs dry (no reloads): held triggers fire at its
@@ -640,6 +644,7 @@ fn main() -> std::io::Result<()> {
         immortal: a.flag("immortal"),
         unlimited_rounds: a.flag("unlimited-rounds"),
         capture_speed: a.get("capture-speed", 1),
+        deploy: a.flag("deploy"),
         clock_minutes: a.opt::<String>("clock").map_or(0.0, |c| parse_clock(&c)),
         cone_of_fire: !a.flag("no-cone"),
         // Where shots go in their cones: a fresh secret from the OS.
@@ -1236,6 +1241,12 @@ fn summary_values(
     kv.put("fall_deaths", c.fall_deaths);
     kv.put("respawns", c.respawns);
     kv.put("site_flips", c.site_flips);
+    kv.put("deploys", c.deploys);
+    kv.put("deploys_asked", c.deploys_asked);
+    kv.put("deploys_refused", c.deploys_refused);
+    kv.put("deploys_waited", c.deploys_waited);
+    kv.put("recaps", c.recaps);
+    kv.put("xp", c.xp);
     for (k, v) in [
         ("shots", c.shots),
         ("shots_late", c.shots_late),
@@ -1493,13 +1504,15 @@ fn print_summary(
         println!("  {:<10} {:>8} {:>8} {:>8}", col_name(i), ms(s.p50), ms(s.p99), ms(s.max));
     }
     println!(
-        "  overruns {over} | spawns {} despawns {} ({} joins deferred) | deaths {} ({} falls) respawns {} | sites taken {} | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
+        "  overruns {over} | spawns {} despawns {} ({} joins deferred) | deaths {} ({} falls) respawns {} deploys {} (refused {}) | sites taken {} | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
         c.spawns,
         c.despawns,
         sim.net().deferred_accepts(),
         c.deaths,
         c.fall_deaths,
         c.respawns,
+        c.deploys,
+        c.deploys_refused,
         c.site_flips,
         c.repeated,
         c.frozen,

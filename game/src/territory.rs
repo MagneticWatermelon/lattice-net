@@ -59,16 +59,24 @@ pub fn spawns_at(kind: SiteKind) -> bool {
     kind == SiteKind::Landing || kind == SiteKind::Hollow || kind.base() || kind.major()
 }
 
-/// Where at each site someone spawning there stands (U4's deploy screen
-/// will pick the site; the server's `--spawn sites` does now): its routes'
-/// waypoints on the ground within it, near its center first (empty for a
-/// site no one spawns at).
-pub fn spawn_points(w: &World) -> Vec<Vec<[f32; 2]>> {
+/// How far from its spot someone deploying appears, at most (m).
+pub const SPAWN_SCATTER: f32 = 0.6;
+
+/// Where at each site someone deploying there stands (feet), for the sites
+/// people spawn at (else empty): spots in its spawn room (U5), or where it
+/// has none (a test level), its routes' waypoints on the ground within it,
+/// near its center first.
+pub fn spawn_points(w: &World) -> Vec<Vec<[f32; 3]>> {
     w.sites()
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
             if !spawns_at(s.kind) {
                 return Vec::new();
+            }
+            let rooms: Vec<[f32; 3]> = w.spawn_rooms().iter().filter(|r| r.site as usize == i).flat_map(|r| room_spots(w, r)).collect();
+            if !rooms.is_empty() {
+                return rooms;
             }
             let mut v: Vec<(f32, [f32; 2])> = w
                 .lanes()
@@ -81,10 +89,73 @@ pub fn spawn_points(w: &World) -> Vec<Vec<[f32; 2]>> {
                 .collect();
             v.sort_by(|a, b| a.0.total_cmp(&b.0));
             v.dedup_by(|a, b| (a.1[0] - b.1[0]).abs() < 4.0 && (a.1[1] - b.1[1]).abs() < 4.0);
-            v.into_iter().take(24).map(|(_, p)| p).collect()
+            v.into_iter().take(24).map(|(_, p)| [p[0], p[1], w.terrain(p[0], p[1])]).collect()
         })
         .collect()
 }
+
+/// Spots on a spawn room's floor 1.5 m apart, each with room to stand
+/// anywhere within `SPAWN_SCATTER` of it (clear of the walls and of cover,
+/// on the floor, not over its covered exit's shaft) and nothing that moves
+/// people within 2 m.
+fn room_spots(w: &World, r: &crate::world::SpawnRoom) -> Vec<[f32; 3]> {
+    use crate::movement::{MoveState, RADIUS};
+    let v = [-r.axis[1], r.axis[0]];
+    let keep = SPAWN_SCATTER + RADIUS + 0.1;
+    let n = |h: f32| ((h - keep) / 1.5).floor().max(0.0) as i32;
+    let ring = |p: [f32; 2], d: f32, j: i32| {
+        let t = j as f32 * std::f32::consts::FRAC_PI_4;
+        if j == 0 { p } else { [p[0] + d * libm::cosf(t), p[1] + d * libm::sinf(t)] }
+    };
+    let mut out = Vec::new();
+    for ia in -n(r.half[0])..=n(r.half[0]) {
+        for ib in -n(r.half[1])..=n(r.half[1]) {
+            let (a, b) = (ia as f32 * 1.5, ib as f32 * 1.5);
+            let p = [r.center[0] + a * r.axis[0] + b * v[0], r.center[1] + a * r.axis[1] + b * v[1]];
+            let fits = (0..=8).all(|j| {
+                let q = ring(p, SPAWN_SCATTER, j);
+                let s = MoveState::standing_at(w, q, r.floor);
+                let unmoved = (s.pos[0] - q[0]).abs() < 1e-3 && (s.pos[1] - q[1]).abs() < 1e-3;
+                unmoved && (s.z - r.floor).abs() < 0.3
+            });
+            let still = (0..=8).all(|j| {
+                let q = ring(p, 2.0, j);
+                (-1..=3).all(|dz| w.volume_at(q[0], q[1], r.floor + dz as f32, crate::clock::Live::OFF).is_none())
+            });
+            if fits && still {
+                out.push([p[0], p[1], r.floor]);
+            }
+        }
+    }
+    out
+}
+
+/// The site whose region holds `pos`: regions are the sites' Voronoi cells
+/// (GDD §3.2), so the nearest site's center (None: no sites).
+pub fn region_of(w: &World, pos: [f32; 2]) -> Option<usize> {
+    let d = |s: &crate::world::Site| (s.center[0] - pos[0]) * (s.center[0] - pos[0]) + (s.center[1] - pos[1]) * (s.center[1] - pos[1]);
+    (0..w.sites().len()).min_by(|&a, &b| d(&w.sites()[a]).total_cmp(&d(&w.sites()[b])))
+}
+
+/// Lattice transit (GDD §3.4): deploying takes `TRANSIT_BASE` steps plus
+/// `TRANSIT_PER_LANE` a lane between the region you died in and the
+/// spawn's, at most `TRANSIT_MAX`. Reinforcing a fight nearby is quick;
+/// crossing the continent in one jump isn't.
+pub const TRANSIT_BASE: u32 = 6 * 30;
+pub const TRANSIT_PER_LANE: u32 = 2 * 30;
+pub const TRANSIT_MAX: u32 = 20 * 30;
+
+/// Why a deploy can't go ahead (`Territory::spawnable`, the server's
+/// refusals): its faction doesn't hold the site.
+pub const REFUSED_NOT_HELD: u8 = 1;
+/// No one spawns at a site of its kind.
+pub const REFUSED_NO_SPAWN: u8 = 2;
+/// Its meter is past halfway to an attacker.
+pub const REFUSED_CONTESTED: u8 = 3;
+/// Alive: only the dead and those not yet deployed deploy.
+pub const REFUSED_ALIVE: u8 = 4;
+/// Not a site, or the server doesn't deploy (no `RULE_DEPLOY`).
+pub const REFUSED_INVALID: u8 = 5;
 
 /// Whether a spawn can stand anywhere within its scatter (2 m) of `p`, with
 /// room: on ground at `p`'s height (no hole), nothing that moves anyone (a
@@ -141,6 +212,8 @@ impl SiteState {
 #[derive(Debug, Clone)]
 struct SiteInfo {
     landing: bool,
+    /// People spawn here (`spawns_at`).
+    spawns: bool,
     /// Steps to flip it, uncontested.
     flip_steps: u32,
     /// Its points' positions.
@@ -152,6 +225,8 @@ struct SiteInfo {
 pub struct Territory {
     info: Vec<SiteInfo>,
     pub sites: Vec<SiteState>,
+    /// Lanes between each two sites (n × n, row by row; `u8::MAX`: no way).
+    hops: Vec<u8>,
 }
 
 impl Territory {
@@ -166,7 +241,7 @@ impl Territory {
         let mut info: Vec<SiteInfo> = world
             .sites()
             .iter()
-            .map(|s| SiteInfo { landing: s.kind == SiteKind::Landing, flip_steps: (flip_secs(s.kind) * 30 / speed.max(1)).max(1), points: Vec::new(), links: Vec::new() })
+            .map(|s| SiteInfo { landing: s.kind == SiteKind::Landing, spawns: spawns_at(s.kind), flip_steps: (flip_secs(s.kind) * 30 / speed.max(1)).max(1), points: Vec::new(), links: Vec::new() })
             .collect();
         for p in world.points() {
             if let Some(i) = info.get_mut(p.site as usize) {
@@ -195,7 +270,56 @@ impl Territory {
                 SiteState { owner, prev: owner, since: 0, attacker: NONE, meter: 0, points: [NONE; MAX_POINTS], contested: 0, locked_until: 0 }
             })
             .collect();
-        Self { info, sites }
+        // Lanes between each two sites, a breadth-first walk from each.
+        let mut hops = vec![u8::MAX; n * n];
+        for a in 0..n {
+            let row = &mut hops[a * n..(a + 1) * n];
+            row[a] = 0;
+            let mut queue = std::collections::VecDeque::from([a]);
+            while let Some(x) = queue.pop_front() {
+                for &y in &info[x].links {
+                    if row[y as usize] == u8::MAX {
+                        row[y as usize] = row[x].saturating_add(1);
+                        queue.push_back(y as usize);
+                    }
+                }
+            }
+        }
+        Self { info, sites, hops }
+    }
+
+    /// Lanes between sites `a` and `b` (`u8::MAX`: no way between).
+    pub fn hops(&self, a: usize, b: usize) -> u8 {
+        self.hops[a * self.sites.len() + b]
+    }
+
+    /// Steps of lattice transit to deploy at site `to`, from the region
+    /// someone died in (`from`; None: joining, from orbit).
+    pub fn transit_steps(&self, from: Option<usize>, to: usize) -> u32 {
+        let lanes = from.map_or(0, |f| self.hops(f, to).min(10) as u32);
+        (TRANSIT_BASE + lanes * TRANSIT_PER_LANE).min(TRANSIT_MAX)
+    }
+
+    /// Whether `faction` may deploy at site `i` at step `step` (GDD §3.4):
+    /// it holds it, people spawn there, and its meter isn't past halfway to
+    /// an attacker (a Landing: always, held). Else why not (`REFUSED_*`).
+    pub fn spawnable(&self, i: usize, faction: u8, step: u32) -> Result<(), u8> {
+        let (Some(s), Some(info)) = (self.sites.get(i), self.info.get(i)) else { return Err(REFUSED_INVALID) };
+        if !info.spawns {
+            return Err(REFUSED_NO_SPAWN);
+        }
+        if s.owner_at(step) != faction {
+            return Err(REFUSED_NOT_HELD);
+        }
+        if !info.landing && s.attacker != NONE && s.attacker != faction && s.meter * 2 >= FULL {
+            return Err(REFUSED_CONTESTED);
+        }
+        Ok(())
+    }
+
+    /// Faction `f`'s Landing, if it holds one.
+    pub fn landing(&self, f: u8) -> Option<usize> {
+        (0..self.sites.len()).find(|&i| self.info[i].landing && self.sites[i].owner == f)
     }
 
     pub fn len(&self) -> usize {
@@ -513,6 +637,87 @@ mod tests {
         }
         let left: Vec<_> = (0..t.len()).filter(|&i| !taken[i] && w.sites()[i].kind != SiteKind::Landing).collect();
         assert!(left.is_empty(), "never attackable: {left:?}");
+    }
+
+    #[test]
+    fn everyone_deploys_in_a_spawn_room() {
+        let (w, t) = kiln();
+        let pts = spawn_points(&w);
+        for (i, s) in w.sites().iter().enumerate() {
+            if !spawns_at(s.kind) {
+                assert!(pts[i].is_empty());
+                continue;
+            }
+            let rooms: Vec<_> = w.spawn_rooms().iter().filter(|r| r.site as usize == i).collect();
+            assert!(!rooms.is_empty(), "{:?} {i} has a spawn room", s.kind);
+            assert!(pts[i].len() >= 8, "{:?} {i}: room for a few at once, {} spots", s.kind, pts[i].len());
+            for p in &pts[i] {
+                // In its room, standing on its floor however the scatter falls.
+                let r = rooms.iter().find(|r| {
+                    let d = [p[0] - r.center[0], p[1] - r.center[1]];
+                    let (a, b) = (d[0] * r.axis[0] + d[1] * r.axis[1], -d[0] * r.axis[1] + d[1] * r.axis[0]);
+                    a.abs() <= r.half[0] && b.abs() <= r.half[1]
+                });
+                assert!(r.is_some(), "{:?} {i}: {p:?} in a room", s.kind);
+                let st = crate::movement::MoveState::standing_at(&w, [p[0] + SPAWN_SCATTER, p[1]], p[2]);
+                assert!((st.z - p[2]).abs() < 0.3);
+            }
+        }
+        // Who may deploy where: their own, not the enemy's; never an outpost.
+        let landing = t.landing(1).unwrap();
+        assert_eq!(t.spawnable(landing, 1, 0), Ok(()));
+        assert_eq!(t.spawnable(landing, 0, 0), Err(REFUSED_NOT_HELD));
+        let outpost = (0..t.len()).find(|&i| !spawns_at(w.sites()[i].kind)).unwrap();
+        assert_eq!(t.spawnable(outpost, t.sites[outpost].owner, 0), Err(REFUSED_NO_SPAWN));
+        assert_eq!(t.spawnable(9999, 0, 0), Err(REFUSED_INVALID));
+    }
+
+    #[test]
+    fn a_site_past_halfway_to_its_attacker_is_no_spawn() {
+        let (w, mut t) = kiln();
+        let mut step = 0;
+        // Faction 0 takes the Hollow (no one's at the start); then faction 1 attacks it.
+        let hollow = (0..t.len()).find(|&i| w.sites()[i].kind == SiteKind::Hollow).unwrap();
+        assert_eq!(t.spawnable(hollow, 0, step), Err(REFUSED_NOT_HELD));
+        hold(&mut t, &mut step, flip_secs(SiteKind::Hollow) + 2, &[(hollow, 0)]);
+        step += LOCK_STEPS + FLIP_DELAY;
+        assert_eq!(t.spawnable(hollow, 0, step), Ok(()));
+        assert!(t.attackable(hollow, 1, step));
+        let half = flip_secs(SiteKind::Hollow) / 2;
+        hold(&mut t, &mut step, half - 3, &[(hollow, 1)]);
+        assert_eq!(t.spawnable(hollow, 0, step), Ok(()), "not yet halfway: meter {}", t.sites[hollow].meter);
+        hold(&mut t, &mut step, 6, &[(hollow, 1)]);
+        assert_eq!(t.spawnable(hollow, 0, step), Err(REFUSED_CONTESTED));
+        // Faction 0 back on its points: the meter drains, and it spawns there again.
+        hold(&mut t, &mut step, half + 10, &[(hollow, 0)]);
+        assert_eq!(t.spawnable(hollow, 0, step), Ok(()));
+    }
+
+    #[test]
+    fn transit_grows_with_the_lanes_between() {
+        let (w, t) = kiln();
+        let landing = t.landing(0).unwrap();
+        assert_eq!(t.transit_steps(None, landing), TRANSIT_BASE, "joining: from orbit");
+        assert_eq!(t.transit_steps(Some(landing), landing), TRANSIT_BASE);
+        let next = t.links(landing)[0] as usize;
+        assert_eq!(t.hops(landing, next), 1);
+        assert_eq!(t.transit_steps(Some(landing), next), TRANSIT_BASE + TRANSIT_PER_LANE);
+        // Across the continent, capped.
+        let far = t.landing(1).unwrap();
+        let lanes = t.hops(landing, far) as u32;
+        assert!(lanes >= 4, "{lanes} lanes between Landings");
+        assert_eq!(t.transit_steps(Some(landing), far), (TRANSIT_BASE + lanes * TRANSIT_PER_LANE).min(TRANSIT_MAX));
+        assert_eq!(t.transit_steps(Some(landing), far) / 30, 18, "Landing to Landing, 6 lanes: 18 s");
+        // Every site is reachable from every other.
+        for a in 0..t.len() {
+            for b in 0..t.len() {
+                assert!(t.hops(a, b) < u8::MAX, "{a} to {b}");
+            }
+        }
+        // Regions: a site's own center is its region.
+        for (i, s) in w.sites().iter().enumerate() {
+            assert_eq!(region_of(&w, s.center), Some(i));
+        }
     }
 
     #[test]

@@ -32,7 +32,16 @@ pub struct BotBrain {
     /// Takes sites (`set_capture`).
     campaign: Option<Campaign>,
     seed: u64,
+    /// Messages for the reliable channel (a Deploy), until `take_reliable`.
+    reliable: Vec<Vec<u8>>,
+    /// Calls it's been dead (or bodiless) and not deploying, for `deploy`.
+    dead_steps: u32,
 }
+
+/// A dead bot asks to deploy this long after it fell (steps), and again
+/// this often while refused.
+const RELEASE_STEPS: u32 = 60;
+const ASK_AGAIN: u32 = 90;
 
 /// How a bot moves (tests use the scripted ones).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,7 +65,59 @@ impl BotBrain {
     }
 
     pub fn with_config(seed: u64, cfg: ClientConfig) -> Self {
-        Self { core: ClientCore::new(cfg), ai: Wander::new(seed), trigger: false, fighter: None, ads: false, reload_once: false, run_lanes: false, campaign: None, seed }
+        Self {
+            core: ClientCore::new(cfg),
+            ai: Wander::new(seed),
+            trigger: false,
+            fighter: None,
+            ads: false,
+            reload_once: false,
+            run_lanes: false,
+            campaign: None,
+            seed,
+            reliable: Vec::new(),
+            dead_steps: 0,
+        }
+    }
+
+    /// The next message for the reliable channel, if any.
+    pub fn take_reliable(&mut self) -> Option<Vec<u8>> {
+        (!self.reliable.is_empty()).then(|| self.reliable.remove(0))
+    }
+
+    /// Deploys (`msg::RULE_DEPLOY`): dead or not yet deployed, and not on
+    /// its way, it asks a couple of seconds after it fell, at the spawn its
+    /// faction holds that's quickest to reach from where it fell (by
+    /// lattice transit); joining, at a front (a spawn linked to a site its
+    /// faction doesn't hold), as a player picking a fight would.
+    fn deploy(&mut self) {
+        let core = &self.core;
+        if !core.deploys() || !core.is_dead() || core.shell.deploying.is_some() {
+            self.dead_steps = 0;
+            return;
+        }
+        self.dead_steps += 1;
+        if self.dead_steps < RELEASE_STEPS || !(self.dead_steps - RELEASE_STEPS).is_multiple_of(ASK_AGAIN) {
+            return;
+        }
+        let Some(t) = core.territory() else { return };
+        let (f, step) = (core.faction(), core.server_step());
+        let mut options: Vec<(u32, usize)> = (0..t.len()).filter_map(|i| core.spawn_option(i).ok().map(|s| (s, i))).collect();
+        if core.shell.died_in.is_none() {
+            let fronts: Vec<(u32, usize)> = options.iter().copied().filter(|&(_, i)| t.links(i).iter().any(|&j| t.sites[j as usize].owner_at(step) != f)).collect();
+            if !fronts.is_empty() {
+                options = fronts;
+            }
+        } else if let Some(best) = options.iter().map(|o| o.0).min() {
+            options.retain(|o| o.0 == best);
+        }
+        if options.is_empty() {
+            return;
+        }
+        let site = options[(self.ai.rng.next_u64() % options.len() as u64) as usize].1;
+        if let Some(m) = self.core.deploy(site as u16, 0) {
+            self.reliable.push(m);
+        }
     }
 
     /// Fights: aims at the nearest enemy it draws and fires in bursts. It
@@ -185,6 +246,7 @@ impl BotBrain {
     /// crouched), and top up their magazine between fights; trigger bots
     /// spray from the hip.
     pub fn tick_inputs(&mut self, now: Instant) -> Option<Vec<u8>> {
+        self.deploy();
         if let Some(f) = &mut self.fighter {
             f.tick(&mut self.core, now);
         } else if self.trigger {

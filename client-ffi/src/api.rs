@@ -48,7 +48,9 @@ use crate::session::dev_token;
 /// 5: the collision kit (K1): turned boxes, wedges and shields in `LtBox`,
 /// one-way lanes, `lt_world_volumes`, `lt_world_holes`.
 /// 8: turned force volumes (`LtVolume`'s center, halves and axis).
-pub const VERSION: u32 = 8;
+/// 9: the shell (U4): `lt_deploy`, `lt_shell`, `lt_spawn_options`,
+/// `lt_recap`, `lt_fights`; `LtEvent::value`, deploy and reward events.
+pub const VERSION: u32 = 9;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]
@@ -453,6 +455,45 @@ ffi_fns! {
     /// (0 before we're welcomed).
     fn lt_territory(s: *mut LtSession, out: *mut LtSiteState, cap: i32) -> i32 {
         with(s, |h| h.territory(slice(out, cap)) as i32)
+    }
+
+    /// Asks to deploy at site `site` with loadout `kit` (U4; when the
+    /// server has us deploy, `LtShell::deploys`): we must be dead or have no
+    /// body. The answer comes as an `LT_EVENT_DEPLOYING` or `LT_EVENT_REFUSED`,
+    /// and in `lt_shell`. Returns 1 if asked, 0 if not (the server doesn't
+    /// deploy, or we aren't connected).
+    fn lt_deploy(s: *mut LtSession, site: u16, kit: u8) -> i32 {
+        with(s, |h| h.deploy(site, kit) as i32)
+    }
+
+    /// The shell's state (U4): deploying, recaps, fights, XP.
+    fn lt_shell(s: *mut LtSession, out: *mut LtShell) -> () {
+        if let Some(o) = out.as_mut() {
+            *o = with(s, |h| Wrapped(h.shell())).0;
+        }
+    }
+
+    /// Every site as a spawn for us now (`lt_world_sites`' order): whether
+    /// our faction may deploy there, and its lattice transit. Fills `out`
+    /// (up to `cap`), returns how many sites there are (0 before we're
+    /// welcomed, or on a world without territory).
+    fn lt_spawn_options(s: *mut LtSession, out: *mut LtSpawnOption, cap: i32) -> i32 {
+        with(s, |h| h.spawn_options(slice(out, cap)) as i32)
+    }
+
+    /// The newest death recap into `out`; returns how many recaps have
+    /// come (0: none yet, and `out` is left alone).
+    fn lt_recap(s: *mut LtSession, out: *mut LtRecap) -> i32 {
+        match out.as_mut() {
+            Some(o) => with(s, |h| h.recap(o) as i32),
+            None => 0,
+        }
+    }
+
+    /// The continent's fights, as the server last said (every 5 s): fills
+    /// `out` (up to `cap`), returns how many there are.
+    fn lt_fights(s: *mut LtSession, out: *mut LtFight, cap: i32) -> i32 {
+        with(s, |h| h.fights(slice(out, cap)) as i32)
     }
 
     /// The net graph's numbers.

@@ -374,6 +374,9 @@ impl Bot {
                 if let Some(batch) = brain.tick_inputs(now) {
                     let _ = client.send(Channel::Unreliable, batch);
                 }
+                while let Some(m) = brain.take_reliable() {
+                    let _ = client.send(Channel::Reliable, m);
+                }
             }
             ClientState::Connecting => {}
             ClientState::Denied(_) | ClientState::TimedOut | ClientState::Disconnected => self.failed = true,

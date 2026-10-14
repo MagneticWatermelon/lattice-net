@@ -169,10 +169,87 @@ ffi_structs! {
         pub amount: u8,
         /// Hurt: the yaw from us to the shooter, in 1/256 turns.
         pub dir: u8,
-        /// Hit: the target; Hurt: the shooter; Kill: the killer.
+        /// Hit: the target; Hurt: the shooter; Kill: the killer;
+        /// Deploying, Refused: the site; Reward: what it's about (an
+        /// entity, or a site).
         pub a: u16,
         /// Kill: the victim.
         pub b: u16,
+        /// Deploying: the step we appear at; Reward: its XP.
+        pub value: u32,
+    }
+
+    /// The game's shell (U4, `lt_shell`): deploying, the death recap, the
+    /// continent's fights, our XP.
+    pub struct LtShell {
+        /// The server has us deploy: we join with no body, and deploy at a
+        /// site (`lt_deploy`) whenever we're dead.
+        pub deploys: u8,
+        /// No body: not deployed yet, or gone from our corpse (released).
+        pub away: u8,
+        /// 1: deploying, at `deploy_site`, appearing in `deploy_secs`.
+        pub deploying: u8,
+        /// The last deploy refused: why (`LT_REFUSED_*`; 0: none), and where.
+        pub refused_reason: u8,
+        pub deploy_site: u16,
+        pub refused_site: u16,
+        pub deploy_secs: f32,
+        /// How many refusals, recaps and rewards so far: a change is a new one.
+        pub refusals: u32,
+        pub recaps: u32,
+        pub rewards: u32,
+        /// XP this session.
+        pub xp: u32,
+        /// The site whose region we last died in: lattice transit counts
+        /// lanes from there (`LT_NO_SITE`: never deployed).
+        pub died_in: u16,
+        pub reserved: u16,
+        /// The newest fights' step (`lt_fights`).
+        pub fights_step: u32,
+    }
+
+    /// A site we might deploy at (`lt_spawn_options`).
+    pub struct LtSpawnOption {
+        pub site: u16,
+        /// 1: our faction may deploy there now; else `reason` says why not
+        /// (`LT_REFUSED_*`).
+        pub ok: u8,
+        pub reason: u8,
+        /// Lattice transit from where we last died, seconds.
+        pub transit_secs: f32,
+    }
+
+    /// The death recap (GDD §4.4, `lt_recap`).
+    pub struct LtRecap {
+        /// Who killed us (`LT_NOBODY`: a fall, or no one), and its faction.
+        pub killer: u16,
+        pub killer_faction: u8,
+        /// `LT_CAUSE_*`.
+        pub cause: u8,
+        /// 1: a headshot.
+        pub head: u8,
+        /// The killer's health when it killed us.
+        pub killer_health: u8,
+        /// How many damage lines `from`.. hold.
+        pub lines: u8,
+        pub reserved: u8,
+        /// From how far, m.
+        pub distance: f32,
+        /// The damage we took in our last 5 s, by who dealt it (`LT_NOBODY`:
+        /// a fall), most first: how much, in how many hits, how many to the head.
+        pub from: [u16; 8],
+        pub damage: [u16; 8],
+        pub hits: [u8; 8],
+        pub heads: [u8; 8],
+    }
+
+    /// A site's fight (`lt_fights`).
+    pub struct LtFight {
+        pub site: u16,
+        /// Players of each faction there.
+        pub players: [u8; 3],
+        /// Its shots a second.
+        pub heat: u8,
     }
 
     /// A moment to show: a shooter drawn firing, or a tracer's impact.
@@ -480,6 +557,20 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_EVENT_HIT", 1, "Our shot hit `a` for `amount`."),
     ("LT_EVENT_HURT", 2, "`a` hit us for `amount`, from `dir`."),
     ("LT_EVENT_KILL", 3, "`a` killed `b`."),
+    ("LT_EVENT_DEPLOYING", 4, "We deploy at site `a`, appearing at step `value` (U4)."),
+    ("LT_EVENT_REFUSED", 5, "We can't deploy at site `a`: `amount` says why (`LT_REFUSED_*`)."),
+    ("LT_EVENT_REWARD", 6, "XP: `value` of it, for `flags` (`LT_REWARD_*`), about `a` (an entity, or a site)."),
+    ("LT_REWARD_KILL", lattice_game::events::REWARD_KILL as i64, "A kill (`a`: the victim)."),
+    ("LT_REWARD_ASSIST", lattice_game::events::REWARD_ASSIST as i64, "Damage to someone a teammate killed."),
+    ("LT_REWARD_CAPTURE", lattice_game::events::REWARD_CAPTURE as i64, "On a site's points when it fell to us (`a`: the site)."),
+    ("LT_REWARD_DEFEND", lattice_game::events::REWARD_DEFEND as i64, "On a site's points when an attack on it drained away."),
+    ("LT_REFUSED_NOT_HELD", lattice_game::territory::REFUSED_NOT_HELD as i64, "Our faction doesn't hold it."),
+    ("LT_REFUSED_NO_SPAWN", lattice_game::territory::REFUSED_NO_SPAWN as i64, "No one spawns at a site of its kind (an outpost)."),
+    ("LT_REFUSED_CONTESTED", lattice_game::territory::REFUSED_CONTESTED as i64, "Its meter is past halfway to an attacker."),
+    ("LT_REFUSED_ALIVE", lattice_game::territory::REFUSED_ALIVE as i64, "We're alive: only the dead and the bodiless deploy."),
+    ("LT_REFUSED_INVALID", lattice_game::territory::REFUSED_INVALID as i64, "Not a site, or the server doesn't deploy."),
+    ("LT_CAUSE_RIFLE", lattice_game::events::CAUSE_RIFLE as i64, "Killed by the rifle."),
+    ("LT_CAUSE_FALL", lattice_game::events::CAUSE_FALL as i64, "Killed by a fall."),
     ("LT_EVENT_HEAD", 1, "A head shot."),
     ("LT_EVENT_KILLED", 2, "The hit killed."),
     ("LT_FX_SHOT", 1, "A shooter drawn firing: a muzzle flash and a shot's sound at `pos`."),
@@ -573,6 +664,9 @@ pub const FLAG_RELOADING: u8 = 16;
 pub const EVENT_HIT: u8 = 1;
 pub const EVENT_HURT: u8 = 2;
 pub const EVENT_KILL: u8 = 3;
+pub const EVENT_DEPLOYING: u8 = 4;
+pub const EVENT_REFUSED: u8 = 5;
+pub const EVENT_REWARD: u8 = 6;
 pub const EVENT_HEAD: u8 = 1;
 pub const EVENT_KILLED: u8 = 2;
 pub const FX_SHOT: u8 = 1;
@@ -651,7 +745,10 @@ mod tests {
         assert_eq!(size("LtVec3"), 12);
         assert_eq!(size("LtIntent"), 20);
         assert_eq!(size("LtEntity"), 40);
-        assert_eq!(size("LtEvent"), 8);
+        assert_eq!(size("LtEvent"), 12);
+        assert_eq!(size("LtShell"), 36);
+        assert_eq!(size("LtRecap"), 60);
+        assert_eq!(size("LtFight"), 6);
         assert_eq!(size("LtTracer"), 32);
         // Every field lies inside its struct, after the one before it.
         for s in STRUCTS {

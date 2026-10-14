@@ -105,6 +105,12 @@ impl Session {
         }
     }
 
+    /// Queues a message on the reliable channel (a Deploy); false if we
+    /// aren't connected.
+    pub fn send_reliable(&mut self, data: Vec<u8>) -> bool {
+        self.client.state() == ClientState::Connected && self.client.send(Channel::Reliable, data).is_ok()
+    }
+
     /// End of a frame: packets out.
     pub fn flush(&mut self, now: Instant) {
         self.client.flush(now);

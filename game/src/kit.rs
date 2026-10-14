@@ -120,6 +120,7 @@ pub fn level() -> World {
         points: Vec::new(),
         holes: hole_bits(&cells),
         volumes,
+        rooms: Vec::new(),
     })
 }
 

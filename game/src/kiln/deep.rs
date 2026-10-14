@@ -266,6 +266,17 @@ pub(crate) fn room(k: &mut Kiln, q: [f64; 2], u: [f64; 2], hu: f64, hv: f64, hig
         k.fixed.push(strip(at(-hu, s * hv), at(hu, s * hv), 0.4, floor - 0.3, floor + high, Kind::Block));
     }
     k.fixed.push(oriented(q, [hu + 0.4, hv + 0.4], u, floor + high, floor + high + 0.6, Kind::Block));
+    // A shielded room is a spawn room: who deploys at its site appears in it (U4).
+    if let Some((site, _)) = shield {
+        k.spawn_rooms.push(crate::world::SpawnRoom {
+            site: site as u16,
+            center: [q[0] as f32, q[1] as f32],
+            axis: [u[0] as f32, u[1] as f32],
+            // Inside the walls (0.4 thick, centered on the edges).
+            half: [(hu - 0.2) as f32, (hv - 0.2) as f32],
+            floor: floor as f32,
+        });
+    }
 }
 
 /// A spawn room (K3, GDD §3.4): a room (as `room`) whose doors are shielded

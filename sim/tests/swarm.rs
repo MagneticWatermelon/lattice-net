@@ -283,6 +283,9 @@ impl Swarm {
                         if let Some(batch) = brain.tick_inputs(self.now) {
                             client.send(Channel::Unreliable, batch).unwrap();
                         }
+                        while let Some(m) = brain.take_reliable() {
+                            client.send(Channel::Reliable, m).unwrap();
+                        }
                     }
                 }
             }
@@ -2283,6 +2286,93 @@ fn a_slow_game_client_keeps_its_inputs_coming() {
     }
 }
 
+
+#[test]
+fn players_deploy_into_their_spawn_rooms_and_every_life_is_exact() {
+    use lattice_game::events::{NOBODY, XP_ASSIST, XP_KILL};
+    use lattice_game::faction::faction;
+    use lattice_game::territory::REFUSED_NOT_HELD;
+    use lattice_game::world::KILN;
+    use lattice_sim::bot::Moves;
+    let inside = |r: &lattice_game::world::SpawnRoom, p: [f32; 2]| {
+        let d = [p[0] - r.center[0], p[1] - r.center[1]];
+        let (a, b) = (d[0] * r.axis[0] + d[1] * r.axis[1], -d[0] * r.axis[1] + d[1] * r.axis[0]);
+        a.abs() <= r.half[0] && b.abs() <= r.half[1]
+    };
+    let mut s = Swarm::with_config(6, SimConfig { world: KILN, spawn: SpawnMode::Uniform, deploy: true, ..Default::default() });
+    for (_, _, b) in &mut s.bots {
+        b.set_moves(Moves::Hold);
+    }
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    // Joined with no body: dead, and away.
+    for (_, _, b) in &s.bots {
+        let c = b.core();
+        assert!(c.deploys() && c.shell.away && c.is_dead(), "joined with no body");
+    }
+    assert_eq!(s.server.counters().deploys, 0);
+    // A deploy at an enemy's Landing is refused.
+    let e0 = s.bots[0].2.welcome().unwrap().entity;
+    let enemy = s.server.territory().landing((faction(e0) + 1) % 3).unwrap();
+    let m = s.bots[0].2.core_mut().deploy(enemy as u16, 0).unwrap();
+    s.bots[0].1.send(Channel::Reliable, m).unwrap();
+    for _ in 0..TICK_HZ / 2 {
+        s.step();
+    }
+    assert_eq!(s.bots[0].2.core().shell.refused, Some((enemy as u16, REFUSED_NOT_HELD)));
+    // They ask 2 s after joining, at a front, and appear 6 s later (from
+    // orbit) in its spawn room.
+    for _ in 0..10 * TICK_HZ {
+        s.step();
+    }
+    assert_eq!(s.server.counters().deploys, 6);
+    for (_, _, b) in &s.bots {
+        let e = b.welcome().unwrap().entity;
+        let st = s.server.entity_state(e).unwrap();
+        assert!(!b.core().shell.away && !b.core().is_dead(), "deployed");
+        let room = s.server.world().spawn_rooms().iter().find(|r| inside(r, st.pos)).copied().expect("in a spawn room");
+        assert_eq!(s.server.territory().sites[room.site as usize].owner, faction(e), "its faction's");
+        assert!((st.z - room.floor).abs() < 0.3, "on its floor");
+    }
+    // A kill: two of another faction hurt it, the second kills it.
+    let victim = s.bots.iter().map(|(_, _, b)| b.welcome().unwrap().entity).find(|&e| faction(e) != faction(e0)).unwrap();
+    let vi = s.bots.iter().position(|(_, _, b)| b.welcome().unwrap().entity == victim).unwrap();
+    let killers: Vec<u16> = s.bots.iter().map(|(_, _, b)| b.welcome().unwrap().entity).filter(|&e| faction(e) != faction(victim)).take(2).collect();
+    let (xp0, xp1) = (s.bots.iter().find(|b| b.2.welcome().unwrap().entity == killers[0]).unwrap().2.core().shell.xp, 0);
+    s.server.damage_by(victim, 40, killers[0]);
+    s.step();
+    s.server.damage_by(victim, 100, killers[1]);
+    for _ in 0..TICK_HZ / 2 {
+        s.step();
+    }
+    let core = s.bots[vi].2.core();
+    assert!(core.is_dead() && !core.shell.away, "a corpse, for now");
+    let recap = core.shell.recap.clone().expect("a recap");
+    assert_eq!((recap.killer, recap.lines.clone()), (killers[1], vec![(killers[1], 60, 1, 0), (killers[0], 40, 1, 0)]), "who, and the damage by whom");
+    let xp = |e: u16| s.bots.iter().find(|b| b.2.welcome().unwrap().entity == e).unwrap().2.core().shell.xp;
+    assert_eq!((xp(killers[0]) - xp0, xp(killers[1]) - xp1), (XP_ASSIST as u64, XP_KILL as u64), "an assist, and the kill");
+    // It releases after 2 s (its body goes), deploys back after transit.
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    let core = s.bots[vi].2.core();
+    assert!(core.shell.away && core.shell.deploying.is_some(), "released, on its way");
+    for _ in 0..22 * TICK_HZ {
+        s.step();
+    }
+    assert!(!s.bots[vi].2.core().is_dead(), "back");
+    assert_eq!(s.server.counters().deploys, 7);
+    // A fall's recap names no one.
+    s.server.damage(victim, 100);
+    for _ in 0..TICK_HZ / 2 {
+        s.step();
+    }
+    assert_eq!(s.bots[vi].2.core().shell.recap.as_ref().map(|r| r.killer), Some(NOBODY));
+    // Fights: every client hears where everyone is.
+    assert!(s.bots.iter().all(|(_, _, b)| !b.core().shell.fights.is_empty()));
+    assert_eq!(s.corrections(), 0, "prediction stays exact through every life");
+}
 
 #[test]
 fn players_on_its_points_capture_a_site_and_every_client_hears() {

@@ -602,6 +602,19 @@ pub struct Point {
     pub site: u16,
 }
 
+/// A spawn room (GDD §3.4; K1-K3): a roofed room at a site, shielded for
+/// its holder, where who deploys there appears (U4). A rectangle about
+/// `center`, `half[0]` along `axis` (its doors are at those ends) and
+/// `half[1]` across it, inside its walls; its floor at `floor`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpawnRoom {
+    pub site: u16,
+    pub center: [f32; 2],
+    pub axis: [f32; 2],
+    pub half: [f32; 2],
+    pub floor: f32,
+}
+
 /// What the ground is made of at a height sample, for drawing (Kiln's
 /// layers each have their own: its design's "readable at a glance").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,6 +657,7 @@ pub struct World {
     /// (`hole`); empty: none.
     holes: Vec<u64>,
     volumes: Vec<Volume>,
+    rooms: Vec<SpawnRoom>,
     /// Volumes overlapping each cover cell, as for boxes.
     vol_start: Vec<u32>,
     vol_items: Vec<u32>,
@@ -668,6 +682,7 @@ pub struct Parts {
     /// set, the terrain has a hole there. Empty: none.
     pub holes: Vec<u64>,
     pub volumes: Vec<Volume>,
+    pub rooms: Vec<SpawnRoom>,
 }
 
 pub(crate) fn hash(seed: u64, octave: u64, x: i64, y: i64) -> u64 {
@@ -738,6 +753,7 @@ impl World {
             points: Vec::new(),
             holes: Vec::new(),
             volumes: Vec::new(),
+            rooms: Vec::new(),
             vol_start: Vec::new(),
             vol_items: Vec::new(),
             digest: OnceLock::new(),
@@ -777,6 +793,7 @@ impl World {
             points: p.points,
             holes: p.holes,
             volumes: p.volumes,
+            rooms: p.rooms,
             vol_start: Vec::new(),
             vol_items: Vec::new(),
             digest: OnceLock::new(),
@@ -869,6 +886,11 @@ impl World {
     /// Force volumes: lifts, drop shafts, springs.
     pub fn volumes(&self) -> &[Volume] {
         &self.volumes
+    }
+
+    /// Spawn rooms (none on Harrow).
+    pub fn spawn_rooms(&self) -> &[SpawnRoom] {
+        &self.rooms
     }
 
     /// The force volume the feet at (x, y, z) are in with the clockwork at
