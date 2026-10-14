@@ -60,11 +60,20 @@ impl SpreadKey {
     /// The pick for shot `seq` of `spawn` (a number no other connection
     /// shares while this key lives).
     pub fn pick(&self, spawn: u64, seq: u32) -> u64 {
-        let mut msg = [0u8; 12];
+        self.picks(spawn, seq, 0)[0]
+    }
+
+    /// Four picks for shot `seq` of `spawn`, the `round`th four (a
+    /// shotgun's pellets take two rounds; the first pick is `pick`'s).
+    pub fn picks(&self, spawn: u64, seq: u32, round: u8) -> [u64; 4] {
+        let mut msg = [0u8; 13];
         msg[..8].copy_from_slice(&spawn.to_le_bytes());
-        msg[8..].copy_from_slice(&seq.to_le_bytes());
-        let tag = hmac::sign(&self.0, &msg);
-        u64::from_le_bytes(tag.as_ref()[..8].try_into().unwrap())
+        msg[8..12].copy_from_slice(&seq.to_le_bytes());
+        msg[12] = round;
+        // (The first round keeps the twelve bytes it always signed.)
+        let tag = hmac::sign(&self.0, if round == 0 { &msg[..12] } else { &msg[..] });
+        let t = tag.as_ref();
+        [0, 1, 2, 3].map(|k| u64::from_le_bytes(t[k * 8..k * 8 + 8].try_into().unwrap()))
     }
 }
 
@@ -192,6 +201,10 @@ pub struct Fire {
     /// steps: its first seconds (`SETTLE_SLACK`), or after the server filled
     /// in a missing input (`STAND_IN_SLACK`).
     pub settling: f64,
+    /// The weapon's kit (`weapon::of`), and which of its shot's pellets this
+    /// is (0: the shot itself; a shotgun's are 0 to 7).
+    pub kit: u8,
+    pub pellet: u8,
 }
 
 /// Slack on top of the plausible rewind, in steps: jitter and frame timing.
@@ -539,6 +552,10 @@ pub struct Projectile {
     pub end: f64,
     /// Rewind per tier (near, mid/far), capped, in steps.
     pub d: [f64; 2],
+    /// The weapon's kit, and where it left the muzzle (its damage falls off
+    /// with the distance).
+    pub kit: u8,
+    pub origin: [f32; 3],
 }
 
 /// How a shot's claimed rewinds were cut.
@@ -573,8 +590,9 @@ impl Projectile {
             }
             f.behind[t].clamp(0.0, limit)
         });
-        let end = f.tau0 + lattice_game::weapon::RANGE_STEPS as f64;
-        (Self { id, shooter: f.shooter, flight: Flight::new(f.origin, f.dir), tau: f.tau0, end, d }, cut)
+        let w = lattice_game::weapon::of(f.kit);
+        let end = f.tau0 + w.range_steps as f64;
+        (Self { id, shooter: f.shooter, flight: Flight::at(f.origin, f.dir, w.speed), tau: f.tau0, end, d, kit: f.kit, origin: f.origin }, cut)
     }
 }
 
@@ -708,7 +726,7 @@ mod tests {
 
     #[test]
     fn rewinds_are_capped() {
-        let f = Fire { shooter: 1, seq: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false, wait: 1.5, held: 0.0, settling: 0.0 };
+        let f = Fire { shooter: 1, seq: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false, wait: 1.5, held: 0.0, settling: 0.0, kit: 0, pellet: 0 };
         let (p, cut) = Projectile::new(1, &f, None);
         assert_eq!((p.d, cut), ([4.0, 8.0], Cut::default()));
         let (p, cut) = Projectile::new(2, &Fire { behind: [12.0, 16.0], ..f }, None);

@@ -18,8 +18,9 @@
 //!     dz          zigzag varbits [0, 6, 10, 17]      (1 cm heights)
 //!     yaw         changed:1 [+ 12]
 //!     pitch       changed:1 [+ 8]
-//!     rest        changed:1 [+ flags 5 (airborne, dead, ADS, crouched, reloading), health 7]
-//!   else: the full state, 104 bits
+//!     rest        changed:1 [+ flags 8 (airborne, dead, ADS, crouched, reloading, 3 for U6's abilities),
+//!                              health 7, kit 3 (the class, U6)]
+//!   else: the full state, 110 bits
 //! ```
 //!
 //! A moving entity typically costs ~40 bits against a 2-3 tick old baseline,
@@ -59,8 +60,9 @@ pub const FLAG_ADS: u8 = 4;
 pub const FLAG_CROUCHED: u8 = 8;
 /// `NearQ::flags` bit: reloading.
 pub const FLAG_RELOADING: u8 = 16;
-/// Bits `NearQ::flags` takes on the wire.
-const FLAG_BITS: u32 = 5;
+/// Bits `NearQ::flags` takes on the wire (the top three are U6's abilities').
+const FLAG_BITS: u32 = 8;
+const KIT_BITS: u32 = 3;
 
 /// An entity's near-tier state, quantized: the unit deltas are taken in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,10 +78,12 @@ pub struct NearQ {
     pub pitch: u8,
     pub flags: u8,
     pub health: u8,
+    /// Its class (`class`, U6).
+    pub kit: u8,
 }
 
 impl NearQ {
-    pub fn new(s: &MoveState, yaw: u16, pitch: i16, health: u8, ads: bool, reloading: bool) -> Self {
+    pub fn new(s: &MoveState, yaw: u16, pitch: i16, health: u8, ads: bool, reloading: bool, kit: u8) -> Self {
         let axis = |v: f32| {
             let c = ((v / CELL) as u32).min(CELLS - 1);
             c << 16 | quantize(v - c as f32 * CELL, 0.0, CELL, 16)
@@ -98,6 +102,7 @@ impl NearQ {
                 | if s.crouched { FLAG_CROUCHED } else { 0 }
                 | if reloading { FLAG_RELOADING } else { 0 },
             health: health.min(127),
+            kit: kit & 7,
         }
     }
 
@@ -157,6 +162,7 @@ fn put_full(w: &mut BitWriter, q: &NearQ) {
     w.write(q.pitch as u32, 8);
     w.write(q.flags as u32, FLAG_BITS);
     w.write(q.health as u32, 7);
+    w.write(q.kit as u32, KIT_BITS);
 }
 
 fn get_full(r: &mut BitReader) -> Result<NearQ, DecodeError> {
@@ -170,6 +176,7 @@ fn get_full(r: &mut BitReader) -> Result<NearQ, DecodeError> {
         pitch: r.read(8)? as u8,
         flags: r.read(FLAG_BITS)? as u8,
         health: r.read(7)? as u8,
+        kit: r.read(KIT_BITS)? as u8,
     })
 }
 
@@ -214,11 +221,12 @@ pub fn encode_near(tick: u32, entries: &mut [NearEntry], out: &mut Writer) {
                 if s.pitch != b.pitch {
                     w.write(s.pitch as u32, 8);
                 }
-                let rest = (s.flags, s.health) != (b.flags, b.health);
+                let rest = (s.flags, s.health, s.kit) != (b.flags, b.health, b.kit);
                 w.write_bool(rest);
                 if rest {
                     w.write(s.flags as u32, FLAG_BITS);
                     w.write(s.health as u32, 7);
+                    w.write(s.kit as u32, KIT_BITS);
                 }
             }
             None => {
@@ -286,6 +294,7 @@ pub fn decode_near(data: &[u8], hist: &mut NearHistory, mut f: impl FnMut(u16, N
             if r.read_bool()? {
                 q.flags = r.read(FLAG_BITS)? as u8;
                 q.health = r.read(7)? as u8;
+                q.kit = r.read(KIT_BITS)? as u8;
             }
             q
         } else {
@@ -303,7 +312,7 @@ mod tests {
 
     fn q(x: f32, y: f32, vx: f32, vy: f32, yaw: u16) -> NearQ {
         let z = (x * 0.013) % 150.0; // terrain-like heights, varying with x
-        NearQ::new(&MoveState { pos: [x, y], vel: [vx, vy], z, vz: 0.0, grounded: true, crouched: false }, yaw, 0, 100, false, false)
+        NearQ::new(&MoveState { pos: [x, y], vel: [vx, vy], z, vz: 0.0, grounded: true, crouched: false }, yaw, 0, 100, false, false, 0)
     }
 
     #[test]
@@ -351,9 +360,9 @@ mod tests {
     fn stance_and_reloading_ride_the_flags() {
         let mut hist = NearHistory::default();
         let s = MoveState { pos: [10.0, 10.0], crouched: true, ..Default::default() };
-        let all = NearQ::new(&s, 0, 0, 100, true, true);
+        let all = NearQ::new(&s, 0, 0, 100, true, true, 4);
         assert_eq!(all.flags, FLAG_AIRBORNE | FLAG_ADS | FLAG_CROUCHED | FLAG_RELOADING);
-        let base = NearQ::new(&MoveState { crouched: false, ..s }, 0, 0, 100, false, false);
+        let base = NearQ::new(&MoveState { crouched: false, ..s }, 0, 0, 100, false, false, 4);
         let mut w = Writer::default();
         encode_near(10, &mut [NearEntry { entity: 3, state: base, base: None }], &mut w);
         decode_near(w.as_slice(), &mut hist, |_, _| {}).unwrap();

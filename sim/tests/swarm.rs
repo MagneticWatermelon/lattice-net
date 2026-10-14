@@ -1326,6 +1326,62 @@ fn shoot_at(lag: u32, strafe: u32, head: bool, extra_lead: f32, secs: u32, letha
     (s, target, hits, g)
 }
 
+#[test]
+fn every_class_fires_its_own_weapon_and_others_see_it() {
+    use lattice_game::{class, weapon};
+    use lattice_sim::bot::Moves;
+    for kit in 0..class::CLASSES {
+        let w = weapon::of(kit);
+        let interest = InterestConfig { squad_size: 0, ..Default::default() };
+        let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, cone_of_fire: false, ..Default::default() };
+        let mut s = render_swarm(2, cfg, Duration::from_secs(3600));
+        for _ in 0..TICK_HZ {
+            s.step();
+        }
+        let (a, _) = range(s.server.world());
+        let b = [a[0] + 12.0, a[1]];
+        let (shooter, target) = (s.bots[0].2.welcome().unwrap().entity, s.bots[1].2.welcome().unwrap().entity);
+        s.server.teleport(shooter, a);
+        s.server.teleport(target, b);
+        s.server.set_kit(shooter, kit);
+        s.server.set_invulnerable(target, true);
+        s.bots[0].2.set_moves(Moves::Hold);
+        s.bots[1].2.set_moves(Moves::Hold);
+        for _ in 0..2 * TICK_HZ {
+            s.step();
+        }
+        assert_eq!(s.bots[0].2.core().kit(), kit, "{}: the shooter's client knows its weapon", w.name);
+        let seen = s.bots[1].2.core().entities().and_then(|e| e.newest(shooter)).map(|x| x.kit);
+        assert_eq!(seen, Some(kit), "{}: the target sees what the shooter carries", w.name);
+        let c0 = s.server.counters().clone();
+        s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: true, back: 0.0, hold: false, fixed: None, pick_back: 0.0 });
+        s.bots[0].2.set_ads(true);
+        for _ in 0..3 * TICK_HZ {
+            s.step();
+        }
+        let g = s.gunner.take().unwrap();
+        for _ in 0..TICK_HZ / 2 {
+            s.step();
+        }
+        let c = s.server.counters().clone();
+        let hits: Vec<_> = s.server.take_hits().into_iter().filter(|h| h.shooter == shooter && h.target == target).collect();
+        // Its rate: as many shots as its interval allows in 3 s, from its magazine.
+        let most = (90.0 * 256.0 / w.interval as f32).floor() as u64 + 1;
+        let shots = c.shots - c0.shots;
+        assert!(shots <= most && shots + 2 >= most.min(w.magazine as u64), "{}: {shots} shots of {most}", w.name);
+        assert_eq!(g.shots, shots, "{}: every shot the client pulled went out", w.name);
+        assert_eq!(c.shots_refused - c0.shots_refused, 0, "{}: none refused (the client keeps its rate and rounds)", w.name);
+        // Its damage at 12 m, and a shotgun's pellets each a hit of their own.
+        let (lo, hi) = (w.damage_at(13.0, false), w.damage_at(11.0, false));
+        assert!(!hits.is_empty() && hits.iter().all(|h| h.head || (lo..=hi).contains(&h.damage)), "{}: {:?}", w.name, hits.iter().map(|h| h.damage).collect::<Vec<_>>());
+        if w.pellets > 1 {
+            assert!(hits.len() as u64 > shots, "{}: {} pellet hits from {shots} shots", w.name, hits.len());
+        }
+        let st = s.bots[0].2.stats();
+        assert_eq!((st.corrections, st.ammo_corrections), (0, 0), "{}: predicted exactly", w.name);
+    }
+}
+
 fn shoot(lag: u32, strafe: u32, head: bool, extra_lead: f32, secs: u32) -> (Swarm, u16, Vec<lattice_sim::server::HitRecord>, Gunner) {
     shoot_at(lag, strafe, head, extra_lead, secs, false)
 }

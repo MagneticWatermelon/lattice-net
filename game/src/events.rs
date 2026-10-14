@@ -55,9 +55,10 @@ pub const XP_CAPTURE: u16 = 500;
 pub const XP_CAPTURE_OUTPOST: u16 = 250;
 pub const XP_DEFEND: u16 = 100;
 
-/// What killed someone (`Recap::cause`): the rifle, or a fall.
+/// What killed someone (`Recap::cause`): a weapon (its kit, `weapon::of`:
+/// 0 is the assault rifle), or a fall.
 pub const CAUSE_RIFLE: u8 = 0;
-pub const CAUSE_FALL: u8 = 1;
+pub const CAUSE_FALL: u8 = 255;
 /// A recap's damage reaches back this far: 5 s.
 pub const RECAP_STEPS: u32 = 150;
 /// The most damage lines a recap carries.

@@ -33,7 +33,7 @@ use lattice_game::clock::Live;
 use lattice_game::movement::{dead_input, stand_in, step, Input, MoveState, Mover, NO_FACTION, TICK_HZ};
 use lattice_game::territory::{self, Territory};
 use lattice_game::msg::{self, InputEntry, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
-use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot, FIRE_STEPS};
+use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot};
 use lattice_game::tier::Tier;
 use lattice_game::world::World;
 
@@ -1043,6 +1043,10 @@ impl ClientCore {
             (p.state, p.ammo) = (s, a);
         }
         self.ammo = a;
+        // A new life's weapon blooms afresh.
+        if self.bloom.kit != a.kit {
+            self.bloom = Bloom::with_kit(a.kit);
+        }
         let (old, cur) = (self.state, self.own_offset(now));
         let o = [cur[0] + old.pos[0] - s.pos[0], cur[1] + old.pos[1] - s.pos[1], cur[2] + old.z - s.z];
         let len = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
@@ -1133,7 +1137,7 @@ impl ClientCore {
         }
         let entity = self.welcome.as_ref()?.entity;
         let (time, seq, frac) = self.shot_at(now);
-        if self.last_shot.is_some_and(|last| time < last + FIRE_STEPS as u64 * 256) {
+        if self.last_shot.is_some_and(|last| time < last + weapon::of(self.ammo.kit).interval as u64) {
             return None;
         }
         // The rounds as of the shot's step: a reload may be done by then.
@@ -1161,6 +1165,12 @@ impl ClientCore {
     /// The world, once welcomed.
     pub fn world(&self) -> Option<&Arc<World>> {
         self.world.as_ref()
+    }
+
+    /// Our class (`class`): the kit our rounds are for (the server's word,
+    /// from this life's snapshots).
+    pub fn kit(&self) -> u8 {
+        self.ammo.kit
     }
 
     /// Own health from the newest snapshot.

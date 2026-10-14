@@ -50,7 +50,9 @@ use crate::session::dev_token;
 /// 8: turned force volumes (`LtVolume`'s center, halves and axis).
 /// 9: the shell (U4): `lt_deploy`, `lt_shell`, `lt_spawn_options`,
 /// `lt_recap`, `lt_fights`; `LtEvent::value`, deploy and reward events.
-pub const VERSION: u32 = 9;
+/// 10: classes and their weapons (U6): `LtOwn::kit`, `LtEntity::kit`,
+/// `LtFx::kit`, `lt_weapon`.
+pub const VERSION: u32 = 10;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]
@@ -494,6 +496,33 @@ ffi_fns! {
     /// `out` (up to `cap`), returns how many there are.
     fn lt_fights(s: *mut LtSession, out: *mut LtFight, cap: i32) -> i32 {
         with(s, |h| h.fights(slice(out, cap)) as i32)
+    }
+
+    /// Kit `kit`'s weapon (a class's, `LT_CLASS_*`) into `out`; returns 1,
+    /// or 0 for no such kit (`out` is then the assault rifle's).
+    fn lt_weapon(kit: u8, out: *mut LtWeapon) -> i32 {
+        let Some(o) = out.as_mut() else { return 0 };
+        let w = lattice_game::weapon::of(kit);
+        let steps = |n: f32| n / lattice_game::movement::TICK_HZ as f32;
+        *o = LtWeapon {
+            speed: w.speed,
+            interval_secs: steps(w.interval as f32 / 256.0),
+            damage: w.damage,
+            far_damage: w.far_damage,
+            falloff: w.falloff.map(|f| f.min(1e6)),
+            pellets: w.pellets,
+            magazine: w.magazine,
+            reserve: w.reserve,
+            pellet_cone: w.pellet_cone,
+            range_secs: steps(w.range_steps as f32),
+            reload_secs: steps(w.reload_steps as f32),
+            reload_empty_secs: steps(w.reload_empty_steps as f32),
+            cone: w.cone,
+            recoil_up: w.recoil_up,
+            recoil_first: w.recoil_first,
+            recoil_side: w.recoil_side,
+        };
+        (kit < lattice_game::class::CLASSES) as i32
     }
 
     /// The net graph's numbers.

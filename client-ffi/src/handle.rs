@@ -180,7 +180,8 @@ impl Handle {
         let feet = core.own_render(now);
         let eye = [feet[0], feet[1], feet[2] + eye_height(&core.predicted())];
         let step = core.last_shot_step();
-        let fired = self.tracers.fire_own(eye, f.yaw, f.pitch, dir, f.muzzle.into(), step, faction);
+        let kit = core.kit();
+        let fired = self.tracers.fire_own(eye, f.yaw, f.pitch, dir, f.muzzle.into(), step, faction, kit);
         Some(LtShot { dir: dir.into(), muzzle: fired.origin.into(), eye: eye.into() })
     }
 
@@ -220,6 +221,7 @@ impl Handle {
             faction: faction(w.entity),
             life: core.life(),
             crouched: p.crouched as u8,
+            kit: ammo.kit,
             mag: ammo.mag,
             reserve: ammo.reserve,
             reload: ammo.reload as f32 / TICK_HZ as f32,
@@ -253,7 +255,7 @@ impl Handle {
                     },
                     flags,
                     health: st.health,
-                    reserved: 0,
+                    kit: st.kit,
                     pos: st.pos.into(),
                     yaw: st.yaw,
                     pitch: st.pitch,
@@ -298,7 +300,7 @@ impl Handle {
                     | if s.crouched { FLAG_CROUCHED } else { 0 }
                     | if s.reloading { FLAG_RELOADING } else { 0 },
                 health: s.health,
-                reserved: 0,
+                kit: s.kit,
                 pos: s.pos.into(),
                 yaw: s.yaw,
                 pitch: s.pitch,
@@ -362,6 +364,7 @@ impl Handle {
                     faction: t.faction,
                     surface: hit.cover.unwrap_or(SURFACE_TERRAIN),
                     shooter: NOBODY,
+                    kit: 0,
                     reserved: 0,
                     pos: hit.pos.into(),
                     dir: hit.dir.into(),
@@ -630,6 +633,7 @@ fn shot_fx(f: Fired) -> LtFx {
         faction: f.faction,
         surface: 0,
         shooter: f.shooter.unwrap_or(NOBODY),
+        kit: f.kit,
         reserved: 0,
         pos: f.origin.into(),
         dir: f.dir.into(),

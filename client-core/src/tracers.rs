@@ -16,7 +16,7 @@
 
 use lattice_game::events::SeenShot;
 use lattice_game::hit;
-use lattice_game::weapon::{aim, Flight, EYE_HEIGHT, RANGE_STEPS, SUBSTEPS};
+use lattice_game::weapon::{self, aim, Flight, EYE_HEIGHT, RANGE_STEPS, SUBSTEPS};
 use lattice_game::world::World;
 
 use crate::distant::AmbientShot;
@@ -70,6 +70,8 @@ struct OwnShot {
     eye: [f32; 3],
     muzzle: [f32; 3],
     real: bool,
+    /// Its weapon's muzzle speed.
+    speed: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,17 +89,23 @@ pub struct Tracer {
 }
 
 impl Tracer {
+    /// The assault rifle's.
     pub fn new(origin: [f32; 3], dir: [f32; 3], kind: Kind, faction: u8) -> Self {
-        Self { flight: Flight::new(origin, dir), start: origin, age: 0.0, owed: 0.0, kind, faction, own: None }
+        Self::at(origin, dir, weapon::MUZZLE_SPEED, kind, faction)
+    }
+
+    /// At `speed` m/s (its weapon's, `weapon::Weapon::speed`).
+    pub fn at(origin: [f32; 3], dir: [f32; 3], speed: f32, kind: Kind, faction: u8) -> Self {
+        Self { flight: Flight::at(origin, dir, speed), start: origin, age: 0.0, owed: 0.0, kind, faction, own: None }
     }
 
     /// Ours: from `muzzle`, converging on what the eye at `eye` aims at along
     /// `aim_dir` (a direction in the cone of fire), `CONVERGE` out.
-    fn ours(eye: [f32; 3], muzzle: [f32; 3], aim_dir: [f32; 3], faction: u8, own: Option<OwnShot>) -> Self {
+    fn ours(eye: [f32; 3], muzzle: [f32; 3], aim_dir: [f32; 3], faction: u8, own: Option<OwnShot>, speed: f32) -> Self {
         let target = [0, 1, 2].map(|k| eye[k] + aim_dir[k] * CONVERGE);
         let d = [0, 1, 2].map(|k| target[k] - muzzle[k]);
         let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
-        Self { own, ..Self::new(muzzle, d.map(|v| v / len), Kind::Own, faction) }
+        Self { own, ..Self::at(muzzle, d.map(|v| v / len), speed, Kind::Own, faction) }
     }
 
     /// The streak to draw: from its tail (up to `TRAIL` behind the head, no
@@ -190,6 +198,17 @@ pub struct Fired {
     pub origin: [f32; 3],
     pub dir: [f32; 3],
     pub kind: Kind,
+    /// The shooter's weapon's kit (a distant fight's: the assault rifle's).
+    pub kit: u8,
+}
+
+/// A cosmetic pellet's spread: any well-spread bits will do (the server's
+/// picks are secret).
+fn pellet_pick(step: f64, k: u8) -> u64 {
+    let mut h = step.to_bits() ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^ (h >> 33)
 }
 
 impl Tracers {
@@ -207,16 +226,23 @@ impl Tracers {
     }
 
     /// One of our shots, fired from the eye at `eye` along `dir` (in the cone
-    /// of fire) while looking at (`yaw`, `pitch`): its tracer leaves from the
-    /// muzzle `offset` from the eye (meters right, up and forward of the
-    /// view). `step`: when it fired, in the server's steps
-    /// (`ClientCore::last_shot_step`), to re-aim it along the real shot.
+    /// of fire) while looking at (`yaw`, `pitch`) with kit `kit`'s weapon:
+    /// its tracer leaves from the muzzle `offset` from the eye (meters
+    /// right, up and forward of the view); a shotgun's pellets too, each
+    /// its own way (cosmetic: the server's picks are secret). `step`: when
+    /// it fired, in the server's steps (`ClientCore::last_shot_step`), to
+    /// re-aim it along the real shot.
     #[allow(clippy::too_many_arguments)]
-    pub fn fire_own(&mut self, eye: [f32; 3], yaw: f32, pitch: f32, dir: [f32; 3], offset: [f32; 3], step: Option<f64>, faction: u8) -> Fired {
+    pub fn fire_own(&mut self, eye: [f32; 3], yaw: f32, pitch: f32, dir: [f32; 3], offset: [f32; 3], step: Option<f64>, faction: u8, kit: u8) -> Fired {
         let muzzle = muzzle(eye, yaw, pitch, offset);
-        let own = step.map(|step| OwnShot { step, eye, muzzle, real: false });
-        self.push(Tracer::ours(eye, muzzle, dir, faction, own));
-        Fired { shooter: None, faction, origin: muzzle, dir, kind: Kind::Own }
+        let w = weapon::of(kit);
+        let own = step.map(|step| OwnShot { step, eye, muzzle, real: false, speed: w.speed });
+        self.push(Tracer::ours(eye, muzzle, dir, faction, own, w.speed));
+        for k in 1..w.pellets {
+            let d = w.pellet(dir, pellet_pick(step.unwrap_or(0.0), k));
+            self.push(Tracer::ours(eye, muzzle, d, faction, None, w.speed));
+        }
+        Fired { shooter: None, faction, origin: muzzle, dir, kind: Kind::Own, kit }
     }
 
     /// Shots the server says were fired (`ClientCore::drain_news`): ours
@@ -239,7 +265,7 @@ impl Tracers {
             let (yaw, pitch) = (a.dir[1].atan2(a.dir[0]), a.dir[2].clamp(-1.0, 1.0).asin());
             let o = muzzle(a.origin, yaw, pitch, offset);
             self.push(Tracer::new(o, a.dir, Kind::Ambient, a.faction));
-            fired(Fired { shooter: a.shooter, faction: a.faction, origin: o, dir: a.dir, kind: Kind::Ambient });
+            fired(Fired { shooter: a.shooter, faction: a.faction, origin: o, dir: a.dir, kind: Kind::Ambient, kit: 0 });
         }
     }
 
@@ -257,8 +283,12 @@ impl Tracers {
                     let (yaw, pitch) = (shot.yaw as f32 / 65536.0 * std::f32::consts::TAU, shot.pitch as f32 / 32767.0 * std::f32::consts::FRAC_PI_2);
                     let o = muzzle(eye, yaw, pitch, offset);
                     let faction = lattice_game::faction::faction(shot.shooter);
-                    self.push(Tracer::new(o, dir, Kind::Seen, faction));
-                    fired(Fired { shooter: Some(shot.shooter), faction, origin: o, dir, kind: Kind::Seen });
+                    let w = weapon::of(st.kit);
+                    self.push(Tracer::at(o, dir, w.speed, Kind::Seen, faction));
+                    for k in 1..w.pellets {
+                        self.push(Tracer::at(o, w.pellet(dir, pellet_pick(shot.step, k)), w.speed, Kind::Seen, faction));
+                    }
+                    fired(Fired { shooter: Some(shot.shooter), faction, origin: o, dir, kind: Kind::Seen, kit: st.kit });
                     false
                 }
                 _ => secs - *at < PENDING_SECS,
@@ -285,7 +315,7 @@ impl Tracers {
             return;
         };
         let o = t.own.expect("matched an own shot");
-        let mut real = Tracer::ours(o.eye, o.muzzle, aim(shot.yaw, shot.pitch), t.faction, Some(OwnShot { real: true, ..o }));
+        let mut real = Tracer::ours(o.eye, o.muzzle, aim(shot.yaw, shot.pitch), t.faction, Some(OwnShot { real: true, ..o }), o.speed);
         let mut flown = 0.0;
         while flown + SEG <= t.age + 1e-6 {
             let next = real.flight.advance();
@@ -346,7 +376,7 @@ mod tests {
     fn flying(world: &World, segments: u32) -> Tracers {
         let eye = [2000.0, 2000.0, world.terrain(2000.0, 2000.0) + 40.0];
         let mut tracers = Tracers::default();
-        tracers.fire_own(eye, 0.0, 0.0, aim(0, 0), OFFSET, Some(100.0), 0);
+        tracers.fire_own(eye, 0.0, 0.0, aim(0, 0), OFFSET, Some(100.0), 0, 0);
         let t = &mut tracers.flying[0];
         for _ in 0..segments {
             t.flight = t.flight.advance();
@@ -375,7 +405,7 @@ mod tests {
         // Exactly where the real shot's tracer is after as many segments, from
         // the same muzzle.
         let s = shot(0.0, real);
-        let mut want = Tracer::ours(o.eye, o.muzzle, aim(s.yaw, s.pitch), 0, None);
+        let mut want = Tracer::ours(o.eye, o.muzzle, aim(s.yaw, s.pitch), 0, None, weapon::MUZZLE_SPEED);
         for _ in 0..6 {
             want.flight = want.flight.advance();
         }

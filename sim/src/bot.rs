@@ -36,6 +36,9 @@ pub struct BotBrain {
     reliable: Vec<Vec<u8>>,
     /// Calls it's been dead (or bodiless) and not deploying, for `deploy`.
     dead_steps: u32,
+    /// The class it deploys as (None: one by its seed, so a swarm's spread
+    /// over them).
+    kit: Option<u8>,
 }
 
 /// A dead bot asks to deploy this long after it fell (steps), and again
@@ -77,7 +80,13 @@ impl BotBrain {
             seed,
             reliable: Vec::new(),
             dead_steps: 0,
+            kit: None,
         }
+    }
+
+    /// Deploys as class `kit` (`class`).
+    pub fn set_kit(&mut self, kit: u8) {
+        self.kit = Some(kit);
     }
 
     /// The next message for the reliable channel, if any.
@@ -121,7 +130,8 @@ impl BotBrain {
             return;
         }
         let site = options[(self.ai.rng.next_u64() % options.len() as u64) as usize].1;
-        if let Some(m) = self.core.deploy(site as u16, 0) {
+        let kit = self.kit.unwrap_or((self.seed % lattice_game::class::CLASSES as u64) as u8);
+        if let Some(m) = self.core.deploy(site as u16, kit) {
             self.reliable.push(m);
         }
     }
@@ -557,7 +567,7 @@ struct Fighter {
 /// carries it.
 pub fn aim_at(core: &ClientCore, target: u16, r: f64, head: bool, extra_lead: f32) -> Option<(u16, i16)> {
     use lattice_game::hit::{BODY_HIGH, BODY_LOW, CROUCH_BODY_HIGH, CROUCH_HEAD_AT, HEAD_AT};
-    use lattice_game::weapon::{eye_height, GRAVITY, MUZZLE_SPEED};
+    use lattice_game::weapon::{eye_height, GRAVITY};
     let ents = core.entities()?;
     let (st, was) = (ents.render_one(target, r)?, ents.render_one(target, r - 0.5)?);
     if st.dead {
@@ -574,7 +584,7 @@ pub fn aim_at(core: &ClientCore, target: u16, r: f64, head: bool, extra_lead: f3
             (false, false) => (BODY_LOW + BODY_HIGH) / 2.0,
             (false, true) => (BODY_LOW + CROUCH_BODY_HIGH) / 2.0,
         };
-    let flight = ((st.pos[0] - eye[0]).powi(2) + (st.pos[1] - eye[1]).powi(2)).sqrt() / MUZZLE_SPEED;
+    let flight = ((st.pos[0] - eye[0]).powi(2) + (st.pos[1] - eye[1]).powi(2)).sqrt() / lattice_game::weapon::of(core.kit()).speed;
     let lead = flight + extra_lead / tick_hz;
     let p = [st.pos[0] + vel[0] * lead, st.pos[1] + vel[1] * lead, at + 0.5 * GRAVITY * flight * flight];
     let d = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];

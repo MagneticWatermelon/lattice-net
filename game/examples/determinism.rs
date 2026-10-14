@@ -318,7 +318,7 @@ fn main() {
                 let mut s = MoveState::standing(&world, at);
                 s.vel = [rng.unit() * 12.0 - 6.0, rng.unit() * 12.0 - 6.0];
                 s.crouched = rng.below(3) == 0;
-                let q = NearQ::new(&s, rng.next() as u16, (rng.below(60000) as i32 - 30000) as i16, rng.below(101) as u8, rng.below(2) == 0, rng.below(4) == 0);
+                let q = NearQ::new(&s, rng.next() as u16, (rng.below(60000) as i32 - 30000) as i16, rng.below(101) as u8, rng.below(2) == 0, rng.below(4) == 0, rng.below(5) as u8);
                 let base = (tick > 0 && e % 2 == 0).then(|| hist.get(e, tick - 1).map(|b| (1u8, b))).flatten();
                 NearEntry { entity: e, state: q, base }
             })
@@ -337,7 +337,7 @@ fn main() {
         .expect("decodes");
         for e in 0..10u16 {
             let s = MoveState { crouched: e % 3 == 0, ..MoveState::standing(&world, [rng.unit() * 8190.0, rng.unit() * 8190.0]) };
-            let blob = msg::encode_blob(e, &s, rng.next() as u16, (rng.below(60000) as i32 - 30000) as i16, rng.below(101) as u8);
+            let blob = msg::encode_blob(e, &s, rng.next() as u16, (rng.below(60000) as i32 - 30000) as i16, rng.below(101) as u8, rng.below(5) as u8);
             let b = msg::decode_blob(&blob).expect("decodes");
             for v in [b.pos[0], b.pos[1], b.z, b.yaw, b.pitch] {
                 h.f32(v);

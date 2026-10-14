@@ -1,6 +1,8 @@
-//! The rifle, and how its projectiles fly. The server simulates every
-//! projectile with this; the client flies its cosmetic tracers with it, so
-//! both draw the same arc.
+//! The weapons (GDD §4.5; a class's own, U6: `class`), and how their
+//! projectiles fly. The server simulates every projectile with this; the
+//! client flies its cosmetic tracers with it, so both draw the same arc.
+//! The assault rifle's numbers are the module's constants (it came first,
+//! and the load baselines are fought with it); the rest are `WEAPONS`'.
 //!
 //! Accuracy follows PlanetSide 2's model (an assault rifle's numbers): a
 //! shot leaves somewhere in a *cone of fire*, tight aiming down sights, wide
@@ -81,23 +83,204 @@ pub const BURST_GAP: f32 = 0.35;
 pub const ADS_SPEED: f32 = 0.5;
 pub const ADS_ZOOM: f32 = 1.35;
 
+/// A weapon's numbers (GDD §4.5, all to tune). Each class carries one
+/// (`class`); its kit is its index in `WEAPONS`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Weapon {
+    pub name: &'static str,
+    /// Muzzle speed, m/s.
+    pub speed: f32,
+    /// Time between shots, in 1/256 steps (a step is 1/30 s): 768 is 10 a second.
+    pub interval: u32,
+    /// Damage to the body and to the head up close, and at `falloff[1]` and
+    /// beyond; between `falloff[0]` and `falloff[1]` (m from the muzzle) it
+    /// falls in a line.
+    pub damage: [u8; 2],
+    pub far_damage: [u8; 2],
+    pub falloff: [f32; 2],
+    /// Projectiles a shot fires (a shotgun's pellets), spread over a cone of
+    /// this many degrees round the shot's own direction.
+    pub pellets: u8,
+    pub pellet_cone: f32,
+    /// Steps a projectile flies.
+    pub range_steps: u32,
+    pub magazine: u8,
+    pub reserve: u16,
+    pub reload_steps: u8,
+    pub reload_empty_steps: u8,
+    /// The cone of fire, degrees: down the sights standing and moving, from
+    /// the hip standing and moving (`Bloom::cone`).
+    pub cone: [f32; 4],
+    /// Bloom a shot, down the sights and from the hip; and its most.
+    pub bloom: [f32; 2],
+    pub bloom_max: [f32; 2],
+    /// Recoil (the client's view): up a shot, the first of a burst this many
+    /// times as much, sideways within these.
+    pub recoil_up: f32,
+    pub recoil_first: f32,
+    pub recoil_side: [f32; 2],
+}
+
+/// The weapons, by kit (`class`): the assault rifle, the carbine, the
+/// shotgun, the marksman rifle, the SMG.
+pub const WEAPONS: [Weapon; 5] = [
+    Weapon {
+        name: "assault rifle",
+        speed: MUZZLE_SPEED,
+        interval: FIRE_STEPS * 256,
+        damage: [DAMAGE_BODY, DAMAGE_HEAD],
+        far_damage: [DAMAGE_BODY, DAMAGE_HEAD],
+        falloff: [f32::MAX, f32::MAX],
+        pellets: 1,
+        pellet_cone: 0.0,
+        range_steps: RANGE_STEPS,
+        magazine: MAGAZINE,
+        reserve: RESERVE,
+        reload_steps: RELOAD_STEPS,
+        reload_empty_steps: RELOAD_EMPTY_STEPS,
+        cone: [CONE_ADS, CONE_ADS_MOVING, CONE_HIP, CONE_HIP_MOVING],
+        bloom: [BLOOM_ADS, BLOOM_HIP],
+        bloom_max: [BLOOM_MAX_ADS, BLOOM_MAX_HIP],
+        recoil_up: RECOIL_UP,
+        recoil_first: RECOIL_FIRST,
+        recoil_side: RECOIL_SIDE,
+    },
+    // The medic's: quicker, lighter, falling off past 10 m.
+    Weapon {
+        name: "carbine",
+        speed: 550.0,
+        interval: 640,
+        damage: [18, 36],
+        far_damage: [12, 24],
+        falloff: [10.0, 50.0],
+        pellets: 1,
+        pellet_cone: 0.0,
+        range_steps: 50,
+        magazine: 30,
+        reserve: 210,
+        reload_steps: 60,
+        reload_empty_steps: 75,
+        cone: [0.15, 0.45, 1.75, 2.4],
+        bloom: [0.05, 0.12],
+        bloom_max: [0.55, 1.6],
+        recoil_up: 0.28,
+        recoil_first: 1.6,
+        recoil_side: [-0.18, 0.2],
+    },
+    // The engineer's: eight pellets, a kill up close, little past 30 m.
+    Weapon {
+        name: "shotgun",
+        speed: 350.0,
+        interval: 20 * 256,
+        damage: [14, 20],
+        far_damage: [4, 6],
+        falloff: [8.0, 30.0],
+        pellets: 8,
+        pellet_cone: 3.0,
+        range_steps: 25,
+        magazine: 6,
+        reserve: 36,
+        reload_steps: 90,
+        reload_empty_steps: 108,
+        cone: [0.6, 1.0, 1.5, 2.0],
+        bloom: [0.3, 0.5],
+        bloom_max: [1.0, 1.5],
+        recoil_up: 2.2,
+        recoil_first: 1.0,
+        recoil_side: [-0.5, 0.6],
+    },
+    // The recon's: four a second, three to the body or a head and a body.
+    Weapon {
+        name: "marksman rifle",
+        speed: 750.0,
+        interval: 1920,
+        damage: [34, 68],
+        far_damage: [34, 68],
+        falloff: [f32::MAX, f32::MAX],
+        pellets: 1,
+        pellet_cone: 0.0,
+        range_steps: 70,
+        magazine: 12,
+        reserve: 72,
+        reload_steps: 75,
+        reload_empty_steps: 90,
+        cone: [0.02, 0.6, 3.0, 4.0],
+        bloom: [0.15, 0.4],
+        bloom_max: [0.6, 2.0],
+        recoil_up: 1.1,
+        recoil_first: 1.0,
+        recoil_side: [-0.12, 0.14],
+    },
+    // The skirmisher's: fifteen a second, good from the hip, weak past 25 m.
+    Weapon {
+        name: "SMG",
+        speed: 400.0,
+        interval: 512,
+        damage: [15, 30],
+        far_damage: [8, 16],
+        falloff: [10.0, 25.0],
+        pellets: 1,
+        pellet_cone: 0.0,
+        range_steps: 35,
+        magazine: 40,
+        reserve: 240,
+        reload_steps: 54,
+        reload_empty_steps: 66,
+        cone: [0.3, 0.5, 1.25, 1.75],
+        bloom: [0.05, 0.08],
+        bloom_max: [0.6, 1.2],
+        recoil_up: 0.22,
+        recoil_first: 1.4,
+        recoil_side: [-0.2, 0.25],
+    },
+];
+
+/// The weapon of kit `kit` (an unknown kit: the assault rifle's).
+pub fn of(kit: u8) -> &'static Weapon {
+    WEAPONS.get(kit as usize).unwrap_or(&WEAPONS[0])
+}
+
+impl Weapon {
+    /// A hit's damage `dist` m from the muzzle, to the head or not.
+    pub fn damage_at(&self, dist: f32, head: bool) -> u8 {
+        let h = head as usize;
+        let t = ((dist - self.falloff[0]) / (self.falloff[1] - self.falloff[0]).max(1e-3)).clamp(0.0, 1.0);
+        let (near, far) = (self.damage[h] as f32, self.far_damage[h] as f32);
+        libm::roundf(near + (far - near) * t) as u8
+    }
+
+    /// Where pellet `k` of a shot along `dir` goes (`pick`: its own random
+    /// bits), within `pellet_cone`.
+    pub fn pellet(&self, dir: [f32; 3], pick: u64) -> [f32; 3] {
+        let (yaw, pitch) = angles(dir);
+        spread(yaw, pitch, self.pellet_cone, pick)
+    }
+}
+
 /// A shooter's bloom. The server keeps one per player and the client one
 /// for its own shots; fed the same shots in the same order, they give the
-/// same cones.
+/// same cones. With its weapon's kit.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Bloom {
     deg: f32,
     /// The last shot (`shot_time`).
     last: Option<u64>,
+    pub kit: u8,
 }
 
 impl Bloom {
+    /// Fresh, for kit `kit`'s weapon.
+    pub fn with_kit(kit: u8) -> Self {
+        Self { kit, ..Self::default() }
+    }
+
     /// The cone (degrees) of a shot at `time` (`shot_time`), aiming down
     /// sights or not, from `state` (the shooter before its step); then the
     /// shot blooms the next one.
     pub fn fire(&mut self, time: u64, ads: bool, state: &MoveState) -> f32 {
         let cone = self.cone(time, ads, state);
-        let (add, max) = if ads { (BLOOM_ADS, BLOOM_MAX_ADS) } else { (BLOOM_HIP, BLOOM_MAX_HIP) };
+        let w = of(self.kit);
+        let (add, max) = if ads { (w.bloom[0], w.bloom_max[0]) } else { (w.bloom[1], w.bloom_max[1]) };
         self.deg = (self.recovered(time) + add).min(max);
         self.last = Some(time);
         cone
@@ -106,11 +289,12 @@ impl Bloom {
     /// The cone a shot at `time` would have (the crosshair shows it).
     pub fn cone(&self, time: u64, ads: bool, state: &MoveState) -> f32 {
         let speed = (state.vel[0] * state.vel[0] + state.vel[1] * state.vel[1]).sqrt();
+        let c = of(self.kit).cone;
         let base = match (ads, speed > MOVING) {
-            (true, false) => CONE_ADS,
-            (true, true) => CONE_ADS_MOVING,
-            (false, false) => CONE_HIP,
-            (false, true) => CONE_HIP_MOVING,
+            (true, false) => c[0],
+            (true, true) => c[1],
+            (false, false) => c[2],
+            (false, true) => c[3],
         };
         let stance = if !state.grounded {
             CONE_AIR
@@ -198,15 +382,16 @@ pub fn muzzle(before: &MoveState, after: &MoveState, frac: u8) -> [f32; 3] {
     [l(before.pos[0], after.pos[0]), l(before.pos[1], after.pos[1]), l(before.z, after.z) + l(eye_height(before), eye_height(after))]
 }
 
-/// The rifle's rounds: a magazine, a reserve, and a reload under way. Both
-/// sides run it on each input's step in the same order (`step`): the
-/// counts are part of the prediction, like movement.
+/// A weapon's rounds: a magazine, a reserve, and a reload under way, and
+/// whose (the kit: `of`). Both sides run it on each input's step in the
+/// same order (`step`): the counts are part of the prediction, like movement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ammo {
     pub mag: u8,
     pub reserve: u16,
     /// Steps until the reload under way is done; 0: none.
     pub reload: u8,
+    pub kit: u8,
 }
 
 impl Default for Ammo {
@@ -216,8 +401,14 @@ impl Default for Ammo {
 }
 
 impl Ammo {
-    /// As a player spawns.
-    pub const FULL: Ammo = Ammo { mag: MAGAZINE, reserve: RESERVE, reload: 0 };
+    /// As a player spawns with the assault rifle.
+    pub const FULL: Ammo = Ammo { mag: MAGAZINE, reserve: RESERVE, reload: 0, kit: 0 };
+
+    /// As a player spawns with kit `kit`'s weapon.
+    pub fn full(kit: u8) -> Ammo {
+        let w = of(kit);
+        Ammo { mag: w.magazine, reserve: w.reserve, reload: 0, kit }
+    }
 
     /// One input's step: the reload counts down (and, done, fills the
     /// magazine from the reserve); a shot in the step fires if a round is
@@ -240,7 +431,8 @@ impl Ammo {
         if self.reload > 0 {
             self.reload -= 1;
             if self.reload == 0 {
-                let take = (MAGAZINE - self.mag).min(self.reserve.min(MAGAZINE as u16) as u8);
+                let m = of(self.kit).magazine;
+                let take = (m - self.mag).min(self.reserve.min(m as u16) as u8);
                 self.mag += take;
                 self.reserve -= take as u16;
             }
@@ -256,7 +448,7 @@ impl Ammo {
     /// a round ready: a reload under way may be done by then.
     pub fn ready_in(&self, steps: u32) -> bool {
         let mut a = *self;
-        for _ in 0..steps.min(RELOAD_EMPTY_STEPS as u32 + 1) {
+        for _ in 0..steps.min(of(self.kit).reload_empty_steps as u32 + 1) {
             a.tick();
         }
         a.ready()
@@ -273,8 +465,9 @@ impl Ammo {
     /// Starts a reload, unless the magazine is full, the reserve empty, or
     /// one is under way.
     pub fn start_reload(&mut self) {
-        if self.reload == 0 && self.mag < MAGAZINE && self.reserve > 0 {
-            self.reload = if self.mag == 0 { RELOAD_EMPTY_STEPS } else { RELOAD_STEPS };
+        let w = of(self.kit);
+        if self.reload == 0 && self.mag < w.magazine && self.reserve > 0 {
+            self.reload = if self.mag == 0 { w.reload_empty_steps } else { w.reload_steps };
         }
     }
 }
@@ -288,8 +481,14 @@ pub struct Flight {
 }
 
 impl Flight {
+    /// The assault rifle's.
     pub fn new(origin: [f32; 3], dir: [f32; 3]) -> Self {
-        Self { pos: origin, vel: dir.map(|d| d * MUZZLE_SPEED) }
+        Self::at(origin, dir, MUZZLE_SPEED)
+    }
+
+    /// At `speed` m/s.
+    pub fn at(origin: [f32; 3], dir: [f32; 3], speed: f32) -> Self {
+        Self { pos: origin, vel: dir.map(|d| d * speed) }
     }
 
     /// One segment: 1 / (`SUBSTEPS` × 30) s, semi-implicit Euler.
@@ -409,13 +608,43 @@ mod tests {
         // A full magazine doesn't reload; an empty reserve can't.
         a.step(BUTTON_RELOAD, false);
         assert_eq!(a.reload, 0);
-        let mut dry = Ammo { mag: 2, reserve: 0, reload: 0 };
+        let mut dry = Ammo { mag: 2, reserve: 0, reload: 0, kit: 0 };
         assert!(dry.step(0, true) && dry.step(0, true) && !dry.step(0, true));
         assert_eq!((dry.mag, dry.reload), (0, 0), "nothing to reload with");
         // The last rounds of the reserve: a partial magazine.
-        let mut low = Ammo { mag: 0, reserve: 7, reload: 1 };
+        let mut low = Ammo { mag: 0, reserve: 7, reload: 1, kit: 0 };
         low.tick();
         assert_eq!((low.mag, low.reserve), (7, 0));
+    }
+
+    #[test]
+    fn every_weapon_kills_and_the_shotgun_up_close() {
+        for (k, w) in WEAPONS.iter().enumerate() {
+            let k = k as u8;
+            // Kill in under a second up close, at its rate, from a full magazine.
+            let hits = 100u32.div_ceil(w.damage_at(0.0, false) as u32 * w.pellets as u32);
+            let secs = (hits - 1) as f32 * w.interval as f32 / 256.0 / 30.0;
+            assert!(secs < 0.8 && hits <= w.magazine as u32, "{}: {hits} shots, {secs:.2} s", w.name);
+            assert!(w.damage_at(1000.0, true) == w.far_damage[1] && w.damage_at(0.0, true) == w.damage[1]);
+            let mut a = Ammo::full(k);
+            for _ in 0..w.magazine {
+                assert!(a.step(0, true), "{}", w.name);
+            }
+            assert_eq!(a.reload, w.reload_empty_steps, "{}: empty, a reload", w.name);
+        }
+        let sg = &WEAPONS[2];
+        assert!(sg.damage_at(5.0, false) as u32 * sg.pellets as u32 >= 100, "a shotgun kills up close");
+        assert!((sg.damage_at(19.0, false) as f32 - 9.0).abs() <= 1.0, "halfway between 14 and 4");
+        // Pellets: within the cone round the shot, each its own.
+        let d = aim(1000, 300);
+        let mut x = 7u64;
+        for _ in 0..200 {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let p = sg.pellet(d, x);
+            let angle = libm::acosf((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]).clamp(-1.0, 1.0)).to_degrees();
+            assert!(angle <= sg.pellet_cone + 0.05, "{angle}");
+        }
+        assert_eq!(of(99).name, "assault rifle");
     }
 
     #[test]

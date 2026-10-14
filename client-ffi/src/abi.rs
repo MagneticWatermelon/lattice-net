@@ -132,6 +132,8 @@ ffi_structs! {
         pub life: u8,
         /// Crouching (predicted, like the position).
         pub crouched: u8,
+        /// Our class (`LT_CLASS_*`, U6): our weapon (`lt_weapon`), this life's.
+        pub kit: u8,
         /// The rifle's rounds (predicted): in the magazine, and carried.
         pub mag: u8,
         pub reserve: u16,
@@ -150,7 +152,8 @@ ffi_structs! {
         /// `LT_FLAG_*`: airborne, dead, aiming down sights, crouched, reloading.
         pub flags: u8,
         pub health: u8,
-        pub reserved: u8,
+        /// Its class (`LT_CLASS_*`, U6): its weapon and its look.
+        pub kit: u8,
         /// The feet.
         pub pos: LtVec3,
         pub yaw: f32,
@@ -243,6 +246,39 @@ ffi_structs! {
         pub heads: [u8; 8],
     }
 
+    /// A weapon's numbers (`lt_weapon`; GDD §4.5): what the HUD, the sounds
+    /// and the view's recoil follow.
+    pub struct LtWeapon {
+        /// Muzzle speed, m/s.
+        pub speed: f32,
+        /// Seconds between shots.
+        pub interval_secs: f32,
+        /// Damage to the body and the head up close, and from `falloff[1]` m
+        /// on (in a line between `falloff[0]` and `falloff[1]`).
+        pub damage: [u8; 2],
+        pub far_damage: [u8; 2],
+        pub falloff: [f32; 2],
+        /// Projectiles a shot fires (a shotgun's pellets), over a cone this
+        /// many degrees round the shot.
+        pub pellets: u8,
+        pub magazine: u8,
+        pub reserve: u16,
+        pub pellet_cone: f32,
+        /// How long a projectile flies, s.
+        pub range_secs: f32,
+        /// A reload, and from empty, s.
+        pub reload_secs: f32,
+        pub reload_empty_secs: f32,
+        /// The cone of fire, degrees: down the sights standing and moving,
+        /// from the hip standing and moving.
+        pub cone: [f32; 4],
+        /// Recoil on the view: up a shot, the first of a burst this many times
+        /// as much, sideways within these (degrees; positive: right).
+        pub recoil_up: f32,
+        pub recoil_first: f32,
+        pub recoil_side: [f32; 2],
+    }
+
     /// A site's fight (`lt_fights`).
     pub struct LtFight {
         pub site: u16,
@@ -263,7 +299,9 @@ ffi_structs! {
         pub surface: u8,
         /// The shooter, or `LT_NOBODY`.
         pub shooter: u16,
-        pub reserved: u16,
+        /// Shots: the shooter's weapon (its kit; a distant fight's, 0).
+        pub kit: u8,
+        pub reserved: u8,
         /// Shots: the muzzle; impacts: the point hit.
         pub pos: LtVec3,
         /// The shot's direction (at impact, the flight's).
@@ -569,8 +607,14 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_REFUSED_CONTESTED", lattice_game::territory::REFUSED_CONTESTED as i64, "Its meter is past halfway to an attacker."),
     ("LT_REFUSED_ALIVE", lattice_game::territory::REFUSED_ALIVE as i64, "We're alive: only the dead and the bodiless deploy."),
     ("LT_REFUSED_INVALID", lattice_game::territory::REFUSED_INVALID as i64, "Not a site, or the server doesn't deploy."),
-    ("LT_CAUSE_RIFLE", lattice_game::events::CAUSE_RIFLE as i64, "Killed by the rifle."),
+    ("LT_CAUSE_RIFLE", lattice_game::events::CAUSE_RIFLE as i64, "Killed by the assault rifle (any other weapon: its kit)."),
     ("LT_CAUSE_FALL", lattice_game::events::CAUSE_FALL as i64, "Killed by a fall."),
+    ("LT_CLASS_ASSAULT", lattice_game::class::ASSAULT as i64, "The assault: the assault rifle (U6)."),
+    ("LT_CLASS_MEDIC", lattice_game::class::MEDIC as i64, "The medic: the carbine."),
+    ("LT_CLASS_ENGINEER", lattice_game::class::ENGINEER as i64, "The engineer: the shotgun."),
+    ("LT_CLASS_RECON", lattice_game::class::RECON as i64, "The recon: the marksman rifle."),
+    ("LT_CLASS_SKIRMISHER", lattice_game::class::SKIRMISHER as i64, "The skirmisher: the SMG."),
+    ("LT_CLASSES", lattice_game::class::CLASSES as i64, "How many classes there are."),
     ("LT_EVENT_HEAD", 1, "A head shot."),
     ("LT_EVENT_KILLED", 2, "The hit killed."),
     ("LT_FX_SHOT", 1, "A shooter drawn firing: a muzzle flash and a shot's sound at `pos`."),
@@ -746,6 +790,7 @@ mod tests {
         assert_eq!(size("LtIntent"), 20);
         assert_eq!(size("LtEntity"), 40);
         assert_eq!(size("LtEvent"), 12);
+        assert_eq!(size("LtWeapon"), 72);
         assert_eq!(size("LtShell"), 36);
         assert_eq!(size("LtRecap"), 60);
         assert_eq!(size("LtFight"), 6);

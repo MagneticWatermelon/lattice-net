@@ -34,7 +34,7 @@ use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearS
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, BUTTON_RELOAD, GRACE_TICKS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
 use crate::shots::{self, ClockRate, Cut, Dips, Fire, FlyStats, History, Judgment, Outcome, Projectile, RenderFloor, Sky, SpreadKey};
-use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot, DAMAGE_BODY, DAMAGE_HEAD, FIRE_STEPS};
+use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot};
 use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::events::{self, Event};
 use lattice_game::faction::{faction, FACTIONS, MAX_HEALTH, RESPAWN_STEPS};
@@ -453,8 +453,10 @@ struct Body {
     /// No body (`SimConfig::deploy`): not yet deployed, or gone from its
     /// corpse. Dead too; in no grid, so no one sees it or counts it.
     away: bool,
-    /// Deploying: at which site, and the step it appears there.
-    deploy: Option<(u16, u32)>,
+    /// Deploying: at which site, the step it appears there, and as what (its kit).
+    deploy: Option<(u16, u32, u8)>,
+    /// Its class (`class`): its weapon, what others see.
+    kit: u8,
     /// When it last died, and the site whose region it fell in (lattice
     /// transit counts lanes from there; none: never deployed).
     died_at: u32,
@@ -484,6 +486,7 @@ impl Default for Body {
             contacts: [(NO_CONTACT, 0); CONTACTS],
             away: false,
             deploy: None,
+            kit: 0,
             died_at: 0,
             died_in: None,
         }
@@ -955,7 +958,8 @@ impl InputQueue {
     #[allow(clippy::too_many_arguments)]
     fn fire(&mut self, e: u16, seq: u32, shot: Shot, held: Option<Held>, render: Option<RenderTime>, late: bool, ads: bool) {
         let time = shot_time(seq, shot.frac);
-        if self.last_shot.is_some_and(|last| time < last + FIRE_STEPS as u64 * 256) {
+        let w = weapon::of(self.ammo.kit);
+        if self.last_shot.is_some_and(|last| time < last + w.interval as u64) {
             self.refused += 1;
             return;
         }
@@ -970,8 +974,9 @@ impl InputQueue {
         self.ammo.fire();
         self.last_shot = Some(time);
         let cone = if self.cone { self.bloom.fire(time, ads, &before) } else { 0.0 };
-        let pick = self.spread.as_ref().map_or(0, |(key, spawn)| key.pick(*spawn, seq));
-        let dir = weapon::spread(shot.yaw, shot.pitch, cone, pick);
+        let picks = |round: u8| self.spread.as_ref().map_or([0; 4], |(key, spawn)| key.picks(*spawn, seq, round));
+        let first = picks(0);
+        let dir = weapon::spread(shot.yaw, shot.pitch, cone, first[0]);
         let (yaw, pitch) = weapon::angles(dir);
         let tau0 = step_no as f64 - 1.0 + shot.frac as f64 / 256.0;
         let mid_lag = render.map_or(0.0, |r| r.mid_lag as f64 / MID_LAG_UNITS);
@@ -980,7 +985,7 @@ impl InputQueue {
             Some((h, moved)) => ([tau0 - h[0], tau0 - h[1]], moved),
             None => ([near, near + mid_lag], 0.0),
         };
-        self.fires.push(Fire {
+        let fire = Fire {
             shooter: e,
             seq,
             origin: weapon::muzzle(&before, &after, shot.frac),
@@ -1001,7 +1006,25 @@ impl InputQueue {
             } else {
                 0.0
             },
-        });
+            kit: self.ammo.kit,
+            pellet: 0,
+        };
+        if w.pellets <= 1 {
+            self.fires.push(fire);
+            return;
+        }
+        // A shotgun: its pellets spread round the shot, each by a pick of its own.
+        let more = picks(1);
+        for k in 0..w.pellets {
+            let pick = match k {
+                0..=2 => first[k as usize + 1],
+                3..=6 => more[k as usize - 3],
+                _ => more[3] ^ first[0].rotate_left(17),
+            };
+            let d = w.pellet(dir, pick);
+            let (yaw, pitch) = weapon::angles(d);
+            self.fires.push(Fire { dir: d, yaw, pitch, pellet: k, ..fire });
+        }
     }
 
     fn consume(&mut self, seq: u32, stand_in: bool) {
@@ -1126,6 +1149,8 @@ struct Ended {
     outcome: Outcome,
     at: [f32; 3],
     after_cover: bool,
+    kit: u8,
+    origin: [f32; 3],
 }
 
 /// How far player `i` at `p`, feet at `z`, is pushed this tick by player `j`
@@ -1837,10 +1862,10 @@ impl SimServer {
             .filter(|(_, (_, b))| b.alive)
             .for_each(|(i, ((near, far), b))| {
                 let e = i as u16;
-                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health, b.ads, b.reloading);
+                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health, b.ads, b.reloading, b.kit);
                 let prev = tick.wrapping_sub(1);
                 if due(e, tick, mid_period) || due(e, tick, far_period) || due(e, prev, far_period) {
-                    *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch, b.health);
+                    *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch, b.health, b.kit);
                 }
             });
         lap(7);
@@ -1977,7 +2002,8 @@ impl SimServer {
     fn shots_phase(&mut self) -> Span {
         let fires = std::mem::take(&mut self.fires);
         self.tick_shots.clear();
-        self.tick_shots.extend(fires.iter().map(|f| (f.shooter, f.yaw, f.pitch, f.tau0)));
+        // (A shot once, however many pellets: others draw a shotgun's own.)
+        self.tick_shots.extend(fires.iter().filter(|f| f.pellet == 0).map(|f| (f.shooter, f.yaw, f.pitch, f.tau0)));
         self.tick_shots.sort_unstable_by_key(|s| s.0);
         // The latest a recent tick sent: what a shooter drew from was up to
         // that much older than its RTT alone says.
@@ -2004,7 +2030,9 @@ impl SimServer {
             .collect();
         self.next_projectile += fires.len() as u64;
         for (f, (p, cut)) in fires.iter().zip(made) {
-            self.activity.add(f.shooter, f.origin, f.yaw);
+            if f.pellet == 0 {
+                self.activity.add(f.shooter, f.origin, f.yaw);
+            }
             if let Some(i) = region_at(&self.regions, [f.origin[0], f.origin[1]]) {
                 self.site_shots[i] += 1;
             }
@@ -2013,6 +2041,9 @@ impl SimServer {
             }
             self.fired.push_back((f.shooter, f.seq, f.dir));
             self.projectiles.push(p);
+            if f.pellet > 0 {
+                continue; // (a shot's pellets: counted once)
+            }
             self.counters.shots += 1;
             self.counters.shots_late += f.late as u64;
             self.counters.rewinds_capped += cut.capped as u64;
@@ -2056,7 +2087,7 @@ impl SimServer {
                 for (i, p) in chunk.iter_mut().enumerate() {
                     if let Some((outcome, at)) = shots::fly(p, until, &sky, &mut st) {
                         let after_cover = matches!(outcome, Outcome::Player { target, .. } if !in_sight(world, owners, live, history, p.shooter, target));
-                        ends.push(Ended { id: p.id, index: c * 64 + i, shooter: p.shooter, outcome, at, after_cover });
+                        ends.push(Ended { id: p.id, index: c * 64 + i, shooter: p.shooter, outcome, at, after_cover, kit: p.kit, origin: p.origin });
                     }
                 }
                 (ends, st, t.elapsed())
@@ -2079,17 +2110,18 @@ impl SimServer {
         }
         // Apply in projectile order, so the outcome doesn't depend on threads.
         ended.sort_unstable_by_key(|e| e.id);
-        for Ended { shooter, outcome, at, after_cover, .. } in ended {
+        for Ended { shooter, outcome, at, after_cover, kit, origin, .. } in ended {
             match outcome {
                 Outcome::Ground => self.counters.hits_ground += 1,
                 Outcome::Cover => self.counters.hits_cover += 1,
                 Outcome::Expired => self.counters.expired += 1,
                 Outcome::Player { target, head, rewind, life } => {
-                    let full = if head { DAMAGE_HEAD } else { DAMAGE_BODY };
+                    let dist = ((at[0] - origin[0]).powi(2) + (at[1] - origin[1]).powi(2) + (at[2] - origin[2]).powi(2)).sqrt();
+                    let full = weapon::of(kit).damage_at(dist, head);
                     // The shooter saw it alive, in the life it hit; if it has
                     // died (or respawned) since, no damage.
                     let same_life = self.bodies[target as usize].life == life;
-                    let (damage, killed) = match same_life.then(|| self.hurt(target, full, shooter, head, events::CAUSE_RIFLE)).flatten() {
+                    let (damage, killed) = match same_life.then(|| self.hurt(target, full, shooter, head, kit)).flatten() {
                         Some(killed) => (full, killed),
                         None => (0, false),
                     };
@@ -2331,7 +2363,7 @@ impl SimServer {
     /// where it died; else it's told why not.
     fn request_deploy(&mut self, client: ClientId, data: &[u8]) {
         let Some(&e) = self.by_client.get(&client) else { return };
-        let Ok((site, _kit)) = msg::decode_deploy(data) else {
+        let Ok((site, kit)) = msg::decode_deploy(data) else {
             self.counters.bad_messages += 1;
             return;
         };
@@ -2351,7 +2383,7 @@ impl SimServer {
         }
         let at = self.step + self.territory.transit_steps(b.died_in.map(|r| r as usize), site as usize);
         let b = &mut self.bodies[e as usize];
-        b.deploy = Some((site, at));
+        b.deploy = Some((site, at, lattice_game::class::valid(kit)));
         b.away = true;
         self.outbox.push((e, Event::Deploying { site, at }));
     }
@@ -2370,7 +2402,7 @@ impl SimServer {
             if b.dead() && !b.away && step_no >= b.died_at + CORPSE_STEPS {
                 b.away = true;
             }
-            let Some((site, _)) = b.deploy.filter(|&(_, at)| at <= step_no) else { continue };
+            let Some((site, _, kit)) = b.deploy.filter(|&(_, at, _)| at <= step_no) else { continue };
             if budget == 0 {
                 self.counters.deploys_waited += 1;
                 continue;
@@ -2388,10 +2420,10 @@ impl SimServer {
             let b = &mut self.bodies[e];
             b.state = MoveState::standing_at(&self.world, p, spot[2]);
             (b.health, b.respawn_at, b.life, b.reloading, b.away, b.deploy) = (MAX_HEALTH, None, b.life.wrapping_add(1), false, false, None);
-            (b.anchor, b.radius) = (p, 30.0);
+            (b.anchor, b.radius, b.kit) = (p, 30.0, kit);
             self.damage_log[e].clear();
             let q = self.inputs[e].get_mut().unwrap();
-            q.ammo = Ammo::FULL;
+            (q.ammo, q.bloom) = (Ammo::full(kit), Bloom::with_kit(kit));
             q.session.deploys += 1;
             self.counters.deploys += 1;
         }
@@ -2422,6 +2454,17 @@ impl SimServer {
         self.reliable_out.resize_with(self.shard_count(), Vec::new);
         for client in self.client_of.iter().flatten() {
             self.reliable_out[self.net.shard_of_client(*client)].push((*client, m.clone()));
+        }
+    }
+
+    /// Test aid: `entity` carries kit `kit` (a class's weapon) from now, as
+    /// if it had deployed so: a new life (its client rebases), its rounds full.
+    pub fn set_kit(&mut self, entity: u16, kit: u8) {
+        if let Some(b) = self.bodies.get_mut(entity as usize).filter(|b| b.alive) {
+            b.kit = lattice_game::class::valid(kit);
+            b.life = b.life.wrapping_add(1);
+            let q = self.inputs[entity as usize].get_mut().unwrap();
+            (q.ammo, q.bloom) = (Ammo::full(b.kit), Bloom::with_kit(b.kit));
         }
     }
 
