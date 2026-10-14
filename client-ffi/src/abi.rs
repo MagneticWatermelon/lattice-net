@@ -492,6 +492,7 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_COVER_BONE", lattice_game::world::Kind::Bone as i64, "The Dry Sea's bones."),
     ("LT_COVER_SHIELD", lattice_game::world::Kind::Shield as i64, "A faction's shield: drawn in its colors, see-through."),
     ("LT_COVER_CORAL", lattice_game::world::Kind::Coral as i64, "Lattice coral: a living bridge (K4), there only at night."),
+    ("LT_COVER_STALK", lattice_game::world::Kind::Stalk as i64, "A sunsail's stalk (K4): its membrane (drawn on top, 20-40 m across, its size the stalk's height's) blocks nothing."),
     ("LT_WHEN_ALWAYS", lattice_game::world::ALWAYS as i64, "There always."),
     ("LT_WHEN_BRIDGE", lattice_game::world::BRIDGE as i64, "A living bridge's: from nightfall to a minute into dawn."),
     ("LT_WHEN_FALLS_A", lattice_game::world::FALLS_A as i64, "A sandfall of the first set: pouring in its turn."),

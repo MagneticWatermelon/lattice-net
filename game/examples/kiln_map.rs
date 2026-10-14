@@ -65,15 +65,26 @@ fn main() {
         }
     };
     // Boxes: filled, darker the taller.
+    eprintln!("{} sunsails' stalks", w.boxes().iter().filter(|b| b.kind as u8 == 13).count());
+    if std::env::var_os("KILN_SAILS").is_some() {
+        for b in w.boxes().iter().filter(|b| b.kind as u8 == 13).step_by(23) {
+            eprintln!("sunsail at ({:.0}, {:.0}) from {:.0} to {:.0}", b.center[0], b.center[1], b.bottom, b.top);
+        }
+    }
     for b in w.boxes() {
-        let (x0, y1) = to_px(b.min[0], b.min[1]);
-        let (x1, y0) = to_px(b.max[0], b.max[1]);
+        // A sunsail: its membrane's span (half the stalk's height across).
+        let r = if b.kind as u8 == 13 { (b.top - b.bottom) * 0.5 } else { 0.0 };
+        let (x0, y1) = to_px(b.min[0] - r, b.min[1] - r);
+        let (x1, y0) = to_px(b.max[0] + r, b.max[1] + r);
         let tall = ((b.top - b.bottom) / 60.0).clamp(0.0, 1.0);
         let c = match b.kind as u8 {
             7 => [(70.0 - 40.0 * tall) as u8, (90.0 - 40.0 * tall) as u8, (130.0 - 40.0 * tall) as u8],
             8 => [110, 64, 40],
             9 => [80, 220, 210],
             10 => [245, 240, 225],
+            // K4: a living bridge's coral, a sunsail's stalk (drawn as its membrane's span).
+            12 => [235, 110, 130],
+            13 => [90, 200, 70],
             _ => [40, 40, 40],
         };
         for y in y0.min(y1)..=y0.max(y1) {

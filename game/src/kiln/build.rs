@@ -1464,6 +1464,12 @@ fn rect(a: [f64; 2], b: [f64; 2], half: f64, along_x: bool) -> ([f64; 2], [f64; 
 /// Cover between sites: boulders in the mesa country and on the rift floors,
 /// crags on the Crown, fulgurite forests in the Glasslands, bones and reef
 /// heads in the Dry Sea, a few rocks among the dunes.
+/// Sunsails (K4, docs/kiln.md "The life"): groves a sector, and a stalk's
+/// side (m). A stalk is cover (`Kind::Stalk`); the membrane on it, 20-40 m
+/// across, is drawn (it blocks nothing), its size the stalk's height's.
+const SAIL_GROVES: usize = 26;
+const SAIL_STALK: f64 = 1.4;
+
 pub(crate) fn scatter(k: &mut Kiln) {
     let mut rng = Rng::new(0x5CA7);
     let free = |k: &Kiln, q: [f64; 2], r: f64| {
@@ -1530,6 +1536,26 @@ pub(crate) fn scatter(k: &mut Kiln) {
         let s = rng.range(2.0, 6.0);
         if free(k, q, s + 1.0) {
             k.boxes.push(stand(k, q, [s, s * rng.range(0.6, 1.4)], rng.range(1.0, 3.0), Kind::Rock, 0));
+        }
+    }
+    // K4's life: groves of sunsails, the same in every sector, on the open
+    // ground between sites (their own stream of chances: nothing else moves).
+    let mut sails = Rng::new(0x5A11);
+    let mut groves: Vec<Vec<([f64; 2], f64)>> = Vec::new();
+    for _ in 0..SAIL_GROVES {
+        let c = scale(unit(sails.range(-52.0, 52.0)), sails.range(1450.0, 3600.0));
+        let n = 3 + (sails.next() * 5.0) as usize;
+        groves.push((0..n).map(|_| (add(c, scale(unit(sails.range(0.0, 360.0)), sails.range(0.0, 50.0))), sails.range(16.0, 30.0))).collect());
+    }
+    for s in 0..3 {
+        let f = Frame::new(s);
+        for grove in &groves {
+            for &(l, tall) in grove {
+                let q = f.world(l);
+                if free(k, q, 6.0) {
+                    k.boxes.push(stand(k, q, [SAIL_STALK, SAIL_STALK], tall, Kind::Stalk, 0));
+                }
+            }
         }
     }
     // The Glasslands' fulgurite forests: clusters of glass spikes.

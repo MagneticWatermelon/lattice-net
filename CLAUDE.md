@@ -452,7 +452,8 @@ Netcode for an experimental PlanetSide-style spiritual successor (MMOFPS). This 
 - **Kiln K4, the living world: started** (2026-10-14; `docs/kiln.md` "K4 as built"):
   - **`game/src/clock.rs`:** the day and the clockwork from the game step alone (a cycle is 216,000 steps; `lattice-server --clock T` only picks the first step). `clock::Live` (the clockwork at a step, or `Live::OFF`) rides in `Mover::live`: **every collision query takes it** (`World::ground`, `ceiling`, `volume_at`; `CoverBox::stops`/`there`), at the same step the shields' holders are taken for (server: `advance`'s `step_no`; client: the input's step). A bare faction's `Mover` has the clockwork off, as the generator, the reachability check and old tests want. `CoverBox::when`/`Volume::when` (`ALWAYS`, `BRIDGE`, `FALLS_A`, `FALLS_B`, `VENT` with `Volume::phase`); `Lane::when` keeps the clockwork's routes out of the bots' graph, the spawn points, the veins and the reachability check (`clock::open(when)` gives a step it's there and one it isn't, for walking them).
   - **Fall damage** (`movement::fall_damage`, server-side, `Body::fallen`): past 8 m, 10 a meter. `reach::walk_as` fails on a fall that would hurt, so every route is checked against it.
-  - **Plugin API v7:** `when` on boxes, volumes and lanes, `LtClock`/`lt_clock`.
+  - **Plugin API v7:** `when` on boxes, volumes and lanes, `LtClock`/`lt_clock`; `LT_COVER_STALK` (a sunsail's stalk: cover; its membrane is the client's to draw).
+  - **The life:** sunsails' stalks (`Kind::Stalk`) placed in `build::scatter` on their own `Rng` stream: add new scatter on its own stream too, or every later random placement moves.
 - **M4:** vehicles. Their physics goes in `lattice-game`, deterministic across platforms (see Conventions: `libm`, `scripts/determinism.sh`).
 - **M5:** minimal playable client.
 

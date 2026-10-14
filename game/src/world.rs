@@ -364,6 +364,8 @@ pub enum Kind {
     Shield = 11,
     /// Lattice coral: a living bridge (K4), there only at night.
     Coral = 12,
+    /// A sunsail's stalk (K4's life): its membrane, drawn on top, blocks nothing.
+    Stalk = 13,
 }
 
 /// Which generator made a world: how it's drawn, and what its sites mean.
