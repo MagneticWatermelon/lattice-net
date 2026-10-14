@@ -15,8 +15,13 @@
 //! shields block all but their faction. Under the terrain's surface (in a
 //! tunnel, reached through a hole in it) the surface is a ceiling, and boxes
 //! are the ground. Force volumes lift, slow a fall or throw.
+//!
+//! K4: the world's clockwork (`clock`) as of the step being taken, carried
+//! by the `Mover`: living bridges there only at night, sandfalls in turns,
+//! vent lifts that rest.
 
-use crate::world::{CoverBox, Force, World, SOLID};
+use crate::clock::{self, Live};
+use crate::world::{CoverBox, Force, World, SOLID, VENT};
 
 pub const TICK_HZ: u32 = 30;
 pub const DT: f32 = 1.0 / TICK_HZ as f32;
@@ -46,19 +51,25 @@ pub const HEIGHT: f32 = 1.8;
 const LIFT_ACCEL: f32 = 30.0;
 /// The faction of a mover that belongs to none: every shield blocks it.
 pub const NO_FACTION: u8 = 254;
+/// Falls past this hurt (GDD §4.1, K4: "falls are a choice"), this much a
+/// meter past it: from 18 m, a fall kills.
+pub const SAFE_FALL: f32 = 8.0;
+pub const FALL_DAMAGE_PER_M: f32 = 10.0;
 
-/// Who's moving, for the shields: their faction, and who holds each site
-/// at the step being taken (`territory::Territory::owners_at`; empty: as at
-/// the start). A bare faction converts into one.
+/// Who's moving, and when: their faction, and who holds each site at the
+/// step being taken (`territory::Territory::owners_at`; empty: as at the
+/// start), for the shields; the clockwork at that step (`clock::Live::at`).
+/// A bare faction converts into one with neither (the clockwork off).
 #[derive(Debug, Clone, Copy)]
 pub struct Mover<'a> {
     pub faction: u8,
     pub owners: &'a [u8],
+    pub live: Live,
 }
 
 impl From<u8> for Mover<'_> {
     fn from(faction: u8) -> Self {
-        Mover { faction, owners: &[] }
+        Mover { faction, owners: &[], live: Live::OFF }
     }
 }
 
@@ -105,7 +116,7 @@ impl MoveState {
         let mut s = MoveState { pos, vel: [0.0; 2], z: f32::MAX, vz: 0.0, grounded: true, crouched: false };
         s.z = world.terrain(pos[0], pos[1]);
         collide(world, &mut s, NO_FACTION.into());
-        s.z = world.ground(s.pos[0], s.pos[1], s.z, STEP_UP);
+        s.z = world.ground(s.pos[0], s.pos[1], s.z, STEP_UP, Live::OFF);
         s
     }
 
@@ -114,7 +125,7 @@ impl MoveState {
     pub fn standing_at(world: &World, pos: [f32; 2], z: f32) -> Self {
         let mut s = MoveState { pos, vel: [0.0; 2], z, vz: 0.0, grounded: true, crouched: false };
         collide(world, &mut s, NO_FACTION.into());
-        s.z = world.ground(s.pos[0], s.pos[1], z + 0.5, 1.0);
+        s.z = world.ground(s.pos[0], s.pos[1], z + 0.5, 1.0, Live::OFF);
         s
     }
 
@@ -164,7 +175,7 @@ pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<
         wish = [wish[0] / len, wish[1] / len];
     }
     // Crouched while held, and after, until there's room to stand.
-    let crouched = input.buttons & BUTTON_CROUCH != 0 || (s.crouched && world.ceiling(s.pos[0], s.pos[1], RADIUS, s.z + CROUCH_HEIGHT) < s.z + HEIGHT);
+    let crouched = input.buttons & BUTTON_CROUCH != 0 || (s.crouched && world.ceiling(s.pos[0], s.pos[1], RADIUS, s.z + CROUCH_HEIGHT, who.live) < s.z + HEIGHT);
     let speed = if crouched {
         CROUCH_SPEED
     } else if input.buttons & BUTTON_ADS != 0 {
@@ -190,25 +201,30 @@ pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<
         n.vz = JUMP_SPEED;
         n.grounded = false;
     }
-    // Gravity, or the force volume the feet are in.
-    match world.volume_at(s.pos[0], s.pos[1], s.z) {
-        Some(v) if v.force == Force::Lift => {
+    // Gravity, or the force volume the feet are in (a resting vent lift
+    // only slows a fall).
+    let force = world.volume_at(s.pos[0], s.pos[1], s.z, who.live).map(|v| match v.when {
+        VENT if !who.live.vent_on(v.phase) => (Force::Drop, [0.0, 0.0, -clock::VENT_SINK]),
+        _ => (v.force, v.vel),
+    });
+    match force {
+        Some((Force::Lift, vel)) => {
             // Up to its speed (or slowed to it), off the ground.
-            let target = v.vel[2];
+            let target = vel[2];
             n.vz = if n.vz < target { (n.vz + LIFT_ACCEL * DT).min(target) } else { (n.vz - GRAVITY * DT).max(target) };
             n.grounded = false;
         }
-        Some(v) if v.force == Force::Spring && s.grounded => {
-            n.vel = [v.vel[0], v.vel[1]];
-            n.vz = v.vel[2];
+        Some((Force::Spring, vel)) if s.grounded => {
+            n.vel = [vel[0], vel[1]];
+            n.vz = vel[2];
             n.grounded = false;
         }
         v => {
             if !n.grounded {
                 n.vz -= GRAVITY * DT;
             }
-            if let Some(v) = v.filter(|v| v.force == Force::Drop) {
-                n.vz = n.vz.max(v.vel[2]);
+            if let Some((Force::Drop, vel)) = v {
+                n.vz = n.vz.max(vel[2]);
             }
         }
     }
@@ -231,9 +247,9 @@ pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<
 
     // Vertical: follow the ground while walking, fall and land otherwise.
     if n.grounded {
-        let g = world.ground(n.pos[0], n.pos[1], n.z, STEP_UP);
+        let g = world.ground(n.pos[0], n.pos[1], n.z, STEP_UP, who.live);
         if g >= n.z - STEP_DOWN {
-            if g > n.z && world.ceiling(n.pos[0], n.pos[1], RADIUS, n.z + height) < g + height {
+            if g > n.z && world.ceiling(n.pos[0], n.pos[1], RADIUS, n.z + height, who.live) < g + height {
                 // Up a step or a slope under a ceiling too low: no further.
                 n.pos = s.pos;
                 n.vel = [0.0; 2];
@@ -248,7 +264,7 @@ pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<
         let mut z = n.z + n.vz * DT;
         if n.vz > 0.0 {
             // Rising: the head stops at a ceiling.
-            let c = world.ceiling(n.pos[0], n.pos[1], RADIUS, n.z + height);
+            let c = world.ceiling(n.pos[0], n.pos[1], RADIUS, n.z + height, who.live);
             if z + height > c {
                 z = (c - height).max(n.z);
                 n.vz = 0.0;
@@ -258,7 +274,7 @@ pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<
         // Falling, the feet catch a ledge within a step (how a jump gets
         // onto a crate); rising, only what's below them.
         let reach = if n.vz <= 0.0 { STEP_UP } else { 0.0 };
-        let g = world.ground(n.pos[0], n.pos[1], s.z.max(n.z), reach);
+        let g = world.ground(n.pos[0], n.pos[1], s.z.max(n.z), reach, who.live);
         if n.z <= g {
             n.z = g;
             n.vz = 0.0;
@@ -266,6 +282,22 @@ pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<
         }
     }
     n
+}
+
+/// How far the step from `s` to `n` fell, by the speed it landed at (a
+/// drop shaft's slowed fall lands at its speed): 0 unless it landed.
+pub fn fall_height(s: &MoveState, n: &MoveState) -> f32 {
+    if s.grounded || !n.grounded {
+        return 0.0;
+    }
+    let v = (GRAVITY * DT - s.vz).max(0.0);
+    v * v / (2.0 * GRAVITY)
+}
+
+/// What landing from the step `s` to `n` does to a player's health (the
+/// server's to apply: health isn't predicted).
+pub fn fall_damage(s: &MoveState, n: &MoveState) -> u8 {
+    ((fall_height(s, n) - SAFE_FALL) * FALL_DAMAGE_PER_M).ceil().clamp(0.0, 255.0) as u8
 }
 
 /// The server moving a player of `faction` by `delta` outside of their
@@ -281,9 +313,9 @@ pub fn nudge<'a>(world: &World, s: MoveState, delta: [f32; 2], who: impl Into<Mo
     n.pos = terrain_move(world, s.pos, n.pos, s.z, s.height(), &mut vel);
     collide(world, &mut n, who);
     if n.grounded {
-        let g = world.ground(n.pos[0], n.pos[1], n.z, STEP_UP);
+        let g = world.ground(n.pos[0], n.pos[1], n.z, STEP_UP, who.live);
         if g >= n.z - STEP_DOWN {
-            if g > n.z && world.ceiling(n.pos[0], n.pos[1], RADIUS, n.z + n.height()) < g + n.height() {
+            if g > n.z && world.ceiling(n.pos[0], n.pos[1], RADIUS, n.z + n.height(), who.live) < g + n.height() {
                 n.pos = s.pos;
             } else {
                 n.z = g;
@@ -368,8 +400,8 @@ fn collide(world: &World, s: &mut MoveState, who: Mover) {
     let height = s.height();
     for _ in 0..2 {
         world.boxes_near(s.pos[0], s.pos[1], RADIUS, |b| {
-            if b.bottom >= s.z + height || !b.blocks_for(who.faction, who.owners) {
-                return; // above the head, or a shield that lets them through
+            if b.bottom >= s.z + height || !b.stops(&who) {
+                return; // above the head, not there, or a shield that lets them through
             }
             if b.is_turned() {
                 collide_turned(b, s);
@@ -482,7 +514,7 @@ mod tests {
         for _ in 0..TICK_HZ {
             s = step(&w, s, fwd);
             assert!(s.grounded);
-            assert_eq!(s.z, w.ground(s.pos[0], s.pos[1], s.z, STEP_UP), "feet on the ground");
+            assert_eq!(s.z, w.ground(s.pos[0], s.pos[1], s.z, STEP_UP, crate::clock::Live::OFF), "feet on the ground");
         }
         assert!((s.vel[0] - RUN_SPEED).abs() < 1e-4, "{s:?}");
         assert!(s.pos[0] - p[0] > 4.0 && s.pos[0] - p[0] < 6.0, "{s:?}");

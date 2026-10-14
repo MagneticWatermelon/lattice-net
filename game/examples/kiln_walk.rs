@@ -18,7 +18,7 @@ fn main() {
         MoveState::standing_at(&w, [s0[0], s0[1]], s0[2])
     } else {
         let s = MoveState::standing(&w, [s0[0], s0[1]]);
-        MoveState { z: w.ground(s0[0], s0[1], s0[2].max(s.z) + 1.0, 1.5).max(s.z), ..s }
+        MoveState { z: w.ground(s0[0], s0[1], s0[2].max(s.z) + 1.0, 1.5, lattice_game::clock::Live::OFF).max(s.z), ..s }
     };
     let mut next = 1;
     let who = lattice_game::reach::walker(&w, l);

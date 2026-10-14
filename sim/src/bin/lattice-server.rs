@@ -113,6 +113,8 @@ lattice-server: M1 movement-only authoritative server
                        nobody dies to be refilled, rounds are unlimited)
   --capture-speed N    territory's meters move N times faster: sites flip in seconds,
                        not minutes (tests) [1]
+  --clock T            start Kiln's two-hour day T minutes in, or at day, dusk, night or
+                       dawn (its first game step; clients follow the step) [day]
   --unlimited-rounds   the rifle never runs dry (no reloads): held triggers fire at its
                        rate as long as a run lasts (load tests; clients are told)
   --no-cone            shots go exactly where aimed: no cone of fire or bloom (to compare
@@ -586,6 +588,18 @@ fn parse_world(w: &str) -> u64 {
     }
 }
 
+/// `--clock`: minutes into Kiln's cycle, or a phase's start.
+fn parse_clock(c: &str) -> f64 {
+    use lattice_game::clock::{DAWN, DUSK, MINUTE, NIGHT};
+    match c {
+        "day" => 0.0,
+        "dusk" => (DUSK / MINUTE) as f64,
+        "night" => (NIGHT / MINUTE) as f64,
+        "dawn" => (DAWN / MINUTE) as f64,
+        m => m.parse().unwrap_or_else(|_| panic!("--clock: minutes, or day, dusk, night or dawn, not {m:?}")),
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let mut a = Args::parse(USAGE);
     let bind: SocketAddr = a.get("bind", "0.0.0.0:40000".parse().unwrap());
@@ -626,6 +640,7 @@ fn main() -> std::io::Result<()> {
         immortal: a.flag("immortal"),
         unlimited_rounds: a.flag("unlimited-rounds"),
         capture_speed: a.get("capture-speed", 1),
+        clock_minutes: a.opt::<String>("clock").map_or(0.0, |c| parse_clock(&c)),
         cone_of_fire: !a.flag("no-cone"),
         // Where shots go in their cones: a fresh secret from the OS.
         spread_secret: None,
@@ -1218,6 +1233,7 @@ fn summary_values(
     kv.put("spawns", c.spawns);
     kv.put("despawns", c.despawns);
     kv.put("deaths", c.deaths);
+    kv.put("fall_deaths", c.fall_deaths);
     kv.put("respawns", c.respawns);
     kv.put("site_flips", c.site_flips);
     for (k, v) in [
@@ -1477,11 +1493,12 @@ fn print_summary(
         println!("  {:<10} {:>8} {:>8} {:>8}", col_name(i), ms(s.p50), ms(s.p99), ms(s.max));
     }
     println!(
-        "  overruns {over} | spawns {} despawns {} ({} joins deferred) | deaths {} respawns {} | sites taken {} | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
+        "  overruns {over} | spawns {} despawns {} ({} joins deferred) | deaths {} ({} falls) respawns {} | sites taken {} | stand-ins: repeated {} frozen {} | late inputs {} discarded {} | bad messages {} | recv errors {} send errors {}",
         c.spawns,
         c.despawns,
         sim.net().deferred_accepts(),
         c.deaths,
+        c.fall_deaths,
         c.respawns,
         c.site_flips,
         c.repeated,

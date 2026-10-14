@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use lattice_game::activity;
 use lattice_game::delta;
 use lattice_game::events::{self, Event, SeenShot};
+use lattice_game::clock::Live;
 use lattice_game::movement::{dead_input, stand_in, step, Input, MoveState, Mover, NO_FACTION, TICK_HZ};
 use lattice_game::territory::{self, Territory};
 use lattice_game::msg::{self, InputEntry, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
@@ -904,8 +905,9 @@ impl ClientCore {
             let input = stand_in(last, seq - self.made);
             if seq > h.ack_seq {
                 let applied = if dead { dead_input(input) } else { input };
-                Self::owners_for(self.territory.as_ref(), h.step + (seq - h.ack_seq), &mut self.owners);
-                s = step(&world, s, applied, Mover { faction: side, owners: &self.owners });
+                let at = h.step + (seq - h.ack_seq);
+                Self::owners_for(self.territory.as_ref(), at, &mut self.owners);
+                s = step(&world, s, applied, Mover { faction: side, owners: &self.owners, live: Live::at(at) });
                 ammo.step(applied.buttons, false);
                 if self.unlimited {
                     ammo = Ammo::FULL;
@@ -944,8 +946,9 @@ impl ClientCore {
         for seq in ack + 1..=self.seq {
             let p = &mut self.history[seq as usize % HISTORY];
             let applied = if dead { dead_input(p.input) } else { p.input };
-            Self::owners_for(self.territory.as_ref(), (seq as i64 + offset).max(0) as u32, &mut self.owners);
-            s = step(world, s, applied, Mover { faction: side, owners: &self.owners });
+            let at = (seq as i64 + offset).max(0) as u32;
+            Self::owners_for(self.territory.as_ref(), at, &mut self.owners);
+            s = step(world, s, applied, Mover { faction: side, owners: &self.owners, live: Live::at(at) });
             a.step(applied.buttons, p.shot.is_some());
             if self.unlimited {
                 a = Ammo::FULL;
@@ -1167,7 +1170,7 @@ impl ClientCore {
             let applied = if self.is_dead() { dead_input(input) } else { input };
             let (side, at) = (self.faction(), self.step_of(self.seq));
             Self::owners_for(self.territory.as_ref(), at, &mut self.owners);
-            self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied, Mover { faction: side, owners: &self.owners });
+            self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied, Mover { faction: side, owners: &self.owners, live: Live::at(at) });
             // A shot fired during this step (a resync drops one it skips).
             let shot = self.pending_shot.filter(|&(seq, _)| seq <= self.seq).map(|(_, shot)| shot);
             if shot.is_some() {

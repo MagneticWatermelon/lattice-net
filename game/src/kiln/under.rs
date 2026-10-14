@@ -290,7 +290,7 @@ impl Ground {
     }
 }
 
-fn hole_near(k: &Kiln, p: [f64; 2], r: f64) -> bool {
+pub(crate) fn hole_near(k: &Kiln, p: [f64; 2], r: f64) -> bool {
     if k.holes.is_empty() {
         return false;
     }

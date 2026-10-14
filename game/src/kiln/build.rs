@@ -754,7 +754,8 @@ pub(crate) fn sites(k: &mut Kiln) {
                     let t = [-u[1], u[0]];
                     for (i, &(start, _)) in TERRACES.iter().enumerate() {
                         let lo = if i == 0 { HOLLOW_FLOOR } else { TERRACES[i - 1].1 };
-                        deep::cliff_lifts(k, 0, &|sd, d| add(add(c, scale(u, d)), scale(t, sd)), start - 20.0, lo, 30.0);
+                        // (The terraces' lifts are vents: K4's clockwork.)
+                        venting(k, |k| deep::cliff_lifts(k, 0, &|sd, d| add(add(c, scale(u, d)), scale(t, sd)), start - 20.0, lo, 30.0));
                     }
                 }
                 // Cover on the floor round each rift's plaza.
@@ -1038,7 +1039,7 @@ pub(crate) fn sites(k: &mut Kiln) {
                 let at = |r: f64, side: f64| add(add(c, scale(u, r)), scale(t, side));
                 let crest = lvl + 151.0;
                 fixed.push(strip(at(102.5, 3.5), at(118.0, 3.5), 6.0, crest - 2.0, crest, Kind::Crystal));
-                lift_up(k, i, at(98.0, 0.0), 2.5, lvl, crest, at(90.0, 0.0), at(110.0, 0.0));
+                venting(k, |k| lift_up(k, i, at(98.0, 0.0), 2.5, lvl, crest, at(90.0, 0.0), at(110.0, 0.0)));
                 drop_down(k, i, at(98.0, 7.0), 2.5, crest, lvl, at(110.0, 7.0), at(103.3, 7.0), at(90.0, 7.0));
                 for j in 0..14 {
                     let r = if j % 2 == 0 { rng.range(80.0, 100.0) } else { rng.range(48.0, 68.0) };
@@ -1279,7 +1280,7 @@ pub(crate) fn sites(k: &mut Kiln) {
                 let top = pillar.top as f64;
                 fixed.push(pillar);
                 fixed.push(strip(add(vent, scale(u, 3.2)), add(vent, scale(u, 18.0)), 2.0, top - 1.5, top, Kind::Rock));
-                lift_up(k, i, vent, 2.0, g, top, c, add(vent, scale(u, 10.0)));
+                venting(k, |k| lift_up(k, i, vent, 2.0, g, top, c, add(vent, scale(u, 10.0))));
                 drop_down(k, i, shaft, 2.0, top, k.height(shaft), tower, add(tower, scale(u, 4.2)), add(tower, scale(u, 15.0)));
                 keep_clear(k, add(c, scale(u, 25.0)), 25.0);
                 points.push(on(k, vent));
@@ -1632,4 +1633,159 @@ pub(crate) fn clear_lanes(k: &mut Kiln, paths: &[Vec<[f64; 2]>]) {
         }
         true
     });
+}
+
+// ---- K4: the clockwork (`crate::clock`) ----
+
+/// Runs `f` and makes the lifts it adds vent lifts (K4): they run on the
+/// clockwork's cycle (`clock::vent_on`), each at its own phase, from where
+/// it stands (a lift's columns, its fast and its slow, share one).
+pub(crate) fn venting(k: &mut Kiln, f: impl FnOnce(&mut Kiln)) {
+    let n = k.volumes.len();
+    f(k);
+    for v in &mut k.volumes[n..] {
+        if v.force == crate::world::Force::Lift {
+            v.when = crate::world::VENT;
+            v.phase = (crate::world::hash(0x7E47, 4, v.min[0].round() as i64, v.min[1].round() as i64) % crate::clock::VENT_CYCLE as u64) as u16;
+        }
+    }
+}
+
+/// A wedge along `a`-`b`, its top `za` at `a` and `zb` at `b` (rising
+/// along its axis, C1), `half` m to either side, from `bottom`.
+fn slope_box(a: [f64; 2], b: [f64; 2], za: f64, zb: f64, half: f64, bottom: f64, kind: Kind) -> CoverBox {
+    let (lo, hi, zl, zh) = if za <= zb { (a, b, za, zb) } else { (b, a, zb, za) };
+    let l = dist(lo, hi);
+    let u = scale(sub(hi, lo), 1.0 / l);
+    let c = scale(add(lo, hi), 0.5);
+    CoverBox::turned([c[0] as f32, c[1] as f32], [(l / 2.0) as f32, half as f32], [u[0] as f32, u[1] as f32], bottom as f32, zh as f32, kind, 0).wedge(zl as f32)
+}
+
+/// How far out from the center the living bridges cross their rifts
+/// (tried in turn until both ends are clear), and how much their arch rises
+/// over its length.
+const CORAL_ALONG: [f64; 6] = [1150.0, 1100.0, 1200.0, 1050.0, 1250.0, 1000.0];
+const CORAL_RISE: f64 = 0.02;
+const CORAL_HALF: f64 = 3.0;
+
+/// The living bridges (K4, the design's "coral spans across chosen gaps"):
+/// one across each rift at the Crown, rim to rim 340 m over the floor, an
+/// arch of coral wedges with a rail each side, there only at night
+/// (`world::BRIDGE`): a night-only way between two sectors' high ground.
+/// Its ends' pads are cut level with it; its route is the Hollow's, walked
+/// at night.
+pub(crate) fn living_bridges(k: &mut Kiln) {
+    for j in 0..3 {
+        let r = Rift::new(j);
+        let placed = CORAL_ALONG.iter().find_map(|&along| {
+            let floor = Rift::floor(along);
+            // Each rim: out from the floor's edge, the first ground high
+            // over the floor that's level for the next 10 m.
+            let rim = |side: f64| {
+                let hw = Rift::half_width(along);
+                (0..130).map(|i| hw + 2.0 * i as f64).find(|&a| {
+                    let (h, next) = (k.height(r.at(along, side * a)), k.height(r.at(along, side * (a + 10.0))));
+                    h > floor + 200.0 && (next - h).abs() < 1.5
+                })
+            };
+            let (ra, rb) = (rim(-1.0)?, rim(1.0)?);
+            let (a, b) = (r.at(along, -(ra + 8.0)), r.at(along, rb + 8.0));
+            // Clear of every box and lane round its ends.
+            let clear = |q: [f64; 2]| {
+                k.boxes.iter().chain(&k.fixed).all(|bx| bx.distance2(q[0] as f32, q[1] as f32) > 15.0 * 15.0)
+                    && k.corridors.iter().all(|c| c.windows(2).all(|w| seg_dist(q, w[0], w[1]).0 > 20.0))
+                    && k.chambers.iter().all(|ch| dist(ch.center, q) > 40.0)
+            };
+            (clear(a) && clear(b) && clear(r.at(along, -(ra + 28.0))) && clear(r.at(along, rb + 28.0))).then_some((along, a, b, ra, rb))
+        });
+        let Some((along, a, b, ra, rb)) = placed else {
+            k.notes.push(format!("rift {j}: no clear crossing for a living bridge"));
+            continue;
+        };
+        let (za, zb) = (k.height(a), k.height(b));
+        pad(k, a, 7.0, za, 8.0);
+        pad(k, b, 7.0, zb, 8.0);
+        let l = dist(a, b);
+        let n = (l / 40.0).ceil() as usize;
+        let rise = CORAL_RISE * l;
+        let at = |t: f64| (add(a, scale(sub(b, a), t)), lerp(za, zb, t) + rise * 4.0 * t * (1.0 - t));
+        let joints: Vec<([f64; 2], f64)> = (0..=n).map(|i| at(i as f64 / n as f64)).collect();
+        let v = r.dir;
+        for w in joints.windows(2) {
+            let ((p, zp), (q, zq)) = (w[0], w[1]);
+            k.fixed.push(slope_box(p, q, zp, zq, CORAL_HALF, zp.min(zq) - 2.5, Kind::Coral).when(crate::world::BRIDGE));
+            // Rails: a lip each side (falls are a choice), short of the ends.
+            let (p2, q2) = (if dist(p, a) < 1.0 { add(p, scale(sub(q, p), 2.0 / dist(p, q))) } else { p }, if dist(q, b) < 1.0 { sub(q, scale(sub(q, p), 2.0 / dist(p, q))) } else { q });
+            let (zp2, zq2) = (lerp(zp, zq, dist(p, p2) / dist(p, q)), lerp(zp, zq, dist(p, q2) / dist(p, q)));
+            for side in [-1.0, 1.0] {
+                let off = scale(v, side * (CORAL_HALF - 0.3));
+                k.fixed.push(slope_box(add(p2, off), add(q2, off), zp2 + 1.1, zq2 + 1.1, 0.3, zp2.min(zq2) - 0.5, Kind::Coral).when(crate::world::BRIDGE));
+            }
+        }
+        let (pa, pb) = (r.at(along, -(ra + 28.0)), r.at(along, rb + 28.0));
+        let legs = vec![
+            Leg { kind: LegKind::Road, path: vec![pa, a], z: None },
+            Leg { kind: LegKind::Road, path: joints.iter().map(|j| j.0).collect(), z: Some(joints.iter().map(|j| j.1).collect()) },
+            Leg { kind: LegKind::Road, path: vec![b, pb], z: None },
+        ];
+        k.clockwork.push((Route { a: 0, b: 0, legs, one_way: false }, crate::world::BRIDGE));
+    }
+}
+
+/// How far from a cenote's center its sandfalls pour (clear of the ledge
+/// winding down its wall), and where along that ledge's turn they stand.
+const FALL_R: f64 = 30.0;
+const FALL_AT: [f64; 2] = [0.35, 0.85];
+
+/// The Dune sea's sandfalls (K4): two into each cenote, on opposite sides of
+/// its pit, pouring in turns (`clock::falls`, 20 minutes each): each a lip
+/// of rock out from the rim over a drop to the floor that's slowed while
+/// its sand pours (a drop shaft, `world::FALLS_A` or `FALLS_B`), so one
+/// way down opens as the other closes.
+pub(crate) fn sandfalls(k: &mut Kiln) {
+    for i in 0..k.sites.len() {
+        let p = k.sites[i].clone();
+        if p.kind != SiteKind::Cenote {
+            continue;
+        }
+        let (c, g) = (p.center, p.level);
+        let axis = Frame::axis_deg(Frame::new(p.sector.min(2) as usize).k);
+        // The ledge's turn, as the cenote's builder winds it.
+        let a0 = axis + 200.0;
+        let span = PIT_DEPTH / RAMP_GRADE / (PIT_R - 7.0) * 180.0 / std::f64::consts::PI * 1.04;
+        for (n, &t0) in FALL_AT.iter().enumerate() {
+            let when = if n == 0 { crate::world::FALLS_A } else { crate::world::FALLS_B };
+            // Where it lands on the floor: no hole, nothing there.
+            let found = [0.0, -0.04, 0.04, -0.08, 0.08, -0.12, -0.16, -0.2].iter().find_map(|dt| {
+                let u = unit(a0 + span * (t0 + dt));
+                let (col, to) = (add(c, scale(u, FALL_R)), add(c, scale(u, FALL_R - 12.0)));
+                let floor = k.height(col);
+                let ok = |q: [f64; 2]| {
+                    (k.height(q) - (g - PIT_DEPTH)).abs() < 3.0
+                        && !super::under::hole_near(k, q, 6.0)
+                        && k.boxes.iter().chain(&k.fixed).all(|bx| bx.distance2(q[0] as f32, q[1] as f32) > 6.0 * 6.0 || (bx.top as f64) < k.height(q) - 0.5)
+                };
+                (ok(col) && ok(to)).then_some((u, col, to, floor))
+            });
+            let Some((u, col, to, floor)) = found else {
+                k.notes.push(format!("cenote {i}: no floor for its sandfall {n}"));
+                continue;
+            };
+            // The lip, from where the rim is whole (the ledge's shoulder dips
+            // it) out over the fall.
+            let h = |d: f64| k.height(add(c, scale(u, d)));
+            let start = (0..40).map(|d| PIT_R + d as f64).find(|&d| h(d) >= g - 1.5 && (h(d + 6.0) - h(d)).abs() < 0.3).unwrap_or(PIT_R + 12.0);
+            // Its top flush with the rim where it starts, a little way onto it.
+            let z0 = h(start + 3.0);
+            let edge = add(c, scale(u, FALL_R + 1.0));
+            k.fixed.push(strip(add(c, scale(u, start + 3.0)), edge, 1.5, z0 - 1.2, z0, Kind::Rock));
+            let nv = k.volumes.len();
+            deep::drop_volume(k, col, [2.5, 2.5], z0, floor);
+            for v in &mut k.volumes[nv..] {
+                v.when = when;
+            }
+            let legs = deep::drop_legs(col, z0, floor, add(c, scale(u, start + 8.0)), edge, to, (false, true));
+            k.clockwork.push((Route { a: i, b: i, legs, one_way: true }, when));
+        }
+    }
 }

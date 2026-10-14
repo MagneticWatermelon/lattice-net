@@ -148,7 +148,10 @@ fn main() {
     println!("kiln {:016x}", h.0);
     let mut h = Hash::new();
     for (i, l) in kiln.lanes().iter().enumerate() {
-        let back = i % 2 == 1;
+        // With the clock running (K4): vents resting on the way, the living
+        // bridges' routes at night, the sandfalls' in their turns.
+        let s0 = lattice_game::clock::open(l.when).0.step().unwrap_or((i as u32 * 4801) % lattice_game::clock::CYCLE);
+        let back = i % 2 == 1 && !l.one_way;
         let w0 = l.waypoint(0, back);
         let mut s = MoveState::standing(&kiln, [w0[0], w0[1]]);
         let mut next = 1;
@@ -160,8 +163,10 @@ fn main() {
             } else {
                 Input { move_x: mx, move_y: my, buttons: if k % 37 == 0 { BUTTON_JUMP } else { BUTTON_SPRINT }, ..Input::default() }
             };
-            s = step(&kiln, s, input, (i % 3) as u8);
+            let before = s;
+            s = step(&kiln, s, input, lattice_game::movement::Mover { faction: (i % 3) as u8, owners: &[], live: lattice_game::clock::Live::at(s0 + k) });
             h.state(&s);
+            h.u64(lattice_game::movement::fall_damage(&before, &s) as u64);
         }
     }
     println!("kiln-move {:016x}", h.0);
@@ -204,7 +209,7 @@ fn main() {
             }
             h.state(&s);
             seen[0] += (kitw.under(s.pos[0], s.pos[1], s.z) && !kitw.hole(s.pos[0], s.pos[1])) as u32;
-            if let Some(v) = kitw.volume_at(s.pos[0], s.pos[1], s.z) {
+            if let Some(v) = kitw.volume_at(s.pos[0], s.pos[1], s.z, lattice_game::clock::Live::OFF) {
                 seen[1 + v.force as usize] += 1;
             }
             seen[4] += (s.crouched && input.buttons & BUTTON_CROUCH == 0) as u32;

@@ -96,7 +96,9 @@ impl Nav {
             }
             id[i] = id[r];
         }
-        // Edges: each route's steps, but none through a shield.
+        // Edges: each route's steps, but none through a shield, and none of
+        // the clockwork's (a night's bridge, a sandfall): the graph is the
+        // world's always.
         let mut out: Vec<Vec<(u32, f32)>> = vec![Vec::new(); nodes.len()];
         let shielded = |a: [f32; 3], b: [f32; 3]| {
             let steps = ((sq(b[0] - a[0]) + sq(b[1] - a[1])).sqrt()).ceil().max(1.0) as usize;
@@ -108,7 +110,7 @@ impl Nav {
                 hit
             })
         };
-        for (l, &s) in lanes.iter().zip(&starts) {
+        for (l, &s) in lanes.iter().zip(&starts).filter(|(l, _)| l.when == crate::world::ALWAYS) {
             for k in 0..l.path.len() - 1 {
                 let (a, b) = (id[s + k], id[s + k + 1]);
                 if a == b {

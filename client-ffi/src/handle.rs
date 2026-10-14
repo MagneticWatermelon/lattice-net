@@ -395,6 +395,21 @@ impl Handle {
 
     /// Every site's state at the step we're predicting (as many as fit);
     /// returns how many sites there are.
+    /// Kiln's clock at the step we're predicting (`lt_clock`).
+    pub fn day(&mut self) -> LtClock {
+        use lattice_game::clock;
+        let step = self.session.core.step();
+        let c = clock::cycle(step);
+        LtClock {
+            step,
+            cycle_step: c,
+            cycle_secs: c as f32 / TICK_HZ as f32,
+            phase: clock::phase(step) as u8,
+            bridges: clock::bridges(step) as u8,
+            falls: clock::falls(step),
+        }
+    }
+
     pub fn territory(&self, out: &mut [LtSiteState]) -> usize {
         let core = &self.session.core;
         let Some(t) = core.territory() else { return 0 };

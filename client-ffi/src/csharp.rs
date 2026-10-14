@@ -8,7 +8,7 @@
 use std::fmt::Write;
 
 use lattice_client_core::{entities, tracers};
-use lattice_game::{faction, hit, movement, msg, weapon, world};
+use lattice_game::{clock, faction, hit, movement, msg, weapon, world};
 
 use crate::abi::{layout_hash, normalize, CODES, STRUCTS};
 use crate::api::{FNS, VERSION};
@@ -86,6 +86,17 @@ fn constants() -> Vec<(&'static str, Value, &'static str)> {
         ("TRACER_TRAIL", F32(tracers::TRAIL), "Path behind a tracer's head that shows, m."),
         ("TRACER_CONVERGE", F32(tracers::CONVERGE), "Our tracers converge on the line of sight this far out, m."),
         ("MAX_TRACERS", Int(tracers::MAX_FLYING as i64, "int"), "Tracers flying at once, at most."),
+        ("CYCLE_STEPS", Int(clock::CYCLE as i64, "int"), "Kiln's day (K4): a cycle, steps; where each phase starts in it:"),
+        ("DUSK_STEP", Int(clock::DUSK as i64, "int"), ""),
+        ("NIGHT_STEP", Int(clock::NIGHT as i64, "int"), ""),
+        ("DAWN_STEP", Int(clock::DAWN as i64, "int"), ""),
+        ("BRIDGE_UP_STEP", Int(clock::BRIDGE_UP as i64, "int"), "The living bridges stand from this step of the cycle,"),
+        ("BRIDGE_DOWN_STEP", Int(clock::BRIDGE_DOWN as i64, "int"), "to this one (the minute before it, their warning)."),
+        ("VENT_CYCLE", Int(clock::VENT_CYCLE as i64, "int"), "A vent lift runs for VENT_ON steps of every VENT_CYCLE."),
+        ("VENT_ON", Int(clock::VENT_ON as i64, "int"), ""),
+        ("FALLS_STEPS", Int(clock::FALLS as i64, "int"), "The sandfalls take turns this many steps long."),
+        ("SAFE_FALL", F32(movement::SAFE_FALL), "Falls past this hurt, m,"),
+        ("FALL_DAMAGE_PER_M", F32(movement::FALL_DAMAGE_PER_M), "this much a meter past it."),
     ]
 }
 

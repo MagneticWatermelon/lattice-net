@@ -7,13 +7,16 @@
 //! a flood of short steps across a 4 m grid, each walked by the same
 //! movement, that finds whatever's there to stand on (stairs, decks, drops).
 //! A point is reached when someone stands where they'd count for it
-//! (`territory::POINT_RADIUS`, `POINT_HEIGHT`).
+//! (`territory::POINT_RADIUS`, `POINT_HEIGHT`). All with the clockwork
+//! switched off (`clock::Live::OFF`: no living bridge, no sandfall, vents
+//! running), and only the routes there always: no point may depend on it.
 
 use std::collections::HashMap;
 
+use crate::clock::Live;
 use crate::movement::{step, Input, MoveState, Mover, BUTTON_SPRINT, DT, WORLD_SIZE};
 use crate::territory::{POINT_HEIGHT, POINT_RADIUS};
-use crate::world::{Lane, SiteKind, World};
+use crate::world::{Lane, SiteKind, World, ALWAYS};
 
 /// Walks lane `l` (backward from its end if `backward`), sprinting, never
 /// jumping, with the sites held as at the start, as faction 0 (a route
@@ -33,7 +36,9 @@ pub fn walker(w: &World, l: &Lane) -> u8 {
     }
 }
 
-/// `walk`, as `who`.
+/// `walk`, as `who`: with the clockwork switched off, or running on from
+/// `who.live`'s step a step at a time (a vent lift rests on the way). A
+/// fall that would hurt (`movement::SAFE_FALL`) fails it: falls are a choice.
 pub fn walk_as(w: &World, l: &Lane, backward: bool, who: Mover) -> Result<f32, String> {
     let start = l.waypoint(0, backward);
     // On whatever's there (a stair's top, a deck): the highest surface
@@ -42,7 +47,7 @@ pub fn walk_as(w: &World, l: &Lane, backward: bool, who: Mover) -> Result<f32, S
         MoveState::standing_at(w, [start[0], start[1]], start[2])
     } else {
         let s = MoveState::standing(w, [start[0], start[1]]);
-        MoveState { z: w.ground(start[0], start[1], start[2].max(s.z) + 1.0, 1.5).max(s.z), ..s }
+        MoveState { z: w.ground(start[0], start[1], start[2].max(s.z) + 1.0, 1.5, who.live).max(s.z), ..s }
     };
     let mut next = 1;
     // Sprinting along it, and up lifts and down drop shafts at 5 m/s or so.
@@ -54,7 +59,13 @@ pub fn walk_as(w: &World, l: &Lane, backward: bool, who: Mover) -> Result<f32, S
             let dz = s.z - end[2];
             return if dz > -4.0 { Ok(i as f32 * DT) } else { Err(format!("reached the end at z {:.1}, not {:.1}", s.z, end[2])) };
         };
-        s = step(w, s, Input { move_x: mx, move_y: my, yaw: 0, pitch: 0, buttons: BUTTON_SPRINT }, who);
+        let live = who.live.step().map_or(Live::OFF, |s0| Live::at(s0.wrapping_add(i)));
+        let before = s;
+        s = step(w, s, Input { move_x: mx, move_y: my, yaw: 0, pitch: 0, buttons: BUTTON_SPRINT }, Mover { live, ..who });
+        let fell = crate::movement::fall_height(&before, &s);
+        if fell > crate::movement::SAFE_FALL {
+            return Err(format!("fell {fell:.1} m to ({:.0}, {:.0}, {:.1}) heading for waypoint {next}/{}", s.pos[0], s.pos[1], s.z, l.path.len()));
+        }
     }
     let w_next = l.waypoint(next.min(l.path.len() - 1), backward);
     Err(format!("stuck at ({:.0}, {:.0}, {:.1}) heading for waypoint {next}/{} at ({:.0}, {:.0}, {:.1})", s.pos[0], s.pos[1], s.z, l.path.len(), w_next[0], w_next[1], w_next[2]))
@@ -182,19 +193,19 @@ pub fn check(w: &World) -> Report {
     for (pi, pt) in w.points().iter().enumerate() {
         let q = pt.pos;
         let s = MoveState { pos: [q[0], q[1]], vel: [0.0; 2], z: q[2], vz: 0.0, grounded: true, crouched: false };
-        let who = Mover { faction: w.sites()[pt.site as usize].sector, owners: &owners };
+        let who = Mover { faction: w.sites()[pt.site as usize].sector, owners: &owners, live: Live::OFF };
         let pushed = crate::movement::nudge(w, s, [0.0, 0.0], who);
-        if (pushed.pos[0] - q[0]).abs() > 0.01 || (pushed.pos[1] - q[1]).abs() > 0.01 || w.ground(q[0], q[1], q[2] + 0.5, 1.0) > q[2] + 0.3 {
+        if (pushed.pos[0] - q[0]).abs() > 0.01 || (pushed.pos[1] - q[1]).abs() > 0.01 || w.ground(q[0], q[1], q[2] + 0.5, 1.0, Live::OFF) > q[2] + 0.3 {
             report.buried.push(pi);
         }
     }
     for (si, s) in w.sites().iter().enumerate().filter(|(_, s)| s.kind == SiteKind::Landing) {
         report.landings += 1;
-        let who = Mover { faction: s.sector, owners: &owners };
+        let who = Mover { faction: s.sector, owners: &owners, live: Live::OFF };
         // The routes, as this faction.
         let route_ok: Vec<[bool; 2]> = std::thread::scope(|sc| {
             let chunk = lanes.len().div_ceil(threads).max(1);
-            let handles: Vec<_> = lanes.chunks(chunk).map(|ls| sc.spawn(move || ls.iter().map(|l| [walk_as(w, l, false, who).is_ok(), !l.one_way && walk_as(w, l, true, who).is_ok()]).collect::<Vec<_>>())).collect();
+            let handles: Vec<_> = lanes.chunks(chunk).map(|ls| sc.spawn(move || ls.iter().map(|l| if l.when != ALWAYS { [false; 2] } else { [walk_as(w, l, false, who).is_ok(), !l.one_way && walk_as(w, l, true, who).is_ok()] }).collect::<Vec<_>>())).collect();
             handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         let mut route_out: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -270,7 +281,7 @@ pub fn check(w: &World) -> Report {
         if report.landings == 1 {
             // (A route that doesn't walk as faction 0.)
             for (r, l) in lanes.iter().enumerate() {
-                if walk(w, l, false).is_err() {
+                if l.when == ALWAYS && walk(w, l, false).is_err() {
                     report.broken_routes.push(r);
                 }
             }
@@ -314,7 +325,7 @@ fn floor(w: &World, area: &[bool], p: [f32; 2], z: f32, who: Mover) -> Option<Fo
     }
     let c = [(x as f32 + 0.5) * CELL, (y as f32 + 0.5) * CELL];
     let mut s = MoveState { pos: c, vel: [0.0; 2], z: 0.0, vz: 0.0, grounded: true, crouched: false };
-    s.z = w.ground(c[0], c[1], z + 1.0, 1.5);
+    s.z = w.ground(c[0], c[1], z + 1.0, 1.5, who.live);
     // Inside cover (or a shield it may not pass): nobody stands there.
     let pushed = crate::movement::nudge(w, s, [0.0, 0.0], who);
     if (pushed.pos[0] - c[0]).abs() > 0.01 || (pushed.pos[1] - c[1]).abs() > 0.01 || (s.z - z).abs() > 3.0 {

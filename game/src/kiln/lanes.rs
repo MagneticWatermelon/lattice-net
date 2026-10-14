@@ -548,7 +548,7 @@ pub(crate) fn finish(k: &Kiln, routes: &[Route], decks: &[Vec<Option<f64>>]) -> 
                     }
                 }
             }
-            Lane { a: r.a as u16, b: r.b as u16, path, one_way: r.one_way }
+            Lane { a: r.a as u16, b: r.b as u16, path, one_way: r.one_way, when: crate::world::ALWAYS }
         })
         .collect()
 }

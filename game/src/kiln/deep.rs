@@ -67,6 +67,8 @@ pub(crate) fn lift_volume(k: &mut Kiln, c: [f64; 2], half: [f64; 2], z0: f64, z1
         min: [(c[0] - half[0]) as f32, (c[1] - half[1]) as f32, lo as f32],
         max: [(c[0] + half[0]) as f32, (c[1] + half[1]) as f32, hi as f32],
         force: Force::Lift,
+        when: crate::world::ALWAYS,
+        phase: 0,
         vel: [0.0, 0.0, v as f32],
     };
     if z1 - z0 > slow + 4.0 {
@@ -112,6 +114,8 @@ pub(crate) fn drop_volume(k: &mut Kiln, c: [f64; 2], half: [f64; 2], z0: f64, z1
         min: [(c[0] - half[0]) as f32, (c[1] - half[1]) as f32, (z1 - 1.0) as f32],
         max: [(c[0] + half[0]) as f32, (c[1] + half[1]) as f32, (z0 + 3.0) as f32],
         force: Force::Drop,
+        when: crate::world::ALWAYS,
+        phase: 0,
         vel: [0.0, 0.0, -DROP_SPEED as f32],
     });
 }
@@ -140,6 +144,8 @@ pub(crate) fn spring(k: &mut Kiln, site: usize, pad: [f64; 2], z0: f64, z1: f64,
         min: [(pad[0] - h) as f32, (pad[1] - h) as f32, (z0 - 0.5) as f32],
         max: [(pad[0] + h) as f32, (pad[1] + h) as f32, (z0 + 0.5) as f32],
         force: Force::Spring,
+        when: crate::world::ALWAYS,
+        phase: 0,
         vel: [0.0, 0.0, vz as f32],
     });
     // Onto the pad, held over it while thrown up, then across near the top.

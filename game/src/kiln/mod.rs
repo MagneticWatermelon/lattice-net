@@ -394,6 +394,9 @@ pub(crate) struct Kiln {
     pub rooms: Vec<(usize, [f64; 2], [f64; 2], f64)>,
     /// What the generator couldn't fit (the tests want none).
     pub notes: Vec<String>,
+    /// The clockwork's routes (K4): over a living bridge, down a sandfall,
+    /// and when they can be walked (`world::BRIDGE`, `FALLS_A`, `FALLS_B`).
+    pub clockwork: Vec<(lanes::Route, u8)>,
 }
 
 /// A road or a ramp is here.
@@ -482,6 +485,7 @@ pub(crate) fn build_kiln() -> Kiln {
         openings: Vec::new(),
         rooms: Vec::new(),
         notes: Vec::new(),
+        clockwork: Vec::new(),
     };
     tick("base");
     // Where the lanes will run, before anything is placed beside them.
@@ -504,12 +508,15 @@ pub(crate) fn build_kiln() -> Kiln {
     let decks = lanes::stamp(&mut kiln, &routes); tick("lanes::stamp");
     build::sites(&mut kiln); tick("build::sites");
     build::spawn_rooms(&mut kiln); tick("build::spawn_rooms");
+    build::living_bridges(&mut kiln); tick("build::living_bridges");
     under::build(&mut kiln); tick("under::build");
+    build::sandfalls(&mut kiln); tick("build::sandfalls");
     build::scatter(&mut kiln); tick("build::scatter");
     // (A tunnel's lane only on the surface: to its mouths.)
     let paths: Vec<Vec<[f64; 2]>> = routes
         .iter()
         .chain(kiln.internal.iter())
+        .chain(kiln.clockwork.iter().map(|(r, _)| r))
         .map(|r| r.legs.iter().flat_map(|l| l.path.iter().copied()).collect())
         .chain(kiln.tunnels.iter().flat_map(|r| r.legs.iter().filter(|l| l.z.is_none()).map(|l| l.path.clone())))
         .collect();
@@ -518,6 +525,11 @@ pub(crate) fn build_kiln() -> Kiln {
     let mut all = lanes::finish(&kiln, &routes, &decks);
     all.extend(lanes::finish(&kiln, &kiln.tunnels, &[]));
     all.extend(lanes::finish(&kiln, &kiln.internal, &[]));
+    let clockwork: Vec<lanes::Route> = kiln.clockwork.iter().map(|(r, _)| r.clone()).collect();
+    for (mut l, &(_, when)) in lanes::finish(&kiln, &clockwork, &[]).into_iter().zip(&kiln.clockwork) {
+        l.when = when;
+        all.push(l);
+    }
     kiln.lanes = all;
     kiln
 }

@@ -38,6 +38,7 @@ use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot, DAMAGE_BODY, DAMA
 use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::events::{self, Event};
 use lattice_game::faction::{faction, FACTIONS, MAX_HEALTH, RESPAWN_STEPS};
+use lattice_game::clock::{self, Live};
 use lattice_game::territory::{self, Territory};
 use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
 use crate::msg::{self, Blob, PacketFill, RenderTime, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
@@ -234,6 +235,10 @@ pub struct SimConfig {
     /// Test aid: territory's meters move this many times faster (1: the
     /// GDD's minutes; `territory::Territory::with_speed`).
     pub capture_speed: u32,
+    /// Where in Kiln's day the server starts (`clock`): its first game step
+    /// is this many minutes into a cycle (0: a day's start). Clients need no
+    /// telling: the clock is the step's.
+    pub clock_minutes: f64,
     /// Shots leave within their cone of fire (`weapon::Bloom`, `spread`).
     /// Off only for tests that measure lag compensation's geometry.
     pub cone_of_fire: bool,
@@ -275,6 +280,7 @@ impl Default for SimConfig {
             immortal: false,
             unlimited_rounds: false,
             capture_speed: 1,
+            clock_minutes: 0.0,
             cone_of_fire: true,
             spread_secret: None,
             render_floor: true,
@@ -293,6 +299,8 @@ pub struct Counters {
     pub spawns: u64,
     pub despawns: u64,
     pub deaths: u64,
+    /// Of them, from falls (`movement::fall_damage`).
+    pub fall_deaths: u64,
     pub respawns: u64,
     pub inputs_applied: u64,
     /// Entity-ticks where the next input hadn't arrived. Each consumes that seq
@@ -414,6 +422,9 @@ struct Body {
     radius: f32,
     /// Test aid: hits land but deal no damage.
     invulnerable: bool,
+    /// Damage from falls (`movement::fall_damage`) its movement took this
+    /// tick, applied with the rest (`apply_damage`).
+    fallen: u16,
     /// Players it hit or was hit by recently: near-tier for each other until
     /// the tick given ("interaction"). `NO_CONTACT` is empty.
     contacts: [(u16, u32); CONTACTS],
@@ -437,6 +448,7 @@ impl Default for Body {
             anchor: [0.0; 2],
             radius: 0.0,
             invulnerable: false,
+            fallen: 0,
             contacts: [(NO_CONTACT, 0); CONTACTS],
         }
     }
@@ -943,7 +955,7 @@ impl InputQueue {
     /// Advance one movement step, consuming seq `last_seq + 1`. `now` is the
     /// tick's time, `step` the game step the result is at.
     fn advance(&mut self, e: u16, body: &mut Body, now: Instant, step_no: u32, world: &World, owners: &[u8]) -> Step {
-        let who = movement::Mover { faction: faction(e), owners };
+        let who = movement::Mover { faction: faction(e), owners, live: Live::at(step_no) };
         self.depth = self.pending.len().min(u8::MAX as usize) as u8;
         self.rewind = None;
         let next = self.last_seq + 1;
@@ -975,6 +987,9 @@ impl InputQueue {
         self.ammo.tick();
         let before = body.state;
         body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input }, who);
+        if !body.dead() {
+            body.fallen = body.fallen.saturating_add(movement::fall_damage(&before, &body.state) as u16);
+        }
         self.steps[next as usize % STEP_RING] = (next, step_no, before, body.state);
         // A body keeps the aim it died with: the dead player's own camera
         // still turns (on its client), but a corpse doesn't spin for others.
@@ -1027,12 +1042,12 @@ fn frame(shard: &mut lattice_net::Shard, snaps: &mut Vec<(ClientId, Vec<u8>, Opt
 
 /// Whether `shooter`'s eye sees `target`'s chest now (no terrain or cover
 /// between them).
-fn in_sight(world: &World, owners: &[u8], history: &History, shooter: u16, target: u16) -> bool {
+fn in_sight(world: &World, owners: &[u8], live: Live, history: &History, shooter: u16, target: u16) -> bool {
     let (Some(a), Some(b)) = (history.now(shooter), history.now(target)) else { return false };
     let eye = if a.crouched { weapon::CROUCH_EYE_HEIGHT } else { weapon::EYE_HEIGHT };
     let chest = lattice_game::hit::chest(b.crouched);
     let (p0, p1) = ([a.pos[0], a.pos[1], a.pos[2] + eye], [b.pos[0], b.pos[1], b.pos[2] + chest]);
-    lattice_game::hit::line_clear(world, p0, p1, movement::Mover { faction: faction(shooter), owners })
+    lattice_game::hit::line_clear(world, p0, p1, movement::Mover { faction: faction(shooter), owners, live })
 }
 
 /// A projectile that ended this tick: where it was in the list, how, and
@@ -1196,6 +1211,7 @@ impl SimServer {
 
     pub fn new(cfg: SimConfig, now: Instant) -> Self {
         assert!(cfg.max_clients <= u16::MAX as usize, "entity ids are u16");
+        let first_step = clock::at_minute(cfg.clock_minutes);
         let mut net =
             Server::with_socket_groups(cfg.net.clone(), &cfg.identity, cfg.max_clients, cfg.shards, cfg.socket_groups, now);
         if cfg.preallocate {
@@ -1209,7 +1225,7 @@ impl SimServer {
             spawn_points: territory::spawn_points(&World::shared(cfg.world)),
             spawn_floor: None,
             owners: [Vec::new(), Vec::new()],
-            territory_step: 0,
+            territory_step: first_step,
             pushes: Vec::new(),
             net,
             shard_clients: (0..cfg.shards).map(|_| Vec::new()).collect(),
@@ -1226,7 +1242,7 @@ impl SimServer {
             rng: Rng::new(cfg.seed),
             cfg,
             tick: 0,
-            step: 0,
+            step: first_step,
             bodies: Vec::new(),
             inputs: Vec::new(),
             near_hist: vec![Vec::new(); NEAR_HISTORY],
@@ -1674,10 +1690,10 @@ impl SimServer {
             .sum();
         // Most ticks of a spread-out crowd push nobody: skip the second pass.
         if pushed > 0 {
-            let (world, owners) = (&*self.world, &self.owners[0][..]);
+            let (world, owners, live) = (&*self.world, &self.owners[0][..], Live::at(self.step));
             self.bodies.par_iter_mut().zip(self.pushes.par_iter()).enumerate().with_min_len(256).for_each(|(e, (b, &push))| {
                 if b.alive && push != [0.0; 2] {
-                    b.state = movement::nudge(world, b.state, push, movement::Mover { faction: faction(e as u16), owners });
+                    b.state = movement::nudge(world, b.state, push, movement::Mover { faction: faction(e as u16), owners, live });
                     b.pushes = b.pushes.wrapping_add(1);
                 }
             });
@@ -1924,8 +1940,8 @@ impl SimServer {
             Some(&Some((k, i))) => Some(&clients[k as usize][i as usize].near),
             _ => None,
         };
-        let (world, history, owners) = (&*self.world, &self.history, &self.owners[0][..]);
-        let sky = Sky { world, grid: &self.grid, history, near: &near, owners };
+        let (world, history, owners, live) = (&*self.world, &self.history, &self.owners[0][..], Live::at(self.step));
+        let sky = Sky { world, grid: &self.grid, history, near: &near, owners, live };
         let until = self.step as f64;
         // Fly in chunks of 64 projectiles; a chunk is a task (its time is
         // the span's "longest task"). A hit also learns whether the shooter
@@ -1939,7 +1955,7 @@ impl SimServer {
                 let (mut ends, mut st) = (Vec::new(), FlyStats::default());
                 for (i, p) in chunk.iter_mut().enumerate() {
                     if let Some((outcome, at)) = shots::fly(p, until, &sky, &mut st) {
-                        let after_cover = matches!(outcome, Outcome::Player { target, .. } if !in_sight(world, owners, history, p.shooter, target));
+                        let after_cover = matches!(outcome, Outcome::Player { target, .. } if !in_sight(world, owners, live, history, p.shooter, target));
                         ends.push(Ended { id: p.id, index: c * 64 + i, shooter: p.shooter, outcome, at, after_cover });
                     }
                 }
@@ -2178,6 +2194,13 @@ impl SimServer {
         for (e, amount) in std::mem::take(&mut self.pending_damage) {
             self.hurt(e, amount);
         }
+        // Falls (movement took them; hits came first).
+        for e in 0..self.bodies.len() {
+            let fallen = std::mem::take(&mut self.bodies[e].fallen);
+            if fallen > 0 && self.hurt(e as u16, fallen.min(255) as u8) == Some(true) {
+                self.counters.fall_deaths += 1;
+            }
+        }
     }
 
     /// Respawns the dead whose time has come by `step`: back where they were
@@ -2247,6 +2270,7 @@ impl SimServer {
             anchor,
             radius,
             invulnerable: self.cfg.immortal,
+            fallen: 0,
             ..Body::default()
         };
         let spread = Some((Arc::clone(&self.spread), self.counters.spawns));

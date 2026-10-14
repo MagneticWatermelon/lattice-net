@@ -73,6 +73,7 @@ pub fn spawn_points(w: &World) -> Vec<Vec<[f32; 2]>> {
             let mut v: Vec<(f32, [f32; 2])> = w
                 .lanes()
                 .iter()
+                .filter(|l| l.when == crate::world::ALWAYS)
                 .flat_map(|l| l.path.iter())
                 .map(|p| (((p[0] - s.center[0]) * (p[0] - s.center[0]) + (p[1] - s.center[1]) * (p[1] - s.center[1])).sqrt(), p))
                 .filter(|(d, p)| *d <= s.half.min(120.0) && (p[2] - w.terrain(p[0], p[1])).abs() < 1.0)

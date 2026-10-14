@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use crate::movement::WORLD_SIZE;
+use crate::clock::Live;
+use crate::movement::{Mover, WORLD_SIZE};
 
 /// The world id of Kiln, the desert continent ("KILN" in ASCII). Any other
 /// id is a seed for Harrow.
@@ -141,10 +142,23 @@ pub struct CoverBox {
     /// whoever holds the site (`territory`), and `pass` is who held it at
     /// the start.
     pub site: u16,
+    /// When it's there (K4's clockwork, `clock`): `ALWAYS`, or `BRIDGE` (a
+    /// living bridge's, only at night).
+    pub when: u8,
 }
 
 /// `CoverBox::site` of a box that belongs to no site.
 pub const NO_SITE: u16 = u16::MAX;
+
+/// When a box, a volume or a route is there (`clock::Live::there`): always;
+/// a living bridge's, from nightfall to a minute into dawn; a sandfall's of
+/// the first or the second set, in turns (`clock::falls`); a vent lift's,
+/// always there but running on its cycle (`clock::vent_on`).
+pub const ALWAYS: u8 = 0;
+pub const BRIDGE: u8 = 1;
+pub const FALLS_A: u8 = 2;
+pub const FALLS_B: u8 = 3;
+pub const VENT: u8 = 4;
 
 /// `CoverBox::pass` for everything but shields: it blocks every faction.
 pub const SOLID: u8 = u8::MAX;
@@ -159,7 +173,7 @@ impl CoverBox {
     pub fn new(min: [f32; 2], max: [f32; 2], bottom: f32, top: f32, kind: Kind, facing: u8) -> Self {
         let center = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5];
         let half = [(max[0] - min[0]) * 0.5, (max[1] - min[1]) * 0.5];
-        CoverBox { min, max, bottom, top, kind, facing, center, half, axis: [1.0, 0.0], low: top, pass: SOLID, site: NO_SITE }
+        CoverBox { min, max, bottom, top, kind, facing, center, half, axis: [1.0, 0.0], low: top, pass: SOLID, site: NO_SITE, when: ALWAYS }
     }
 
     /// A box turned about the vertical: its footprint `half` along `axis` (a
@@ -168,7 +182,7 @@ impl CoverBox {
         let ex = axis[0].abs() * half[0] + axis[1].abs() * half[1];
         let ey = axis[1].abs() * half[0] + axis[0].abs() * half[1];
         let (min, max) = ([center[0] - ex, center[1] - ey], [center[0] + ex, center[1] + ey]);
-        CoverBox { min, max, bottom, top, kind, facing, center, half, axis, low: top, pass: SOLID, site: NO_SITE }
+        CoverBox { min, max, bottom, top, kind, facing, center, half, axis, low: top, pass: SOLID, site: NO_SITE, when: ALWAYS }
     }
 
     /// This as a wedge: its top `low` at the low end of its axis, rising to `top`.
@@ -185,6 +199,23 @@ impl CoverBox {
     /// lets through whoever holds the site.
     pub fn site_shield(self, site: u16, faction: u8) -> Self {
         CoverBox { pass: faction, site, ..self }
+    }
+
+    /// This, there only `when` the clockwork says (`ALWAYS`, `BRIDGE`).
+    pub fn when(self, when: u8) -> Self {
+        CoverBox { when, ..self }
+    }
+
+    /// Whether it's there with the clockwork at `live`.
+    #[inline]
+    pub fn there(&self, live: Live) -> bool {
+        self.when == ALWAYS || live.there(self.when)
+    }
+
+    /// Whether it stops `who`: there, and not a shield that lets them through.
+    #[inline]
+    pub fn stops(&self, who: &Mover) -> bool {
+        self.there(who.live) && self.blocks_for(who.faction, who.owners)
     }
 
     pub fn is_turned(&self) -> bool {
@@ -279,7 +310,8 @@ pub enum Force {
 }
 
 /// A force volume: an axis-aligned box of air that moves players in it.
-/// Static: it acts on whoever's feet are in it, the same on every machine.
+/// It acts on whoever's feet are in it, the same on every machine; a
+/// clockwork one (`when`) as the step says.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Volume {
     /// Its bounds; the feet are in it from `min[2]` up to (not at) `max[2]`.
@@ -288,6 +320,12 @@ pub struct Volume {
     pub force: Force,
     /// What it does: see `Force`.
     pub vel: [f32; 3],
+    /// When it's there: `ALWAYS`; `FALLS_A`, `FALLS_B` (a sandfall, a drop
+    /// in turns); `VENT` (a vent lift: there always, running on its cycle,
+    /// at `phase` steps into it, `clock::vent_on`; resting, it only slows a
+    /// fall, to `clock::VENT_SINK`).
+    pub when: u8,
+    pub phase: u16,
 }
 
 impl Volume {
@@ -324,6 +362,8 @@ pub enum Kind {
     Bone = 10,
     /// A faction's shield (C1): drawn in its colors, see-through.
     Shield = 11,
+    /// Lattice coral: a living bridge (K4), there only at night.
+    Coral = 12,
 }
 
 /// Which generator made a world: how it's drawn, and what its sites mean.
@@ -419,6 +459,10 @@ pub struct Lane {
     pub path: Vec<[f32; 3]>,
     /// Only walked from `a` to `b` (up a lift, down a drop shaft).
     pub one_way: bool,
+    /// When it can be walked (`ALWAYS`; over a living bridge, `BRIDGE`; down
+    /// a sandfall, `FALLS_A` or `FALLS_B`): the bots' graph and the
+    /// reachability check keep to those there always.
+    pub when: u8,
 }
 
 impl Lane {
@@ -460,7 +504,13 @@ impl Lane {
                 let straight = sx * ix + sy * iy > 0.9 * (sx * sx + sy * sy).sqrt() * (ix * ix + iy * iy).sqrt();
                 straight && (pos[0] - w[0]) * sx + (pos[1] - w[1]) * sy > 0.0 && d < 6.0
             };
-            if (d < 1.5 && level) || passed {
+            // Over a waypoint with the next straight over or under it (a
+            // spring's pad, a shaft): carried on from it, at any height.
+            let carried = d < 1.5 && *next + 1 < n && {
+                let u = self.waypoint(*next + 1, backward);
+                (u[0] - w[0]).abs() < 0.5 && (u[1] - w[1]).abs() < 0.5
+            };
+            if (d < 1.5 && level) || passed || carried {
                 *next += 1;
                 continue;
             }
@@ -750,9 +800,9 @@ impl World {
         &self.volumes
     }
 
-    /// The force volume the feet at (x, y, z) are in, if any (the first in
-    /// the index's order).
-    pub fn volume_at(&self, x: f32, y: f32, z: f32) -> Option<&Volume> {
+    /// The force volume the feet at (x, y, z) are in with the clockwork at
+    /// `live`, if any (the first there, in the index's order).
+    pub fn volume_at(&self, x: f32, y: f32, z: f32, live: Live) -> Option<&Volume> {
         if self.volumes.is_empty() {
             return None;
         }
@@ -761,7 +811,7 @@ impl World {
         self.vol_items[self.vol_start[cell] as usize..self.vol_start[cell + 1] as usize]
             .iter()
             .map(|&i| &self.volumes[i as usize])
-            .find(|v| v.contains(x, y, z))
+            .find(|v| v.contains(x, y, z) && live.there(v.when))
     }
 
     /// Whether the terrain has a hole at (x, y): no ground there, open to
@@ -788,10 +838,10 @@ impl World {
     }
 
     /// The lowest underside above `above` over the circle of radius `r` at
-    /// (x, y): a box's bottom (not a shield's), or the terrain's surface
-    /// where (x, y) is under it; `f32::MAX` if there's none. What a head
-    /// bumps into (C1: ceilings).
-    pub fn ceiling(&self, x: f32, y: f32, r: f32, above: f32) -> f32 {
+    /// (x, y): a box's bottom (not a shield's, and one there with the
+    /// clockwork at `live`), or the terrain's surface where (x, y) is under
+    /// it; `f32::MAX` if there's none. What a head bumps into (C1: ceilings).
+    pub fn ceiling(&self, x: f32, y: f32, r: f32, above: f32, live: Live) -> f32 {
         let mut c = f32::MAX;
         if !self.holes.is_empty() {
             let t = self.terrain(x, y);
@@ -800,7 +850,7 @@ impl World {
             }
         }
         self.boxes_near(x, y, r, |b| {
-            if b.pass == SOLID && b.bottom >= above && b.bottom < c && b.distance2(x, y) < r * r {
+            if b.pass == SOLID && b.bottom >= above && b.bottom < c && b.there(live) && b.distance2(x, y) < r * r {
                 c = b.bottom;
             }
         });
@@ -1014,12 +1064,13 @@ impl World {
     /// reach` (so a player steps up onto low boxes and lands on high ones).
     /// Under the terrain's surface (more than `UNDER` below it) or over a
     /// hole in it, the terrain isn't ground: only boxes are, and with none,
-    /// the bottom of the world (0). Shields are never ground.
-    pub fn ground(&self, x: f32, y: f32, z: f32, reach: f32) -> f32 {
+    /// the bottom of the world (0). Shields are never ground, nor boxes the
+    /// clockwork at `live` has taken away (a living bridge by day).
+    pub fn ground(&self, x: f32, y: f32, z: f32, reach: f32, live: Live) -> f32 {
         let t = self.terrain(x, y);
         let mut g = if self.holes.is_empty() || (t <= z + UNDER.max(reach) && !self.hole(x, y)) { t } else { 0.0 };
         self.boxes_near(x, y, 0.0, |b| {
-            if b.pass == SOLID && b.covers(x, y) {
+            if b.pass == SOLID && b.covers(x, y) && b.there(live) {
                 let top = b.top_at(x, y);
                 if top <= z + reach && top > g {
                     g = top;
@@ -1055,6 +1106,9 @@ impl World {
                 }
                 eat(b.pass as u64 | (b.site as u64) << 8);
             }
+            if b.when != ALWAYS {
+                eat(0xC10C_0000 | b.when as u64);
+            }
         }
         for (i, &w) in self.holes.iter().enumerate() {
             if w != 0 {
@@ -1066,7 +1120,7 @@ impl World {
             for x in v.min.iter().chain(&v.max).chain(&v.vel) {
                 eat(x.to_bits() as u64);
             }
-            eat(v.force as u64);
+            eat(v.force as u64 | (v.when as u64) << 8 | (v.phase as u64) << 16);
         }
         for s in &self.sites {
             for v in [s.center[0], s.center[1], s.half, s.level] {
@@ -1075,7 +1129,7 @@ impl World {
             eat(s.kind as u64 | (s.sector as u64) << 8);
         }
         for l in &self.lanes {
-            eat(l.a as u64 | (l.b as u64) << 16 | (l.one_way as u64) << 32);
+            eat(l.a as u64 | (l.b as u64) << 16 | (l.one_way as u64) << 32 | (l.when as u64) << 40);
             for p in &l.path {
                 for v in p {
                     eat(v.to_bits() as u64);
@@ -1240,7 +1294,7 @@ mod tests {
         w.boxes_near(cx, cy, 0.0, |x| found |= *x == b);
         assert!(found, "the index finds a box at its center");
         // On the box's top from above; on the terrain from below its top.
-        assert_eq!(w.ground(cx, cy, b.top, 0.5), b.top);
-        assert_eq!(w.ground(cx, cy, b.top - 2.0, 0.5), w.terrain(cx, cy), "out of reach: the terrain");
+        assert_eq!(w.ground(cx, cy, b.top, 0.5, crate::clock::Live::OFF), b.top);
+        assert_eq!(w.ground(cx, cy, b.top - 2.0, 0.5, crate::clock::Live::OFF), w.terrain(cx, cy), "out of reach: the terrain");
     }
 }

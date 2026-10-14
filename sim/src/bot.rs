@@ -542,7 +542,9 @@ impl Fighter {
             .filter(|&(d, ..)| d <= self.cfg.range)
             .collect();
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        near.into_iter().take(3).find(|&(_, _, p)| lattice_game::hit::line_clear(world, eye, p, side)).map(|(_, e, _)| e)
+        // (Shields as at the start; the clockwork as at its step.)
+        let who = lattice_game::movement::Mover { faction: side, owners: &[], live: lattice_game::clock::Live::at(core.step()) };
+        near.into_iter().take(3).find(|&(_, _, p)| lattice_game::hit::line_clear(world, eye, p, who)).map(|(_, e, _)| e)
     }
 
     /// One tick: pick a target now and then, fire in bursts (0.5-1 s, with

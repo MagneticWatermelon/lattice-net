@@ -85,7 +85,9 @@ fn every_route_walks_end_to_end() {
             if backward && l.one_way {
                 continue;
             }
-            if let Err(e) = walk(&w, l, backward) {
+            // (The clockwork's routes when they're there: a bridge at night.)
+            let who = crate::movement::Mover { faction: crate::reach::walker(&w, l), owners: &[], live: crate::clock::open(l.when).0 };
+            if let Err(e) = crate::reach::walk_as(&w, l, backward, who) {
                 let (a, b) = (w.sites()[l.a as usize], w.sites()[l.b as usize]);
                 failed.push(format!("route {i} {:?} {} -> {:?} {} ({}): {e}", a.kind, l.a, b.kind, l.b, if backward { "back" } else { "forth" }));
             }
@@ -155,7 +157,7 @@ fn stairs_climb() {
         holes: Vec::new(),
         volumes: Vec::new(),
     });
-    let l = crate::world::Lane { a: 0, b: 0, path: path.iter().zip(&zs).map(|(p, z)| [p[0] as f32, p[1] as f32, *z as f32]).collect(), one_way: false };
+    let l = crate::world::Lane { a: 0, b: 0, path: path.iter().zip(&zs).map(|(p, z)| [p[0] as f32, p[1] as f32, *z as f32]).collect(), one_way: false, when: 0 };
     let up = walk(&w, &l, false);
     assert!(up.is_ok(), "up: {up:?}");
     let down = walk(&w, &l, true);
@@ -200,8 +202,8 @@ fn tunnels_run_under_the_ground_from_holes() {
                 cells += 1;
                 let (x, y) = ((cx as f32 + 0.5) * 4.0, (cy as f32 + 0.5) * 4.0);
                 let t = w.terrain(x, y);
-                let floor = w.ground(x, y, t + 1.0, 1.5);
-                if w.volume_at(x, y, t - 3.0).is_none() {
+                let floor = w.ground(x, y, t + 1.0, 1.5, crate::clock::Live::OFF);
+                if w.volume_at(x, y, t - 3.0, crate::clock::Live::OFF).is_none() {
                     assert!(floor > t - 14.0, "a hole at ({x}, {y}) with no ramp or shaft in it");
                     continue; // a trench's ramp
                 }
@@ -258,7 +260,7 @@ fn a_sites_shields_let_its_holder_through() {
         })
         .find(|(b, n)| {
             let (x, y) = (b.center[0] + n[0] * 4.0, b.center[1] + n[1] * 4.0);
-            (w.ground(x, y, b.bottom + 0.8, 1.0) - b.bottom).abs() < 0.6 && (w.ground(b.center[0] - n[0] * 3.0, b.center[1] - n[1] * 3.0, b.bottom + 0.8, 1.0) - b.bottom).abs() < 0.6
+            (w.ground(x, y, b.bottom + 0.8, 1.0, crate::clock::Live::OFF) - b.bottom).abs() < 0.6 && (w.ground(b.center[0] - n[0] * 3.0, b.center[1] - n[1] * 3.0, b.bottom + 0.8, 1.0, crate::clock::Live::OFF) - b.bottom).abs() < 0.6
         })
         .expect("the Span's spawn room's door onto its gallery");
     assert_ne!(b.site, NO_SITE);
@@ -266,7 +268,7 @@ fn a_sites_shields_let_its_holder_through() {
         let start = [b.center[0] + n[0] * 4.0, b.center[1] + n[1] * 4.0];
         let mut m = MoveState::standing_at(&w, start, b.bottom + 0.3);
         for _ in 0..60 {
-            m = step(&w, m, Input { move_x: (-n[0] * 127.0) as i8, move_y: (-n[1] * 127.0) as i8, ..Default::default() }, Mover { faction, owners });
+            m = step(&w, m, Input { move_x: (-n[0] * 127.0) as i8, move_y: (-n[1] * 127.0) as i8, ..Default::default() }, Mover { faction, owners, live: crate::clock::Live::OFF });
         }
         (m.pos[0] - b.center[0]) * n[0] + (m.pos[1] - b.center[1]) * n[1] < -1.0
     };
@@ -320,11 +322,11 @@ fn every_base_and_great_site_has_a_spawn_room_that_sees_no_point() {
     }) {
         let n = if b.half[0] < b.half[1] { b.world_dir([1.0, 0.0]) } else { b.world_dir([0.0, 1.0]) };
         let floor = b.bottom + 0.3;
-        let inside = [-1.0f32, 1.0].into_iter().map(|s| [b.center[0] + n[0] * s * 1.2, b.center[1] + n[1] * s * 1.2]).find(|q| w.ceiling(q[0], q[1], 0.1, floor + 1.0) < floor + 6.0).expect("a door under a roof on one side");
+        let inside = [-1.0f32, 1.0].into_iter().map(|s| [b.center[0] + n[0] * s * 1.2, b.center[1] + n[1] * s * 1.2]).find(|q| w.ceiling(q[0], q[1], 0.1, floor + 1.0, crate::clock::Live::OFF) < floor + 6.0).expect("a door under a roof on one side");
         let eye = [inside[0], inside[1], floor + 1.6];
         let owners: Vec<u8> = sites.iter().map(|s| s.sector).collect();
         for p in w.points().iter().filter(|p| p.site == b.site) {
-            let seen = crate::hit::line_clear(&w, eye, [p.pos[0], p.pos[1], p.pos[2] + 1.0], crate::movement::Mover { faction: sites[b.site as usize].sector, owners: &owners });
+            let seen = crate::hit::line_clear(&w, eye, [p.pos[0], p.pos[1], p.pos[2] + 1.0], crate::movement::Mover { faction: sites[b.site as usize].sector, owners: &owners, live: crate::clock::Live::OFF });
             assert!(!seen, "site {} ({:?}): its point at {:?} is in sight from the door at {eye:?}", b.site, sites[b.site as usize].kind, p.pos);
         }
         doors += 1;
@@ -389,7 +391,7 @@ fn every_base_has_its_tunnels() {
         for l in &exits {
             assert!(crate::reach::walk_as(&w, l, false, s.sector.into()).is_ok());
             let other = (s.sector + 1) % 3;
-            assert!(crate::reach::walk_as(&w, l, false, crate::movement::Mover { faction: other, owners: &owners }).is_err(), "{:?} {i}: faction {other} through its covered exit", s.kind);
+            assert!(crate::reach::walk_as(&w, l, false, crate::movement::Mover { faction: other, owners: &owners, live: crate::clock::Live::OFF }).is_err(), "{:?} {i}: faction {other} through its covered exit", s.kind);
         }
         // An approach tunnel: from the ground well outside it, mostly under the ground.
         let approach = routes.iter().any(|l| {
@@ -545,7 +547,7 @@ fn rift_walls_have_galleries() {
             let out = at(b.to + 100.0, mid);
             let floor = [out[0] as f32, out[1] as f32, w.terrain(out[0] as f32, out[1] as f32) + 1.0];
             for (p, q) in [(eye, floor), (floor, eye)] {
-                if !crate::hit::line_clear(&w, p, q, Mover { faction: 0, owners: &owners }) {
+                if !crate::hit::line_clear(&w, p, q, Mover { faction: 0, owners: &owners, live: crate::clock::Live::OFF }) {
                     let t = crate::hit::terrain(&w, p, q);
                     let mut boxes = Vec::new();
                     w.boxes_near((p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0, 60.0, |bx| {
@@ -559,12 +561,12 @@ fn rift_walls_have_galleries() {
             // Walked to from the hall.
             let end = at(b.to - 1.2, mid);
             let door = at(10.0, mid);
-            let l = crate::world::Lane { a: 0, b: 0, path: vec![[c[0] as f32, c[1] as f32, zg], [door[0] as f32, door[1] as f32, zg], [end[0] as f32, end[1] as f32, zg]], one_way: false };
+            let l = crate::world::Lane { a: 0, b: 0, path: vec![[c[0] as f32, c[1] as f32, zg], [door[0] as f32, door[1] as f32, zg], [end[0] as f32, end[1] as f32, zg]], one_way: false, when: 0 };
             let walked = walk(&w, &l, false);
             assert!(walked.is_ok(), "the window at {sill:?} of the gallery at {c:?}: {walked:?}");
             // The sill stops a walk out of the window (it's no door).
             let past = at(b.to + 3.0, mid);
-            let out_l = crate::world::Lane { a: 0, b: 0, path: vec![[c[0] as f32, c[1] as f32, zg], [door[0] as f32, door[1] as f32, zg], [past[0] as f32, past[1] as f32, zg]], one_way: false };
+            let out_l = crate::world::Lane { a: 0, b: 0, path: vec![[c[0] as f32, c[1] as f32, zg], [door[0] as f32, door[1] as f32, zg], [past[0] as f32, past[1] as f32, zg]], one_way: false, when: 0 };
             assert!(walk(&w, &out_l, false).is_err(), "walked out of the window at {sill:?} over its {SILL} m sill");
         }
     }
@@ -601,4 +603,51 @@ fn every_tunnel_fits() {
         eprintln!("{n}");
     }
     assert!(k.notes.is_empty(), "{} things the generator couldn't fit", k.notes.len());
+}
+
+#[test]
+fn the_clockwork_runs() {
+    // K4: living bridges at night, sandfalls in turns, vent lifts that rest.
+    use crate::clock::{self, Live};
+    use crate::movement::Mover;
+    use crate::world::{Kind, ALWAYS, BRIDGE, FALLS_A, FALLS_B, VENT};
+    let w = kiln();
+    let walk_at = |l: &crate::world::Lane, backward: bool, live: Live| crate::reach::walk_as(&w, l, backward, Mover { faction: crate::reach::walker(&w, l), owners: &[], live });
+    let timed: Vec<&crate::world::Lane> = w.lanes().iter().filter(|l| l.when != ALWAYS).collect();
+    let count = |when: u8| timed.iter().filter(|l| l.when == when).count();
+    assert_eq!((count(BRIDGE), count(FALLS_A), count(FALLS_B)), (3, 2, 2), "a bridge over each rift, two sandfalls into each cenote");
+    for l in &timed {
+        let (a, b) = (l.path[0], l.path[l.path.len() - 1]);
+        eprintln!("when {}: ({:.0}, {:.0}, {:.0}) to ({:.0}, {:.0}, {:.0}), {:.0} m", l.when, a[0], a[1], a[2], b[0], b[1], b[2], l.length());
+    }
+    for l in &timed {
+        let (open, shut) = clock::open(l.when);
+        for backward in [false, true].into_iter().filter(|&b| !b || !l.one_way) {
+            assert!(walk_at(l, backward, open).is_ok(), "{} walks while it's there", l.when);
+            let fails = walk_at(l, backward, shut);
+            assert!(fails.as_ref().is_err_and(|e| e.contains("fell")), "{}: walked while it isn't there: {fails:?}", l.when);
+        }
+    }
+    // A bridge's deck stops shots at night only, and is never there by day.
+    let decks: Vec<_> = w.boxes().iter().filter(|b| b.kind == Kind::Coral).collect();
+    assert!(decks.iter().all(|b| b.when == BRIDGE));
+    let b = decks.iter().max_by(|a, b| a.half[1].total_cmp(&b.half[1])).unwrap();
+    let (over, under) = ([b.center[0], b.center[1], b.top + 3.0], [b.center[0], b.center[1], b.bottom - 3.0]);
+    let (night, day) = clock::open(BRIDGE);
+    assert!(!crate::hit::line_clear(&w, over, under, Mover { faction: 0, owners: &[], live: night }));
+    assert!(crate::hit::line_clear(&w, over, under, Mover { faction: 0, owners: &[], live: day }));
+    // The vent lifts: every route up one walks, however its vent's cycle
+    // falls (arriving as it starts to rest, or midway), and no one riding
+    // it falls hard when it rests.
+    let vents: Vec<_> = w.volumes().iter().filter(|v| v.when == VENT).collect();
+    let rides: Vec<&crate::world::Lane> = w.lanes().iter().filter(|l| l.path.iter().any(|p| vents.iter().any(|v| v.contains(p[0], p[1], p[2])))).collect();
+    eprintln!("{} vent lifts' columns, {} routes up them", vents.len(), rides.len());
+    assert!(vents.len() >= 9 && rides.len() >= 9);
+    for l in &rides {
+        for s0 in (0..clock::VENT_CYCLE).step_by(clock::VENT_CYCLE as usize / 6) {
+            if let Err(e) = walk_at(l, false, Live::at(s0)) {
+                panic!("route up a vent from step {s0}: {e}");
+            }
+        }
+    }
 }

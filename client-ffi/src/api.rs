@@ -47,7 +47,7 @@ use crate::session::dev_token;
 /// 4: worlds by id (Kiln), lanes, points, materials.
 /// 5: the collision kit (K1): turned boxes, wedges and shields in `LtBox`,
 /// one-way lanes, `lt_world_volumes`, `lt_world_holes`.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]
@@ -439,6 +439,14 @@ ffi_fns! {
         with(s, |h| h.flush())
     }
 
+    /// Kiln's clock (K4): the day and the clockwork at the step we're
+    /// predicting.
+    fn lt_clock(s: *mut LtSession, out: *mut LtClock) -> () {
+        if let Some(o) = out.as_mut() {
+            *o = with(s, |h| Wrapped(h.day())).0;
+        }
+    }
+
     /// Every site's state (who holds it, its fight; U5): fills `out` (up to
     /// `cap`, in `lt_world_sites`' order), returns how many sites there are
     /// (0 before we're welcomed).
@@ -550,6 +558,7 @@ ffi_fns! {
                 facing: b.facing,
                 pass: b.pass,
                 site: b.site,
+                when: b.when,
             };
         }
         w.boxes().len() as i32
@@ -573,7 +582,7 @@ ffi_fns! {
             .lanes()
             .iter()
             .map(|l| {
-                let lane = LtLane { a: l.a, b: l.b, first, count: l.path.len() as u32, one_way: l.one_way as u8 };
+                let lane = LtLane { a: l.a, b: l.b, first, count: l.path.len() as u32, one_way: l.one_way as u8, when: l.when };
                 first += l.path.len() as u32;
                 lane
             })
@@ -612,7 +621,7 @@ ffi_fns! {
     fn lt_world_volumes(w: *const LtWorld, out: *mut LtVolume, cap: i32) -> i32 {
         let Some(w) = world(w) else { return 0 };
         for (o, v) in slice(out, cap).iter_mut().zip(w.volumes()) {
-            *o = LtVolume { min: v.min.into(), max: v.max.into(), vel: v.vel.into(), force: v.force as u8 };
+            *o = LtVolume { min: v.min.into(), max: v.max.into(), vel: v.vel.into(), force: v.force as u8, when: v.when, phase: v.phase };
         }
         w.volumes().len() as i32
     }
@@ -664,7 +673,7 @@ ffi_fns! {
     /// The highest surface at (`x`, `y`) feet at `z` can stand on: the
     /// terrain, or a box's top no higher than `z + reach`.
     fn lt_world_ground(w: *const LtWorld, x: f32, y: f32, z: f32, reach: f32) -> f32 {
-        world(w).map_or(0.0, |w| w.ground(x, y, z, reach))
+        world(w).map_or(0.0, |w| w.ground(x, y, z, reach, lattice_game::clock::Live::OFF))
     }
 
     /// Where the segment `from` -> `to` first hits the ground or cover

@@ -247,7 +247,7 @@ pub fn line_clear<'a>(world: &World, p0: V, p1: V, who: impl Into<crate::movemen
     let half = (dx * dx + dy * dy).sqrt() / 2.0;
     let mut clear = true;
     world.boxes_near(mid[0], mid[1], half + 1.0, |c| {
-        clear &= !c.blocks_for(who.faction, who.owners) || solid(p0, p1, c).is_none();
+        clear &= !c.stops(&who) || solid(p0, p1, c).is_none();
     });
     clear
 }

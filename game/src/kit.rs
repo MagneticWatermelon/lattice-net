@@ -13,7 +13,7 @@
 //! - a tower with a lift up its side and a drop shaft down the other (x 1300);
 //! - a spring (x 1350).
 
-use crate::world::{hole_bits, Continent, CoverBox, Force, Kind, Lane, Parts, Volume, World, TERRAIN_N, TERRAIN_RES};
+use crate::world::{hole_bits, Continent, CoverBox, Force, Kind, Lane, Parts, Volume, World, ALWAYS, TERRAIN_N, TERRAIN_RES};
 
 /// The kit level's world id ("KIT" in ASCII).
 pub const KIT: u64 = 0x4B_4954;
@@ -96,9 +96,9 @@ pub fn level() -> World {
     let (tx, ty, ttop) = TOWER;
     boxes.push(CoverBox::new([tx[0], ty[0]], [tx[1], ty[1]], g - 0.3, ttop, Kind::Block, 0));
     let volumes = vec![
-        Volume { min: [LIFT_X[0], ty[0], g], max: [LIFT_X[1], ty[0] + 4.0, ttop + 1.0], force: Force::Lift, vel: [0.0, 0.0, 12.0] },
-        Volume { min: [DROP_X[0], ty[0], g], max: [DROP_X[1], ty[1], ttop + 2.0], force: Force::Drop, vel: [0.0, 0.0, -5.0] },
-        Volume { min: [SPRING.0[0], 996.0, g - 0.5], max: [SPRING.0[1], 1004.0, g + 0.5], force: Force::Spring, vel: SPRING.1 },
+        Volume { min: [LIFT_X[0], ty[0], g], max: [LIFT_X[1], ty[0] + 4.0, ttop + 1.0], force: Force::Lift, vel: [0.0, 0.0, 12.0], when: ALWAYS, phase: 0 },
+        Volume { min: [DROP_X[0], ty[0], g], max: [DROP_X[1], ty[1], ttop + 2.0], force: Force::Drop, vel: [0.0, 0.0, -5.0], when: ALWAYS, phase: 0 },
+        Volume { min: [SPRING.0[0], 996.0, g - 0.5], max: [SPRING.0[1], 1004.0, g + 0.5], force: Force::Spring, vel: SPRING.1, when: ALWAYS, phase: 0 },
     ];
 
     // A route through all of it, for walking: down the tunnel and out.
@@ -107,6 +107,7 @@ pub fn level() -> World {
         b: 0,
         path: vec![[1094.0, 1000.0, g], [i0 + 1.0, 1000.0, g], [i1 + 2.0, 1000.0, f], [o0 - 2.0, 1000.0, f], [o1 - 1.0, 1000.0, g], [1260.0, 1000.0, g]],
         one_way: false,
+        when: ALWAYS,
     };
     World::from_parts(Parts {
         id: KIT,
@@ -250,7 +251,7 @@ mod tests {
         assert!(!hit::line_clear(&w, p0, p1, 0));
         assert!(!hit::line_clear(&w, p0, p1, crate::movement::NO_FACTION));
         // Nobody stands on one.
-        assert_eq!(w.ground(mid, GAP_Y, GROUND + 5.0, 1.0), GROUND);
+        assert_eq!(w.ground(mid, GAP_Y, GROUND + 5.0, 1.0, crate::clock::Live::OFF), GROUND);
     }
 
     #[test]

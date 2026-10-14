@@ -332,6 +332,9 @@ ffi_structs! {
         /// the site (`lt_territory`), and `pass` is who held it at the start.
         /// `LT_NO_SITE` for the rest.
         pub site: u16,
+        /// When it's there (`LT_WHEN_ALWAYS`, or `LT_WHEN_BRIDGE`: a living
+        /// bridge's, at night: `LtClock::bridges`).
+        pub when: u8,
     }
 
     /// A force volume (an axis-aligned box of air): a lift, a drop shaft or
@@ -343,6 +346,13 @@ ffi_structs! {
         /// down (z, negative), a spring's throw.
         pub vel: LtVec3,
         pub force: u8,
+        /// When it's there (`LT_WHEN_*`): always; a sandfall's, in its set's
+        /// turn (`LtClock::falls`); a vent lift, always there but running
+        /// for `LT_VENT_ON` steps of every `LT_VENT_CYCLE`, `phase` steps
+        /// into its cycle (running while `(step + phase) % LT_VENT_CYCLE <
+        /// LT_VENT_ON`), resting it only slows a fall.
+        pub when: u8,
+        pub phase: u16,
     }
 
     /// A site: a base, an outpost, a great site or a Landing.
@@ -370,6 +380,9 @@ ffi_structs! {
         pub count: u32,
         /// 1: only walked from `a` to `b` (up a lift, down a drop shaft).
         pub one_way: u8,
+        /// When it can be walked (`LT_WHEN_*`: over a living bridge, down a
+        /// sandfall; else always).
+        pub when: u8,
     }
 
     /// A control point: holding it holds the site's tap.
@@ -399,6 +412,24 @@ ffi_structs! {
         pub point_count: u8,
         pub points: [u8; 6],
         pub contested: u8,
+    }
+
+    /// Kiln's clock (K4): the day and the clockwork, from the game step
+    /// we're predicting (`lt_clock`). The same on every client: it's the
+    /// step's.
+    pub struct LtClock {
+        /// The game step.
+        pub step: u32,
+        /// Its place in the cycle (`LT_CYCLE_STEPS`, from the day's start).
+        pub cycle_step: u32,
+        /// Seconds into the cycle, between steps (for the sky).
+        pub cycle_secs: f32,
+        /// `LT_PHASE_*`.
+        pub phase: u8,
+        /// 1: the living bridges stand (`LT_WHEN_BRIDGE` boxes are there).
+        pub bridges: u8,
+        /// Which sandfalls pour: `LT_WHEN_FALLS_A` or `LT_WHEN_FALLS_B`.
+        pub falls: u8,
     }
 
     /// Where a segment first hits the ground or cover.
@@ -460,6 +491,16 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_COVER_CRYSTAL", lattice_game::world::Kind::Crystal as i64, "Glass and crystal: fulgurite spikes, a Geode's crystals."),
     ("LT_COVER_BONE", lattice_game::world::Kind::Bone as i64, "The Dry Sea's bones."),
     ("LT_COVER_SHIELD", lattice_game::world::Kind::Shield as i64, "A faction's shield: drawn in its colors, see-through."),
+    ("LT_COVER_CORAL", lattice_game::world::Kind::Coral as i64, "Lattice coral: a living bridge (K4), there only at night."),
+    ("LT_WHEN_ALWAYS", lattice_game::world::ALWAYS as i64, "There always."),
+    ("LT_WHEN_BRIDGE", lattice_game::world::BRIDGE as i64, "A living bridge's: from nightfall to a minute into dawn."),
+    ("LT_WHEN_FALLS_A", lattice_game::world::FALLS_A as i64, "A sandfall of the first set: pouring in its turn."),
+    ("LT_WHEN_FALLS_B", lattice_game::world::FALLS_B as i64, "A sandfall of the second set."),
+    ("LT_WHEN_VENT", lattice_game::world::VENT as i64, "A vent lift: there always, running on its cycle."),
+    ("LT_PHASE_DAY", lattice_game::clock::Phase::Day as i64, "Day: 70 minutes."),
+    ("LT_PHASE_DUSK", lattice_game::clock::Phase::Dusk as i64, "Dusk: 10 minutes; the living bridges grow."),
+    ("LT_PHASE_NIGHT", lattice_game::clock::Phase::Night as i64, "Night: 30 minutes; the bridges stand."),
+    ("LT_PHASE_DAWN", lattice_game::clock::Phase::Dawn as i64, "Dawn: 10 minutes; the bridges wither after a minute's warning."),
     ("LT_SOLID", lattice_game::world::SOLID as i64, "`LtBox::pass` of everything but shields: it blocks every faction."),
     ("LT_NO_SITE", lattice_game::world::NO_SITE as i64, "`LtBox::site` of a box that belongs to no site."),
     ("LT_NO_ONE", lattice_game::territory::NONE as i64, "No faction: who holds a site or a point no one holds."),
