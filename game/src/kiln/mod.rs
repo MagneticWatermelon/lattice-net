@@ -387,6 +387,8 @@ pub(crate) struct Kiln {
     pub tunnels: Vec<lanes::Route>,
     /// The tubes dug (K3).
     pub bores: Vec<deep::Bored>,
+    /// The galleries' windows in the rifts' walls, the reef caves' doorways (K3).
+    pub openings: Vec<under::Opening>,
     /// The bases' spawn rooms (K3): site, center (its shaft's corner), its
     /// long axis, its floor.
     pub rooms: Vec<(usize, [f64; 2], [f64; 2], f64)>,
@@ -477,6 +479,7 @@ pub(crate) fn build_kiln() -> Kiln {
         chambers: Vec::new(),
         tunnels: Vec::new(),
         bores: Vec::new(),
+        openings: Vec::new(),
         rooms: Vec::new(),
         notes: Vec::new(),
     };

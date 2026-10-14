@@ -13,8 +13,18 @@
 //! - **The Undervein.** Tubes under the lanes: each sector's two Tunnel
 //!   mouths (K1), from the one to the citadel's undercroft and from the
 //!   other to its first biome base's, and two under each rift, down a shaft
-//!   on one side to a junction under its floor (a trench up to it), up a
-//!   shaft on the other.
+//!   on one side to a gallery in the rift's wall, on down to a junction
+//!   under its floor (a trench up to it), up through the far wall's
+//!   gallery and a shaft on the other.
+//! - **The galleries** (docs/kiln.md: "in the rift walls, galleries with
+//!   windows over the drop"): a hall in the rock 30 m over the rift's
+//!   floor, behind its wall's face, and a row of window bays out to the
+//!   face. A bay is a height cell wide; where its window is, the cells the
+//!   window's band crosses are cut out of the terrain and plugged with
+//!   boxes above and below it, so the face is whole but for the window.
+//! - **The reef warren's caves** ("rooms in its caves"): a room in each of
+//!   its blocks of reef, level with the corridors, a doorway out to each of
+//!   the two beside it (cut and plugged as a window is, without a sill).
 //!
 //! A tunnel that climbs more than a walk can (`GRADE`) takes a shaft between
 //! two chambers stacked in the rock (`deep::shaft_pair`). Long tubes have a
@@ -28,10 +38,10 @@
 use std::collections::HashMap;
 
 use super::deep::{self, axis_of, rev, snap, trench_leg, Chamber};
-use super::build::free_dir;
+use super::build::{self, free_dir, strip};
 use super::lanes::{Leg, LegKind, Route};
 use super::*;
-use crate::world::{SiteKind, CELLS};
+use crate::world::{Kind, SiteKind, CELLS};
 
 /// A base's undercroft: half its side, its headroom, how far its shaft is
 /// off its center.
@@ -57,6 +67,21 @@ const SHAFT: f64 = 4.0;
 const TUBE_OUT: f64 = 3.6;
 /// The farthest a tunnel runs between stops: a junction or an exit.
 pub(crate) const STRETCH: f64 = 400.0;
+/// A gallery: its hall's half-side and headroom, its floor over the rift's,
+/// its window bays' headroom and sills, and the bays' sides across its axis
+/// from the hall's center (a height cell each, piers on the cells' edges).
+const G_HALF: f64 = 12.0;
+const G_HIGH: f64 = 5.0;
+const GALLERY_UP: f64 = 30.0;
+pub(crate) const BAY_HIGH: f64 = 3.5;
+pub(crate) const SILL: f64 = 1.1;
+const WINDOWS: [(f64, f64); 4] = [(-8.0, -4.0), (-4.0, 0.0), (0.0, 4.0), (4.0, 8.0)];
+/// A reef cave: its room's half-side and headroom, its doorways' headroom
+/// and sides across their axis (two cells, no pier between them).
+const CAVE_HALF: f64 = 8.0;
+const CAVE_HIGH: f64 = 5.0;
+const DOOR_HIGH: f64 = 4.0;
+const DOORS: [(f64, f64); 2] = [(-4.0, 0.0), (0.0, 4.0)];
 
 /// A tunnel to dig: its chambers in order and how each joins the next, the
 /// sites it runs between, and where on the ground it starts and ends
@@ -110,9 +135,13 @@ struct Seg {
     ends: (usize, usize),
 }
 
-/// What's in the rock: chambers and tubes, dug and planned.
+/// What's in the rock: chambers (and their openings' bays) and tubes, dug and planned.
 fn taken(k: &Kiln, planned: &[(usize, usize)]) -> (Vec<(usize, Rect)>, Vec<Seg>) {
-    let rects = k.chambers.iter().enumerate().map(|(i, c)| (i, Rect::chamber(c.center, c.half, c.floor, c.high))).collect();
+    let mut rects: Vec<(usize, Rect)> = k.chambers.iter().enumerate().map(|(i, c)| (i, Rect::chamber(c.center, c.half, c.floor, c.high))).collect();
+    rects.extend(k.openings.iter().map(|o| {
+        let ch = &k.chambers[o.room];
+        (usize::MAX, bays_rect(ch.center, ch.half, o.a, &o.bays, o.floor, o.high))
+    }));
     let mut segs: Vec<Seg> = k.bores.iter().map(|b| Seg { a: b.0, b: b.1, z0: b.2, z1: b.3, ends: b.4 }).collect();
     for &(x, y) in planned {
         let (cx, cy) = (&k.chambers[x], &k.chambers[y]);
@@ -339,7 +368,7 @@ struct Spot {
 
 /// A chamber that isn't dug: for asking whether a tube to it would walk.
 fn ghost(center: [f64; 2], half: f64, floor: f64, high: f64) -> Chamber {
-    Chamber { site: 0, top: center, e: [1.0, 0.0], foot: center, trench: false, center, half, high, surface: floor, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0, ground: false, pair: None }
+    Chamber { site: 0, top: center, e: [1.0, 0.0], foot: center, trench: false, center, half, high, surface: floor, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0, ground: false, pair: None, doors: Vec::new() }
 }
 
 /// Whether a straight tube between two chambers walks: its floor meets
@@ -926,10 +955,281 @@ fn undervein(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, crofts
     nets
 }
 
+/// A row of bays out of a chamber through a face (K3): a gallery's windows
+/// in a rift's wall, or a cave's doorways in a reef.
+#[derive(Clone, Debug)]
+pub(crate) struct Opening {
+    /// The chamber, and the axis its bays run out along.
+    pub room: usize,
+    pub a: [f64; 2],
+    /// The bays' floor (the chamber's) and headroom.
+    pub floor: f64,
+    pub high: f64,
+    /// Doorways, walked through; else windows, over a sill.
+    #[allow(dead_code)] // (read by the tests)
+    pub door: bool,
+    pub bays: Vec<Bay>,
+}
+
+/// A bay: from its chamber's wall out along the axis to the face, where the
+/// cells its band (its floor to its headroom) crosses are cut out of the
+/// terrain and plugged above and below it.
+#[derive(Clone, Debug)]
+pub(crate) struct Bay {
+    /// Its sides, across the axis from the chamber's center (cells' edges).
+    pub span: (f64, f64),
+    /// Along the axis from the chamber's center: where its holes start, and
+    /// its end (where they stop, open air beyond).
+    pub from: f64,
+    pub to: f64,
+    /// The height cells cut out.
+    pub cells: Vec<(usize, usize)>,
+}
+
+/// A height cell's lowest and highest corners.
+fn cell_range(k: &Kiln, cx: usize, cy: usize) -> (f64, f64) {
+    [(0, 0), (1, 0), (0, 1), (1, 1)].iter().map(|&(dx, dy)| k.h[(cy + dy) * TERRAIN_N + cx + dx]).fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(v), h.max(v)))
+}
+
+/// A bay from a chamber at `c` (half-side `half`, its floor at `zg`) out
+/// along `a` over the cells between `span` across it, `high` m high: rock
+/// over it first (a cell at least, the one the chamber's wall stands in),
+/// then the cells its band crosses, then open air (under its floor for a
+/// window, level with it for a doorway). None if the face isn't within
+/// seven cells or the rock comes back past it.
+#[allow(clippy::too_many_arguments)]
+fn plan_bay(k: &Kiln, c: [f64; 2], half: f64, a: [f64; 2], span: (f64, f64), zg: f64, high: f64, door: bool) -> Option<Bay> {
+    let lat = [-a[1], a[0]];
+    let res = TERRAIN_RES as f64;
+    let mut cells = Vec::new();
+    let mut from = None;
+    for i in 0..7 {
+        let s0 = half + 4.0 * i as f64;
+        let p = add(add(c, scale(a, s0 + 2.0)), scale(lat, (span.0 + span.1) / 2.0));
+        let (cx, cy) = ((p[0] / res).floor() as usize, (p[1] / res).floor() as usize);
+        let (lo, hi) = cell_range(k, cx, cy);
+        if lo >= zg + high + 1.6 {
+            if from.is_some() {
+                return None;
+            }
+            continue;
+        }
+        if i == 0 {
+            return None;
+        }
+        let open = if door { hi <= zg + 0.6 } else { hi < zg - 0.5 };
+        if !open {
+            from.get_or_insert(s0);
+            cells.push((cx, cy));
+            continue;
+        }
+        // (A doorway's way out is level with its floor, not a drop.)
+        if door && lo < zg - 0.6 {
+            return None;
+        }
+        return from.map(|f| Bay { span, from: f, to: s0, cells });
+    }
+    None
+}
+
+/// The rock a row of bays takes, from its chamber's wall out to its farthest end.
+fn bays_rect(c: [f64; 2], half: f64, a: [f64; 2], bays: &[Bay], zg: f64, high: f64) -> Rect {
+    let lat = [-a[1], a[0]];
+    let far = bays.iter().map(|b| b.to).fold(half, f64::max);
+    let (l0, l1) = (bays[0].span.0 - 0.6, bays[bays.len() - 1].span.1 + 0.6);
+    let (p, q) = (add(add(c, scale(a, half)), scale(lat, l0)), add(add(c, scale(a, far)), scale(lat, l1)));
+    Rect { min: [p[0].min(q[0]), p[1].min(q[1])], max: [p[0].max(q[0]), p[1].max(q[1])], z0: zg - 1.0, z1: zg + high + 0.6 }
+}
+
+/// Digs a row of bays out of chamber `room` along `a`, `high` m high (as
+/// `Opening` says): their floors and ceilings through the rock, the cells
+/// at the face cut out and plugged under their floor and over their
+/// headroom (where the face rises past it: else that cell is open to the
+/// sky), the piers between them (a window's on every cell's edge, a
+/// doorway's at its sides) out to the farther end, windows' sills; the
+/// chamber's wall open to them, a lintel over them.
+fn dig_bays(k: &mut Kiln, room: usize, a: [f64; 2], bays: Vec<Bay>, high: f64, door: bool) {
+    let ch = k.chambers[room].clone();
+    let (c, half, zg) = (ch.center, ch.half, ch.floor);
+    let lat = [-a[1], a[0]];
+    let at = |s: f64, l: f64| add(add(c, scale(a, s)), scale(lat, l));
+    let (l0, l1) = (bays[0].span.0, bays[bays.len() - 1].span.1);
+    k.chambers[room].blocked.push((a, 0.55));
+    k.chambers[room].doors.push((a, l0, l1, door));
+    if high < ch.high {
+        k.fixed.push(strip(at(half + 0.3, l0), at(half + 0.3, l1), 0.3, zg + high, zg + ch.high + 0.6, Kind::Block));
+    }
+    let res = TERRAIN_RES as f64;
+    for b in &bays {
+        let mid = (b.span.0 + b.span.1) / 2.0;
+        let w = (b.span.1 - b.span.0) / 2.0 + 0.3;
+        if b.from > half {
+            k.fixed.push(strip(at(half, mid), at(b.from, mid), w, zg - 1.0, zg, Kind::Block));
+            k.fixed.push(strip(at(half, mid), at(b.from, mid), w, zg + high, zg + high + 0.6, Kind::Block));
+        }
+        for &(cx, cy) in &b.cells {
+            deep::set_hole(k, cx, cy);
+            let (lo, hi) = cell_range(k, cx, cy);
+            let center = [(cx as f64 + 0.5) * res, (cy as f64 + 0.5) * res];
+            k.fixed.push(build::oriented(center, [res / 2.0, res / 2.0], [1.0, 0.0], (lo - 0.5).min(zg - 1.0), zg, Kind::Block));
+            if hi + 0.5 > zg + high + 0.1 {
+                k.fixed.push(build::oriented(center, [res / 2.0, res / 2.0], [1.0, 0.0], zg + high, hi + 0.5, Kind::Block));
+            }
+        }
+        if !door {
+            k.fixed.push(strip(at(b.to - 0.3, b.span.0), at(b.to - 0.3, b.span.1), 0.3, zg, zg + SILL, Kind::Block));
+        }
+    }
+    let mut lines: Vec<(f64, f64)> = Vec::new();
+    for b in &bays {
+        for l in [b.span.0, b.span.1] {
+            if door && l != l0 && l != l1 {
+                continue;
+            }
+            match lines.iter_mut().find(|x| (x.0 - l).abs() < 0.1) {
+                Some(x) => x.1 = x.1.max(b.to),
+                None => lines.push((l, b.to)),
+            }
+        }
+    }
+    for (l, to) in lines {
+        k.fixed.push(strip(at(half, l), at(to, l), 0.3, zg - 1.0, zg + high + 0.6, Kind::Block));
+    }
+    k.openings.push(Opening { room, a, floor: zg, high, door, bays });
+}
+
+/// A gallery found: its hall's center, its axis, its bays.
+type Found = ([f64; 2], [f64; 2], Vec<Bay>);
+
+/// Whether a gallery's hall at `c` with its windows out along `a` fits:
+/// rock over the hall, every bay reaching the face, nothing before the
+/// windows (boxes, holes, lifts), clear of what's in the rock.
+fn plan_gallery(k: &Kiln, g: &Ground, planned: &[(usize, usize)], c: [f64; 2], a: [f64; 2], zg: f64) -> Option<Vec<Bay>> {
+    if !rock_over(k, c, G_HALF + 1.0, zg + G_HIGH + 0.6 + ROCK) {
+        return None;
+    }
+    let bays: Vec<Bay> = WINDOWS.iter().map(|&sp| plan_bay(k, c, G_HALF, a, sp, zg, BAY_HIGH, false)).collect::<Option<_>>()?;
+    let lat = [-a[1], a[0]];
+    for b in &bays {
+        let w = add(add(c, scale(a, b.to)), scale(lat, (b.span.0 + b.span.1) / 2.0));
+        let out = add(w, scale(a, 10.0));
+        if hole_near(k, w, 10.0) || g.boxed(out, 10.0, zg - 60.0, zg + 20.0) || k.volumes.iter().any(|v| dist([(v.min[0] + v.max[0]) as f64 / 2.0, (v.min[1] + v.max[1]) as f64 / 2.0], w) < 24.0) {
+            return None;
+        }
+    }
+    free(k, planned, &[Rect::chamber(c, G_HALF, zg, G_HIGH), bays_rect(c, G_HALF, a, &bays, zg, BAY_HIGH)], &[], &[]).then_some(bays)
+}
+
+/// A gallery in rift `rift`'s wall on side `side` (of its axis) near
+/// `along`, its floor at `zg`: the hall nearest the face that fits, its
+/// windows out along the world axis nearest the way into the rift.
+#[allow(clippy::too_many_arguments)]
+fn find_gallery(k: &Kiln, g: &Ground, planned: &[(usize, usize)], rift: &Rift, along: f64, side: f64, zg: f64) -> Option<Found> {
+    let a = axis_of(scale(rift.normal, -side));
+    for da in [0.0, 16.0, -16.0, 32.0, -32.0, 48.0, -48.0, 64.0, -64.0, 80.0, -80.0, 96.0, -96.0] {
+        let w = Rift::half_width(along + da);
+        for d in (0..13).map(|i| 16.0 + 4.0 * i as f64) {
+            let c = snap(rift.at(along + da, side * (w + d)));
+            if let Some(bays) = plan_gallery(k, g, planned, c, a, zg) {
+                return Some((c, a, bays));
+            }
+        }
+    }
+    None
+}
+
+/// Digs a gallery for `site`: its hall (a chamber) and its windows. Returns the hall.
+fn dig_gallery(k: &mut Kiln, site: usize, gal: &Found, zg: f64) -> usize {
+    let room = deep::chamber(k, site, gal.0, G_HALF, G_HIGH, zg, k.height(gal.0), &[]);
+    dig_bays(k, room, gal.1, gal.2.clone(), BAY_HIGH, false);
+    room
+}
+
+/// A cave's doorways planned: each its axis and bays.
+type Doorways = Vec<([f64; 2], Vec<Bay>)>;
+/// A doorway asked for: its axis, and its bays' sides across it.
+type Doorway<'a> = ([f64; 2], &'a [(f64, f64)]);
+
+/// Whether a cave's room at `r` (its floor at `zg`) fits with doorways as
+/// `shape` asks (each an axis, and its bays' sides across it): rock over
+/// the room, every doorway out to level ground with nothing in its way,
+/// clear of what's in the rock.
+fn plan_cave(k: &Kiln, g: &Ground, planned: &[(usize, usize)], r: [f64; 2], zg: f64, shape: &[Doorway]) -> Option<Doorways> {
+    if !rock_over(k, r, CAVE_HALF + 1.0, zg + CAVE_HIGH + 0.6 + ROCK) {
+        return None;
+    }
+    let mut ways = Vec::new();
+    let mut rects = vec![Rect::chamber(r, CAVE_HALF, zg, CAVE_HIGH)];
+    for &(a, spans) in shape {
+        let bays: Vec<Bay> = spans.iter().map(|&sp| plan_bay(k, r, CAVE_HALF, a, sp, zg, DOOR_HIGH, true)).collect::<Option<_>>()?;
+        let lat = [-a[1], a[0]];
+        let mid = (bays[0].span.0 + bays[bays.len() - 1].span.1) / 2.0;
+        if g.boxed(add(add(r, scale(a, bays[0].to + 3.0)), scale(lat, mid)), 4.0, zg, zg + DOOR_HIGH) {
+            return None;
+        }
+        rects.push(bays_rect(r, CAVE_HALF, a, &bays, zg, DOOR_HIGH));
+        ways.push((a, bays));
+    }
+    free(k, planned, &rects, &[], &[]).then_some(ways)
+}
+
+/// The reef warren's caves (docs/kiln.md: "rooms in its caves"): a room in
+/// each of its four blocks of reef, level with the corridors' crossing, as
+/// near it as fits, with two ways out: a doorway to each of the two
+/// corridors beside it (through the block's corner), or where one of them
+/// climbs (a lane's ramp down it), two mouths a cell wide onto the other;
+/// and a route through it, in at the one and out at the other.
+fn caves(k: &mut Kiln, g: &Ground, planned: &[(usize, usize)], i: usize) {
+    let c = k.sites[i].center;
+    let zg = land::SALT;
+    let mut spots: Vec<(f64, f64)> = (0..8).flat_map(|x| (0..8).map(move |y| (12.0 + 4.0 * x as f64, 12.0 + 4.0 * y as f64))).collect();
+    spots.sort_by(|p, q| (p.0 + p.1).total_cmp(&(q.0 + q.1)).then(p.0.total_cmp(&q.0)));
+    for (sx, sy) in [(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
+        // Toward the corridors: along -x and -y from it.
+        let (ax, ay) = ([-sx, 0.0], [0.0, -sy]);
+        let shapes: [Vec<Doorway>; 3] = [
+            vec![(ax, &DOORS[..]), (ay, &DOORS[..])],
+            vec![(ay, &[(-8.0, -4.0)][..]), (ay, &[(4.0, 8.0)][..])],
+            vec![(ax, &[(-8.0, -4.0)][..]), (ax, &[(4.0, 8.0)][..])],
+        ];
+        let found = shapes.iter().find_map(|shape| spots.iter().find_map(|&(dx, dy)| {
+            let r = snap(add(c, [sx * dx, sy * dy]));
+            plan_cave(k, g, planned, r, zg, shape).map(|ways| (r, ways))
+        }));
+        let Some((r, ways)) = found else {
+            k.notes.push(format!("the reef warren {i} has no room for a cave in its block toward ({sx}, {sy})"));
+            continue;
+        };
+        let room = deep::chamber(k, i, r, CAVE_HALF, CAVE_HIGH, zg, k.height(r), &[]);
+        // In at the one, through the room, out at the other: under the reef
+        // at its floor's height, on the corridors' ground beyond.
+        let ends: Vec<([f64; 2], [f64; 2], [f64; 2])> = ways
+            .iter()
+            .map(|(a, bays)| {
+                let lat = [-a[1], a[0]];
+                let mid = (bays[0].span.0 + bays[bays.len() - 1].span.1) / 2.0;
+                let at = |s: f64| add(add(r, scale(*a, s)), scale(lat, mid));
+                (at(CAVE_HALF - 1.0), at(bays[0].to), at(bays[0].to + 6.0))
+            })
+            .collect();
+        for (a, bays) in ways {
+            dig_bays(k, room, a, bays, DOOR_HIGH, true);
+        }
+        let ((in0, edge0, out0), (in1, edge1, out1)) = (ends[0], ends[1]);
+        let legs = vec![
+            Leg { kind: LegKind::Road, path: vec![out0, edge0], z: None },
+            Leg { kind: LegKind::Road, path: vec![edge0, in0, r, in1, edge1], z: Some(vec![zg; 5]) },
+            Leg { kind: LegKind::Road, path: vec![edge1, out1], z: None },
+        ];
+        k.internal.push(Route { a: i, b: i, legs, one_way: false });
+    }
+}
+
 /// A tube under rift `rift` at `along`: from a chamber along `chain` (on
-/// one side) over to the rift's edge, down a shaft to under its floor,
-/// across under it by a junction (a trench up to the floor), up a shaft on
-/// the far side and over to a mouth by site `near`.
+/// one side) over to the rift's edge, down a shaft to a gallery in its
+/// wall, on down under its floor, across under it by a junction (a trench
+/// up to the floor), up through the far wall's gallery and a shaft there,
+/// and over to a mouth by site `near`.
 fn rift_tube(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, rift: &Rift, along: f64, chain: &[usize], near: usize) -> Option<Net> {
     let start = chain[0];
     let a_site = k.chambers[start].site;
@@ -957,23 +1257,32 @@ fn rift_tube(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, rift: 
         k.notes.push(format!("rift {} at {along}: no room on the floor for the junction", rift.j));
         return None;
     };
-    let jcenter = add(top, scale(e, 48.0));
-    let low = k.mean(add(top, scale(e, 20.0)), 26.0) - 12.0;
-    // The shafts: under each side's ground beyond its wall's top.
-    let mut shafts = Vec::new();
+    // The galleries: one in each side's wall, their floors `GALLERY_UP` over the rift's.
+    let zg = Rift::floor(along) + GALLERY_UP;
+    let mut galleries = Vec::new();
     for side in [side_a, -side_a] {
+        let Some(gal) = find_gallery(k, g, planned, rift, along, side, zg) else {
+            k.notes.push(format!("rift {} at {along}: no room for a gallery on side {side}", rift.j));
+            return None;
+        };
+        galleries.push(gal);
+    }
+    // The shafts: under each side's ground beyond its wall's top, down to its gallery's level.
+    let mut shafts = Vec::new();
+    for (side, gal) in [side_a, -side_a].into_iter().zip(&galleries) {
+        let held = [Rect::chamber(gal.0, G_HALF, zg, G_HIGH), bays_rect(gal.0, G_HALF, gal.1, &gal.2, zg, BAY_HIGH)];
         let mut found = None;
         for out in [80.0, 95.0, 110.0, 130.0] {
             let s = rift.at(along, side * (w + out));
-            let dx = scale(sub(jcenter, s), 1.0 / dist(jcenter, s));
+            let dx = scale(sub(gal.0, s), 1.0 / dist(gal.0, s));
             let outward = scale(rift.normal, side);
             let hi = lowest(k, add(s, scale(outward, 5.0)), 11.0) - 5.6 - ROCK - 6.0;
             let (uc, xc) = (add(s, scale(outward, 5.0)), add(s, scale(dx, 5.0)));
-            if !rock_over(k, xc, 11.0, low + 5.6 + ROCK) {
+            if !rock_over(k, xc, 11.0, zg + 5.6 + ROCK) {
                 continue;
             }
-            let rects = [Rect::chamber(uc, 10.0, hi, 5.0), Rect::chamber(xc, 10.0, low, 5.0)];
-            if free(k, planned, &rects, &[], &[]) {
+            let rects = [Rect::chamber(uc, 10.0, hi, 5.0), Rect::chamber(xc, 10.0, zg, 5.0)];
+            if free(k, planned, &rects, &[], &held) {
                 found = Some((s, dx, hi));
                 break;
             }
@@ -1002,6 +1311,7 @@ fn rift_tube(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, rift: 
     };
     let jc = deep::mouth_at(k, a_site, top, e);
     let mc = deep::mouth_at(k, near, mtop, me);
+    let rooms: Vec<usize> = galleries.iter().map(|gal| dig_gallery(k, a_site, gal, zg)).collect();
     // The near side's upper chamber faces where the chain's branch is; the far's, the mouth.
     let (prefix, prefix_links) = branch(k, a_site, planned, &chain[..chain.len() / 2 + 1], shafts[0].0);
     let branch = *prefix.last().unwrap();
@@ -1009,10 +1319,11 @@ fn rift_tube(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, rift: 
     for (i, &(s, dx, hi)) in shafts.iter().enumerate() {
         let toward = if i == 0 { k.chambers[branch].center } else { k.chambers[mc].center };
         let dh = scale(sub(toward, s), 1.0 / dist(toward, s));
-        pairs.push(deep::shaft_pair(k, a_site, s, dh, dx, hi, low, 10.0));
+        pairs.push(deep::shaft_pair(k, a_site, s, dh, dx, hi, zg, 10.0));
     }
     // The chain: along it to the branch, over to the near shaft, down,
-    // across by the junction, up, over to the mouth.
+    // through the gallery, on down and across by the junction, up through
+    // the far gallery, up, over to the mouth.
     let mut hops: Vec<usize> = prefix[1..].to_vec();
     let mut links: Vec<Link> = prefix_links;
     let mut join = |k: &mut Kiln, planned: &mut Vec<(usize, usize)>, from: usize, to: usize| {
@@ -1023,8 +1334,10 @@ fn rift_tube(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, rift: 
     let (u0, l0, down0, up0) = pairs.remove(0);
     let (u1, l1, down1, up1) = pairs.remove(0);
     join(k, planned, branch, u0);
-    join(k, planned, l0, jc);
-    join(k, planned, jc, l1);
+    join(k, planned, l0, rooms[0]);
+    join(k, planned, rooms[0], jc);
+    join(k, planned, jc, rooms[1]);
+    join(k, planned, rooms[1], l1);
     join(k, planned, u1, mc);
     // (The shafts' links, in their places: after the tube to each upper chamber, and to each lower.)
     let mut out_hops = Vec::new();
@@ -1066,7 +1379,7 @@ impl Stretch {
 /// The tunnels' stretches between stops (docs/kiln.md "Tunnels": "no more
 /// than 400 m between junctions or exits"), given the tubes between
 /// chambers: a stop is a junction (three ways or more, or a dead end) or
-/// an exit (a trench, a shaft up to the ground).
+/// an exit (a trench, a shaft up to the ground, a doorway).
 pub(crate) fn stretches(k: &Kiln, tubes: &[(usize, usize)]) -> Vec<Stretch> {
     let mut tubes: Vec<(usize, usize)> = tubes.iter().map(|&(a, b)| (a.min(b), a.max(b))).collect();
     tubes.sort_unstable();
@@ -1083,7 +1396,7 @@ pub(crate) fn stretches(k: &Kiln, tubes: &[(usize, usize)]) -> Vec<Stretch> {
         at[a].push(e);
         at[b].push(e);
     }
-    let stop = |i: usize| k.chambers[i].trench || k.chambers[i].ground || at[i].len() != 2;
+    let stop = |i: usize| k.chambers[i].trench || k.chambers[i].ground || k.chambers[i].doors.iter().any(|d| d.3) || at[i].len() != 2;
     let mut seen = vec![false; edges.len()];
     let mut out = Vec::new();
     for s in (0..k.chambers.len()).filter(|&i| stop(i)) {
@@ -1185,6 +1498,9 @@ pub(crate) fn build(k: &mut Kiln) {
     let mut nets = Vec::new();
     let mut crofts = Vec::new();
     for i in 0..k.sites.len() {
+        if k.sites[i].kind == SiteKind::ReefWarren {
+            caves(k, &g, &planned, i);
+        }
         if k.sites[i].kind.base() {
             let (n, u) = base(k, &g, &mut planned, i);
             nets.extend(n);

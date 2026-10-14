@@ -257,9 +257,14 @@ pub(crate) struct Chamber {
     pub ground: bool,
     /// The chamber over or under it, down or up a shaft between them.
     pub pair: Option<usize>,
+    /// Openings in its walls besides its tubes' (`under::Opening`'s bays):
+    /// the side's outward normal, from where to where along it (as `walls`
+    /// measures, from the side's middle), and whether they're walked
+    /// through (a cave's doorways; else a gallery's windows).
+    pub doors: Vec<([f64; 2], f64, f64, bool)>,
 }
 
-fn set_hole(k: &mut Kiln, cx: usize, cy: usize) {
+pub(crate) fn set_hole(k: &mut Kiln, cx: usize, cy: usize) {
     if k.holes.is_empty() {
         k.holes = vec![0; (CELLS * CELLS).div_ceil(64)];
     }
@@ -320,7 +325,7 @@ pub(crate) fn chamber_open(k: &mut Kiln, site: usize, center: [f64; 2], half: f6
     slab(k, sub(center, [half, half]), add(center, [half, half]), floor - 1.0, floor, &open(below));
     let h = half + 0.6;
     slab(k, sub(center, [h, h]), add(center, [h, h]), floor + high, floor + high + 0.6, &open(shafts));
-    k.chambers.push(Chamber { site, top: center, e: [1.0, 0.0], foot: center, trench: false, center, half, high, surface, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0, ground: false, pair: None });
+    k.chambers.push(Chamber { site, top: center, e: [1.0, 0.0], foot: center, trench: false, center, half, high, surface, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0, ground: false, pair: None, doors: Vec::new() });
     k.chambers.len() - 1
 }
 
@@ -368,7 +373,7 @@ pub(crate) fn mouth_sized(k: &mut Kiln, site: usize, top: [f64; 2], e: [f64; 2],
     }
     k.fixed.push(oriented(center, [half, half], e, floor - 1.0, floor, Kind::Block));
     k.fixed.push(oriented(center, [half + 0.6, half + 0.6], e, floor + high, floor + high + 0.6, Kind::Block));
-    k.chambers.push(Chamber { site, top, e, foot, trench: true, center, half, high, surface, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0, ground: false, pair: None });
+    k.chambers.push(Chamber { site, top, e, foot, trench: true, center, half, high, surface, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0, ground: false, pair: None, doors: Vec::new() });
     k.chambers.len() - 1
 }
 
@@ -639,6 +644,11 @@ pub(crate) fn walls(k: &mut Kiln, i: usize) {
         let mut gaps: Vec<(f64, f64, bool)> = Vec::new();
         if c.trench && dot(normal, c.e) < -0.5 {
             gaps.push((-4.0, 4.0, false)); // the trench
+        }
+        for &(side, f, t, _) in &c.doors {
+            if dot(side, normal) > 0.99 {
+                gaps.push((f, t, false));
+            }
         }
         let end = c.half + 0.6;
         for &out in &c.outs {

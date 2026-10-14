@@ -187,12 +187,16 @@ fn tunnels_run_under_the_ground_from_holes() {
         let holes = l.path.iter().filter(|p| w.hole(p[0], p[1])).count();
         assert!(holes >= 6, "{holes} waypoints in the trenches");
     }
-    // Every hole is a trench's (a ramp in it) or a shaft's (a lift or a drop
-    // shaft in it, a chamber's floor under it): never a fall to the world's bottom.
+    // Every hole is a trench's (a ramp in it), a shaft's (a lift or a drop
+    // shaft in it, a chamber's floor under it) or a gallery's window's
+    // (plugged above and below it: `rift_walls_have_galleries`): never a
+    // fall to the world's bottom.
+    let k = build_kiln();
+    let windows: Vec<(usize, usize)> = k.openings.iter().flat_map(|g| g.bays.iter().flat_map(|b| b.cells.iter().copied())).collect();
     let (mut cells, mut shafts) = (0, 0);
     for cy in 0..crate::world::CELLS {
         for cx in 0..crate::world::CELLS {
-            if w.hole_cell(cx, cy) {
+            if w.hole_cell(cx, cy) && !windows.contains(&(cx, cy)) {
                 cells += 1;
                 let (x, y) = ((cx as f32 + 0.5) * 4.0, (cy as f32 + 0.5) * 4.0);
                 let t = w.terrain(x, y);
@@ -435,10 +439,136 @@ fn tunnels_have_no_dead_ends() {
     // Every chamber has two ways out at the least: tubes, shafts, a trench.
     let k = build_kiln();
     for (i, c) in k.chambers.iter().enumerate() {
-        let ways = c.trench as usize + c.outs.len() + c.shafts;
+        let ways = c.trench as usize + c.outs.len() + c.shafts + c.doors.iter().filter(|d| d.3).count();
         assert!(ways >= 2, "chamber {i} of site {} at ({:.0}, {:.0}, {:.0}): {ways} way out", c.site, c.center[0], c.center[1], c.floor);
     }
     eprintln!("{} chambers, {} tubes", k.chambers.len(), k.bores.len());
+}
+
+/// What you see is what blocks you round an opening: every cell cut out of
+/// the face is filled with boxes but for its band (its floor to its
+/// headroom). The cells checked.
+fn sealed(w: &World, o: &super::under::Opening, what: &str) -> usize {
+    let mut cells = 0;
+    let solid = |x: f32, y: f32, z: f32| {
+        let mut hit = false;
+        w.boxes_near(x, y, 0.0, |b| hit |= b.kind == crate::world::Kind::Block && b.covers(x, y) && b.bottom <= z && z <= b.top);
+        hit
+    };
+    let (zg, high) = (o.floor as f32, o.high as f32);
+    for b in &o.bays {
+        for &(cx, cy) in &b.cells {
+            cells += 1;
+            let corners = [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dy)| w.sample(cx + dx, cy + dy));
+            let (lo, hi) = corners.iter().fold((f32::MAX, f32::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+            for (fx, fy) in [(0.1, 0.1), (0.5, 0.5), (0.9, 0.9), (0.1, 0.9), (0.9, 0.1)] {
+                let (x, y) = ((cx as f32 + fx) * 4.0, (cy as f32 + fy) * 4.0);
+                let mut z = lo;
+                while z <= hi {
+                    if z < zg - 0.05 || z > zg + high + 0.05 {
+                        assert!(solid(x, y, z), "a gap in the face at ({x}, {y}, {z}) round {what}");
+                    }
+                    z += 0.5;
+                }
+            }
+        }
+    }
+    cells
+}
+
+#[test]
+fn the_reef_warren_has_caves() {
+    let k = build_kiln();
+    let w = kiln();
+    let warren = w.sites().iter().position(|s| s.kind == SiteKind::ReefWarren).unwrap();
+    let doors: Vec<_> = k.openings.iter().filter(|o| o.door).collect();
+    let mut rooms: Vec<usize> = doors.iter().map(|o| o.room).collect();
+    rooms.sort_unstable();
+    rooms.dedup();
+    // A cave in each of its four blocks of reef, two ways out of each.
+    assert_eq!(rooms.len(), 4);
+    let mut cells = 0;
+    for &r in &rooms {
+        let c = &k.chambers[r];
+        assert_eq!(c.site, warren);
+        assert_eq!(doors.iter().filter(|o| o.room == r).count(), 2, "the cave at {:?}", c.center);
+        for o in doors.iter().filter(|o| o.room == r) {
+            cells += sealed(&w, o, &format!("a doorway of the cave at {:?}", c.center));
+        }
+        // Its route, in at one doorway and out at the other, walked both ways.
+        let near = |p: &[f32; 3]| {
+            let (dx, dy) = (p[0] - c.center[0] as f32, p[1] - c.center[1] as f32);
+            dx * dx + dy * dy < 0.25
+        };
+        let lane = w.lanes().iter().find(|l| l.a as usize == warren && l.b as usize == warren && l.path.iter().any(near)).expect("a route through the cave");
+        for back in [false, true] {
+            let walked = walk(&w, lane, back);
+            assert!(walked.is_ok(), "through the cave at {:?}: {walked:?}", c.center);
+        }
+    }
+    eprintln!("{} caves, {} doorways, {cells} cells cut; rooms at {:?}", rooms.len(), doors.len(), rooms.iter().map(|&r| k.chambers[r].center).collect::<Vec<_>>());
+}
+
+#[test]
+fn rift_walls_have_galleries() {
+    use super::under::SILL;
+    use crate::movement::Mover;
+    let k = build_kiln();
+    let w = kiln();
+    // Two in each wall of each rift (a crossing's on each side), four windows each.
+    let galleries: Vec<_> = k.openings.iter().filter(|o| !o.door).collect();
+    assert_eq!(galleries.len(), 12);
+    for j in 0..3 {
+        let rift = Rift::new(j);
+        for side in [-1.0, 1.0] {
+            let n = galleries.iter().filter(|g| {
+                let (along, across) = rift.coords(k.chambers[g.room].center);
+                along > 0.0 && across * side > 0.0 && across.abs() < Rift::half_width(along) + 120.0
+            });
+            assert_eq!(n.count(), 2, "rift {j}, side {side}");
+        }
+    }
+    let owners: Vec<u8> = w.sites().iter().map(|s| s.sector).collect();
+    let (mut cells, mut longest) = (0, 0.0f64);
+    for g in &galleries {
+        let c = k.chambers[g.room].center;
+        let lat = [-g.a[1], g.a[0]];
+        let at = |s: f64, l: f64| add(add(c, scale(g.a, s)), scale(lat, l));
+        let zg = g.floor as f32;
+        cells += sealed(&w, g, &format!("a window of the gallery at {c:?}"));
+        for b in &g.bays {
+            let mid = (b.span.0 + b.span.1) / 2.0;
+            longest = longest.max(b.to);
+            // From the sill, the rift's floor in sight, and the other way.
+            let sill = at(b.to - 0.8, mid);
+            let eye = [sill[0] as f32, sill[1] as f32, zg + 1.6];
+            let out = at(b.to + 100.0, mid);
+            let floor = [out[0] as f32, out[1] as f32, w.terrain(out[0] as f32, out[1] as f32) + 1.0];
+            for (p, q) in [(eye, floor), (floor, eye)] {
+                if !crate::hit::line_clear(&w, p, q, Mover { faction: 0, owners: &owners }) {
+                    let t = crate::hit::terrain(&w, p, q);
+                    let mut boxes = Vec::new();
+                    w.boxes_near((p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0, 60.0, |bx| {
+                        if let Some(f) = crate::hit::solid(p, q, bx) {
+                            boxes.push((f, bx.min, bx.max, bx.bottom, bx.top));
+                        }
+                    });
+                    panic!("the floor not in sight from the window at {sill:?} of the gallery at {c:?} (to {:.1}, cells {:?}): terrain {t:?}, boxes {boxes:?}", b.to, b.cells);
+                }
+            }
+            // Walked to from the hall.
+            let end = at(b.to - 1.2, mid);
+            let door = at(10.0, mid);
+            let l = crate::world::Lane { a: 0, b: 0, path: vec![[c[0] as f32, c[1] as f32, zg], [door[0] as f32, door[1] as f32, zg], [end[0] as f32, end[1] as f32, zg]], one_way: false };
+            let walked = walk(&w, &l, false);
+            assert!(walked.is_ok(), "the window at {sill:?} of the gallery at {c:?}: {walked:?}");
+            // The sill stops a walk out of the window (it's no door).
+            let past = at(b.to + 3.0, mid);
+            let out_l = crate::world::Lane { a: 0, b: 0, path: vec![[c[0] as f32, c[1] as f32, zg], [door[0] as f32, door[1] as f32, zg], [past[0] as f32, past[1] as f32, zg]], one_way: false };
+            assert!(walk(&w, &out_l, false).is_err(), "walked out of the window at {sill:?} over its {SILL} m sill");
+        }
+    }
+    eprintln!("{} galleries, {} windows, {cells} cells cut, the longest bay {longest:.0} m from its hall's center", galleries.len(), galleries.iter().map(|g| g.bays.len()).sum::<usize>());
 }
 
 #[test]
