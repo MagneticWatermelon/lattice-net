@@ -6,14 +6,17 @@
 //!
 //! Routes through a shield (a spawn room's covered exit) aren't in it: who
 //! may pass changes as sites change hands, and a bot that walked into one
-//! would stand there.
+//! would stand there. But every spawn room has ways out of it (U4: players
+//! deploy in them): from its middle out of each door, round the baffle,
+//! to the nearest route node, one way (only its holder is ever in it),
+//! each leg walked before it's added.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::territory::{POINT_HEIGHT, POINT_RADIUS};
-use crate::world::{Kind, World};
+use crate::world::{Kind, Lane, SpawnRoom, World, ALWAYS};
 
 /// Waypoints within this of each other (and `MERGE_Z` in height) are one node.
 const MERGE: f32 = 2.5;
@@ -31,6 +34,8 @@ pub struct Nav {
     /// Per site, per node: how far it is from standing on one of the site's
     /// points (`f32::MAX`: no way there).
     to_site: Vec<Vec<f32>>,
+    /// Spawn rooms with a way out, and the node at each one's middle.
+    rooms: Vec<(SpawnRoom, u32)>,
 }
 
 fn cell(p: [f32; 3]) -> (i32, i32) {
@@ -39,6 +44,10 @@ fn cell(p: [f32; 3]) -> (i32, i32) {
 
 fn sq(x: f32) -> f32 {
     x * x
+}
+
+fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
+    (sq(a[0] - b[0]) + sq(a[1] - b[1]) + sq(a[2] - b[2])).sqrt()
 }
 
 impl Nav {
@@ -132,10 +141,45 @@ impl Nav {
         for (i, &p) in nodes.iter().enumerate() {
             grid.entry(cell(p)).or_default().push(i as u32);
         }
-        let mut nav = Nav { nodes, out, grid, to_site: Vec::new() };
-        // Every site's distances: back along the edges from its points.
-        let mut into: Vec<Vec<(u32, f32)>> = vec![Vec::new(); nav.nodes.len()];
-        for (a, es) in nav.out.iter().enumerate() {
+        let mut nav = Nav { nodes, out, grid, to_site: Vec::new(), rooms: Vec::new() };
+        nav.fields(w);
+        // Out of the spawn rooms (`exits`): to nodes that lead to most sites.
+        let sites = nav.to_site.len();
+        let lattice: Vec<bool> = (0..nav.nodes.len()).map(|i| nav.to_site.iter().filter(|d| d[i] < f32::MAX).count() * 2 >= sites).collect();
+        let rooms = w.spawn_rooms();
+        let threads = std::thread::available_parallelism().map_or(1, |t| t.get()).min(16);
+        let found: Vec<Vec<(Vec<[f32; 3]>, u32)>> = std::thread::scope(|sc| {
+            let chunk = rooms.len().div_ceil(threads).max(1);
+            let (nav, lattice) = (&nav, &lattice);
+            let handles: Vec<_> = rooms.chunks(chunk).map(|rs| sc.spawn(move || rs.iter().map(|r| nav.exits(w, r, lattice)).collect::<Vec<_>>())).collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        for (r, ways) in rooms.iter().zip(found) {
+            if ways.is_empty() {
+                continue;
+            }
+            let c = nav.add([r.center[0], r.center[1], r.floor]);
+            for (way, goal) in ways {
+                let mut from = c;
+                for p in way.into_iter().skip(1) {
+                    let n = nav.add(p);
+                    nav.link(from, n);
+                    from = n;
+                }
+                nav.link(from, goal);
+            }
+            nav.rooms.push((*r, c));
+        }
+        if !nav.rooms.is_empty() {
+            nav.fields(w);
+        }
+        nav
+    }
+
+    /// Every site's distances: back along the edges from its points.
+    fn fields(&mut self, w: &World) {
+        let mut into: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.nodes.len()];
+        for (a, es) in self.out.iter().enumerate() {
             for &(b, c) in es {
                 into[b as usize].push((a as u32, c));
             }
@@ -144,8 +188,7 @@ impl Nav {
         for p in w.points() {
             pts[p.site as usize].push(p.pos);
         }
-        nav.to_site = pts.iter().map(|ps| nav.field(ps, &into)).collect();
-        nav
+        self.to_site = pts.iter().map(|ps| self.field(ps, &into)).collect();
     }
 
     /// The graph of `w` (one a world, shared).
@@ -191,6 +234,65 @@ impl Nav {
         d
     }
 
+    /// Spawn room `r`'s way out: a walk of grid steps (`walk_to`) from its
+    /// middle, out of whichever door leads somewhere, to a node that leads
+    /// about the continent (`lattice`, by node: those beside a room are
+    /// often a site's inner ways, behind its shields), and that node.
+    /// Walked as the room's holder (one way: out; only its holder is ever
+    /// in it).
+    fn exits(&self, w: &World, r: &SpawnRoom, lattice: &[bool]) -> Vec<(Vec<[f32; 3]>, u32)> {
+        // As the room's holder (its site held by faction 0, as 0).
+        let mut owners: Vec<u8> = w.sites().iter().map(|s| if s.sector < 3 { s.sector } else { crate::territory::NONE }).collect();
+        if let Some(o) = owners.get_mut(r.site as usize) {
+            *o = 0;
+        }
+        let who = crate::movement::Mover { faction: 0, owners: &owners, live: crate::clock::Live::OFF };
+        let mid = [r.center[0], r.center[1], r.floor];
+        let mut goals: Vec<(u32, [f32; 3])> =
+            self.within(mid, EXIT_REACH).into_iter().filter(|&i| lattice.get(i as usize).copied().unwrap_or(false)).map(|i| (i, self.nodes[i as usize])).collect();
+        goals.sort_by(|a, b| dist(a.1, mid).total_cmp(&dist(b.1, mid)));
+        goals.truncate(1000);
+        match self.walk_to(w, mid, &goals, lattice, who) {
+            Some((mut way, g)) => {
+                way.insert(0, mid);
+                vec![(way, g)]
+            }
+            None => {
+                if std::env::var_os("NAV_DEBUG").is_some() {
+                    eprintln!("room {}: no way out ({} goals, the nearest {:?})", r.site, goals.len(), goals.first().map(|g| g.1));
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    fn add(&mut self, p: [f32; 3]) -> u32 {
+        self.nodes.push(p);
+        self.out.push(Vec::new());
+        let i = (self.nodes.len() - 1) as u32;
+        self.grid.entry(cell(p)).or_default().push(i);
+        i
+    }
+
+    /// A one-way edge, costed as the routes' are.
+    fn link(&mut self, a: u32, b: u32) {
+        let (p, q) = (self.nodes[a as usize], self.nodes[b as usize]);
+        let cost = ((sq(q[0] - p[0]) + sq(q[1] - p[1])).sqrt() + 0.5 * (q[2] - p[2]).abs()).max(0.1);
+        self.out[a as usize].push((b, cost));
+    }
+
+    /// The spawn room `p` stands in, and its middle's node.
+    fn room_of(&self, p: [f32; 3]) -> Option<u32> {
+        self.rooms
+            .iter()
+            .find(|(r, _)| {
+                let d = [p[0] - r.center[0], p[1] - r.center[1]];
+                let (a, b) = (d[0] * r.axis[0] + d[1] * r.axis[1], -d[0] * r.axis[1] + d[1] * r.axis[0]);
+                a.abs() <= r.half[0] && b.abs() <= r.half[1] && (p[2] - r.floor).abs() < 2.0
+            })
+            .map(|&(_, c)| c)
+    }
+
     fn flat(&self, i: u32, p: [f32; 3]) -> f32 {
         let q = self.nodes[i as usize];
         (sq(q[0] - p[0]) + sq(q[1] - p[1])).sqrt()
@@ -228,6 +330,10 @@ impl Nav {
     /// site `site`, if any.
     pub fn nearest(&self, p: [f32; 3], site: usize) -> Option<u32> {
         let d = &self.to_site[site];
+        // In a spawn room: out of it, by its doors (the nodes beyond its walls are near too).
+        if let Some(c) = self.room_of(p) {
+            return (d[c as usize] < f32::MAX).then_some(c);
+        }
         self.within(p, NEAR)
             .into_iter()
             .filter(|&i| (self.nodes[i as usize][2] - p[2]).abs() <= 6.0 && d[i as usize] < f32::MAX)
@@ -250,6 +356,132 @@ impl Nav {
             .filter(|&&(j, e)| d[j as usize] < f32::MAX && e + d[j as usize] <= here)
             .min_by(|a, b| (a.1 + d[a.0 as usize]).total_cmp(&(b.1 + d[b.0 as usize])))
             .map(|&(j, _)| j)
+    }
+}
+
+/// How far from a spawn room's door its way out looks for the graph (m).
+const EXIT_REACH: f32 = 400.0;
+/// The grid steps a way out may take at most.
+const EXIT_STEPS: usize = 2500;
+
+impl Nav {
+    /// A way from `from` to one of `goals` (graph nodes that lead about the
+    /// continent, nearest first): A* over grid steps of 4 m, each walked
+    /// eight ways as the reachability check walks them (`reach`'s flood),
+    /// none a fall that hurts; and along the routes' own edges from any of
+    /// their nodes it stands on (up a spiral stair, a lift). The points after
+    /// `from`, and the goal reached.
+    fn walk_to(&self, w: &World, from: [f32; 3], goals: &[(u32, [f32; 3])], lattice: &[bool], who: crate::movement::Mover) -> Option<(Vec<[f32; 3]>, u32)> {
+        use crate::movement::{fall_height, step, Input, MoveState, SAFE_FALL};
+        const STEP: f32 = 4.0;
+        if goals.is_empty() {
+            return None;
+        }
+        let straight = |a: [f32; 3], b: [f32; 3]| crate::reach::walk_as(w, &Lane { a: 0, b: 0, path: vec![a, b], one_way: true, when: ALWAYS }, false, crate::movement::Mover { ..who }).is_ok();
+        let h = |p: [f32; 3]| goals.iter().map(|(_, q)| dist(*q, p)).fold(f32::MAX, f32::min);
+        // A place walked to (by its grid cell and height), or a graph node.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum K {
+            Cell(i32, i32, i32),
+            Node(u32),
+        }
+        let cell_key = |p: [f32; 3]| K::Cell((p[0] / STEP).floor() as i32, (p[1] / STEP).floor() as i32, (p[2] / 2.0).round() as i32);
+        let mut pts: Vec<([f32; 3], Option<u32>)> = vec![(from, None)];
+        let mut parent = vec![usize::MAX];
+        let mut g = vec![0.0f32];
+        let mut seen: HashMap<K, usize> = HashMap::from([(cell_key(from), 0)]);
+        let mut heap = BinaryHeap::from([(Reverse(h(from).to_bits()), 0usize)]);
+        let mut expanded = 0;
+        let way = |pts: &Vec<([f32; 3], Option<u32>)>, parent: &Vec<usize>, mut k: usize| {
+            let mut v = Vec::new();
+            while k != 0 {
+                v.push(pts[k].0);
+                k = parent[k];
+            }
+            v.reverse();
+            v
+        };
+        let mut push = |pts: &mut Vec<([f32; 3], Option<u32>)>, parent: &mut Vec<usize>, g: &mut Vec<f32>, heap: &mut BinaryHeap<(Reverse<u32>, usize)>, key: K, q: [f32; 3], node: Option<u32>, from: usize, cost: f32| {
+            if seen.contains_key(&key) {
+                return;
+            }
+            let n = pts.len();
+            seen.insert(key, n);
+            pts.push((q, node));
+            parent.push(from);
+            g.push(g[from] + cost);
+            heap.push((Reverse((g[n] + h(q)).to_bits()), n));
+        };
+        while let Some((_, i)) = heap.pop() {
+            let (p, node) = pts[i];
+            if let Some(n) = node {
+                // A node that leads about: there.
+                if lattice.get(n as usize).copied().unwrap_or(false) {
+                    let mut v = way(&pts, &parent, i);
+                    v.pop();
+                    return Some((v, n));
+                }
+                // On along its routes, and off them walking.
+                for &(m, e) in &self.out[n as usize] {
+                    push(&mut pts, &mut parent, &mut g, &mut heap, K::Node(m), self.nodes[m as usize], Some(m), i, e);
+                }
+                push(&mut pts, &mut parent, &mut g, &mut heap, cell_key(p), p, None, i, 0.0);
+                continue;
+            }
+            // A goal near enough to walk to straight.
+            for &(gi, q) in goals.iter().filter(|(_, q)| (sq(q[0] - p[0]) + sq(q[1] - p[1])).sqrt() <= 10.0 && (q[2] - p[2]).abs() <= 3.0).take(3) {
+                if straight(p, q) {
+                    let mut v = way(&pts, &parent, i);
+                    v.push(q);
+                    return Some((v, gi));
+                }
+            }
+            expanded += 1;
+            if expanded > EXIT_STEPS {
+                break;
+            }
+            // Onto the routes' nodes it stands by.
+            for n in self.within(p, 2.5) {
+                let q = self.nodes[n as usize];
+                if (q[2] - p[2]).abs() <= 2.0 && straight(p, q) {
+                    push(&mut pts, &mut parent, &mut g, &mut heap, K::Node(n), q, Some(n), i, dist(p, q));
+                }
+            }
+            for (dx, dy) in [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)] {
+                let to = [p[0] + dx as f32 * STEP, p[1] + dy as f32 * STEP];
+                let l = ((dx * dx + dy * dy) as f32).sqrt();
+                let (mx, my) = ((dx as f32 / l * 127.0) as i8, (dy as f32 / l * 127.0) as i8);
+                let mut s = MoveState { pos: [p[0], p[1]], vel: [0.0; 2], z: p[2], vz: 0.0, grounded: true, crouched: false };
+                // Walked (about two-thirds of a second at a run), then standing
+                // till it lands: long enough to ride a drop shaft or a lift; no
+                // landing that hurts (as the game measures falls, a step at a time).
+                let mut hurt = false;
+                let mut k = 0;
+                while k < 40 && sq(s.pos[0] - to[0]) + sq(s.pos[1] - to[1]) > 0.36 {
+                    let before = s;
+                    s = step(w, s, Input { move_x: mx, move_y: my, ..Default::default() }, crate::movement::Mover { ..who });
+                    hurt |= fall_height(&before, &s) > SAFE_FALL;
+                    k += 1;
+                }
+                let mut j = 0;
+                while j < 400 && !(s.grounded && s.vz.abs() < 0.01) {
+                    let before = s;
+                    s = step(w, s, Input::default(), crate::movement::Mover { ..who });
+                    hurt |= fall_height(&before, &s) > SAFE_FALL;
+                    j += 1;
+                }
+                let moved = (sq(s.pos[0] - p[0]) + sq(s.pos[1] - p[1])).sqrt() + (s.z - p[2]).abs();
+                if !s.grounded || moved < 2.5 || hurt {
+                    continue;
+                }
+                let q = [s.pos[0], s.pos[1], s.z];
+                push(&mut pts, &mut parent, &mut g, &mut heap, cell_key(q), q, None, i, moved);
+            }
+        }
+        if std::env::var_os("NAV_DEBUG").is_some() {
+            eprintln!("  walk from {from:?}: {expanded} expanded, {} places", pts.len());
+        }
+        None
     }
 }
 
@@ -284,5 +516,17 @@ mod tests {
                 assert!(w.points().iter().any(|p| p.site as usize == s && sq(p.pos[0] - end[0]) + sq(p.pos[1] - end[1]) <= 30.0 * 30.0), "Landing {l} to site {s}: ends at {end:?}");
             }
         }
+        // Out of every spawn room, to most sites' points.
+        let hollow = w.sites().iter().position(|s| s.kind == SiteKind::Hollow).unwrap();
+        let stuck: Vec<(u16, usize)> = w
+            .spawn_rooms()
+            .iter()
+            .filter_map(|r| {
+                let p = [r.center[0], r.center[1], r.floor];
+                let reached = nav.room_of(p).map_or(0, |c| (0..w.sites().len()).filter(|&s| nav.cost(s, c) < f32::MAX).count());
+                (reached * 2 < w.sites().len()).then_some((r.site, reached))
+            })
+            .collect();
+        assert!(stuck.is_empty(), "no way out of the spawn rooms of sites (and how many sites they reach) {stuck:?}");
     }
 }

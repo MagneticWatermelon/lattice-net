@@ -235,14 +235,15 @@ impl CoverBox {
 
     /// Whether it blocks `faction` while the sites are held by `owners` (by
     /// site; empty: as at the start). No one passes a shield of a site no
-    /// one holds.
+    /// one holds. (A site's shield asks its holder first: one no one held at
+    /// the start, the Hollow's, has the same pass as solid cover, and its
+    /// holder must pass it once there is one.)
     #[inline]
     pub fn blocks_for(&self, faction: u8, owners: &[u8]) -> bool {
-        if self.pass == SOLID {
-            return true;
+        if self.site != NO_SITE && self.kind == Kind::Shield {
+            return owners.get(self.site as usize).copied().unwrap_or(self.pass) != faction;
         }
-        let pass = if self.site != NO_SITE { owners.get(self.site as usize).copied().unwrap_or(self.pass) } else { self.pass };
-        pass != faction
+        self.pass == SOLID || self.pass != faction
     }
 
     /// (x, y) in its frame: along its axis and across, from its center.
