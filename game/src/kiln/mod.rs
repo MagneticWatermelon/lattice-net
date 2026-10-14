@@ -397,6 +397,11 @@ pub(crate) struct Kiln {
     /// The clockwork's routes (K4): over a living bridge, down a sandfall,
     /// and when they can be walked (`world::BRIDGE`, `FALLS_A`, `FALLS_B`).
     pub clockwork: Vec<(lanes::Route, u8)>,
+    /// Lips along edges (K4, `build::lip`), laid after the tunnels
+    /// (`build::lay_lips`): boxes added sooner would steer their planning.
+    pub(crate) lips: Vec<build::Lip>,
+    /// Rails laid with them (a spiral road's parapet).
+    pub(crate) rails: Vec<CoverBox>,
 }
 
 /// A road or a ramp is here.
@@ -486,6 +491,8 @@ pub(crate) fn build_kiln() -> Kiln {
         rooms: Vec::new(),
         notes: Vec::new(),
         clockwork: Vec::new(),
+        lips: Vec::new(),
+        rails: Vec::new(),
     };
     tick("base");
     // Where the lanes will run, before anything is placed beside them.
@@ -510,6 +517,7 @@ pub(crate) fn build_kiln() -> Kiln {
     build::spawn_rooms(&mut kiln); tick("build::spawn_rooms");
     build::living_bridges(&mut kiln); tick("build::living_bridges");
     under::build(&mut kiln); tick("under::build");
+    build::lay_lips(&mut kiln); tick("build::lay_lips");
     build::sandfalls(&mut kiln); tick("build::sandfalls");
     build::scatter(&mut kiln); tick("build::scatter");
     // (A tunnel's lane only on the surface: to its mouths.)
@@ -523,6 +531,7 @@ pub(crate) fn build_kiln() -> Kiln {
     build::clear_lanes(&mut kiln, &paths); tick("build::clear_lanes");
     land::ground(&mut kiln); tick("land::ground");
     let mut all = lanes::finish(&kiln, &routes, &decks);
+    under::around_shafts(&mut kiln);
     all.extend(lanes::finish(&kiln, &kiln.tunnels, &[]));
     all.extend(lanes::finish(&kiln, &kiln.internal, &[]));
     let clockwork: Vec<lanes::Route> = kiln.clockwork.iter().map(|(r, _)| r.clone()).collect();

@@ -12,7 +12,7 @@ use super::build::{oriented, strip};
 use super::land;
 use super::lanes::{Leg, LegKind, Route};
 use super::*;
-use crate::world::{CoverBox, Force, Kind, Volume, CELLS};
+use crate::world::{CoverBox, Force, Kind, Volume, CELLS, UNTURNED};
 
 /// A lift's speed up (m/s), a tall one's, and its top's: slow enough that a
 /// rider leaves it bobbing just over where it goes.
@@ -70,6 +70,8 @@ pub(crate) fn lift_volume(k: &mut Kiln, c: [f64; 2], half: [f64; 2], z0: f64, z1
         when: crate::world::ALWAYS,
         phase: 0,
         vel: [0.0, 0.0, v as f32],
+        axis: UNTURNED,
+        half: [0.0; 2],
     };
     if z1 - z0 > slow + 4.0 {
         k.volumes.push(column(z0 - 1.0, z1 - slow, fast));
@@ -117,7 +119,18 @@ pub(crate) fn drop_volume(k: &mut Kiln, c: [f64; 2], half: [f64; 2], z0: f64, z1
         when: crate::world::ALWAYS,
         phase: 0,
         vel: [0.0, 0.0, -DROP_SPEED as f32],
+        axis: UNTURNED,
+        half: [0.0; 2],
     });
+}
+
+/// Turns the force volumes pushed since `from` to `axis` about their own
+/// centers: columns standing in a turned frame (a walkway's, a deck's), so
+/// they fill its openings exactly.
+pub(crate) fn turn_volumes(k: &mut Kiln, from: usize, axis: [f64; 2]) {
+    for v in &mut k.volumes[from..] {
+        *v = v.turned([axis[0] as f32, axis[1] as f32]);
+    }
 }
 
 /// A drop shaft's walk (as `drop_rect`): off the edge, down, and on.
@@ -147,6 +160,25 @@ pub(crate) fn spring(k: &mut Kiln, site: usize, pad: [f64; 2], z0: f64, z1: f64,
         when: crate::world::ALWAYS,
         phase: 0,
         vel: [0.0, 0.0, vz as f32],
+        axis: UNTURNED,
+        half: [0.0; 2],
+    });
+    // Over the pad, a fall slowed (a throw that misses the ledge comes back
+    // down onto the pad to be thrown again, not to its death: falls are a
+    // choice, K4); a throw up isn't.
+    // (Wider than the pad: a throw drifts.)
+    let wide = 4.0;
+    k.volumes.push(Volume {
+        min: [(pad[0] - wide) as f32, (pad[1] - wide) as f32, (z0 + 0.5) as f32],
+        // (To 4 m over the ledge: held only under it, `HELD_DROP`, so the
+        // throw carries over onto it.)
+        max: [(pad[0] + wide) as f32, (pad[1] + wide) as f32, (z1 + 4.0) as f32],
+        force: Force::Drop,
+        vel: [0.0, 0.0, -DROP_SPEED as f32],
+        when: crate::world::ALWAYS,
+        phase: 0,
+        axis: UNTURNED,
+        half: [0.0; 2],
     });
     // Onto the pad, held over it while thrown up, then across near the top.
     let legs = vec![Leg { kind: LegKind::Road, path: vec![from, pad, pad, to], z: Some(vec![z0, z0, z1 + 2.0, z1]) }];
@@ -171,9 +203,37 @@ pub(crate) fn cliff_lifts(k: &mut Kiln, site: usize, at: &dyn Fn(f64, f64) -> [f
     top_d += 6.0;
     let top = [-6.0, 0.0, 6.0].iter().map(|&s| k.height(at(s, top_d))).fold(f64::MIN, f64::max);
     let col = foot - 4.0;
-    k.fixed.push(strip(at(0.0, col + 4.8), at(0.0, top_d), 7.0, top - 2.0, top, Kind::Block));
+    // The walkway, and at the columns' top a floor round them (between them,
+    // behind them to the walkway): open only over the lift and the drop
+    // shaft, so a step off it is into one or the other, never 70 m of air.
+    k.fixed.push(strip(at(0.0, col + 2.5), at(0.0, top_d), 7.0, top - 2.0, top, Kind::Block));
+    k.fixed.push(strip(at(0.0, col - 2.5), at(0.0, col + 2.5), 1.5, top - 2.0, top, Kind::Block));
+    for side in [-6.75, 6.75] {
+        k.fixed.push(strip(at(side, col - 2.5), at(side, col + 2.5), 0.25, top - 2.0, top, Kind::Block));
+    }
+    // Its rails (falls are a choice, K4): along both sides, and round the
+    // columns a cage out of reach of a lift's riders bobbing at its top
+    // (to 2 m over it: a rail lower than 2.5 m is stepped onto and off).
+    for side in [-6.75, 6.75] {
+        k.fixed.push(strip(at(side, col + 3.0), at(side, top_d - 1.0), 0.25, top - 0.5, top + 1.1, Kind::Block));
+        k.fixed.push(strip(at(side, col - 2.8), at(side, col + 3.0), 0.25, top - 0.5, top + 4.0, Kind::Block));
+    }
+    k.fixed.push(strip(at(-7.0, col - 2.8), at(7.0, col - 2.8), 0.25, top - 0.5, top + 4.0, Kind::Block));
+    // The rim either side of the walkway's head, where walkers come and go,
+    // lipped for 20 m (falls are a choice, K4), at the rim's own height.
+    let toward_rift = sub(at(0.0, col), at(0.0, col + 1.0));
+    let toward_rift = scale(toward_rift, 1.0 / len(toward_rift));
+    for s in [-1.0, 1.0] {
+        for j in 0..4 {
+            let (a, b) = (s * (7.0 + 5.0 * j as f64), s * (12.0 + 5.0 * j as f64));
+            super::build::lip(k, at(a, top_d - 8.0), at(b, top_d - 8.0), f64::NAN, toward_rift, None);
+        }
+    }
+    let first = k.volumes.len();
     lift_up(k, site, at(4.0, col), 2.5, lo, top, at(4.0, col - 18.0), at(4.0, col + 12.0));
     drop_down(k, site, at(-4.0, col), 2.5, top, lo, at(-4.0, col + 12.0), at(-4.0, col + 5.2), at(-4.0, col - 18.0));
+    let along = sub(at(1.0, col), at(0.0, col));
+    turn_volumes(k, first, scale(along, 1.0 / len(along)));
     keep_clear(k, at(0.0, top_d), 12.0);
 }
 
@@ -418,8 +478,10 @@ pub(crate) fn shaft_with(k: &mut Kiln, site: usize, corner: [f64; 2], ch: usize,
         let (p, q) = (add(corner, scale(a, SHAFT + 0.3)), add(corner, scale(b, SHAFT + 0.3)));
         k.fixed.push(strip(p, q, 0.3, ceiling, surface, Kind::Block));
     }
-    // The halves: the lift's toward `side`, the drop shaft's away.
-    let half = if side[0] != 0.0 { [SHAFT / 2.0 - 0.1, SHAFT - 0.1] } else { [SHAFT - 0.1, SHAFT / 2.0 - 0.1] };
+    // The halves: the lift's toward `side`, the drop shaft's away, filling the
+    // opening (a step over its rim, or along their seam, is into one or the
+    // other: never a fall). Routes walk round its foot (`around_shafts`).
+    let half = if side[0] != 0.0 { [SHAFT / 2.0, SHAFT] } else { [SHAFT, SHAFT / 2.0] };
     let (up, down) = (add(corner, scale(side, SHAFT / 2.0)), sub(corner, scale(side, SHAFT / 2.0)));
     lift_rect(k, site, up, half, c.floor, surface, below, above, false);
     let edge = sub(corner, scale(side, SHAFT + 0.8));
@@ -458,7 +520,8 @@ pub(crate) fn shaft_pair(k: &mut Kiln, site: usize, s: [f64; 2], dh: [f64; 2], d
     // straight onto that floor, never over the drop shaft's opening), the
     // drop shaft's on the lower's (landed in, never walked out over the lift).
     let side = pair_side(dh, dx);
-    let half2 = if side[0] != 0.0 { [SHAFT / 2.0 - 0.1, SHAFT - 0.1] } else { [SHAFT - 0.1, SHAFT / 2.0 - 0.1] };
+    // (Filling the opening, as `shaft_with`'s.)
+    let half2 = if side[0] != 0.0 { [SHAFT / 2.0, SHAFT] } else { [SHAFT, SHAFT / 2.0] };
     let (up, down) = (add(s, scale(side, SHAFT / 2.0)), sub(s, scale(side, SHAFT / 2.0)));
     lift_volume(k, up, half2, lo, hi);
     drop_volume(k, down, half2, hi, lo);
@@ -567,11 +630,24 @@ pub(crate) fn bore(k: &mut Kiln, a: usize, b: usize) -> (Vec<[f64; 2]>, Vec<f64>
         let (s0, s1) = (sp.max(span.0), sq.min(span.1));
         (s1 - s0 > 0.1).then(|| (add(ca.center, scale(u, s0)), add(ca.center, scale(u, s1))))
     };
+    // A diagonal tube's walls leave its chambers before its axis does (the
+    // outer one by up to a couple of meters): its first and last stretches'
+    // walls and roof reach back to where they do, and a flat apron of floor
+    // under them from there to its first floor (else there are holes beside
+    // its mouths, open to the rock and nothing under them).
+    let (first, last) = (add(ca.center, scale(u, roof.0.min(s_at(pts[0])))), add(ca.center, scale(u, roof.1.max(s_at(pts[n])))));
+    for (from, to, z) in [(first, pts[0], floor[0]), (pts[n], last, floor[n])] {
+        if dist(from, to) > 0.05 {
+            k.fixed.push(strip(sub(from, scale(u, 0.05)), add(to, scale(u, 0.05)), TUBE + 0.3, z - 1.0, z, Kind::Block));
+        }
+    }
     for j in 0..n {
         let (p, q) = (pts[j], pts[j + 1]);
         let (z0, z1) = (floor[j], floor[j + 1]);
         let (lo, hi) = (z0.min(z1), z0.max(z1));
         let mid = scale(add(p, q), 0.5);
+        // (The walls' and roof's stretch: to the ends' aprons at the ends.)
+        let (wp, wq) = (if j == 0 { first } else { p }, if j + 1 == n { last } else { q });
         if hi - lo < 1e-6 {
             // (Overlapping the next by a little: abutting exactly, a point on
             // the seam could round to neither.)
@@ -584,11 +660,11 @@ pub(crate) fn bore(k: &mut Kiln, a: usize, b: usize) -> (Vec<[f64; 2]>, Vec<f64>
         }
         for (side, span) in [-1.0, 1.0].into_iter().zip(spans) {
             let off = scale(v, side * (TUBE + 0.3));
-            if let Some((p, q)) = clip(p, q, span) {
+            if let Some((p, q)) = clip(wp, wq, span) {
                 k.fixed.push(strip(add(p, off), add(q, off), 0.3, lo - 1.0, hi + TUBE_HIGH + 0.6, Kind::Block));
             }
         }
-        if let Some((p, q)) = clip(p, q, roof) {
+        if let Some((p, q)) = clip(wp, wq, roof) {
             k.fixed.push(strip(p, q, TUBE + 0.6, hi + TUBE_HIGH, hi + TUBE_HIGH + 0.6, Kind::Block));
         }
     }

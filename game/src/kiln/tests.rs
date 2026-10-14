@@ -162,6 +162,25 @@ fn stairs_climb() {
     assert!(up.is_ok(), "up: {up:?}");
     let down = walk(&w, &l, true);
     assert!(down.is_ok(), "down: {down:?}");
+    // Railed (falls are a choice, K4): from anywhere on it, a walk straight
+    // out over its outer side falls nowhere.
+    use crate::movement::{fall_height, step, Input, MoveState, SAFE_FALL};
+    for (p, z) in path.iter().zip(&zs).skip(2) {
+        for k in 0..=8 {
+            // (Within the flight: the path is 1.2 m from its edge.)
+            let at = [p[0] + (k as f64 - 4.0) * 0.15, p[1] + (k as f64 - 4.0) * 0.15];
+            let out = [at[0] - 104.5, at[1] - 104.5];
+            let n = (out[0] * out[0] + out[1] * out[1]).sqrt();
+            let input = Input { move_x: (127.0 * out[0] / n) as i8, move_y: (127.0 * out[1] / n) as i8, ..Input::default() };
+            let mut s = MoveState::standing_at(&w, [at[0] as f32, at[1] as f32], *z as f32);
+            for _ in 0..90 {
+                let next = step(&w, s, input, 0u8);
+                assert!(fall_height(&s, &next) <= SAFE_FALL, "walked off the stair from ({:.1}, {:.1}, {z:.1})", at[0], at[1]);
+                s = next;
+            }
+            assert!(s.z > *z as f32 - 3.0, "fell off the stair from ({:.1}, {:.1}, {z:.1}) to {:.1}", at[0], at[1], s.z);
+        }
+    }
 }
 
 #[test]
@@ -605,6 +624,55 @@ fn every_tunnel_fits() {
     assert!(k.notes.is_empty(), "{} things the generator couldn't fit", k.notes.len());
 }
 
+/// Falls are a choice (K4): a rider in the air in any lift's or drop
+/// shaft's column, steering hard out of it any of eight ways, stays in it (to near a lift's
+/// top, to a drop shaft's floor) or crosses into the column beside it, and
+/// lands from a drop shaft unhurt.
+#[test]
+fn columns_hold_their_riders() {
+    use crate::movement::{fall_damage, step, Input, MoveState, BUTTON_SPRINT, HELD_DROP, HELD_LIFT};
+    use crate::world::{Force, ALWAYS, VENT};
+    let w = kiln();
+    let mut rides = 0;
+    for v in w.volumes().iter().filter(|v| (v.when == ALWAYS || v.when == VENT) && v.max[2] - v.min[2] > 20.0) {
+        let margin = match v.force {
+            Force::Lift => HELD_LIFT,
+            Force::Drop => HELD_DROP,
+            _ => continue,
+        };
+        // (A tall lift is two columns, one on the other: ridden to the top of both.)
+        let c = v.center();
+        let mut top = v.max[2];
+        while let Some(o) = w.volume_at(c[0], c[1], top, crate::clock::Live::OFF).filter(|o| o.force == Force::Lift && v.force == Force::Lift) {
+            top = o.max[2];
+        }
+        for (mx, my) in [(127, 0), (90, 90), (0, 127), (-90, 90), (-127, 0), (-90, -90), (0, -127), (90, -90)] {
+            let mut s = MoveState { pos: c, vel: [0.0; 2], z: (v.min[2] + v.max[2]) / 2.0, vz: 0.0, grounded: false, crouched: false };
+            let input = Input { move_x: mx, move_y: my, buttons: BUTTON_SPRINT, ..Input::default() };
+            for _ in 0..30 * 300 {
+                let n = step(&w, s, input, 0u8);
+                // (Over its footprint, a turned one's too.)
+                let inside = v.contains(n.pos[0], n.pos[1], v.min[2]);
+                if v.force == Force::Lift && n.z >= top - margin {
+                    break;
+                }
+                if !inside && w.volume_at(n.pos[0], n.pos[1], n.z, crate::clock::Live::OFF).is_some_and(|o| o.force == Force::Lift || o.force == Force::Drop) {
+                    break; // into the column beside it (a shaft's other half)
+                }
+                assert!(inside || n.z < v.min[2] + 3.0, "{:?} at ({:.0}, {:.0}, {:.0}): steered out at {:.1}", v.force, c[0], c[1], v.min[2], n.z);
+                if n.grounded {
+                    assert_eq!(fall_damage(&s, &n), 0, "landed hurt from a drop shaft at ({:.0}, {:.0})", c[0], c[1]);
+                    break;
+                }
+                s = n;
+            }
+            rides += 1;
+        }
+    }
+    eprintln!("{rides} rides held");
+    assert!(rides > 100);
+}
+
 #[test]
 fn the_clockwork_runs() {
     // K4: living bridges at night, sandfalls in turns, vent lifts that rest.
@@ -650,4 +718,70 @@ fn the_clockwork_runs() {
             }
         }
     }
+}
+
+#[test]
+fn tunnels_hold_whoever_walks_in_them() {
+    // Under the ground only boxes are ground: a gap in a tunnel's walls or
+    // floor drops whoever finds it to the bottom of the world (bots found
+    // them at the ends of diagonal tubes, where a tube meets its chamber).
+    // Round each end of every tube, on a half-meter grid at its floor: no
+    // floor beside floor without a wall between (but over a shaft's column).
+    use crate::clock::Live;
+    let k = build_kiln();
+    let w = kiln();
+    let floor_at = |p: [f32; 2], f: f32| w.ground(p[0], p[1], f + 0.5, 1.0, Live::OFF) >= f - 0.5;
+    let mut leaks = Vec::new();
+    for &(from, to, _, _, (a, b)) in &k.bores {
+        for (end, c) in [(from, a), (to, b)] {
+            let f = k.chambers[c].floor as f32;
+            for i in -14..=14 {
+                for j in -14..=14 {
+                    let p = [end[0] as f32 + i as f32 * 0.5, end[1] as f32 + j as f32 * 0.5];
+                    if !floor_at(p, f) || !w.under(p[0], p[1], f) {
+                        continue;
+                    }
+                    for (dx, dy) in [(0.5f32, 0.0f32), (-0.5, 0.0), (0.0, 0.5), (0.0, -0.5)] {
+                        let q = [p[0] + dx, p[1] + dy];
+                        if floor_at(q, f) || w.volume_at(q[0], q[1], f - 1.0, Live::OFF).is_some() || w.volume_at(q[0], q[1], f + 0.5, Live::OFF).is_some() {
+                            continue;
+                        }
+                        // Walk from the floor toward it (and a little either side),
+                        // as movement would: does it end in a fall that hurts?
+                        // (On the floor there: a tube's may slope up from the chamber's.)
+                        let z = w.ground(p[0], p[1], f + 1.5, 2.0, Live::OFF);
+                        let start = crate::movement::MoveState { pos: p, vel: [0.0; 2], z, vz: 0.0, grounded: true, crouched: false };
+                        let start = crate::movement::nudge(&w, start, [0.0, 0.0], 0u8);
+                        // (Not from inside something: no one stands there.)
+                        if (start.pos[0] - p[0]).abs() + (start.pos[1] - p[1]).abs() > 0.05 {
+                            continue;
+                        }
+                        let toward = libm::atan2f(q[1] - p[1], q[0] - p[0]);
+                        for turn in [0.0f32, 0.35, -0.35] {
+                            let a = toward + turn;
+                            let (mx, my) = ((libm::cosf(a) * 127.0) as i8, (libm::sinf(a) * 127.0) as i8);
+                            let mut m = start;
+                            let mut worst = 0.0f32;
+                            for i in 0..120 {
+                                let input = if i < 15 { crate::movement::Input { move_x: mx, move_y: my, ..Default::default() } } else { crate::movement::Input::default() };
+                                let before = m;
+                                m = crate::movement::step(&w, m, input, 0u8);
+                                worst = worst.max(crate::movement::fall_height(&before, &m));
+                            }
+                            if worst > crate::movement::SAFE_FALL || m.z < 1.0 {
+                                leaks.push(format!("from ({:.1}, {:.1}, {f:.1}) toward ({:.1}, {:.1}): fell {worst:.1} m to ({:.1}, {:.1}, {:.1})", p[0], p[1], q[0], q[1], m.pos[0], m.pos[1], m.z));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    leaks.sort();
+    leaks.dedup();
+    for l in leaks.iter().take(if std::env::var_os("KILN_LEAK_ALL").is_some() { usize::MAX } else { 20 }) {
+        eprintln!("{l}");
+    }
+    assert!(leaks.is_empty(), "{} gaps out of the tunnels' ends", leaks.len());
 }

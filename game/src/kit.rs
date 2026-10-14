@@ -13,7 +13,7 @@
 //! - a tower with a lift up its side and a drop shaft down the other (x 1300);
 //! - a spring (x 1350).
 
-use crate::world::{hole_bits, Continent, CoverBox, Force, Kind, Lane, Parts, Volume, World, ALWAYS, TERRAIN_N, TERRAIN_RES};
+use crate::world::{hole_bits, Continent, CoverBox, Force, Kind, Lane, Parts, Volume, World, ALWAYS, TERRAIN_N, TERRAIN_RES, UNTURNED};
 
 /// The kit level's world id ("KIT" in ASCII).
 pub const KIT: u64 = 0x4B_4954;
@@ -96,9 +96,9 @@ pub fn level() -> World {
     let (tx, ty, ttop) = TOWER;
     boxes.push(CoverBox::new([tx[0], ty[0]], [tx[1], ty[1]], g - 0.3, ttop, Kind::Block, 0));
     let volumes = vec![
-        Volume { min: [LIFT_X[0], ty[0], g], max: [LIFT_X[1], ty[0] + 4.0, ttop + 1.0], force: Force::Lift, vel: [0.0, 0.0, 12.0], when: ALWAYS, phase: 0 },
-        Volume { min: [DROP_X[0], ty[0], g], max: [DROP_X[1], ty[1], ttop + 2.0], force: Force::Drop, vel: [0.0, 0.0, -5.0], when: ALWAYS, phase: 0 },
-        Volume { min: [SPRING.0[0], 996.0, g - 0.5], max: [SPRING.0[1], 1004.0, g + 0.5], force: Force::Spring, vel: SPRING.1, when: ALWAYS, phase: 0 },
+        Volume { min: [LIFT_X[0], ty[0], g], max: [LIFT_X[1], ty[0] + 4.0, ttop + 1.0], force: Force::Lift, vel: [0.0, 0.0, 12.0], when: ALWAYS, phase: 0, axis: UNTURNED, half: [0.0; 2] },
+        Volume { min: [DROP_X[0], ty[0], g], max: [DROP_X[1], ty[1], ttop + 2.0], force: Force::Drop, vel: [0.0, 0.0, -5.0], when: ALWAYS, phase: 0, axis: UNTURNED, half: [0.0; 2] },
+        Volume { min: [SPRING.0[0], 996.0, g - 0.5], max: [SPRING.0[1], 1004.0, g + 0.5], force: Force::Spring, vel: SPRING.1, when: ALWAYS, phase: 0, axis: UNTURNED, half: [0.0; 2] },
     ];
 
     // A route through all of it, for walking: down the tunnel and out.

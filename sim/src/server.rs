@@ -39,6 +39,10 @@ use lattice_game::msg::MID_LAG_UNITS;
 use lattice_game::events::{self, Event};
 use lattice_game::faction::{faction, FACTIONS, MAX_HEALTH, RESPAWN_STEPS};
 use lattice_game::clock::{self, Live};
+
+/// Debugging aid (`LATTICE_FALL_TRACE=1`): every fall that hurts, where it
+/// landed and from how high, to stderr.
+static FALL_TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LATTICE_FALL_TRACE").is_some());
 use lattice_game::territory::{self, Territory};
 use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
 use crate::msg::{self, Blob, PacketFill, RenderTime, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
@@ -425,6 +429,8 @@ struct Body {
     /// Damage from falls (`movement::fall_damage`) its movement took this
     /// tick, applied with the rest (`apply_damage`).
     fallen: u16,
+    /// Where it last left the ground (for `LATTICE_FALL_TRACE`).
+    left_ground: [f32; 3],
     /// Players it hit or was hit by recently: near-tier for each other until
     /// the tick given ("interaction"). `NO_CONTACT` is empty.
     contacts: [(u16, u32); CONTACTS],
@@ -449,6 +455,7 @@ impl Default for Body {
             radius: 0.0,
             invulnerable: false,
             fallen: 0,
+            left_ground: [0.0; 3],
             contacts: [(NO_CONTACT, 0); CONTACTS],
         }
     }
@@ -987,8 +994,17 @@ impl InputQueue {
         self.ammo.tick();
         let before = body.state;
         body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input }, who);
+        if before.grounded && !body.state.grounded {
+            body.left_ground = [before.pos[0], before.pos[1], before.z];
+        }
         if !body.dead() {
-            body.fallen = body.fallen.saturating_add(movement::fall_damage(&before, &body.state) as u16);
+            let hurt = movement::fall_damage(&before, &body.state);
+            body.fallen = body.fallen.saturating_add(hurt as u16);
+            if hurt > 0 && *FALL_TRACE {
+                let s = &body.state;
+                let l = body.left_ground;
+                eprintln!("fall {e} at ({:.0}, {:.0}, {:.1}) from {:.1} m: {hurt} damage, left the ground at ({:.1}, {:.1}, {:.1})", s.pos[0], s.pos[1], s.z, movement::fall_height(&before, s), l[0], l[1], l[2]);
+            }
         }
         self.steps[next as usize % STEP_RING] = (next, step_no, before, body.state);
         // A body keeps the aim it died with: the dead player's own camera
@@ -2271,6 +2287,7 @@ impl SimServer {
             radius,
             invulnerable: self.cfg.immortal,
             fallen: 0,
+            left_ground: [0.0; 3],
             ..Body::default()
         };
         let spread = Some((Arc::clone(&self.spread), self.counters.spawns));

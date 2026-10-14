@@ -1527,3 +1527,65 @@ pub(crate) fn build(k: &mut Kiln) {
         }
     }
 }
+
+/// Tunnels' routes round the shafts in their chambers: a stretch walked level
+/// across a chamber whose shaft stands between its two ends (its standing
+/// place across the shaft from where a tube comes in) goes round the
+/// shaft's foot by the side it passes, inside the chamber's walls: walked
+/// across, the lift would carry it up, the drop shaft let it fall.
+pub(crate) fn around_shafts(k: &mut Kiln) {
+    // Each shaft's footprint at its foot: its columns' together.
+    let mut feet: Vec<([f64; 2], [f64; 2], f64)> = Vec::new();
+    for v in k.volumes.iter().filter(|v| v.force != crate::world::Force::Spring) {
+        let (min, max) = ([v.min[0] as f64, v.min[1] as f64], [v.max[0] as f64, v.max[1] as f64]);
+        let lo = v.min[2] as f64;
+        if let Some(f) = feet.iter_mut().find(|f| min[0] <= f.1[0] + 0.01 && max[0] >= f.0[0] - 0.01 && min[1] <= f.1[1] + 0.01 && max[1] >= f.0[1] - 0.01) {
+            *f = ([f.0[0].min(min[0]), f.0[1].min(min[1])], [f.1[0].max(max[0]), f.1[1].max(max[1])], f.2.min(lo));
+        } else {
+            feet.push((min, max, lo));
+        }
+    }
+    let chambers: Vec<([f64; 2], f64, f64)> = k.chambers.iter().map(|c| (c.center, c.half, c.floor)).collect();
+    let inside = |p: [f64; 2], c: [f64; 2], h: f64| (p[0] - c[0]).abs() <= h && (p[1] - c[1]).abs() <= h;
+    let across = |p: [f64; 2], q: [f64; 2], min: [f64; 2], max: [f64; 2]| {
+        let n = (dist(p, q) / 0.25).ceil().max(1.0) as usize;
+        (0..=n).any(|i| {
+            let r = add(p, scale(sub(q, p), i as f64 / n as f64));
+            r[0] > min[0] - 0.6 && r[0] < max[0] + 0.6 && r[1] > min[1] - 0.6 && r[1] < max[1] + 0.6
+        })
+    };
+    for route in &mut k.tunnels {
+        for leg in &mut route.legs {
+            let Some(z) = leg.z.clone() else { continue };
+            let (mut path, mut zs) = (vec![leg.path[0]], vec![z[0]]);
+            for i in 0..leg.path.len() - 1 {
+                let (p, q, zp, zq) = (leg.path[i], leg.path[i + 1], z[i], z[i + 1]);
+                // Level, both ends in one chamber, on its floor, the foot of a shaft in it between them.
+                let room = chambers.iter().find(|c| (zp - c.2).abs() < 0.6 && (zq - c.2).abs() < 0.6 && inside(p, c.0, c.1 + 1.5) && inside(q, c.0, c.1 + 1.5));
+                let foot = room.and_then(|c| {
+                    feet.iter().find(|f| (f.2 - (c.2 - 1.0)).abs() < 1.5 && inside(scale(add(f.0, f.1), 0.5), c.0, c.1) && across(p, q, f.0, f.1) && !inside(p, scale(add(f.0, f.1), 0.5), (f.1[0] - f.0[0]) / 2.0) && !inside(q, scale(add(f.0, f.1), 0.5), (f.1[0] - f.0[0]) / 2.0))
+                });
+                if let (Some(&(cc, ch, _)), Some(&(min, max, _))) = (room, foot) {
+                    let c = scale(add(min, max), 0.5);
+                    let u = scale(sub(q, p), 1.0 / dist(p, q).max(1e-9));
+                    // By the side the stretch passes (its middle's), a meter and a half clear.
+                    let mid = scale(add(p, q), 0.5);
+                    let s = if u[0] * (c[1] - mid[1]) - u[1] * (c[0] - mid[0]) > 0.0 { -1.0 } else { 1.0 };
+                    let perp = [-u[1] * s, u[0] * s];
+                    let h = [(max[0] - min[0]) / 2.0 + 1.5, (max[1] - min[1]) / 2.0 + 1.5];
+                    let room_in = ch - 1.2;
+                    for a in [-1.0, 1.0] {
+                        let corner = [c[0] + (a * u[0] + perp[0]) * h[0], c[1] + (a * u[1] + perp[1]) * h[1]];
+                        let corner = [corner[0].clamp(cc[0] - room_in, cc[0] + room_in), corner[1].clamp(cc[1] - room_in, cc[1] + room_in)];
+                        path.push(corner);
+                        zs.push(zp);
+                    }
+                }
+                path.push(q);
+                zs.push(zq);
+            }
+            leg.path = path;
+            leg.z = Some(zs);
+        }
+    }
+}

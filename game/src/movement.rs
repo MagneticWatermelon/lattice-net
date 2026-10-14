@@ -21,7 +21,7 @@
 //! vent lifts that rest.
 
 use crate::clock::{self, Live};
-use crate::world::{CoverBox, Force, World, SOLID, VENT};
+use crate::world::{CoverBox, Force, Volume, World, SOLID, VENT};
 
 pub const TICK_HZ: u32 = 30;
 pub const DT: f32 = 1.0 / TICK_HZ as f32;
@@ -55,6 +55,17 @@ pub const NO_FACTION: u8 = 254;
 /// meter past it: from 18 m, a fall kills.
 pub const SAFE_FALL: f32 = 8.0;
 pub const FALL_DAMAGE_PER_M: f32 = 10.0;
+/// A rider in the air is held in a lift's column (`Force::Lift`) once
+/// `HELD_LIFT_FOOT` over its foot and carried toward where a fall out would
+/// hurt (lower, a walk across the foot is carried a little and steps out
+/// unhurt) until `HELD_LIFT` under its top (its riders bob over it and step
+/// off), and in a drop shaft's (`Force::Drop`) from `HELD_DROP` under its
+/// top (half a meter under the floor it's stepped into from: its top is 3 m
+/// over it) to 2 m over its floor (stepping out as they land): steering
+/// doesn't carry anyone out mid-ride, under a floor's edge, to a fall (K4).
+pub const HELD_LIFT_FOOT: f32 = 3.0;
+pub const HELD_LIFT: f32 = 3.0;
+pub const HELD_DROP: f32 = 3.5;
 
 /// Who's moving, and when: their faction, and who holds each site at the
 /// step being taken (`territory::Territory::owners_at`; empty: as at the
@@ -203,7 +214,8 @@ pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<
     }
     // Gravity, or the force volume the feet are in (a resting vent lift
     // only slows a fall).
-    let force = world.volume_at(s.pos[0], s.pos[1], s.z, who.live).map(|v| match v.when {
+    let column = world.volume_at(s.pos[0], s.pos[1], s.z, who.live);
+    let force = column.map(|v| match v.when {
         VENT if !who.live.vent_on(v.phase) => (Force::Drop, [0.0, 0.0, -clock::VENT_SINK]),
         _ => (v.force, v.vel),
     });
@@ -237,6 +249,9 @@ pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<
             n.pos[i] = n.pos[i].clamp(0.0, WORLD_SIZE);
             n.vel[i] = 0.0;
         }
+    }
+    if let Some(v) = column.filter(|v| holds(world, v, &s, n.grounded, who.live)) {
+        v.hold(&mut n.pos, &mut n.vel);
     }
     // A slope too steep to walk up is a wall where it rises past the feet:
     // walking, and in the air too (landing on it would climb a cliff a jump
@@ -300,14 +315,46 @@ pub fn fall_damage(s: &MoveState, n: &MoveState) -> u8 {
     ((fall_height(s, n) - SAFE_FALL) * FALL_DAMAGE_PER_M).ceil().clamp(0.0, 255.0) as u8
 }
 
+/// Whether column `v`, the one the feet are in at `s`, holds its rider (in
+/// the air, `grounded` false, after the step's forces): in a lift's once
+/// `HELD_LIFT_FOOT` over its foot and carried high enough that leaving
+/// would hurt, until `HELD_LIFT` under its top; in a drop shaft's from
+/// `HELD_DROP` under its top to 2 m over its floor. A tall lift is two
+/// columns, fast then slow, one on the other: its foot is the lower's, its
+/// top the upper's.
+fn holds(world: &World, v: &Volume, s: &MoveState, grounded: bool, live: Live) -> bool {
+    let (foot, margin) = match v.force {
+        Force::Lift => (HELD_LIFT_FOOT, HELD_LIFT),
+        Force::Drop => (2.0, HELD_DROP),
+        _ => return false,
+    };
+    if grounded {
+        return false;
+    }
+    let c = v.center();
+    let lift_at = |z: f32| world.volume_at(c[0], c[1], z, live).is_some_and(|o| o.force == Force::Lift);
+    let (on, under) = (v.force == Force::Lift && lift_at(v.max[2]), v.force == Force::Lift && lift_at(v.min[2] - 0.01));
+    let top = if on { v.max[2] } else { v.max[2] - margin };
+    // (How high a lift would have carried them if they left it now: its
+    // foot is 1 m under its floor.)
+    let apex = s.z + s.vz.max(0.0) * s.vz.max(0.0) / (2.0 * GRAVITY);
+    let high = v.force != Force::Lift || under || apex > v.min[2] + 1.0 + SAFE_FALL;
+    s.z < top && (under || s.z > v.min[2] + 1.0 + foot) && high
+}
+
 /// The server moving a player of `faction` by `delta` outside of their
 /// inputs (a crowd's separation push): kept in the world and out of cover,
-/// and on the ground if they were on it. Clients can't predict these; they
-/// reconcile.
+/// on the ground if they were on it (never pushed off a ledge: falls are a
+/// choice, K4), and in a column holding them (`holds`). Clients can't
+/// predict these; they reconcile.
 pub fn nudge<'a>(world: &World, s: MoveState, delta: [f32; 2], who: impl Into<Mover<'a>>) -> MoveState {
     let who = who.into();
     let mut n = s;
     n.pos = [(s.pos[0] + delta[0]).clamp(0.0, WORLD_SIZE), (s.pos[1] + delta[1]).clamp(0.0, WORLD_SIZE)];
+    if let Some(v) = world.volume_at(s.pos[0], s.pos[1], s.z, who.live).filter(|v| holds(world, v, &s, s.grounded, who.live)) {
+        let mut vel = n.vel;
+        v.hold(&mut n.pos, &mut vel);
+    }
     // Never up a cliff: a crowd at its foot would push its edge up it.
     let mut vel = n.vel;
     n.pos = terrain_move(world, s.pos, n.pos, s.z, s.height(), &mut vel);
@@ -320,7 +367,10 @@ pub fn nudge<'a>(world: &World, s: MoveState, delta: [f32; 2], who: impl Into<Mo
             } else {
                 n.z = g;
             }
+        } else if delta != [0.0, 0.0] {
+            n.pos = s.pos;
         } else {
+            // (Placed, not pushed: over nothing, they fall.)
             n.grounded = false;
             n.vz = 0.0;
         }

@@ -170,19 +170,40 @@ fn stairs(min: [f64; 2], side: f64, z0: f64, z1: f64, kind: Kind, out: &mut Vec<
     let mut turn = 0;
     // Each flight's start corner and direction, counterclockwise from the south-west.
     let corners = [([min[0], min[1]], [1.0, 0.0]), ([min[0] + side - w, min[1]], [0.0, 1.0]), ([min[0] + side - w, min[1] + side - w], [-1.0, 0.0]), ([min[0], min[1] + side - w], [0.0, -1.0])];
+    // A rail (falls are a choice, K4) along the outer side of a flight going
+    // `d`, between `a` and `b` along it.
+    let rail = |a: [f64; 2], b: [f64; 2], d: [f64; 2], lo: f64, hi: f64| {
+        let (x0, x1, y0, y1) = (a[0].min(b[0]), a[0].max(b[0]), a[1].min(b[1]), a[1].max(b[1]));
+        let (p, q) = match (d[0] as i32, d[1] as i32) {
+            (1, 0) => ([x0, min[1]], [x1, min[1] + 0.2]),
+            (0, 1) => ([min[0] + side - 0.2, y0], [min[0] + side, y1]),
+            (-1, 0) => ([x0, min[1] + side - 0.2], [x1, min[1] + side]),
+            _ => ([min[0], y0], [min[0] + 0.2, y1]),
+        };
+        bx(p, q, lo, hi, kind, 0)
+    };
     let mut first = true;
     while z < z1 - 0.2 {
         let (corner, d) = corners[turn % 4];
-        // The landing in this corner (none under the first flight's start: it starts at the ground).
+        // The landing in this corner (none under the first flight's start: it
+        // starts at the ground), railed along the side the last flight came
+        // up (its other outer side is this flight's rail's).
         if !first {
             out.push(bx(corner, add(corner, [w, w]), z - 0.4, z, kind, 0));
+            out.push(rail(corner, add(corner, [w, w]), corners[(turn + 3) % 4].1, z - 0.4, z + 1.1));
         }
-        first = false;
         let start = add(corner, [w / 2.0, w / 2.0]);
         path.push(start);
         zs.push(z);
         // The flight runs from the corner square's far edge along `d`.
         let edge = if d[0] + d[1] > 0.0 { add(corner, scale(d, w)) } else { corner };
+        // Its rail: one wedge, rising with it from the landing's outer side
+        // before it.
+        let (ra, rb) = (rail(edge, edge, d, 0.0, 0.0), add(edge, scale(d, steps as f64 * tread)));
+        let line = |p: [f64; 2]| if d[0] != 0.0 { [p[0], (ra.min[1] + ra.max[1]) as f64 / 2.0] } else { [(ra.min[0] + ra.max[0]) as f64 / 2.0, p[1]] };
+        let (from, z_from) = if first { (edge, z + 0.4) } else { (sub(edge, scale(d, w)), z) };
+        out.push(slope_box(line(from), line(rb), z_from + 1.1, z + steps as f64 * 0.4 + 1.1, 0.1, z - 0.4, kind));
+        first = false;
         for s in 0..steps {
             z += 0.4;
             let a = add(edge, scale(d, s as f64 * tread));
@@ -194,8 +215,11 @@ fn stairs(min: [f64; 2], side: f64, z0: f64, z1: f64, kind: Kind, out: &mut Vec<
         }
         turn += 1;
     }
-    let (corner, _) = corners[turn % 4];
+    let (corner, d) = corners[turn % 4];
     out.push(bx(corner, add(corner, [w, w]), z - 0.4, z, kind, 0));
+    for dd in [corners[(turn + 3) % 4].1, d] {
+        out.push(rail(corner, add(corner, [w, w]), dd, z - 0.4, z + 1.1));
+    }
     path.push(add(corner, [w / 2.0, w / 2.0]));
     zs.push(z);
     // The core.
@@ -227,8 +251,18 @@ fn stairs_at(k: &mut Kiln, c: [f64; 2], side: f64, z0: f64, z1: f64, toward: [f6
         add(c, v)
     };
     for b in boxes {
-        let (p, q) = (turn([b.min[0] as f64, b.min[1] as f64]), turn([b.max[0] as f64, b.max[1] as f64]));
-        out.push(bx([p[0].min(q[0]), p[1].min(q[1])], [p[0].max(q[0]), p[1].max(q[1])], b.bottom as f64, b.top as f64, b.kind, b.facing));
+        if b.axis == [1.0, 0.0] && b.low == b.top {
+            let (p, q) = (turn([b.min[0] as f64, b.min[1] as f64]), turn([b.max[0] as f64, b.max[1] as f64]));
+            out.push(bx([p[0].min(q[0]), p[1].min(q[1])], [p[0].max(q[0]), p[1].max(q[1])], b.bottom as f64, b.top as f64, b.kind, b.facing));
+        } else {
+            // (A wedge, the flights' rails: turned about its center.)
+            let c = turn([b.center[0] as f64, b.center[1] as f64]);
+            let mut axis = [b.axis[0] as f64, b.axis[1] as f64];
+            for _ in 0..turns {
+                axis = [-axis[1], axis[0]];
+            }
+            out.push(CoverBox::turned([c[0] as f32, c[1] as f32], b.half, [axis[0] as f32, axis[1] as f32], b.bottom, b.top, b.kind, b.facing).wedge(b.low));
+        }
     }
     (path.into_iter().map(turn).collect(), zs)
 }
@@ -276,6 +310,15 @@ fn spiral(k: &mut Kiln, c: [f64; 2], r: f64, top: f64, ground: f64, a0: f64, a1:
         })
         .collect();
     stamp_ramp(k, &path, z0, z1);
+    // A parapet along its open side, a meter in from its edge, down into
+    // the face (falls are a choice, K4); its ends open. Laid after the
+    // tunnels (`lay_lips`).
+    for j in 1..n - 1 {
+        let (p, q) = (path[j], path[j + 1]);
+        let (zp, zq) = (lerp(z0, z1, j as f64 / n as f64), lerp(z0, z1, (j + 1) as f64 / n as f64));
+        let out = |a: [f64; 2]| add(a, scale(sub(a, c), 5.0 / dist(a, c)));
+        k.rails.push(slope_box(out(p), out(q), zp + 1.1, zq + 1.1, 0.25, zp.min(zq) - 4.0, Kind::Block));
+    }
     path
 }
 
@@ -426,6 +469,14 @@ pub(crate) fn shape_site(k: &mut Kiln, i: usize) -> f64 {
             let (low, top) = (add(pit, scale(unit(axis + 90.0), 8.0)), add(pit, scale(unit(axis + 90.0), 52.0)));
             stamp_levels(k, &[add(pit, scale(unit(axis + 90.0), 2.0)), low, top, add(top, scale(unit(axis + 90.0), 6.0))], &[g - 14.0, g - 14.0, g, g]);
             internal(k, i, vec![vec![c, top, low, pit]]);
+            // A lip round the pit, 14 m deep, but where its ramp goes down
+            // (kept: the site's route passes close by its rim).
+            let n = (2.0 * std::f64::consts::PI * 18.0 / 6.0).ceil() as usize;
+            for j in 0..n {
+                let (a0, a1) = (360.0 * j as f64 / n as f64, 360.0 * (j + 1) as f64 / n as f64);
+                let inward = scale(unit((a0 + a1) / 2.0), -1.0);
+                lip_kept(k, add(pit, scale(unit(a0), 18.0)), add(pit, scale(unit(a1), 18.0)), g, inward, Some((pit, top, super::lanes::ROAD_HALF + 2.0)));
+            }
             g
         }
         SiteKind::GlassVault => {
@@ -521,6 +572,21 @@ fn cliffhold(k: &mut Kiln, i: usize) -> f64 {
         let d = band * t as f64 + 5.0;
         let path = vec![rift.at(from, -(w + d)), rift.at(to, -(w + d))];
         stamp_ramp_narrow(k, &path, level(t), level(t + 1));
+        // A parapet along its open side, over the terrace below (falls are a
+        // choice, K4): rising with it, a meter in from its edge, down to the
+        // terrace (the ground there is blended), in pieces, to its top (its
+        // foot, level with the terrace beside it, open).
+        let pieces = 12;
+        for j in 1..pieces {
+            let (s0, s1) = (j as f64 / pieces as f64, (j + 1) as f64 / pieces as f64);
+            let (za, zb) = (lerp(level(t), level(t + 1), s0), lerp(level(t), level(t + 1), s1));
+            let (p, q) = (rift.at(lerp(from, to, s0), -(w + d - 5.0)), rift.at(lerp(from, to, s1), -(w + d - 5.0)));
+            k.boxes.push(slope_box(p, q, za + 1.1, zb + 1.1, 0.25, level(t) - 0.6, Kind::Block));
+        }
+        // And on past its top, level, over the ground its stamp leaves there.
+        let on = if to > from { 8.0 } else { -8.0 };
+        let (p, q) = (rift.at(to, -(w + d - 5.0)), rift.at(to + on, -(w + d - 5.0)));
+        k.boxes.push(strip(p, q, 0.25, level(t) - 0.6, level(t + 1) + 1.1, Kind::Block));
         if t > 0 {
             // Out from the last ramp's top to this one's foot, level.
             let last = *legs.last().unwrap().last().unwrap();
@@ -528,6 +594,23 @@ fn cliffhold(k: &mut Kiln, i: usize) -> f64 {
             legs.push(vec![last, path[0]]);
         }
         legs.push(path);
+    }
+    // Falls are a choice (K4, with fall damage): a lip along each terrace's
+    // edge, the drop to the one below; in pieces, only where the ground at
+    // both ends is the terrace's (not over a ramp), and cleared where a route
+    // crosses (`clear_lanes`).
+    for t in 1..=7 {
+        let d = if t == 1 { 0.6 } else { band * (t - 1) as f64 + 4.6 };
+        let z = level(t);
+        let mut a = lo + 3.0;
+        while a + 1.0 < hi - 3.0 {
+            let a1 = (a + 6.0).min(hi - 3.0);
+            let (p, q) = (rift.at(a, -(w + d)), rift.at(a1, -(w + d)));
+            if (k.height(p) - z).abs() < 0.3 && (k.height(q) - z).abs() < 0.3 {
+                k.boxes.push(strip(p, q, 0.25, z - 0.6, z + 1.1, Kind::Block));
+            }
+            a = a1;
+        }
     }
     let keep_anchor = rift.at(a_hi + 30.0, -(w + 7.0 * band + 40.0));
     legs.push(vec![*legs.last().unwrap().last().unwrap(), rift.at(a_hi, -(w + 7.0 * band + 10.0)), keep_anchor]);
@@ -604,6 +687,16 @@ fn geode(k: &mut Kiln, i: usize) -> f64 {
     let a1 = a0 + span1 + 12.0;
     let p2: Vec<[f64; 2]> = (0..=60).map(|j| add(c, scale(unit(a1 + span2 * j as f64 / 60.0), 42.0))).collect();
     stamp_ramp(k, &p2, g - 50.0, g - 100.0);
+    // Lips round the terraces' inner edges, 50 m over the next (falls are a
+    // choice, K4): routes clear them where they cross, the ramps aren't level.
+    for (r, z) in [(44.0, g - 50.0), (77.0, g)] {
+        let n = (2.0 * std::f64::consts::PI * r / 6.0).ceil() as usize;
+        for j in 0..n {
+            let (a0, a1) = (360.0 * j as f64 / n as f64, 360.0 * (j + 1) as f64 / n as f64);
+            let inward = scale(unit((a0 + a1) / 2.0), -1.0);
+            lip(k, add(c, scale(unit(a0), r)), add(c, scale(unit(a1), r)), z, inward, None);
+        }
+    }
     let crack_in = add(c, scale(unit(cracks.first().copied().unwrap_or(0.0)), 92.0));
     let crack_out = add(c, scale(unit(cracks.first().copied().unwrap_or(0.0)), k.sites[i].half + 26.0));
     internal(
@@ -695,22 +788,54 @@ pub(crate) fn sites(k: &mut Kiln) {
                 // walkway out from it to a lift up from the floor and a drop
                 // shaft back down (K1).
                 fixed.push(bx(sub(c, [16.0, 16.0]), add(c, [16.0, 16.0]), 548.0, 550.0, Kind::Block, 0));
+                // (Each walkway's line out from the gallery, for its rails' gaps.)
+                let mut walkways: Vec<([f64; 2], [f64; 2])> = Vec::new();
                 for s in 0..3 {
                     let u = unit(Frame::axis_deg(s));
                     let t = [-u[1], u[0]];
                     // Out until both shafts clear the spire's foot (30 m half-side).
-                    let clear = |q: [f64; 2]| (q[0] - c[0]).abs().max((q[1] - c[1]).abs()) >= 30.0 + 2.5 + 1.0;
+                    // (A column turned with its walkway reaches 2.5 m x the
+                    // square root of 2 from its center.)
+                    let clear = |q: [f64; 2]| (q[0] - c[0]).abs().max((q[1] - c[1]).abs()) >= 30.0 + 3.6 + 1.0;
                     let at = |d: f64, side: f64| add(add(c, scale(u, d)), scale(t, side));
                     let mut d = 20.0;
                     while !(clear(at(d + 3.0, -4.0)) && clear(at(d + 3.0, 4.0))) {
                         d += 0.5;
                     }
                     fixed.push(strip(at(10.0, 0.0), at(d, 0.0), 7.0, 548.0, 550.0, Kind::Block));
+                    walkways.push((at(10.0, 0.0), at(d, 0.0)));
+                    // 470 m up (falls are a choice, K4): floor at its end round
+                    // the lift and the drop shaft (between them, and up to them),
+                    // open only over them; rails along its sides and across
+                    // their far side.
+                    fixed.push(strip(at(d, 0.0), at(d + 5.5, 0.0), 1.5, 548.0, 550.0, Kind::Block));
+                    fixed.push(strip(at(d - 0.1, 0.0), at(d + 0.6, 0.0), 7.0, 548.0, 550.0, Kind::Block));
+                    for side in [-6.75, 6.75] {
+                        fixed.push(strip(at(d, side), at(d + 5.5, side), 0.25, 548.0, 550.0, Kind::Block));
+                        fixed.push(strip(at(16.5, side), at(d - 0.5, side), 0.25, 549.5, 551.1, Kind::Block));
+                        fixed.push(strip(at(d - 0.5, side), at(d + 5.8, side), 0.25, 549.5, 554.0, Kind::Block));
+                    }
+                    fixed.push(strip(at(d + 5.8, -7.0), at(d + 5.8, 7.0), 0.25, 549.5, 554.0, Kind::Block));
                     let (up, down) = (at(d + 3.0, -4.0), at(d + 3.0, 4.0));
                     let (z_up, z_down) = (k.height(up), k.height(down));
+                    let first = k.volumes.len();
                     lift_up(k, 0, up, 2.5, z_up, 550.0, at(d + 20.0, -4.0), at(d - 5.0, -4.0));
                     drop_down(k, 0, down, 2.5, 550.0, z_down, at(d - 5.0, 4.0), at(d - 0.8, 4.0), at(d + 20.0, 4.0));
+                    deep::turn_volumes(k, first, u);
                     keep_clear(k, at(d + 10.0, 0.0), 16.0);
+                }
+                // The gallery's rails, round its edge in pieces, open where
+                // the walkways leave it.
+                let corners = [[-15.75, -15.75], [15.75, -15.75], [15.75, 15.75], [-15.75, 15.75]];
+                for e in 0..4 {
+                    let (a, b) = (add(c, corners[e]), add(c, corners[(e + 1) % 4]));
+                    for j in 0..10 {
+                        let (p, q) = (add(a, scale(sub(b, a), j as f64 / 10.0)), add(a, scale(sub(b, a), (j + 1) as f64 / 10.0)));
+                        let mid = scale(add(p, q), 0.5);
+                        if walkways.iter().all(|w| seg_dist(mid, w.0, w.1).0 > 6.0) {
+                            fixed.push(strip(p, q, 0.25, 549.5, 551.1, Kind::Block));
+                        }
+                    }
                 }
                 // The Heart chamber (K2, the Deep): under the Heartwell's
                 // foot, 40 m under the floor; a shaft down to it beside the
@@ -820,6 +945,15 @@ pub(crate) fn sites(k: &mut Kiln) {
                 let l = dist(near, far);
                 let u = scale(sub(far, near), 1.0 / l);
                 let at = |s: f64, a: f64| add(add(near, scale(u, s)), scale(v, a));
+                // The bridgeheads' lips (falls are a choice, K4): round each
+                // 90 m square's edges, open where the deck meets it.
+                for head in [p.anchors[0], p.anchors[1]] {
+                    let corners = [[-45.0, -45.0], [45.0, -45.0], [45.0, 45.0], [-45.0, 45.0]];
+                    let outs = [[0.0, -1.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]];
+                    for e in 0..4 {
+                        lip(k, add(head, corners[e]), add(head, corners[(e + 1) % 4]), DECK, outs[e], Some((near, far, half + 0.2)));
+                    }
+                }
                 let wells = [(40.0, 54.0), (l - 54.0, l - 40.0)];
                 let mut from = 0.0;
                 for &(s0, s1) in &wells {
@@ -836,6 +970,10 @@ pub(crate) fn sites(k: &mut Kiln) {
                     let rise = scale(u, -dir);
                     let ramp = CoverBox::turned([c[0] as f32, c[1] as f32], [12.0, 3.0], [rise[0] as f32, rise[1] as f32], (DECK - 8.5) as f32, DECK as f32, Kind::Block, 0);
                     fixed.push(ramp.wedge((DECK - 8.0) as f32));
+                    // A rail along its side by the gallery's wall, over its
+                    // windows (falls are a choice, K4).
+                    let (top, foot) = (at(s_top, -9.75), at(s_top + dir * 24.0, -9.75));
+                    fixed.push(slope_box(top, foot, DECK + 1.1, DECK - 8.0 + 1.1, 0.25, DECK - 8.5, Kind::Block));
                 }
                 let mid_s = l / 2.0;
                 let gallery = Leg {
@@ -857,21 +995,33 @@ pub(crate) fn sites(k: &mut Kiln) {
                         fixed.push(strip(add(a, off), add(b, off), 0.5, DECK - 8.0, DECK - 2.0, Kind::Block));
                     }
                 }
-                // Rails on the deck, with a gap over each pylon's lift.
+                // The windows' sills, 1.1 m (as the rift galleries'): seen and
+                // shot over standing, never walked out of (falls are a choice, K4).
+                for side in [-1.0, 1.0] {
+                    let off = scale(v, side * (half - 1.5));
+                    fixed.push(strip(add(near, off), add(far, off), 0.5, DECK - 8.5, DECK - 6.9, Kind::Block));
+                }
+                // Rails on the deck, with a gap over each pylon's lift; 8 m on
+                // onto each bridgehead, to meet its lip (set in from the edge).
                 let mid = rift.at(SPAN_ALONG, 0.0);
                 for side in [-1.0, 1.0] {
                     let off = scale(v, side * half);
                     let (a, b) = (add(near, off), add(far, off));
+                    fixed.push(strip(sub(a, scale(u, 8.0)), a, 0.3, DECK, DECK + 1.1, Kind::Block));
+                    fixed.push(strip(b, add(b, scale(u, 8.0)), 0.3, DECK, DECK + 1.1, Kind::Block));
                     if side < 0.0 {
                         fixed.push(strip(a, b, 0.3, DECK, DECK + 1.1, Kind::Block));
                         continue;
                     }
+                    // (Open only over each pylon's lift and its drop shaft beside
+                    // it: falls are a choice, K4.)
                     let t = |d: f64| 0.5 + d / l;
                     let mut from = 0.0;
                     for gap in [-70.0, 70.0] {
-                        let (g0, g1) = (t(gap - 5.0), t(gap + 12.0));
-                        fixed.push(strip(add(a, scale(sub(b, a), from)), add(a, scale(sub(b, a), g0)), 0.3, DECK, DECK + 1.1, Kind::Block));
-                        from = g1;
+                        for (g0, g1) in [(gap - 2.8, gap + 2.8), (gap + 4.2, gap + 9.8)] {
+                            fixed.push(strip(add(a, scale(sub(b, a), from)), add(a, scale(sub(b, a), t(g0))), 0.3, DECK, DECK + 1.1, Kind::Block));
+                            from = t(g1);
+                        }
                     }
                     fixed.push(strip(add(a, scale(sub(b, a), from)), b, 0.3, DECK, DECK + 1.1, Kind::Block));
                 }
@@ -886,11 +1036,13 @@ pub(crate) fn sites(k: &mut Kiln) {
                     let deck = add(q, scale(v, half - 6.0));
                     // (From and to the ground under each, the rift's floor.)
                     let z_up = k.height(shaft);
+                    let first = k.volumes.len();
                     lift_up(k, i, shaft, 2.5, z_up, DECK, foot, deck);
                     let drop = add(add(q, scale(v, half + 3.5)), scale(cross, 7.0));
                     let edge = add(add(q, scale(v, half - 0.8)), scale(cross, 7.0));
                     let z_down = k.height(drop);
                     drop_down(k, i, drop, 2.5, DECK, z_down, add(deck, scale(cross, 7.0)), edge, add(foot, scale(cross, 7.0)));
+                    deep::turn_volumes(k, first, cross);
                     points.push(on(k, add(q, scale(v, -(half + 8.0)))));
                 }
                 // Two arches over the deck, 150 m: stepped blocks from each end to a crown.
@@ -910,11 +1062,23 @@ pub(crate) fn sites(k: &mut Kiln) {
                     }
                     let q = add(near, scale(sub(far, near), 0.5 + shift));
                     fixed.push(oriented(q, [12.0, half + 8.0], cross, DECK + rise - 6.0, DECK + rise, Kind::Block));
+                    // Rails round the crown (falls are a choice, K4), open at
+                    // each end where its lift arrives and its drop shaft leaves.
+                    let crown = DECK + rise;
+                    let edge = |a: f64, b: f64| add(add(q, scale(cross, a)), scale(v, b));
+                    for s in [-1.0, 1.0] {
+                        fixed.push(strip(edge(-11.75, s * (half + 7.75)), edge(11.75, s * (half + 7.75)), 0.25, crown - 0.5, crown + 1.1, Kind::Block));
+                        for (b0, b1) in [(-(half + 7.75), -10.0), (-4.0, half + 7.75)] {
+                            fixed.push(strip(edge(s * 11.75, b0), edge(s * 11.75, b1), 0.25, crown - 0.5, crown + 1.1, Kind::Block));
+                        }
+                    }
                     // A perch on its crown (K2): a lift up from the deck past
                     // one end of it, a drop shaft down past the other.
                     let qs = l * (0.5 + shift);
+                    let first = k.volumes.len();
                     deep::lift_rect(k, i, at(qs + 15.5, -7.0), [2.5, 2.5], DECK, DECK + rise, at(qs + 30.0, -7.0), at(qs + 5.0, -7.0), false);
                     deep::drop_rect(k, i, at(qs - 15.5, -7.0), [2.5, 2.5], DECK + rise, DECK, at(qs - 5.0, -7.0), at(qs - 12.8, -7.0), at(qs - 30.0, -7.0), (false, false));
+                    deep::turn_volumes(k, first, u);
                 }
                 // The wall tunnels (K2, the Deep): from the rift's floor down a
                 // trench short of each wall, under it to a chamber under its
@@ -1039,8 +1203,10 @@ pub(crate) fn sites(k: &mut Kiln) {
                 let at = |r: f64, side: f64| add(add(c, scale(u, r)), scale(t, side));
                 let crest = lvl + 151.0;
                 fixed.push(strip(at(102.5, 3.5), at(118.0, 3.5), 6.0, crest - 2.0, crest, Kind::Crystal));
+                let first = k.volumes.len();
                 venting(k, |k| lift_up(k, i, at(98.0, 0.0), 2.5, lvl, crest, at(90.0, 0.0), at(110.0, 0.0)));
                 drop_down(k, i, at(98.0, 7.0), 2.5, crest, lvl, at(110.0, 7.0), at(103.3, 7.0), at(90.0, 7.0));
+                deep::turn_volumes(k, first, u);
                 for j in 0..14 {
                     let r = if j % 2 == 0 { rng.range(80.0, 100.0) } else { rng.range(48.0, 68.0) };
                     let q = add(c, scale(unit(rng.range(0.0, 360.0)), r));
@@ -1074,10 +1240,19 @@ pub(crate) fn sites(k: &mut Kiln) {
                 ] {
                     let u = unit(deg);
                     let at = |r: f64| add(c, scale(u, r));
-                    // The ledge: from the wall 9 m in, 10 m wide.
+                    // The ledge: from the wall 9 m in, 10 m wide; railed on its
+                    // three open sides, 25 m over the floor (falls are a choice,
+                    // K4: the spring's throw carries you over the inner one).
                     fixed.push(oriented(at(r_ledge + 1.0), [4.5, 5.0], u, z1 - 2.0, z1, Kind::Crystal));
+                    let t = [-u[1], u[0]];
+                    let corner = |r: f64, s: f64| add(at(r), scale(t, s));
+                    for (a, b) in [((r_ledge - 3.25, -4.75), (r_ledge - 3.25, 4.75)), ((r_ledge - 3.25, -4.75), (r_ledge + 5.5, -4.75)), ((r_ledge - 3.25, 4.75), (r_ledge + 5.5, 4.75))] {
+                        fixed.push(strip(corner(a.0, a.1), corner(b.0, b.1), 0.25, z1 - 0.5, z1 + 1.1, Kind::Crystal));
+                    }
+                    let first = k.volumes.len();
                     deep::spring(k, i, at(r_pad), z0, z1, at(r_pad - 8.0), at(r_ledge - 1.0));
                     deep::spring(k, i, at(r_up), z1, z2, at(r_up - 4.5), at(r_land));
+                    deep::turn_volumes(k, first, u);
                     deep::keep_clear(k, at(r_pad), 8.0);
                 }
                 points.push([below[0], below[1], well_floor]);
@@ -1102,6 +1277,13 @@ pub(crate) fn sites(k: &mut Kiln) {
                 // (the wall's foot) and where the rim's begins, found.
                 let mid_a = along - 17.0;
                 deep::cliff_lifts(k, i, &|s, d| r.at(mid_a + s, side * (w + d)), 0.0, lvl, 20.0);
+                // The shelf's lips: along its edge over the rift's floor, 170 m
+                // down, and its ends.
+                let (a0, a1, d0, d1) = (along - LEDGE_HALF, along + LEDGE_HALF, w - 40.0, w + 44.0);
+                // (One end, the edge, the other end: laid in turn, chained.)
+                lip(k, r.at(a0, side * d1), r.at(a0, side * d0), lvl, scale(r.dir, -1.0), None);
+                lip(k, r.at(a0, side * d0), r.at(a1, side * d0), lvl, scale(r.normal, -side), None);
+                lip(k, r.at(a1, side * d0), r.at(a1, side * d1), lvl, r.dir, None);
                 points.push(on(k, r.at(along - 45.0, side * (w + 5.0))));
                 points.push(on(k, r.at(along + 45.0, side * (w + 5.0))));
                 if big {
@@ -1280,7 +1462,11 @@ pub(crate) fn sites(k: &mut Kiln) {
                 let top = pillar.top as f64;
                 fixed.push(pillar);
                 fixed.push(strip(add(vent, scale(u, 3.2)), add(vent, scale(u, 18.0)), 2.0, top - 1.5, top, Kind::Rock));
+                // (The lift turned with the walkway it serves; the drop shaft
+                // is off the square pillar's side.)
+                let first = k.volumes.len();
                 venting(k, |k| lift_up(k, i, vent, 2.0, g, top, c, add(vent, scale(u, 10.0))));
+                deep::turn_volumes(k, first, u);
                 drop_down(k, i, shaft, 2.0, top, k.height(shaft), tower, add(tower, scale(u, 4.2)), add(tower, scale(u, 15.0)));
                 keep_clear(k, add(c, scale(u, 25.0)), 25.0);
                 points.push(on(k, vent));
@@ -1645,8 +1831,15 @@ pub(crate) fn clear_lanes(k: &mut Kiln, paths: &[Vec<[f64; 2]>]) {
                     let n = (l / 1.0).ceil().max(1.0) as usize;
                     for j in 0..=n {
                         let p = add(a, scale(sub(bb, a), j as f64 / n as f64));
-                        let dx = ((p[0] - mid[0]).abs() - half[0]).max(0.0);
-                        let dy = ((p[1] - mid[1]).abs() - half[1]).max(0.0);
+                        // (A turned box by its own footprint, not its bounds.)
+                        let (dx, dy) = if b.axis != [1.0, 0.0] {
+                            let v = [p[0] - b.center[0] as f64, p[1] - b.center[1] as f64];
+                            let (ax, ay) = (b.axis[0] as f64, b.axis[1] as f64);
+                            let (u, w) = (v[0] * ax + v[1] * ay, -v[0] * ay + v[1] * ax);
+                            ((u.abs() - b.half[0] as f64).max(0.0), (w.abs() - b.half[1] as f64).max(0.0))
+                        } else {
+                            (((p[0] - mid[0]).abs() - half[0]).max(0.0), ((p[1] - mid[1]).abs() - half[1]).max(0.0))
+                        };
                         if len([dx, dy]) < 3.0 {
                             let z = height(p);
                             if (b.bottom as f64) < z + 2.4 && (b.top as f64) > z + 0.45 {
@@ -1675,6 +1868,116 @@ pub(crate) fn venting(k: &mut Kiln, f: impl FnOnce(&mut Kiln)) {
             v.phase = (crate::world::hash(0x7E47, 4, v.min[0].round() as i64, v.min[1].round() as i64) % crate::clock::VENT_CYCLE as u64) as u16;
         }
     }
+}
+
+/// A lip to lay (`lip`): along `a`-`b` at `z` (NaN: the ground's own height
+/// there, as a rim's), its drop toward `out`, open within `open.2` of the
+/// segment `open.0`-`open.1` if any; `keep`: never cleared for a route that
+/// passes close by (`clear_lanes`).
+#[derive(Debug, Clone)]
+pub(crate) struct Lip {
+    a: [f64; 2],
+    b: [f64; 2],
+    z: f64,
+    out: [f64; 2],
+    open: Option<([f64; 2], [f64; 2], f64)>,
+    keep: bool,
+}
+
+/// Falls are a choice (K4, with fall damage): a lip along the edge from `a`
+/// to `b` of ground at height `z`, the drop on the side of `out` (a unit
+/// vector), open within `open.2` of a segment (a bridge's deck, a ramp);
+/// queued, laid after the tunnels (`lay_lips`).
+pub(crate) fn lip(k: &mut Kiln, a: [f64; 2], b: [f64; 2], z: f64, out: [f64; 2], open: Option<([f64; 2], [f64; 2], f64)>) {
+    k.lips.push(Lip { a, b, z, out, open, keep: false });
+}
+
+/// A lip (`lip`) kept where a route passes close by: one no route crosses
+/// but where its `open` is.
+pub(crate) fn lip_kept(k: &mut Kiln, a: [f64; 2], b: [f64; 2], z: f64, out: [f64; 2], open: Option<([f64; 2], [f64; 2], f64)>) {
+    k.lips.push(Lip { a, b, z, out, open, keep: true });
+}
+
+/// Lays the lips queued (`lip`), and the rails (`Kiln::rails`).
+pub(crate) fn lay_lips(k: &mut Kiln) {
+    let rails = std::mem::take(&mut k.rails);
+    k.boxes.extend(rails);
+    // Lips laid one after another, each starting where the last ended (a
+    // ring's edges), are joined as one lip's pieces are; and a ring closed.
+    let mut carry: Option<([f64; 2], [f64; 2])> = None;
+    let mut head: Option<([f64; 2], [f64; 2])> = None;
+    for l in std::mem::take(&mut k.lips) {
+        let open = |m: [f64; 2]| l.open.is_some_and(|(p, q, r)| seg_dist(m, p, q).0 < r);
+        let chained = carry.is_some_and(|(o, _)| dist(o, l.a) < 1e-6);
+        let (first, last) = lay_lip(k, &l, &open, if chained { carry.map(|c| c.1) } else { None });
+        if !chained {
+            head = first.map(|f| (l.a, f));
+        }
+        if let (Some((a, f)), Some(e)) = (head, last) {
+            if dist(a, l.b) < 1e-6 && dist(e, f) > 0.05 {
+                let z = if l.z.is_nan() { k.height(e) } else { l.z };
+                let join = strip(e, f, 0.25, z - 0.6, z + 1.1, Kind::Block);
+                if l.keep { k.fixed.push(join) } else { k.boxes.push(join) }
+            }
+        }
+        carry = last.map(|e| (l.b, e));
+    }
+}
+
+/// A lip, in pieces of 6 m: each only where the ground 3 m beyond falls
+/// away, set in from the edge to where the ground at both its ends is level
+/// (the terrain's 4 m samples blend an edge), none where `open`; routes
+/// clear the pieces they cross (`clear_lanes`). Joined to `before` (the
+/// last lip's end, this one continuing it); returns where its first piece
+/// starts if at `a`, and where its last ends if at `b`.
+fn lay_lip(k: &mut Kiln, l: &Lip, open: &dyn Fn([f64; 2]) -> bool, before: Option<[f64; 2]>) -> (Option<[f64; 2]>, Option<[f64; 2]>) {
+    let (a, b, out) = (l.a, l.b, l.out);
+    let n = (dist(a, b) / 6.0).ceil().max(1.0) as usize;
+    let at = |j: usize| add(a, scale(sub(b, a), j as f64 / n as f64));
+    // (Without a height: level where the ground is flat going in from it.)
+    let own = l.z.is_nan();
+    let z_at = |r: [f64; 2]| if own { k.height(r) } else { l.z };
+    let level = |r: [f64; 2]| if own { (k.height(r) - k.height(sub(r, scale(out, 2.0)))).abs() < 0.6 } else { (k.height(r) - l.z).abs() < 0.3 };
+    let drops = |r: [f64; 2]| k.height(add(r, scale(out, 3.0))) < z_at(r) - 4.0;
+    let mut pieces = Vec::new();
+    // (The last piece's index and far end, if it ran to it: joined to the
+    // next's near end, as pieces set in by different amounts leave a gap.)
+    let mut last: Option<(isize, [f64; 2])> = before.map(|e| (-1, e));
+    let mut first = None;
+    for j in 0..n as isize {
+        let ju = j as usize;
+        let (p0, q0) = (at(ju), at(ju + 1));
+        // Cut short where it meets an opening (by half meters).
+        let m = 12;
+        let shut: Vec<bool> = (0..m).map(|s| !open(add(p0, scale(sub(q0, p0), (s as f64 + 0.5) / m as f64)))).collect();
+        let Some(s0) = shut.iter().position(|&s| s) else { continue };
+        let s1 = s0 + shut[s0..].iter().take_while(|&&s| s).count();
+        let (p0, q0) = (add(p0, scale(sub(q0, p0), s0 as f64 / m as f64)), add(p0, scale(sub(q0, p0), s1 as f64 / m as f64)));
+        if !(drops(p0) || drops(q0)) {
+            continue;
+        }
+        let set_in = (0..14).map(|s| scale(out, -0.5 * s as f64)).find(|&v| level(add(p0, v)) && level(add(q0, v)) && (z_at(add(p0, v)) - z_at(add(q0, v))).abs() < 1.0);
+        if let Some(v) = set_in {
+            let (p, q) = (add(p0, v), add(q0, v));
+            let z = z_at(p).max(z_at(q));
+            if let Some((i, end)) = last {
+                if i + 1 == j && s0 == 0 && dist(end, p) > 0.05 {
+                    pieces.push(strip(end, p, 0.25, z - 0.6, z + 1.1, Kind::Block));
+                }
+            }
+            pieces.push(strip(p, q, 0.25, z - 0.6 - (z_at(p) - z_at(q)).abs(), z + 1.1, Kind::Block));
+            if j == 0 && s0 == 0 {
+                first = Some(p);
+            }
+            last = (s1 == m).then_some((j, q));
+        }
+    }
+    if l.keep {
+        k.fixed.extend(pieces);
+    } else {
+        k.boxes.extend(pieces);
+    }
+    (first, last.filter(|&(i, _)| i == n as isize - 1).map(|(_, q)| q))
 }
 
 /// A wedge along `a`-`b`, its top `za` at `a` and `zb` at `b` (rising
@@ -1779,6 +2082,31 @@ pub(crate) fn sandfalls(k: &mut Kiln) {
         // The ledge's turn, as the cenote's builder winds it.
         let a0 = axis + 200.0;
         let span = PIT_DEPTH / RAMP_GRADE / (PIT_R - 7.0) * 180.0 / std::f64::consts::PI * 1.04;
+        // Falls are a choice (K4): a lip round the pit's rim, and a rail
+        // along the ledge's inner edge down to near the floor; in pieces the
+        // routes clear where they cross (the ledge's top, the sandfalls'
+        // lips: `clear_lanes`). (After the tunnels: they plan round cover.)
+        {
+            let floor = g - PIT_DEPTH;
+            for j in 0..72 {
+                let (p, q) = (add(c, scale(unit(j as f64 * 5.0), PIT_R + 0.6)), add(c, scale(unit((j + 1) as f64 * 5.0), PIT_R + 0.6)));
+                k.boxes.push(strip(p, q, 0.25, g - 0.6, g + 1.1, Kind::Rock));
+            }
+            let n = (span / 3.0).ceil() as usize;
+            let path: Vec<[f64; 2]> = (0..=n).map(|j| add(c, scale(unit(a0 + span * j as f64 / n as f64), PIT_R - 7.0))).collect();
+            let start = add(c, scale(unit(a0 - 10.0), PIT_R + 4.0));
+            let total: f64 = dist(start, path[0]) + path.windows(2).map(|w| dist(w[0], w[1])).sum::<f64>();
+            let mut s = dist(start, path[0]);
+            let inner = |p: [f64; 2]| add(c, scale(sub(p, c), (PIT_R - 13.5) / (PIT_R - 7.0)));
+            for j in 0..n {
+                let ds = dist(path[j], path[j + 1]);
+                let (za, zb) = (lerp(g, floor, s / total), lerp(g, floor, (s + ds) / total));
+                s += ds;
+                if za.min(zb) - floor >= 2.0 {
+                    k.boxes.push(slope_box(inner(path[j]), inner(path[j + 1]), za + 1.1, zb + 1.1, 0.25, za.min(zb) - 0.6, Kind::Rock));
+                }
+            }
+        }
         for (n, &t0) in FALL_AT.iter().enumerate() {
             let when = if n == 0 { crate::world::FALLS_A } else { crate::world::FALLS_B };
             // Where it lands on the floor: no hole, nothing there.
@@ -1810,6 +2138,7 @@ pub(crate) fn sandfalls(k: &mut Kiln) {
             for v in &mut k.volumes[nv..] {
                 v.when = when;
             }
+            deep::turn_volumes(k, nv, u);
             let legs = deep::drop_legs(col, z0, floor, add(c, scale(u, start + 8.0)), edge, to, (false, true));
             k.clockwork.push((Route { a: i, b: i, legs, one_way: true }, when));
         }

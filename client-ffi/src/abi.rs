@@ -337,11 +337,20 @@ ffi_structs! {
         pub when: u8,
     }
 
-    /// A force volume (an axis-aligned box of air): a lift, a drop shaft or
-    /// a spring.
+    /// A force volume (a box of air, turned like a box can be): a lift, a
+    /// drop shaft or a spring.
     pub struct LtVolume {
+        /// Its bounds (a turned one's: around it).
         pub min: LtVec3,
         pub max: LtVec3,
+        /// Its footprint's center, half its size along its axis and across,
+        /// and its axis (a unit vector: (1, 0) for one that isn't turned).
+        pub center_x: f32,
+        pub center_y: f32,
+        pub half_along: f32,
+        pub half_across: f32,
+        pub axis_x: f32,
+        pub axis_y: f32,
         /// What it does (`LT_FORCE_*`): a lift's speed up (z), a drop shaft's
         /// down (z, negative), a spring's throw.
         pub vel: LtVec3,

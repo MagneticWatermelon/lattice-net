@@ -314,7 +314,8 @@ pub enum Force {
 /// clockwork one (`when`) as the step says.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Volume {
-    /// Its bounds; the feet are in it from `min[2]` up to (not at) `max[2]`.
+    /// Its bounds (a turned one's: around it); the feet are in it from
+    /// `min[2]` up to (not at) `max[2]`.
     pub min: [f32; 3],
     pub max: [f32; 3],
     pub force: Force,
@@ -326,12 +327,80 @@ pub struct Volume {
     /// fall, to `clock::VENT_SINK`).
     pub when: u8,
     pub phase: u16,
+    /// Its axis, a unit vector (`UNTURNED`: the bounds are its footprint), and
+    /// a turned one's half-sizes along it and across, about the bounds'
+    /// center (as a column in a turned frame: a walkway over a diagonal rift).
+    pub axis: [f32; 2],
+    pub half: [f32; 2],
 }
+
+/// A volume's axis when it isn't turned.
+pub const UNTURNED: [f32; 2] = [1.0, 0.0];
 
 impl Volume {
     #[inline]
     pub fn contains(&self, x: f32, y: f32, z: f32) -> bool {
-        x >= self.min[0] && x <= self.max[0] && y >= self.min[1] && y <= self.max[1] && z >= self.min[2] && z < self.max[2]
+        let bounds = x >= self.min[0] && x <= self.max[0] && y >= self.min[1] && y <= self.max[1] && z >= self.min[2] && z < self.max[2];
+        if !bounds || self.axis == UNTURNED {
+            return bounds;
+        }
+        let (u, w) = self.local(x, y);
+        u.abs() <= self.half[0] && w.abs() <= self.half[1]
+    }
+
+    /// The footprint's center.
+    pub fn center(&self) -> [f32; 2] {
+        [(self.min[0] + self.max[0]) * 0.5, (self.min[1] + self.max[1]) * 0.5]
+    }
+
+    /// (x, y) along its axis and across it, from its center.
+    #[inline]
+    fn local(&self, x: f32, y: f32) -> (f32, f32) {
+        let c = self.center();
+        let (dx, dy) = (x - c[0], y - c[1]);
+        (dx * self.axis[0] + dy * self.axis[1], -dx * self.axis[1] + dy * self.axis[0])
+    }
+
+    /// This, its bounds its footprint, turned to `axis` about their center.
+    pub fn turned(self, axis: [f32; 2]) -> Self {
+        let c = self.center();
+        let half = [(self.max[0] - self.min[0]) * 0.5, (self.max[1] - self.min[1]) * 0.5];
+        let ex = axis[0].abs() * half[0] + axis[1].abs() * half[1];
+        let ey = axis[1].abs() * half[0] + axis[0].abs() * half[1];
+        Volume { min: [c[0] - ex, c[1] - ey, self.min[2]], max: [c[0] + ex, c[1] + ey, self.max[2]], axis, half, ..self }
+    }
+
+    /// Keeps `pos` within its footprint, stopping what of `vel` would carry
+    /// it out (a rider held in a column, `movement::HELD_LIFT`).
+    pub fn hold(&self, pos: &mut [f32; 2], vel: &mut [f32; 2]) {
+        if self.axis == UNTURNED {
+            for i in 0..2 {
+                let held = pos[i].clamp(self.min[i], self.max[i]);
+                if held != pos[i] {
+                    pos[i] = held;
+                    vel[i] = 0.0;
+                }
+            }
+            return;
+        }
+        // (A centimeter inside: turned back into world coordinates, the edge
+        // itself can round to just outside.)
+        let (u, w) = self.local(pos[0], pos[1]);
+        let (eu, ew) = (self.half[0] - 0.01, self.half[1] - 0.01);
+        let (hu, hw) = (u.clamp(-eu, eu), w.clamp(-ew, ew));
+        if hu == u && hw == w {
+            return;
+        }
+        let (a, c) = (self.axis, self.center());
+        *pos = [c[0] + hu * a[0] - hw * a[1], c[1] + hu * a[1] + hw * a[0]];
+        let (mut vu, mut vw) = (vel[0] * a[0] + vel[1] * a[1], -vel[0] * a[1] + vel[1] * a[0]);
+        if hu != u {
+            vu = 0.0;
+        }
+        if hw != w {
+            vw = 0.0;
+        }
+        *vel = [vu * a[0] - vw * a[1], vu * a[1] + vw * a[0]];
     }
 }
 
@@ -1123,6 +1192,11 @@ impl World {
                 eat(x.to_bits() as u64);
             }
             eat(v.force as u64 | (v.when as u64) << 8 | (v.phase as u64) << 16);
+            if v.axis != UNTURNED {
+                for x in v.axis.iter().chain(&v.half) {
+                    eat(x.to_bits() as u64);
+                }
+            }
         }
         for s in &self.sites {
             for v in [s.center[0], s.center[1], s.half, s.level] {

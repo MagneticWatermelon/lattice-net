@@ -76,7 +76,7 @@ pub fn spawn_points(w: &World) -> Vec<Vec<[f32; 2]>> {
                 .filter(|l| l.when == crate::world::ALWAYS)
                 .flat_map(|l| l.path.iter())
                 .map(|p| (((p[0] - s.center[0]) * (p[0] - s.center[0]) + (p[1] - s.center[1]) * (p[1] - s.center[1])).sqrt(), p))
-                .filter(|(d, p)| *d <= s.half.min(120.0) && (p[2] - w.terrain(p[0], p[1])).abs() < 1.0)
+                .filter(|(d, p)| *d <= s.half.min(120.0) && (p[2] - w.terrain(p[0], p[1])).abs() < 1.0 && firm(w, p))
                 .map(|(d, p)| (d, [p[0], p[1]]))
                 .collect();
             v.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -84,6 +84,19 @@ pub fn spawn_points(w: &World) -> Vec<Vec<[f32; 2]>> {
             v.into_iter().take(24).map(|(_, p)| p).collect()
         })
         .collect()
+}
+
+/// Whether a spawn can stand anywhere within its scatter (2 m) of `p`, with
+/// room: on ground at `p`'s height (no hole), nothing that moves anyone (a
+/// spring's pad, a lift's foot) within 4 m.
+fn firm(w: &World, p: &[f32; 3]) -> bool {
+    (0..=16).all(|j| {
+        let (r, a) = if j == 0 { (0.0, 0.0) } else if j <= 8 { (2.0, j as f32) } else { (4.0, j as f32 + 0.5) };
+        let a = a * std::f32::consts::FRAC_PI_4;
+        let (x, y) = (p[0] + r * libm::cosf(a), p[1] + r * libm::sinf(a));
+        let still = (-1..=3).all(|dz| w.volume_at(x, y, p[2] + dz as f32, crate::clock::Live::OFF).is_none());
+        still && (r > 2.0 || (!w.hole(x, y) && (w.ground(x, y, p[2] + 0.5, 1.0, crate::clock::Live::OFF) - p[2]).abs() < 1.0))
+    })
 }
 
 /// Seconds to flip a site, uncontested (GDD §3.3).

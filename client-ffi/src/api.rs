@@ -47,7 +47,8 @@ use crate::session::dev_token;
 /// 4: worlds by id (Kiln), lanes, points, materials.
 /// 5: the collision kit (K1): turned boxes, wedges and shields in `LtBox`,
 /// one-way lanes, `lt_world_volumes`, `lt_world_holes`.
-pub const VERSION: u32 = 7;
+/// 8: turned force volumes (`LtVolume`'s center, halves and axis).
+pub const VERSION: u32 = 8;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]
@@ -621,7 +622,22 @@ ffi_fns! {
     fn lt_world_volumes(w: *const LtWorld, out: *mut LtVolume, cap: i32) -> i32 {
         let Some(w) = world(w) else { return 0 };
         for (o, v) in slice(out, cap).iter_mut().zip(w.volumes()) {
-            *o = LtVolume { min: v.min.into(), max: v.max.into(), vel: v.vel.into(), force: v.force as u8, when: v.when, phase: v.phase };
+            let c = v.center();
+            let half = if v.axis == lattice_game::world::UNTURNED { [(v.max[0] - v.min[0]) * 0.5, (v.max[1] - v.min[1]) * 0.5] } else { v.half };
+            *o = LtVolume {
+                min: v.min.into(),
+                max: v.max.into(),
+                center_x: c[0],
+                center_y: c[1],
+                half_along: half[0],
+                half_across: half[1],
+                axis_x: v.axis[0],
+                axis_y: v.axis[1],
+                vel: v.vel.into(),
+                force: v.force as u8,
+                when: v.when,
+                phase: v.phase,
+            };
         }
         w.volumes().len() as i32
     }
