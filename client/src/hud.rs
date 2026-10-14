@@ -198,6 +198,8 @@ pub fn combat(
                     combat.feed.remove(0);
                 }
             }
+            // The shell's news (deploying, rewards): the Unity client's (U4).
+            Event::Deploying { .. } | Event::Refused { .. } | Event::Reward { .. } => {}
         }
     }
     // Hit marker: white body, orange head, a bigger red one for a kill.
