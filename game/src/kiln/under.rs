@@ -18,9 +18,12 @@
 //!
 //! A tunnel that climbs more than a walk can (`GRADE`) takes a shaft between
 //! two chambers stacked in the rock (`deep::shaft_pair`). Long tubes have a
-//! chamber every 150 m or so. Built in two passes: first every chamber,
-//! shaft and mouth (each may level the ground round it), then the tubes
-//! between them, which keep under whatever ground there is by then.
+//! chamber every 150 m or so, and where one runs more than 400 m between
+//! stops (junctions and exits: `stretches`), an exit off one of them: a
+//! chamber beside it, level with it, a shaft up to open ground (`exits`).
+//! Built in two passes: first every chamber, shaft and mouth (each may level
+//! the ground round it), then the tubes between them, which keep under
+//! whatever ground there is by then.
 
 use std::collections::HashMap;
 
@@ -52,6 +55,8 @@ const ROCK: f64 = 2.5;
 const SHAFT: f64 = 4.0;
 /// A tube's half-width to its walls' outer faces.
 const TUBE_OUT: f64 = 3.6;
+/// The farthest a tunnel runs between stops: a junction or an exit.
+pub(crate) const STRETCH: f64 = 400.0;
 
 /// A tunnel to dig: its chambers in order and how each joins the next, the
 /// sites it runs between, and where on the ground it starts and ends
@@ -269,9 +274,27 @@ fn hole_near(k: &Kiln, p: [f64; 2], r: f64) -> bool {
     }))
 }
 
-/// Whether the ground at `c` takes a shaft's mouth: about `z` high, level,
-/// open (no ways, roads, boxes, lifts, holes or points near).
-fn open_ground(k: &Kiln, g: &Ground, c: [f64; 2], z: f64) -> bool {
+/// Where a shaft's mouth is looked for and how it takes the ground: the
+/// rings round what it's near, how far the ground may rise and fall over
+/// the mouth's 22 m, the pad leveled round it (radius, blend), and how far
+/// that may lower the ground over its chamber.
+struct Lay {
+    rings: &'static [f64],
+    rough: f64,
+    pad: (f64, f64),
+    sink: f64,
+}
+
+/// In a site, where the ground's level already.
+const LEVEL: Lay = Lay { rings: &[12.0, 16.0, 20.0, 25.0, 30.0, 36.0, 42.0], rough: 1.0, pad: (SHAFT + 1.0, 2.0), sink: 0.0 };
+/// Out in the open (an exit along a long tunnel, on a hillside maybe): a
+/// level pad cut and filled round it.
+const ROUGH: Lay = Lay { rings: &[25.0, 30.0, 36.0, 42.0, 50.0, 60.0, 72.0, 86.0, 100.0], rough: 10.0, pad: (SHAFT + 6.0, 12.0), sink: 5.0 };
+
+/// Whether the ground at `c` takes a shaft's mouth: about `z` high (any,
+/// if `z` is NaN), level enough (`lay`), open (no ways, roads, boxes,
+/// lifts, holes or points near).
+fn open_ground(k: &Kiln, g: &Ground, c: [f64; 2], z: f64, lay: &Lay) -> bool {
     let surface = k.height(c);
     if (surface - z).abs() > 2.5 {
         return false;
@@ -292,9 +315,11 @@ fn open_ground(k: &Kiln, g: &Ground, c: [f64; 2], z: f64) -> bool {
             hi = hi.max(k.h[j]);
         }
     }
-    hi - lo <= 1.0
+    // (Nothing on the ground its pad would move.)
+    let reach = (SHAFT + 7.0).max(lay.pad.0 + lay.pad.1 + 2.0);
+    hi - lo <= lay.rough
         && g.way(c) > SHAFT + 8.0
-        && !g.boxed(c, SHAFT + 7.0, surface - 3.0, surface + 10.0)
+        && !g.boxed(c, reach, surface - 3.0 - lay.rough, surface + 10.0)
         && !hole_near(k, c, SHAFT + 8.0)
         && !k.points.iter().any(|p| dist([p.pos[0] as f64, p.pos[1] as f64], c) < SHAFT + 6.0)
         && !k.volumes.iter().any(|v| dist([(v.min[0] + v.max[0]) as f64 / 2.0, (v.min[1] + v.max[1]) as f64 / 2.0], c) < SHAFT + 10.0)
@@ -314,7 +339,7 @@ struct Spot {
 
 /// A chamber that isn't dug: for asking whether a tube to it would walk.
 fn ghost(center: [f64; 2], half: f64, floor: f64, high: f64) -> Chamber {
-    Chamber { site: 0, top: center, e: [1.0, 0.0], foot: center, trench: false, center, half, high, surface: floor, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0 }
+    Chamber { site: 0, top: center, e: [1.0, 0.0], foot: center, trench: false, center, half, high, surface: floor, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0, ground: false, pair: None }
 }
 
 /// Whether a straight tube between two chambers walks: its floor meets
@@ -349,21 +374,22 @@ fn crowded(k: &Kiln, planned: &[(usize, usize)], ch: usize, dir: [f64; 2]) -> bo
 }
 
 /// A chamber of half-side `half` (its shaft `off` m off its center) with a
-/// shaft up to open ground 12-42 m from `near` (a point) at about its
-/// height, under rock all over, clear of what's in the rock and of
-/// `reserved`; its shaft not on the side toward `away` (where its tubes go).
-/// The first that `prefer` likes, else the first.
+/// shaft up to open ground on `lay`'s rings round `near` (a point) at about
+/// its height, its floor `DEPTH` under that ground (or at `level`, lower
+/// where the rock's thinner), under rock all over, clear of what's in the
+/// rock and of `reserved`; its shaft not on the side toward `away` (where
+/// its tubes go); its mouth laid as `lay` says. The first that `prefer`
+/// likes, else the first.
 #[allow(clippy::too_many_arguments)]
-fn spot(k: &Kiln, g: &Ground, planned: &[(usize, usize)], near: [f64; 3], half: f64, off: f64, high: f64, reserved: &[Rect], away: Option<[f64; 2]>, prefer: &dyn Fn(&Kiln, &Spot) -> bool) -> Option<Spot> {
+fn spot(k: &Kiln, g: &Ground, planned: &[(usize, usize)], near: [f64; 3], half: f64, off: f64, high: f64, level: Option<f64>, lay: &Lay, reserved: &[Rect], away: Option<[f64; 2]>, prefer: &dyn Fn(&Kiln, &Spot) -> bool) -> Option<Spot> {
     let mut fallback = None;
-    for r in [12.0, 16.0, 20.0, 25.0, 30.0, 36.0, 42.0] {
+    for &r in lay.rings {
         for j in 0..24 {
             let corner = snap(add([near[0], near[1]], scale(unit(j as f64 * 15.0), r)));
-            if !open_ground(k, g, corner, near[2]) {
+            if !open_ground(k, g, corner, near[2], lay) {
                 continue;
             }
             let surface = k.height(corner);
-            let floor = surface - DEPTH;
             let mut backs = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]];
             if let Some(o) = away {
                 let to = sub(corner, o);
@@ -377,7 +403,11 @@ fn spot(k: &Kiln, g: &Ground, planned: &[(usize, usize)], near: [f64; 3], half: 
                         continue;
                     }
                 }
-                if !rock_over(k, center, half + 1.0, floor + high + 0.6 + ROCK) {
+                let floor = match level {
+                    Some(f) => f.min(lowest(k, center, half + 1.0) - high - 0.6 - ROCK - lay.sink),
+                    None => surface - DEPTH,
+                };
+                if !rock_over(k, center, half + 1.0, floor + high + 0.6 + ROCK + lay.sink) {
                     continue;
                 }
                 let col = Rect { min: sub(corner, [SHAFT + 1.0, SHAFT + 1.0]), max: add(corner, [SHAFT + 1.0, SHAFT + 1.0]), z0: floor + high, z1: surface };
@@ -398,14 +428,14 @@ fn spot(k: &Kiln, g: &Ground, planned: &[(usize, usize)], near: [f64; 3], half: 
 }
 
 /// Digs a spot's chamber and its shaft (the ground's level there already).
-fn dig_spot(k: &mut Kiln, site: usize, s: &Spot, half: f64, high: f64) -> usize {
+fn dig_spot(k: &mut Kiln, site: usize, s: &Spot, half: f64, high: f64, lay: &Lay) -> usize {
     let c = deep::chamber_open(k, site, s.center, half, high, s.floor, s.surface, &[s.corner], &[]);
     k.chambers[c].stand = sub(s.center, scale(s.back, 3.0));
     k.chambers[c].blocked.push((s.back, 0.74));
     let above = add(s.corner, scale(s.side, SHAFT + 3.0));
     let from = sub(s.corner, scale(s.side, SHAFT + 5.8));
     let stand = k.chambers[c].stand;
-    deep::shaft_with(k, site, s.corner, c, s.side, stand, above, Some(from), (SHAFT + 1.0, 2.0));
+    deep::shaft_with(k, site, s.corner, c, s.side, stand, above, Some(from), lay.pad);
     c
 }
 
@@ -711,7 +741,7 @@ fn base(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, i: usize) -
         // An undercroft a straight tube from the spawn room's foot walks to.
         let prefer = |k: &Kiln, s: &Spot| walkable(k, &foot_ghost, &ghost(s.center, U_HALF, s.floor, U_HIGH));
         for pt in &pts {
-            if let Some(s) = spot(k, g, planned, *pt, U_HALF, U_OFF, U_HIGH, &[foot, col], Some(q), &prefer) {
+            if let Some(s) = spot(k, g, planned, *pt, U_HALF, U_OFF, U_HIGH, None, &LEVEL, &[foot, col], Some(q), &prefer) {
                 found = Some((s, [pt[0], pt[1]]));
                 break;
             }
@@ -720,7 +750,7 @@ fn base(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, i: usize) -
             k.notes.push(format!("base {i} has no room for its undercroft"));
             return (Vec::new(), None);
         };
-        (dig_spot(k, i, &s, U_HALF, U_HIGH), pt)
+        (dig_spot(k, i, &s, U_HALF, U_HIGH, &LEVEL), pt)
     };
     // The covered exit: a shaft down the spawn room's middle (a lift in the
     // half toward one door, a drop shaft in the other's), to its foot.
@@ -745,11 +775,11 @@ fn base(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, i: usize) -
             let d = sub(s.center, under.center);
             !crowded(k, planned, uc, scale(d, 1.0 / len(d))) && walkable(k, &under, &ghost(s.center, HALF, s.floor, HIGH))
         };
-        if let Some(s) = spot(k, g, planned, *pt, HALF, OFF, HIGH, &[], Some(under.center), &prefer) {
+        if let Some(s) = spot(k, g, planned, *pt, HALF, OFF, HIGH, None, &LEVEL, &[], Some(under.center), &prefer) {
             if !prefer(k, &s) {
                 continue;
             }
-            let vc = dig_spot(k, i, &s, HALF, HIGH);
+            let vc = dig_spot(k, i, &s, HALF, HIGH, &LEVEL);
             let (hops, links) = connect(k, i, planned, uc, vc);
             nets.push(Net { a: i, b: i, from: None, to: None, hops: [vec![uc], hops].concat(), links });
             break;
@@ -1020,6 +1050,132 @@ fn rift_tube(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, rift: 
     Some(Net { a: start_site, b: near, from: trench.then(|| k.sites[start_site].center), to: Some(k.sites[near].center), hops: [vec![start], out_hops].concat(), links: out_links })
 }
 
+/// A stretch of tunnel between stops: its chambers end to end, and how far
+/// along it each is (along the tubes, up and down the shafts between them).
+pub(crate) struct Stretch {
+    pub chambers: Vec<usize>,
+    pub along: Vec<f64>,
+}
+
+impl Stretch {
+    pub fn length(&self) -> f64 {
+        *self.along.last().unwrap()
+    }
+}
+
+/// The tunnels' stretches between stops (docs/kiln.md "Tunnels": "no more
+/// than 400 m between junctions or exits"), given the tubes between
+/// chambers: a stop is a junction (three ways or more, or a dead end) or
+/// an exit (a trench, a shaft up to the ground).
+pub(crate) fn stretches(k: &Kiln, tubes: &[(usize, usize)]) -> Vec<Stretch> {
+    let mut tubes: Vec<(usize, usize)> = tubes.iter().map(|&(a, b)| (a.min(b), a.max(b))).collect();
+    tubes.sort_unstable();
+    tubes.dedup();
+    let far = |a: &Chamber, b: &Chamber| libm::hypot(dist(a.center, b.center), a.floor - b.floor);
+    let mut edges: Vec<(usize, usize, f64)> = tubes.iter().map(|&(a, b)| (a, b, far(&k.chambers[a], &k.chambers[b]))).collect();
+    for (i, c) in k.chambers.iter().enumerate() {
+        if let Some(p) = c.pair.filter(|&p| p > i) {
+            edges.push((i, p, (c.floor - k.chambers[p].floor).abs()));
+        }
+    }
+    let mut at: Vec<Vec<usize>> = vec![Vec::new(); k.chambers.len()];
+    for (e, &(a, b, _)) in edges.iter().enumerate() {
+        at[a].push(e);
+        at[b].push(e);
+    }
+    let stop = |i: usize| k.chambers[i].trench || k.chambers[i].ground || at[i].len() != 2;
+    let mut seen = vec![false; edges.len()];
+    let mut out = Vec::new();
+    for s in (0..k.chambers.len()).filter(|&i| stop(i)) {
+        for &first in &at[s] {
+            if seen[first] {
+                continue;
+            }
+            let (mut here, mut e) = (s, first);
+            let mut st = Stretch { chambers: vec![s], along: vec![0.0] };
+            loop {
+                seen[e] = true;
+                let (a, b, l) = edges[e];
+                here = if a == here { b } else { a };
+                st.chambers.push(here);
+                st.along.push(st.length() + l);
+                if stop(here) {
+                    break;
+                }
+                match at[here].iter().find(|&&x| x != e) {
+                    Some(&next) if !seen[next] => e = next,
+                    _ => break,
+                }
+            }
+            out.push(st);
+        }
+    }
+    out
+}
+
+/// The tubes dug and planned, by their chambers.
+fn all_tubes(k: &Kiln, planned: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    k.bores.iter().map(|b| b.4).chain(planned.iter().copied()).collect()
+}
+
+/// Exits where the tunnels run too far between stops: off a chamber along
+/// such a stretch (one that leaves both sides short enough first, then one
+/// near the ground, then the nearest its middle), a chamber beside it with
+/// a shaft up to open ground.
+fn exits(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>) -> Vec<Net> {
+    let mut nets = Vec::new();
+    let mut tried = Vec::new();
+    loop {
+        let mut long: Vec<Stretch> = stretches(k, &all_tubes(k, planned)).into_iter().filter(|s| s.length() > STRETCH).collect();
+        long.sort_by(|a, b| b.length().total_cmp(&a.length()));
+        let mut added = false;
+        'each: for st in &long {
+            let total = st.length();
+            let both = |j: usize| st.along[j] <= STRETCH && total - st.along[j] <= STRETCH;
+            let mut order: Vec<usize> = (1..st.chambers.len() - 1).filter(|&j| !tried.contains(&st.chambers[j])).collect();
+            let deep = |j: usize| {
+                let c = &k.chambers[st.chambers[j]];
+                k.height(c.center) - c.floor > 40.0
+            };
+            let key = |j: usize| (!both(j), deep(j));
+            order.sort_by(|&a, &b| key(a).cmp(&key(b)).then((st.along[a] - total / 2.0).abs().total_cmp(&(st.along[b] - total / 2.0).abs())));
+            for j in order {
+                tried.push(st.chambers[j]);
+                if let Some(n) = exit(k, g, planned, st.chambers[j]) {
+                    nets.push(n);
+                    added = true;
+                    break 'each;
+                }
+            }
+        }
+        if !added {
+            for st in long {
+                let (a, b) = (&k.chambers[st.chambers[0]], &k.chambers[*st.chambers.last().unwrap()]);
+                k.notes.push(format!("{:.0} m of tunnel between stops, from ({:.0}, {:.0}, {:.0}) to ({:.0}, {:.0}, {:.0})", st.length(), a.center[0], a.center[1], a.floor, b.center[0], b.center[1], b.floor));
+            }
+            return nets;
+        }
+    }
+}
+
+/// An exit off chamber `ch`: a chamber beside it, level with it, with a
+/// shaft up to open ground (as tall as the rock is deep there), a tube to
+/// it that walks, leaving `ch` clear of its others.
+fn exit(k: &mut Kiln, g: &Ground, planned: &mut Vec<(usize, usize)>, ch: usize) -> Option<Net> {
+    let c = k.chambers[ch].clone();
+    let prefer = |k: &Kiln, s: &Spot| {
+        let d = sub(s.center, c.center);
+        !crowded(k, planned, ch, scale(d, 1.0 / len(d))) && walkable(k, &c, &ghost(s.center, HALF, s.floor, HIGH))
+    };
+    let s = spot(k, g, planned, [c.center[0], c.center[1], f64::NAN], HALF, OFF, HIGH, Some(c.floor), &ROUGH, &[], Some(c.center), &prefer)?;
+    if !prefer(k, &s) {
+        return None;
+    }
+    let vc = dig_spot(k, c.site, &s, HALF, HIGH, &ROUGH);
+    let (hops, links) = connect(k, c.site, planned, ch, vc);
+    Some(Net { a: c.site, b: c.site, from: None, to: None, hops: [vec![ch], hops].concat(), links })
+}
+
 /// Every base's tunnels and the Undervein (then every chamber's walls).
 pub(crate) fn build(k: &mut Kiln) {
     // Points on the ground stay on it, wherever it's leveled below.
@@ -1040,6 +1196,7 @@ pub(crate) fn build(k: &mut Kiln) {
         }
     }
     nets.extend(undervein(k, &g, &mut planned, &crofts));
+    nets.extend(exits(k, &g, &mut planned));
     let mut dug = HashMap::new();
     for n in &nets {
         dig(k, n, &mut dug);

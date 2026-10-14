@@ -253,6 +253,10 @@ pub(crate) struct Chamber {
     pub blocked: Vec<([f64; 2], f64)>,
     /// The shafts into it (to the ground, or to a chamber over or under it).
     pub shafts: usize,
+    /// Whether one of them goes up to the ground (an exit, as a trench is).
+    pub ground: bool,
+    /// The chamber over or under it, down or up a shaft between them.
+    pub pair: Option<usize>,
 }
 
 fn set_hole(k: &mut Kiln, cx: usize, cy: usize) {
@@ -316,7 +320,7 @@ pub(crate) fn chamber_open(k: &mut Kiln, site: usize, center: [f64; 2], half: f6
     slab(k, sub(center, [half, half]), add(center, [half, half]), floor - 1.0, floor, &open(below));
     let h = half + 0.6;
     slab(k, sub(center, [h, h]), add(center, [h, h]), floor + high, floor + high + 0.6, &open(shafts));
-    k.chambers.push(Chamber { site, top: center, e: [1.0, 0.0], foot: center, trench: false, center, half, high, surface, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0 });
+    k.chambers.push(Chamber { site, top: center, e: [1.0, 0.0], foot: center, trench: false, center, half, high, surface, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0, ground: false, pair: None });
     k.chambers.len() - 1
 }
 
@@ -364,7 +368,7 @@ pub(crate) fn mouth_sized(k: &mut Kiln, site: usize, top: [f64; 2], e: [f64; 2],
     }
     k.fixed.push(oriented(center, [half, half], e, floor - 1.0, floor, Kind::Block));
     k.fixed.push(oriented(center, [half + 0.6, half + 0.6], e, floor + high, floor + high + 0.6, Kind::Block));
-    k.chambers.push(Chamber { site, top, e, foot, trench: true, center, half, high, surface, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0 });
+    k.chambers.push(Chamber { site, top, e, foot, trench: true, center, half, high, surface, floor, outs: Vec::new(), stand: center, shield: None, blocked: Vec::new(), shafts: 0, ground: false, pair: None });
     k.chambers.len() - 1
 }
 
@@ -395,6 +399,7 @@ pub(crate) fn shaft_with(k: &mut Kiln, site: usize, corner: [f64; 2], ch: usize,
         set_hole(k, cx + dx - 1, cy + dy - 1);
     }
     k.chambers[ch].shafts += 1;
+    k.chambers[ch].ground = true;
     let c = k.chambers[ch].clone();
     let surface = [[-SHAFT, -SHAFT], [SHAFT, -SHAFT], [-SHAFT, SHAFT], [SHAFT, SHAFT], [0.0, 0.0]].iter().map(|&o| k.height(add(corner, o))).fold(f64::MIN, f64::max);
     let ceiling = c.floor + c.high;
@@ -432,6 +437,8 @@ pub(crate) fn shaft_pair(k: &mut Kiln, site: usize, s: [f64; 2], dh: [f64; 2], d
     k.chambers[lower].blocked.push((scale(dx, -1.0), 0.57));
     k.chambers[upper].shafts += 1;
     k.chambers[lower].shafts += 1;
+    k.chambers[upper].pair = Some(lower);
+    k.chambers[lower].pair = Some(upper);
     for (a, b) in [([-1.0, -1.0], [1.0, -1.0]), ([1.0, -1.0], [1.0, 1.0]), ([1.0, 1.0], [-1.0, 1.0]), ([-1.0, 1.0], [-1.0, -1.0])] {
         let (p, q) = (add(s, scale(a, SHAFT + 0.3)), add(s, scale(b, SHAFT + 0.3)));
         k.fixed.push(strip(p, q, 0.3, lo + HIGH, hi - 1.0, Kind::Block));

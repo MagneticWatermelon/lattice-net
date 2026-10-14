@@ -175,7 +175,7 @@ fn tunnels_run_under_the_ground_from_holes() {
     // Each sector's two Tunnel mouths joined by a lane that goes under the
     // ground, its floor at least 7.5 m under it all the way.
     let mouths: Vec<usize> = w.sites().iter().enumerate().filter(|(_, s)| s.kind == SiteKind::TunnelMouth).map(|(i, _)| i).collect();
-    let tunnels: Vec<_> = w.lanes().iter().filter(|l| mouths.contains(&(l.a as usize)) && mouths.contains(&(l.b as usize))).collect();
+    let tunnels: Vec<_> = w.lanes().iter().filter(|l| l.a != l.b && mouths.contains(&(l.a as usize)) && mouths.contains(&(l.b as usize))).collect();
     assert_eq!(tunnels.len(), 3, "one tunnel a sector");
     for l in tunnels {
         let under: Vec<&[f32; 3]> = l.path.iter().filter(|p| w.under(p[0], p[1], p[2]) && !w.hole(p[0], p[1])).collect();
@@ -197,11 +197,12 @@ fn tunnels_run_under_the_ground_from_holes() {
                 let (x, y) = ((cx as f32 + 0.5) * 4.0, (cy as f32 + 0.5) * 4.0);
                 let t = w.terrain(x, y);
                 let floor = w.ground(x, y, t + 1.0, 1.5);
-                if floor > t - 14.0 {
+                if w.volume_at(x, y, t - 3.0).is_none() {
+                    assert!(floor > t - 14.0, "a hole at ({x}, {y}) with no ramp or shaft in it");
                     continue; // a trench's ramp
                 }
                 shafts += 1;
-                assert!(floor > 1.0 && w.volume_at(x, y, t - 3.0).is_some(), "a shaft at ({x}, {y}): floor {floor}");
+                assert!(floor > 1.0, "a shaft at ({x}, {y}): floor {floor}");
             }
         }
     }
@@ -438,6 +439,28 @@ fn tunnels_have_no_dead_ends() {
         assert!(ways >= 2, "chamber {i} of site {} at ({:.0}, {:.0}, {:.0}): {ways} way out", c.site, c.center[0], c.center[1], c.floor);
     }
     eprintln!("{} chambers, {} tubes", k.chambers.len(), k.bores.len());
+}
+
+#[test]
+fn tunnels_run_no_more_than_400_m_between_stops() {
+    // A junction or an exit (a trench, a shaft up) every 400 m at the most.
+    let k = build_kiln();
+    let tubes: Vec<(usize, usize)> = k.bores.iter().map(|b| b.4).collect();
+    let all = super::under::stretches(&k, &tubes);
+    let longest = all.iter().map(|s| s.length()).fold(0.0, f64::max);
+    for s in all.iter().filter(|s| s.length() > super::under::STRETCH) {
+        eprintln!("-- {:.0} m", s.length());
+        for (&i, d) in s.chambers.iter().zip(&s.along) {
+            let c = &k.chambers[i];
+            eprintln!("  {d:5.0} #{i} site {} ({:.0}, {:.0}) floor {:.0} surface {:.0} half {} trench {} ground {} pair {:?} outs {}", c.site, c.center[0], c.center[1], c.floor, k.height(c.center), c.half, c.trench, c.ground, c.pair, c.outs.len());
+        }
+    }
+    for s in &all {
+        let (a, b) = (&k.chambers[s.chambers[0]], &k.chambers[*s.chambers.last().unwrap()]);
+        assert!(s.length() <= super::under::STRETCH, "{:.0} m between stops, ({:.0}, {:.0}, {:.0}) to ({:.0}, {:.0}, {:.0})", s.length(), a.center[0], a.center[1], a.floor, b.center[0], b.center[1], b.floor);
+    }
+    let exits = k.chambers.iter().filter(|c| c.trench || c.ground).count();
+    eprintln!("{} stretches, the longest {longest:.0} m; {exits} exits", all.len());
 }
 
 #[test]
