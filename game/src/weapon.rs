@@ -122,9 +122,23 @@ pub struct Weapon {
     pub recoil_side: [f32; 2],
 }
 
-/// The weapons, by kit (`class`): the assault rifle, the carbine, the
-/// shotgun, the marksman rifle, the SMG.
-pub const WEAPONS: [Weapon; 5] = [
+/// Weapon ids (`WEAPONS`); a class carries one (`class::WEAPONS_OF`).
+pub const RIFLE: u8 = 0;
+pub const CARBINE: u8 = 1;
+pub const SHOTGUN: u8 = 2;
+pub const MARKSMAN: u8 = 3;
+pub const SMG: u8 = 4;
+pub const LMG: u8 = 5;
+pub const SNIPER: u8 = 6;
+/// The Exo's arm weapons: twin anti-infantry guns, or a launcher of
+/// explosive shells.
+pub const EXO_GUNS: u8 = 7;
+pub const EXO_LAUNCHER: u8 = 8;
+
+/// The weapons, by id: the assault rifle, the carbine, the shotgun, the
+/// marksman rifle, the SMG, the LMG, the sniper rifle, the Exo's guns and
+/// launcher.
+pub const WEAPONS: [Weapon; 9] = [
     Weapon {
         name: "assault rifle",
         speed: MUZZLE_SPEED,
@@ -234,11 +248,102 @@ pub const WEAPONS: [Weapon; 5] = [
         recoil_first: 1.4,
         recoil_side: [-0.2, 0.25],
     },
+    // The assault's other: a hundred rounds, twelve a second, slow to reload,
+    // wide from the hip.
+    Weapon {
+        name: "LMG",
+        speed: 620.0,
+        interval: 640,
+        damage: [18, 36],
+        far_damage: [15, 30],
+        falloff: [40.0, 80.0],
+        pellets: 1,
+        pellet_cone: 0.0,
+        range_steps: 70,
+        magazine: 100,
+        reserve: 300,
+        reload_steps: 120,
+        reload_empty_steps: 150,
+        cone: [0.25, 0.6, 2.2, 3.0],
+        bloom: [0.06, 0.12],
+        bloom_max: [0.9, 2.2],
+        recoil_up: 0.3,
+        recoil_first: 1.5,
+        recoil_side: [-0.25, 0.3],
+    },
+    // The recon's other: a bolt-action rifle, a head in one, a body in two.
+    Weapon {
+        name: "sniper rifle",
+        speed: 900.0,
+        interval: 42 * 256,
+        damage: [80, 200],
+        far_damage: [80, 200],
+        falloff: [f32::MAX, f32::MAX],
+        pellets: 1,
+        pellet_cone: 0.0,
+        range_steps: 90,
+        magazine: 5,
+        reserve: 30,
+        reload_steps: 90,
+        reload_empty_steps: 105,
+        cone: [0.0, 1.0, 6.0, 8.0],
+        bloom: [0.5, 1.0],
+        bloom_max: [1.0, 4.0],
+        recoil_up: 3.5,
+        recoil_first: 1.0,
+        recoil_side: [-0.3, 0.3],
+    },
+    // The Exo's twin guns: an arm each, twenty a second between them,
+    // falling off past 15 m.
+    Weapon {
+        name: "twin guns",
+        speed: 450.0,
+        interval: 384,
+        damage: [16, 32],
+        far_damage: [9, 18],
+        falloff: [15.0, 40.0],
+        pellets: 1,
+        pellet_cone: 0.0,
+        range_steps: 40,
+        magazine: 60,
+        reserve: 360,
+        reload_steps: 90,
+        reload_empty_steps: 105,
+        cone: [0.8, 1.0, 1.2, 1.4],
+        bloom: [0.04, 0.06],
+        bloom_max: [1.5, 2.0],
+        recoil_up: 0.15,
+        recoil_first: 1.2,
+        recoil_side: [-0.2, 0.2],
+    },
+    // The Exo's launcher: slow shells that burst (`Weapon::blast`), two a
+    // second, little direct damage.
+    Weapon {
+        name: "launcher",
+        speed: 120.0,
+        interval: 15 * 256,
+        damage: [30, 40],
+        far_damage: [30, 40],
+        falloff: [f32::MAX, f32::MAX],
+        pellets: 1,
+        pellet_cone: 0.0,
+        range_steps: 60,
+        magazine: 8,
+        reserve: 48,
+        reload_steps: 105,
+        reload_empty_steps: 120,
+        cone: [0.3, 0.5, 0.8, 1.0],
+        bloom: [0.2, 0.3],
+        bloom_max: [1.0, 1.5],
+        recoil_up: 1.6,
+        recoil_first: 1.0,
+        recoil_side: [-0.3, 0.3],
+    },
 ];
 
-/// The weapon of kit `kit` (an unknown kit: the assault rifle's).
-pub fn of(kit: u8) -> &'static Weapon {
-    WEAPONS.get(kit as usize).unwrap_or(&WEAPONS[0])
+/// Weapon `id` (an unknown one: the assault rifle).
+pub fn of(id: u8) -> &'static Weapon {
+    WEAPONS.get(id as usize).unwrap_or(&WEAPONS[0])
 }
 
 impl Weapon {
@@ -260,19 +365,19 @@ impl Weapon {
 
 /// A shooter's bloom. The server keeps one per player and the client one
 /// for its own shots; fed the same shots in the same order, they give the
-/// same cones. With its weapon's kit.
+/// same cones. Of its weapon.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Bloom {
     deg: f32,
     /// The last shot (`shot_time`).
     last: Option<u64>,
-    pub kit: u8,
+    pub weapon: u8,
 }
 
 impl Bloom {
-    /// Fresh, for kit `kit`'s weapon.
-    pub fn with_kit(kit: u8) -> Self {
-        Self { kit, ..Self::default() }
+    /// Fresh, for weapon `weapon`.
+    pub fn with_weapon(weapon: u8) -> Self {
+        Self { weapon, ..Self::default() }
     }
 
     /// The cone (degrees) of a shot at `time` (`shot_time`), aiming down
@@ -280,7 +385,7 @@ impl Bloom {
     /// shot blooms the next one.
     pub fn fire(&mut self, time: u64, ads: bool, state: &MoveState) -> f32 {
         let cone = self.cone(time, ads, state);
-        let w = of(self.kit);
+        let w = of(self.weapon);
         let (add, max) = if ads { (w.bloom[0], w.bloom_max[0]) } else { (w.bloom[1], w.bloom_max[1]) };
         self.deg = (self.recovered(time) + add).min(max);
         self.last = Some(time);
@@ -290,7 +395,7 @@ impl Bloom {
     /// The cone a shot at `time` would have (the crosshair shows it).
     pub fn cone(&self, time: u64, ads: bool, state: &MoveState) -> f32 {
         let speed = (state.vel[0] * state.vel[0] + state.vel[1] * state.vel[1]).sqrt();
-        let c = of(self.kit).cone;
+        let c = of(self.weapon).cone;
         let base = match (ads, speed > MOVING) {
             (true, false) => c[0],
             (true, true) => c[1],
@@ -392,7 +497,9 @@ pub struct Ammo {
     pub reserve: u16,
     /// Steps until the reload under way is done; 0: none.
     pub reload: u8,
+    /// The class (`class`) and the weapon it carries (`WEAPONS`).
     pub kit: u8,
+    pub weapon: u8,
     /// The class's ability (U6), run by the same steps.
     pub ability: Ability,
 }
@@ -405,17 +512,33 @@ impl Default for Ammo {
 
 impl Ammo {
     /// As a player spawns with the assault rifle.
-    pub const FULL: Ammo = Ammo { mag: MAGAZINE, reserve: RESERVE, reload: 0, kit: 0, ability: Ability { active: 0, cooldown: 0, energy: 0, held: false } };
+    pub const FULL: Ammo = Ammo { mag: MAGAZINE, reserve: RESERVE, reload: 0, kit: 0, weapon: RIFLE, ability: Ability { active: 0, cooldown: 0, energy: 0, held: false } };
 
-    /// As a player spawns with kit `kit`'s weapon (and its ability ready).
-    pub fn full(kit: u8) -> Ammo {
-        let w = of(kit);
-        Ammo { mag: w.magazine, reserve: w.reserve, reload: 0, kit, ability: Ability::fresh(kit) }
+    /// As a player spawns as class `kit` carrying `weapon` (and its ability ready).
+    pub fn full(kit: u8, weapon: u8) -> Ammo {
+        let w = of(weapon);
+        Ammo { mag: w.magazine, reserve: w.reserve, reload: 0, kit, weapon, ability: Ability::fresh(kit) }
+    }
+
+    /// As a player spawns as class `kit` with its own weapon.
+    pub fn of_class(kit: u8) -> Ammo {
+        Self::full(kit, crate::class::WEAPONS_OF[crate::class::valid(kit) as usize][0])
     }
 
     /// Full rounds again (unlimited rounds' refill), the ability as it is.
     pub fn refilled(&self) -> Ammo {
-        Ammo { ability: self.ability, ..Ammo::full(self.kit) }
+        Ammo { ability: self.ability, ..Ammo::full(self.kit, self.weapon) }
+    }
+
+    /// Its weapon.
+    pub fn arms(&self) -> &'static Weapon {
+        of(self.weapon)
+    }
+
+    /// The least time between its shots now (`Weapon::interval`'s units): an
+    /// Exo locked down fires faster.
+    pub fn interval(&self) -> u32 {
+        crate::ability::interval(self.kit, self.ability.on(), self.arms().interval)
     }
 
     /// What the ability does to movement in a step with `buttons`, taken before it.
@@ -445,7 +568,7 @@ impl Ammo {
         if self.reload > 0 {
             self.reload -= 1;
             if self.reload == 0 {
-                let m = of(self.kit).magazine;
+                let m = of(self.weapon).magazine;
                 let take = (m - self.mag).min(self.reserve.min(m as u16) as u8);
                 self.mag += take;
                 self.reserve -= take as u16;
@@ -462,7 +585,7 @@ impl Ammo {
     /// a round ready: a reload under way may be done by then.
     pub fn ready_in(&self, steps: u32) -> bool {
         let mut a = *self;
-        for _ in 0..steps.min(of(self.kit).reload_empty_steps as u32 + 1) {
+        for _ in 0..steps.min(of(self.weapon).reload_empty_steps as u32 + 1) {
             a.tick();
         }
         a.ready()
@@ -479,7 +602,7 @@ impl Ammo {
     /// Starts a reload, unless the magazine is full, the reserve empty, or
     /// one is under way.
     pub fn start_reload(&mut self) {
-        let w = of(self.kit);
+        let w = of(self.weapon);
         if self.reload == 0 && self.mag < w.magazine && self.reserve > 0 {
             self.reload = if self.mag == 0 { w.reload_empty_steps } else { w.reload_steps };
         }
@@ -622,11 +745,11 @@ mod tests {
         // A full magazine doesn't reload; an empty reserve can't.
         a.step(BUTTON_RELOAD, false);
         assert_eq!(a.reload, 0);
-        let mut dry = Ammo { mag: 2, reserve: 0, reload: 0, kit: 0, ability: Ability::default() };
+        let mut dry = Ammo { mag: 2, reserve: 0, reload: 0, kit: 0, weapon: 0, ability: Ability::default() };
         assert!(dry.step(0, true) && dry.step(0, true) && !dry.step(0, true));
         assert_eq!((dry.mag, dry.reload), (0, 0), "nothing to reload with");
         // The last rounds of the reserve: a partial magazine.
-        let mut low = Ammo { mag: 0, reserve: 7, reload: 1, kit: 0, ability: Ability::default() };
+        let mut low = Ammo { mag: 0, reserve: 7, reload: 1, kit: 0, weapon: 0, ability: Ability::default() };
         low.tick();
         assert_eq!((low.mag, low.reserve), (7, 0));
     }
@@ -635,12 +758,14 @@ mod tests {
     fn every_weapon_kills_and_the_shotgun_up_close() {
         for (k, w) in WEAPONS.iter().enumerate() {
             let k = k as u8;
-            // Kill in under a second up close, at its rate, from a full magazine.
+            // Kill up close at its rate from a full magazine: in under a second
+            // (the sniper rifle's second shot, a launcher's burst, take longer).
             let hits = 100u32.div_ceil(w.damage_at(0.0, false) as u32 * w.pellets as u32);
             let secs = (hits - 1) as f32 * w.interval as f32 / 256.0 / 30.0;
-            assert!(secs < 0.8 && hits <= w.magazine as u32, "{}: {hits} shots, {secs:.2} s", w.name);
+            let most = match k { SNIPER => 1.5, EXO_LAUNCHER => 2.0, _ => 0.8 };
+            assert!(secs < most && hits <= w.magazine as u32, "{}: {hits} shots, {secs:.2} s", w.name);
             assert!(w.damage_at(1000.0, true) == w.far_damage[1] && w.damage_at(0.0, true) == w.damage[1]);
-            let mut a = Ammo::full(k);
+            let mut a = Ammo::full(0, k);
             for _ in 0..w.magazine {
                 assert!(a.step(0, true), "{}", w.name);
             }

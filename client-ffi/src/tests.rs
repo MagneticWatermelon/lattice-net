@@ -644,11 +644,11 @@ fn deploying_through_the_c_api() {
     assert_eq!((opts[home].ok, opts[home].transit_secs), (1, 6.0), "our Landing, from orbit");
     assert_eq!((opts[enemy].ok, opts[enemy].reason), (0, lattice_game::territory::REFUSED_NOT_HELD));
     // Asking for theirs is refused; ours is granted.
-    assert_eq!(unsafe { lt_deploy(a.s, enemy as u16, 0) }, 1);
+    assert_eq!(unsafe { lt_deploy(a.s, enemy as u16, 0, 0) }, 1);
     run(&mut a, &mut server, &mut next, 2.0, &|a| shell(a).refusals > 0);
     assert_eq!((shell(&a).refused_site, shell(&a).refused_reason), (enemy as u16, lattice_game::territory::REFUSED_NOT_HELD));
     assert!(a.events.iter().any(|e| e.kind == EVENT_REFUSED && e.a == enemy as u16));
-    assert_eq!(unsafe { lt_deploy(a.s, home as u16, 0) }, 1);
+    assert_eq!(unsafe { lt_deploy(a.s, home as u16, 0, 0) }, 1);
     run(&mut a, &mut server, &mut next, 2.0, &|a| shell(a).deploying == 1);
     let sh = shell(&a);
     assert_eq!(sh.deploy_site, home as u16);
@@ -668,7 +668,7 @@ fn deploying_through_the_c_api() {
     assert_eq!((r.killer, r.lines, r.from[0], r.damage[0]), (NOBODY, 1, NOBODY, 100));
     assert_eq!((a.own.dead, shell(&a).away, shell(&a).died_in), (1, 0, home as u16), "a corpse, where it fell");
     // Deploying again releases it.
-    assert_eq!(unsafe { lt_deploy(a.s, home as u16, 0) }, 1);
+    assert_eq!(unsafe { lt_deploy(a.s, home as u16, 0, 0) }, 1);
     run(&mut a, &mut server, &mut next, 2.0, &|a| shell(a).deploying == 1);
     assert_eq!(shell(&a).away, 1, "released: no body");
     run(&mut a, &mut server, &mut next, 8.0, &|a| a.own.dead == 0);

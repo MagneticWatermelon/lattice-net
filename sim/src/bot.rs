@@ -137,8 +137,13 @@ impl BotBrain {
             return;
         }
         let site = options[(self.ai.rng.next_u64() % options.len() as u64) as usize].1;
+        // A class by its seed (or `set_kit`), and one of its weapons by its seed.
         let kit = self.kit.unwrap_or((self.seed % lattice_game::class::CLASSES as u64) as u8);
-        if let Some(m) = self.core.deploy(site as u16, kit) {
+        // An Exo is one every 3 minutes: refused one, it goes as an assault.
+        let kit = if self.core.shell.refused.is_some_and(|r| r.1 == lattice_game::territory::REFUSED_EXO) { lattice_game::class::ASSAULT } else { kit };
+        let arms = lattice_game::class::WEAPONS_OF[lattice_game::class::valid(kit) as usize];
+        let arms = arms[(self.seed / 7 % arms.len() as u64) as usize];
+        if let Some(m) = self.core.deploy(site as u16, kit, arms) {
             self.reliable.push(m);
         }
     }
@@ -613,7 +618,7 @@ pub fn aim_at(core: &ClientCore, target: u16, r: f64, head: bool, extra_lead: f3
             (false, false) => (BODY_LOW + BODY_HIGH) / 2.0,
             (false, true) => (BODY_LOW + CROUCH_BODY_HIGH) / 2.0,
         };
-    let flight = ((st.pos[0] - eye[0]).powi(2) + (st.pos[1] - eye[1]).powi(2)).sqrt() / lattice_game::weapon::of(core.kit()).speed;
+    let flight = ((st.pos[0] - eye[0]).powi(2) + (st.pos[1] - eye[1]).powi(2)).sqrt() / lattice_game::weapon::of(core.weapon()).speed;
     let lead = flight + extra_lead / tick_hz;
     let p = [st.pos[0] + vel[0] * lead, st.pos[1] + vel[1] * lead, at + 0.5 * GRAVITY * flight * flight];
     let d = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];

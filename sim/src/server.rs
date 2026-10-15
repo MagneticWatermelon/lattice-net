@@ -461,10 +461,14 @@ struct Body {
     /// No body (`SimConfig::deploy`): not yet deployed, or gone from its
     /// corpse. Dead too; in no grid, so no one sees it or counts it.
     away: bool,
-    /// Deploying: at which site, the step it appears there, and as what (its kit).
-    deploy: Option<(u16, u32, u8)>,
-    /// Its class (`class`): its weapon, what others see.
+    /// Deploying: at which site, the step it appears there, and as what (its
+    /// class and weapon).
+    deploy: Option<(u16, u32, u8, u8)>,
+    /// Its class (`class`) and the weapon it carries (`weapon::WEAPONS`).
     kit: u8,
+    weapon: u8,
+    /// The step from which it may deploy an Exo again (`class::EXO_COOLDOWN`).
+    exo_ready: u32,
     /// When it last died, and the site whose region it fell in (lattice
     /// transit counts lanes from there; none: never deployed).
     died_at: u32,
@@ -496,6 +500,8 @@ impl Default for Body {
             away: false,
             deploy: None,
             kit: 0,
+            weapon: 0,
+            exo_ready: 0,
             died_at: 0,
             died_in: None,
         }
@@ -967,8 +973,8 @@ impl InputQueue {
     #[allow(clippy::too_many_arguments)]
     fn fire(&mut self, e: u16, seq: u32, shot: Shot, held: Option<Held>, render: Option<RenderTime>, late: bool, ads: bool) {
         let time = shot_time(seq, shot.frac);
-        let w = weapon::of(self.ammo.kit);
-        if self.last_shot.is_some_and(|last| time < last + w.interval as u64) {
+        let w = self.ammo.arms();
+        if self.last_shot.is_some_and(|last| time < last + self.ammo.interval() as u64) {
             self.refused += 1;
             return;
         }
@@ -1015,7 +1021,7 @@ impl InputQueue {
             } else {
                 0.0
             },
-            kit: self.ammo.kit,
+            weapon: self.ammo.weapon,
             pellet: 0,
         };
         if w.pellets <= 1 {
@@ -1180,7 +1186,7 @@ struct Ended {
     outcome: Outcome,
     at: [f32; 3],
     after_cover: bool,
-    kit: u8,
+    weapon: u8,
     origin: [f32; 3],
 }
 
@@ -1865,6 +1871,7 @@ impl SimServer {
             life: b.life,
             live: b.alive && !b.dead(),
             crouched: b.state.crouched,
+            wide: b.kit == class::EXO,
         });
         self.history.record(self.tick, self.step, entries);
         lap(5);
@@ -1899,10 +1906,11 @@ impl SimServer {
             .filter(|(_, (_, b))| b.alive)
             .for_each(|(i, ((near, far), b))| {
                 let e = i as u16;
-                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health, b.ads, b.reloading, b.kit).with(delta::FLAG_ABILITY, b.ability);
+                let look = class::look(b.kit, b.weapon);
+                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health, b.ads, b.reloading, look).with(delta::FLAG_ABILITY, b.ability);
                 let prev = tick.wrapping_sub(1);
                 if due(e, tick, mid_period) || due(e, tick, far_period) || due(e, prev, far_period) {
-                    *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch, b.health, b.kit);
+                    *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch, b.health, look);
                 }
             });
         lap(7);
@@ -2124,7 +2132,7 @@ impl SimServer {
                 for (i, p) in chunk.iter_mut().enumerate() {
                     if let Some((outcome, at)) = shots::fly(p, until, &sky, &mut st) {
                         let after_cover = matches!(outcome, Outcome::Player { target, .. } if !in_sight(world, owners, live, history, p.shooter, target));
-                        ends.push(Ended { id: p.id, index: c * 64 + i, shooter: p.shooter, outcome, at, after_cover, kit: p.kit, origin: p.origin });
+                        ends.push(Ended { id: p.id, index: c * 64 + i, shooter: p.shooter, outcome, at, after_cover, weapon: p.weapon, origin: p.origin });
                     }
                 }
                 (ends, st, t.elapsed())
@@ -2147,18 +2155,18 @@ impl SimServer {
         }
         // Apply in projectile order, so the outcome doesn't depend on threads.
         ended.sort_unstable_by_key(|e| e.id);
-        for Ended { shooter, outcome, at, after_cover, kit, origin, .. } in ended {
+        for Ended { shooter, outcome, at, after_cover, weapon: arms, origin, .. } in ended {
             match outcome {
                 Outcome::Ground => self.counters.hits_ground += 1,
                 Outcome::Cover => self.counters.hits_cover += 1,
                 Outcome::Expired => self.counters.expired += 1,
                 Outcome::Player { target, head, rewind, life } => {
                     let dist = ((at[0] - origin[0]).powi(2) + (at[1] - origin[1]).powi(2) + (at[2] - origin[2]).powi(2)).sqrt();
-                    let full = weapon::of(kit).damage_at(dist, head);
+                    let full = weapon::of(arms).damage_at(dist, head);
                     // The shooter saw it alive, in the life it hit; if it has
                     // died (or respawned) since, no damage.
                     let same_life = self.bodies[target as usize].life == life;
-                    let (damage, killed) = match same_life.then(|| self.hurt(target, full, shooter, head, kit)).flatten() {
+                    let (damage, killed) = match same_life.then(|| self.hurt(target, full, shooter, head, arms)).flatten() {
                         Some(killed) => (full, killed),
                         None => (0, false),
                     };
@@ -2406,7 +2414,8 @@ impl SimServer {
             grid.for_each_within([at[0], at[1]], ability::MEND_RADIUS, |j, _, _| {
                 let b = &mut bodies[j as usize];
                 let d2 = (b.state.pos[0] - at[0]).powi(2) + (b.state.pos[1] - at[1]).powi(2) + (b.state.z - at[2]).powi(2);
-                if faction(j as u16) == side && b.alive && !b.dead() && d2 <= r2 {
+                // (Not an Exo: armor is repaired, not healed.)
+                if faction(j as u16) == side && b.alive && !b.dead() && d2 <= r2 && b.kit != class::EXO {
                     b.health = (b.health + ability::MEND_HEAL).min(MAX_HEALTH);
                 }
             });
@@ -2471,7 +2480,7 @@ impl SimServer {
     /// where it died; else it's told why not.
     fn request_deploy(&mut self, client: ClientId, data: &[u8]) {
         let Some(&e) = self.by_client.get(&client) else { return };
-        let Ok((site, kit)) = msg::decode_deploy(data) else {
+        let Ok((site, kit, arms)) = msg::decode_deploy(data) else {
             self.counters.bad_messages += 1;
             return;
         };
@@ -2481,6 +2490,8 @@ impl SimServer {
             Err(territory::REFUSED_INVALID)
         } else if !b.dead() {
             Err(territory::REFUSED_ALIVE)
+        } else if class::valid(kit) == class::EXO && self.step < b.exo_ready {
+            Err(territory::REFUSED_EXO)
         } else {
             self.territory.spawnable(site as usize, faction(e), self.step)
         };
@@ -2491,7 +2502,8 @@ impl SimServer {
         }
         let at = self.step + self.territory.transit_steps(b.died_in.map(|r| r as usize), site as usize);
         let b = &mut self.bodies[e as usize];
-        b.deploy = Some((site, at, lattice_game::class::valid(kit)));
+        let kit = class::valid(kit);
+        b.deploy = Some((site, at, kit, class::weapon_for(kit, arms)));
         b.away = true;
         self.outbox.push((e, Event::Deploying { site, at }));
     }
@@ -2510,7 +2522,7 @@ impl SimServer {
             if b.dead() && !b.away && step_no >= b.died_at + CORPSE_STEPS {
                 b.away = true;
             }
-            let Some((site, _, kit)) = b.deploy.filter(|&(_, at, _)| at <= step_no) else { continue };
+            let Some((site, _, kit, arms)) = b.deploy.filter(|&(_, at, _, _)| at <= step_no) else { continue };
             if budget == 0 {
                 self.counters.deploys_waited += 1;
                 continue;
@@ -2528,10 +2540,13 @@ impl SimServer {
             let b = &mut self.bodies[e];
             b.state = MoveState::standing_at(&self.world, p, spot[2]);
             (b.health, b.respawn_at, b.life, b.reloading, b.away, b.deploy) = (MAX_HEALTH, None, b.life.wrapping_add(1), false, false, None);
-            (b.anchor, b.radius, b.kit) = (p, 30.0, kit);
+            (b.anchor, b.radius, b.kit, b.weapon) = (p, 30.0, kit, arms);
+            if kit == class::EXO {
+                b.exo_ready = step_no + class::EXO_COOLDOWN;
+            }
             self.damage_log[e].clear();
             let q = self.inputs[e].get_mut().unwrap();
-            (q.ammo, q.bloom) = (Ammo::full(kit), Bloom::with_kit(kit));
+            (q.ammo, q.bloom) = (Ammo::full(kit, arms), Bloom::with_weapon(arms));
             q.session.deploys += 1;
             self.counters.deploys += 1;
         }
@@ -2565,14 +2580,21 @@ impl SimServer {
         }
     }
 
-    /// Test aid: `entity` carries kit `kit` (a class's weapon) from now, as
+    /// Test aid: `entity` is class `kit` with its own weapon from now, as
     /// if it had deployed so: a new life (its client rebases), its rounds full.
     pub fn set_kit(&mut self, entity: u16, kit: u8) {
+        let kit = class::valid(kit);
+        self.set_loadout(entity, kit, class::WEAPONS_OF[kit as usize][0]);
+    }
+
+    /// Test aid: `entity` is class `kit` carrying `arms` (if the class may) from now.
+    pub fn set_loadout(&mut self, entity: u16, kit: u8, arms: u8) {
         if let Some(b) = self.bodies.get_mut(entity as usize).filter(|b| b.alive) {
-            b.kit = lattice_game::class::valid(kit);
+            b.kit = class::valid(kit);
+            b.weapon = class::weapon_for(b.kit, arms);
             b.life = b.life.wrapping_add(1);
             let q = self.inputs[entity as usize].get_mut().unwrap();
-            (q.ammo, q.bloom) = (Ammo::full(b.kit), Bloom::with_kit(b.kit));
+            (q.ammo, q.bloom) = (Ammo::full(b.kit, b.weapon), Bloom::with_weapon(b.weapon));
         }
     }
 
@@ -2708,7 +2730,7 @@ impl SimServer {
             (b.health, b.respawn_at, b.life, b.reloading) = (MAX_HEALTH, None, b.life.wrapping_add(1), false);
             self.damage_log[e].clear();
             // A new life with its class's weapon, full.
-            self.inputs[e].get_mut().unwrap().ammo = Ammo::full(b.kit);
+            self.inputs[e].get_mut().unwrap().ammo = Ammo::full(b.kit, b.weapon);
             self.counters.respawns += 1;
         }
     }

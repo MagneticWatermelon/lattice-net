@@ -1330,8 +1330,10 @@ fn shoot_at(lag: u32, strafe: u32, head: bool, extra_lead: f32, secs: u32, letha
 fn every_class_fires_its_own_weapon_and_others_see_it() {
     use lattice_game::{class, weapon};
     use lattice_sim::bot::Moves;
-    for kit in 0..class::CLASSES {
-        let w = weapon::of(kit);
+    // Every weapon of every class.
+    let loadouts: Vec<(u8, u8)> = class::WEAPONS_OF.iter().enumerate().flat_map(|(k, l)| l.iter().map(move |&w| (k as u8, w))).collect();
+    for (kit, arms) in loadouts {
+        let w = weapon::of(arms);
         let interest = InterestConfig { squad_size: 0, ..Default::default() };
         let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, cone_of_fire: false, ..Default::default() };
         let mut s = render_swarm(2, cfg, Duration::from_secs(3600));
@@ -1343,16 +1345,16 @@ fn every_class_fires_its_own_weapon_and_others_see_it() {
         let (shooter, target) = (s.bots[0].2.welcome().unwrap().entity, s.bots[1].2.welcome().unwrap().entity);
         s.server.teleport(shooter, a);
         s.server.teleport(target, b);
-        s.server.set_kit(shooter, kit);
+        s.server.set_loadout(shooter, kit, arms);
         s.server.set_invulnerable(target, true);
         s.bots[0].2.set_moves(Moves::Hold);
         s.bots[1].2.set_moves(Moves::Hold);
         for _ in 0..2 * TICK_HZ {
             s.step();
         }
-        assert_eq!(s.bots[0].2.core().kit(), kit, "{}: the shooter's client knows its weapon", w.name);
-        let seen = s.bots[1].2.core().entities().and_then(|e| e.newest(shooter)).map(|x| x.kit);
-        assert_eq!(seen, Some(kit), "{}: the target sees what the shooter carries", w.name);
+        assert_eq!((s.bots[0].2.core().kit(), s.bots[0].2.core().weapon()), (kit, arms), "{}: the shooter's client knows its class and weapon", w.name);
+        let seen = s.bots[1].2.core().entities().and_then(|e| e.newest(shooter)).map(|x| (x.kit, x.weapon));
+        assert_eq!(seen, Some((kit, arms)), "{}: the target sees what the shooter is and carries", w.name);
         let c0 = s.server.counters().clone();
         s.gunner = Some(Gunner { bot: 0, target, head: false, extra_lead: 0.0, shots: 0, ads: true, back: 0.0, hold: false, fixed: None, pick_back: 0.0 });
         s.bots[0].2.set_ads(true);
@@ -1368,7 +1370,9 @@ fn every_class_fires_its_own_weapon_and_others_see_it() {
         // Its rate: as many shots as its interval allows in 3 s, from its magazine.
         let most = (90.0 * 256.0 / w.interval as f32).floor() as u64 + 1;
         let shots = c.shots - c0.shots;
-        assert!(shots <= most && shots + 2 >= most.min(w.magazine as u64), "{}: {shots} shots of {most}", w.name);
+        // (This gunner pulls on whole steps: an interval of 2.5 steps fires every 3.)
+        let stepped = (90.0 / (w.interval as f32 / 256.0).ceil()).floor() as u64;
+        assert!(shots <= most && shots + 2 >= stepped.min(w.magazine as u64), "{}: {shots} shots of {most}", w.name);
         assert_eq!(g.shots, shots, "{}: every shot the client pulled went out", w.name);
         assert_eq!(c.shots_refused - c0.shots_refused, 0, "{}: none refused (the client keeps its rate and rounds)", w.name);
         // Its damage at 12 m, and a shotgun's pellets each a hit of their own.
@@ -1417,7 +1421,7 @@ fn every_ability_is_predicted_exactly() {
         let st = &b.2.core().stats;
         assert_eq!((st.corrections, st.ammo_corrections), (0, 0), "bot {i} (kit {}): predicted exactly", i % 5);
     }
-    assert_eq!(seen, [true, true, false, true, true], "every class with an ability used it (the engineer has none yet)");
+    assert_eq!(seen, [true, true, false, true, true, true], "every class with an ability used it (the engineer has none yet)");
     assert!(lift > 3.0, "jets climb: {lift} m");
 }
 
@@ -2536,7 +2540,7 @@ fn players_deploy_into_their_spawn_rooms_and_every_life_is_exact() {
     // A deploy at an enemy's Landing is refused.
     let e0 = s.bots[0].2.welcome().unwrap().entity;
     let enemy = s.server.territory().landing((faction(e0) + 1) % 3).unwrap();
-    let m = s.bots[0].2.core_mut().deploy(enemy as u16, 0).unwrap();
+    let m = s.bots[0].2.core_mut().deploy(enemy as u16, 0, 0).unwrap();
     s.bots[0].1.send(Channel::Reliable, m).unwrap();
     for _ in 0..TICK_HZ / 2 {
         s.step();
@@ -2593,6 +2597,43 @@ fn players_deploy_into_their_spawn_rooms_and_every_life_is_exact() {
     // Fights: every client hears where everyone is.
     assert!(s.bots.iter().all(|(_, _, b)| !b.core().shell.fights.is_empty()));
     assert_eq!(s.corrections(), 0, "prediction stays exact through every life");
+}
+
+#[test]
+fn an_exo_takes_a_third_and_comes_once_every_three_minutes() {
+    use lattice_game::class::{ASSAULT, EXO};
+    use lattice_game::world::KILN;
+    use lattice_sim::bot::Moves;
+    let mut s = Swarm::with_config(3, SimConfig { world: KILN, spawn: SpawnMode::Uniform, deploy: true, ..Default::default() });
+    for (_, _, b) in &mut s.bots {
+        b.set_moves(Moves::Hold);
+    }
+    s.bots[0].2.set_kit(EXO);
+    for _ in 0..12 * TICK_HZ {
+        s.step();
+    }
+    let e = s.bots[0].2.welcome().unwrap().entity;
+    assert_eq!((s.bots[0].2.core().kit(), s.bots[0].2.core().weapon()), (EXO, lattice_game::weapon::EXO_GUNS), "deployed as an Exo");
+    let exo_secs = (s.bots[0].2.core().shell.exo_ready - s.bots[0].2.core().server_step()) / TICK_HZ;
+    assert!((175..=180).contains(&exo_secs), "its client counts the 3 minutes down: {exo_secs} s");
+    // 30 lands as 10 on its armor; 300 in all to kill it.
+    s.server.damage(e, 30);
+    s.step();
+    assert_eq!(s.server.vitals(e), Some((90, false)));
+    s.server.damage(e, 255);
+    s.server.damage(e, 255);
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    assert_eq!(s.server.vitals(e).map(|v| v.1), Some(true), "dead");
+    // It asks to come back as an Exo: refused, so it comes as an assault.
+    for _ in 0..30 * TICK_HZ {
+        s.step();
+    }
+    let core = s.bots[0].2.core();
+    assert!(core.shell.refusals >= 1, "an Exo again was refused");
+    assert_eq!((core.kit(), core.is_dead()), (ASSAULT, false), "back as an assault");
+    assert_eq!(s.corrections(), 0);
 }
 
 #[test]

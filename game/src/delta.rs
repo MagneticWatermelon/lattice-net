@@ -65,7 +65,8 @@ pub const FLAG_RELOADING: u8 = 16;
 pub const FLAG_ABILITY: u8 = 32;
 /// Bits `NearQ::flags` takes on the wire (the top three are U6's abilities').
 const FLAG_BITS: u32 = 8;
-const KIT_BITS: u32 = 3;
+/// The look: class and weapon (`class::look`).
+const LOOK_BITS: u32 = 8;
 
 /// An entity's near-tier state, quantized: the unit deltas are taken in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -81,12 +82,12 @@ pub struct NearQ {
     pub pitch: u8,
     pub flags: u8,
     pub health: u8,
-    /// Its class (`class`, U6).
-    pub kit: u8,
+    /// Its class and weapon (`class::look`, U6).
+    pub look: u8,
 }
 
 impl NearQ {
-    pub fn new(s: &MoveState, yaw: u16, pitch: i16, health: u8, ads: bool, reloading: bool, kit: u8) -> Self {
+    pub fn new(s: &MoveState, yaw: u16, pitch: i16, health: u8, ads: bool, reloading: bool, look: u8) -> Self {
         let axis = |v: f32| {
             let c = ((v / CELL) as u32).min(CELLS - 1);
             c << 16 | quantize(v - c as f32 * CELL, 0.0, CELL, 16)
@@ -105,7 +106,7 @@ impl NearQ {
                 | if s.crouched { FLAG_CROUCHED } else { 0 }
                 | if reloading { FLAG_RELOADING } else { 0 },
             health: health.min(127),
-            kit: kit & 7,
+            look,
         }
     }
 
@@ -173,7 +174,7 @@ fn put_full(w: &mut BitWriter, q: &NearQ) {
     w.write(q.pitch as u32, 8);
     w.write(q.flags as u32, FLAG_BITS);
     w.write(q.health as u32, 7);
-    w.write(q.kit as u32, KIT_BITS);
+    w.write(q.look as u32, LOOK_BITS);
 }
 
 fn get_full(r: &mut BitReader) -> Result<NearQ, DecodeError> {
@@ -187,7 +188,7 @@ fn get_full(r: &mut BitReader) -> Result<NearQ, DecodeError> {
         pitch: r.read(8)? as u8,
         flags: r.read(FLAG_BITS)? as u8,
         health: r.read(7)? as u8,
-        kit: r.read(KIT_BITS)? as u8,
+        look: r.read(LOOK_BITS)? as u8,
     })
 }
 
@@ -232,12 +233,12 @@ pub fn encode_near(tick: u32, entries: &mut [NearEntry], out: &mut Writer) {
                 if s.pitch != b.pitch {
                     w.write(s.pitch as u32, 8);
                 }
-                let rest = (s.flags, s.health, s.kit) != (b.flags, b.health, b.kit);
+                let rest = (s.flags, s.health, s.look) != (b.flags, b.health, b.look);
                 w.write_bool(rest);
                 if rest {
                     w.write(s.flags as u32, FLAG_BITS);
                     w.write(s.health as u32, 7);
-                    w.write(s.kit as u32, KIT_BITS);
+                    w.write(s.look as u32, LOOK_BITS);
                 }
             }
             None => {
@@ -305,7 +306,7 @@ pub fn decode_near(data: &[u8], hist: &mut NearHistory, mut f: impl FnMut(u16, N
             if r.read_bool()? {
                 q.flags = r.read(FLAG_BITS)? as u8;
                 q.health = r.read(7)? as u8;
-                q.kit = r.read(KIT_BITS)? as u8;
+                q.look = r.read(LOOK_BITS)? as u8;
             }
             q
         } else {

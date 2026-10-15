@@ -212,6 +212,10 @@ pub struct Shell {
     /// XP this session, and how many rewards it came in.
     pub xp: u64,
     pub rewards: u32,
+    /// The class we last asked to deploy as, and the step from which we may
+    /// deploy an Exo again (`class::EXO_COOLDOWN` from the last one).
+    pub asked_kit: u8,
+    pub exo_ready: u32,
 }
 
 /// When one of our inputs was first seen acked.
@@ -454,8 +458,9 @@ impl ClientCore {
     /// A Deploy to send on the reliable channel: to deploy at `site` with
     /// loadout `kit`. None if the server doesn't deploy. The server answers
     /// with an event (`Shell::deploying`, or `Shell::refused`).
-    pub fn deploy(&mut self, site: u16, kit: u8) -> Option<Vec<u8>> {
-        self.deploys().then(|| msg::encode_deploy(site, kit))
+    pub fn deploy(&mut self, site: u16, kit: u8, weapon: u8) -> Option<Vec<u8>> {
+        self.shell.asked_kit = kit;
+        self.deploys().then(|| msg::encode_deploy(site, kit, weapon))
     }
 
     /// Whether we may deploy at `site` now, as our copy of the territory
@@ -725,7 +730,12 @@ impl ClientCore {
                         Event::Hit { killed, .. } => (st.hits_confirmed, st.kills_confirmed) = (st.hits_confirmed + 1, st.kills_confirmed + killed as u64),
                         Event::Hurt { amount, .. } => (st.hurts, st.damage_taken) = (st.hurts + 1, st.damage_taken + amount as u64),
                         Event::Kill { .. } => st.kills_heard += 1,
-                        Event::Deploying { site, at } => (sh.deploying, sh.refused) = (Some((site, at)), None),
+                        Event::Deploying { site, at } => {
+                            (sh.deploying, sh.refused) = (Some((site, at)), None);
+                            if sh.asked_kit == lattice_game::class::EXO {
+                                sh.exo_ready = at + lattice_game::class::EXO_COOLDOWN;
+                            }
+                        }
                         Event::Refused { site, reason } => {
                             (sh.deploying, sh.refused, sh.refusals) = (None, Some((site, reason)), sh.refusals + 1);
                         }
@@ -1046,8 +1056,8 @@ impl ClientCore {
         }
         self.ammo = a;
         // A new life's weapon blooms afresh.
-        if self.bloom.kit != a.kit {
-            self.bloom = Bloom::with_kit(a.kit);
+        if self.bloom.weapon != a.weapon {
+            self.bloom = Bloom::with_weapon(a.weapon);
         }
         let (old, cur) = (self.state, self.own_offset(now));
         let o = [cur[0] + old.pos[0] - s.pos[0], cur[1] + old.pos[1] - s.pos[1], cur[2] + old.z - s.z];
@@ -1139,7 +1149,7 @@ impl ClientCore {
         }
         let entity = self.welcome.as_ref()?.entity;
         let (time, seq, frac) = self.shot_at(now);
-        if self.last_shot.is_some_and(|last| time < last + weapon::of(self.ammo.kit).interval as u64) {
+        if self.last_shot.is_some_and(|last| time < last + self.ammo.interval() as u64) {
             return None;
         }
         // The rounds as of the shot's step: a reload may be done by then.
@@ -1171,6 +1181,10 @@ impl ClientCore {
 
     /// Our class (`class`): the kit our rounds are for (the server's word,
     /// from this life's snapshots).
+    pub fn weapon(&self) -> u8 {
+        self.ammo.weapon
+    }
+
     pub fn kit(&self) -> u8 {
         self.ammo.kit
     }

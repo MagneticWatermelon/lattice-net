@@ -93,6 +93,8 @@ pub struct HistEntry {
     pub live: bool,
     /// Crouched: its hitboxes are lower (`hit::player`).
     pub crouched: bool,
+    /// An Exo: its hitboxes are wider (`hit::player_sized`).
+    pub wide: bool,
 }
 
 #[derive(Debug, Default)]
@@ -160,13 +162,13 @@ impl History {
     /// Entity `e`'s feet at the bracket's time, if it was alive and on one
     /// life throughout (never across a death, respawn or teleport), that
     /// life's counter, and whether it was crouched (as of the nearer tick).
-    pub fn at(&self, br: Bracket, e: u16) -> Option<([f32; 3], u8, bool)> {
+    pub fn at(&self, br: Bracket, e: u16) -> Option<([f32; 3], u8, bool, bool)> {
         let (a, b) = (self.ticks[br.a].at.get(e as usize)?, self.ticks[br.b].at.get(e as usize)?);
         if !a.live || !b.live || a.life != b.life {
             return None;
         }
         let crouched = if br.t < 0.5 { a.crouched } else { b.crouched };
-        Some(([0, 1, 2].map(|k| a.pos[k] + (b.pos[k] - a.pos[k]) * br.t), a.life, crouched))
+        Some(([0, 1, 2].map(|k| a.pos[k] + (b.pos[k] - a.pos[k]) * br.t), a.life, crouched, a.wide))
     }
 
     /// The newest recorded entry for `e`.
@@ -201,9 +203,9 @@ pub struct Fire {
     /// steps: its first seconds (`SETTLE_SLACK`), or after the server filled
     /// in a missing input (`STAND_IN_SLACK`).
     pub settling: f64,
-    /// The weapon's kit (`weapon::of`), and which of its shot's pellets this
+    /// The weapon (`weapon::of`), and which of its shot's pellets this
     /// is (0: the shot itself; a shotgun's are 0 to 7).
-    pub kit: u8,
+    pub weapon: u8,
     pub pellet: u8,
 }
 
@@ -552,9 +554,9 @@ pub struct Projectile {
     pub end: f64,
     /// Rewind per tier (near, mid/far), capped, in steps.
     pub d: [f64; 2],
-    /// The weapon's kit, and where it left the muzzle (its damage falls off
+    /// The weapon, and where it left the muzzle (its damage falls off
     /// with the distance).
-    pub kit: u8,
+    pub weapon: u8,
     pub origin: [f32; 3],
 }
 
@@ -590,9 +592,9 @@ impl Projectile {
             }
             f.behind[t].clamp(0.0, limit)
         });
-        let w = lattice_game::weapon::of(f.kit);
+        let w = lattice_game::weapon::of(f.weapon);
         let end = f.tau0 + w.range_steps as f64;
-        (Self { id, shooter: f.shooter, flight: Flight::at(f.origin, f.dir, w.speed), tau: f.tau0, end, d, kit: f.kit, origin: f.origin }, cut)
+        (Self { id, shooter: f.shooter, flight: Flight::at(f.origin, f.dir, w.speed), tau: f.tau0, end, d, weapon: f.weapon, origin: f.origin }, cut)
     }
 }
 
@@ -672,15 +674,15 @@ pub fn fly(p: &mut Projectile, until: f64, sky: &Sky, stats: &mut FlyStats) -> O
         let at = p.tau + half / 2.0;
         let brackets = [sky.history.bracket(at - p.d[0]), sky.history.bracket(at - p.d[1])];
         let pad = MAX_SPEED * (p.d[1] as f32 + 1.0) / TICK_HZ as f32;
-        sky.grid.for_each_within(mid, half_len + hit::BODY_RADIUS + pad + 0.5, |j, _, _| {
+        sky.grid.for_each_within(mid, half_len + hit::EXO_BODY_RADIUS + pad + 0.5, |j, _, _| {
             let j = j as u16;
             if j == p.shooter || faction(j) == side {
                 return;
             }
             stats.candidates += 1;
             let tier = if near.is_some_and(|n| n.contains(j)) { 0 } else { 1 };
-            let Some((feet, life, crouched)) = brackets[tier].and_then(|br| sky.history.at(br, j)) else { return };
-            if let Some((t, head)) = hit::player(p0, p1, feet, crouched) {
+            let Some((feet, life, crouched, wide)) = brackets[tier].and_then(|br| sky.history.at(br, j)) else { return };
+            if let Some((t, head)) = hit::player_sized(p0, p1, feet, crouched, wide) {
                 take(t, Outcome::Player { target: j, head, rewind: p.d[tier], life });
             }
         });
@@ -703,7 +705,7 @@ mod tests {
     use super::*;
 
     fn entry(x: f32, life: u8, live: bool) -> HistEntry {
-        HistEntry { pos: [x, 0.0, 0.0], life, live, crouched: false }
+        HistEntry { pos: [x, 0.0, 0.0], life, live, crouched: false, wide: false }
     }
 
     #[test]
@@ -715,18 +717,18 @@ mod tests {
             h.record(tick, step, [entry(x, 0, true), entry(x, (tick == 12) as u8, true), entry(x, 0, tick != 11)].into_iter());
         }
         let br = h.bracket(102.0).unwrap();
-        assert_eq!(h.at(br, 0), Some(([102.0, 0.0, 0.0], 0, false)), "halfway between steps 101 and 103");
+        assert_eq!(h.at(br, 0), Some(([102.0, 0.0, 0.0], 0, false, false)), "halfway between steps 101 and 103");
         assert_eq!(h.at(br, 1), None, "respawned in between");
         assert_eq!(h.at(br, 2), None, "dead at one end");
         assert_eq!(h.at(h.bracket(100.5).unwrap(), 2), None);
         assert!(h.bracket(103.5).is_none(), "the future");
         assert!(h.bracket(99.0).is_none(), "before the history");
-        assert_eq!(h.at(h.bracket(103.0).unwrap(), 0), Some(([103.0, 0.0, 0.0], 0, false)));
+        assert_eq!(h.at(h.bracket(103.0).unwrap(), 0), Some(([103.0, 0.0, 0.0], 0, false, false)));
     }
 
     #[test]
     fn rewinds_are_capped() {
-        let f = Fire { shooter: 1, seq: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false, wait: 1.5, held: 0.0, settling: 0.0, kit: 0, pellet: 0 };
+        let f = Fire { shooter: 1, seq: 1, origin: [0.0; 3], dir: [1.0, 0.0, 0.0], yaw: 0, pitch: 0, tau0: 100.0, behind: [4.0, 8.0], late: false, wait: 1.5, held: 0.0, settling: 0.0, weapon: 0, pellet: 0 };
         let (p, cut) = Projectile::new(1, &f, None);
         assert_eq!((p.d, cut), ([4.0, 8.0], Cut::default()));
         let (p, cut) = Projectile::new(2, &Fire { behind: [12.0, 16.0], ..f }, None);

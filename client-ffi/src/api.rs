@@ -52,7 +52,7 @@ use crate::session::dev_token;
 /// `lt_recap`, `lt_fights`; `LtEvent::value`, deploy and reward events.
 /// 10: classes and their weapons (U6): `LtOwn::kit`, `LtEntity::kit`,
 /// `LtFx::kit`, `lt_weapon`.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]
@@ -464,8 +464,8 @@ ffi_fns! {
     /// body. The answer comes as an `LT_EVENT_DEPLOYING` or `LT_EVENT_REFUSED`,
     /// and in `lt_shell`. Returns 1 if asked, 0 if not (the server doesn't
     /// deploy, or we aren't connected).
-    fn lt_deploy(s: *mut LtSession, site: u16, kit: u8) -> i32 {
-        with(s, |h| h.deploy(site, kit) as i32)
+    fn lt_deploy(s: *mut LtSession, site: u16, kit: u8, weapon: u8) -> i32 {
+        with(s, |h| h.deploy(site, kit, weapon) as i32)
     }
 
     /// The shell's state (U4): deploying, recaps, fights, XP.
@@ -500,9 +500,9 @@ ffi_fns! {
 
     /// Kit `kit`'s weapon (a class's, `LT_CLASS_*`) into `out`; returns 1,
     /// or 0 for no such kit (`out` is then the assault rifle's).
-    fn lt_weapon(kit: u8, out: *mut LtWeapon) -> i32 {
+    fn lt_weapon(id: u8, out: *mut LtWeapon) -> i32 {
         let Some(o) = out.as_mut() else { return 0 };
-        let w = lattice_game::weapon::of(kit);
+        let w = lattice_game::weapon::of(id);
         let steps = |n: f32| n / lattice_game::movement::TICK_HZ as f32;
         *o = LtWeapon {
             speed: w.speed,
@@ -522,7 +522,19 @@ ffi_fns! {
             recoil_first: w.recoil_first,
             recoil_side: w.recoil_side,
         };
-        (kit < lattice_game::class::CLASSES) as i32
+        ((id as usize) < lattice_game::weapon::WEAPONS.len()) as i32
+    }
+
+    /// The weapons class `kit` may carry (`LT_WEAPON_*`), its own first, into
+    /// `out` (as many as fit in `cap`); returns how many there are.
+    fn lt_class_weapons(kit: u8, out: *mut u8, cap: u32) -> u32 {
+        let list = lattice_game::class::WEAPONS_OF[lattice_game::class::valid(kit) as usize];
+        if !out.is_null() {
+            for (i, &w) in list.iter().take(cap as usize).enumerate() {
+                *out.add(i) = w;
+            }
+        }
+        list.len() as u32
     }
 
     /// The net graph's numbers.

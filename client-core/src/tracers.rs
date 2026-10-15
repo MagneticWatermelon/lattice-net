@@ -199,7 +199,8 @@ pub struct Fired {
     pub dir: [f32; 3],
     pub kind: Kind,
     /// The shooter's weapon's kit (a distant fight's: the assault rifle's).
-    pub kit: u8,
+    /// The weapon that fired it (`weapon::WEAPONS`).
+    pub weapon: u8,
 }
 
 /// A cosmetic pellet's spread: any well-spread bits will do (the server's
@@ -233,16 +234,16 @@ impl Tracers {
     /// it fired, in the server's steps (`ClientCore::last_shot_step`), to
     /// re-aim it along the real shot.
     #[allow(clippy::too_many_arguments)]
-    pub fn fire_own(&mut self, eye: [f32; 3], yaw: f32, pitch: f32, dir: [f32; 3], offset: [f32; 3], step: Option<f64>, faction: u8, kit: u8) -> Fired {
+    pub fn fire_own(&mut self, eye: [f32; 3], yaw: f32, pitch: f32, dir: [f32; 3], offset: [f32; 3], step: Option<f64>, faction: u8, weapon: u8) -> Fired {
         let muzzle = muzzle(eye, yaw, pitch, offset);
-        let w = weapon::of(kit);
+        let w = weapon::of(weapon);
         let own = step.map(|step| OwnShot { step, eye, muzzle, real: false, speed: w.speed });
         self.push(Tracer::ours(eye, muzzle, dir, faction, own, w.speed));
         for k in 1..w.pellets {
             let d = w.pellet(dir, pellet_pick(step.unwrap_or(0.0), k));
             self.push(Tracer::ours(eye, muzzle, d, faction, None, w.speed));
         }
-        Fired { shooter: None, faction, origin: muzzle, dir, kind: Kind::Own, kit }
+        Fired { shooter: None, faction, origin: muzzle, dir, kind: Kind::Own, weapon }
     }
 
     /// Shots the server says were fired (`ClientCore::drain_news`): ours
@@ -265,7 +266,7 @@ impl Tracers {
             let (yaw, pitch) = (a.dir[1].atan2(a.dir[0]), a.dir[2].clamp(-1.0, 1.0).asin());
             let o = muzzle(a.origin, yaw, pitch, offset);
             self.push(Tracer::new(o, a.dir, Kind::Ambient, a.faction));
-            fired(Fired { shooter: a.shooter, faction: a.faction, origin: o, dir: a.dir, kind: Kind::Ambient, kit: 0 });
+            fired(Fired { shooter: a.shooter, faction: a.faction, origin: o, dir: a.dir, kind: Kind::Ambient, weapon: 0 });
         }
     }
 
@@ -283,12 +284,12 @@ impl Tracers {
                     let (yaw, pitch) = (shot.yaw as f32 / 65536.0 * std::f32::consts::TAU, shot.pitch as f32 / 32767.0 * std::f32::consts::FRAC_PI_2);
                     let o = muzzle(eye, yaw, pitch, offset);
                     let faction = lattice_game::faction::faction(shot.shooter);
-                    let w = weapon::of(st.kit);
+                    let w = weapon::of(st.weapon);
                     self.push(Tracer::at(o, dir, w.speed, Kind::Seen, faction));
                     for k in 1..w.pellets {
                         self.push(Tracer::at(o, w.pellet(dir, pellet_pick(shot.step, k)), w.speed, Kind::Seen, faction));
                     }
-                    fired(Fired { shooter: Some(shot.shooter), faction, origin: o, dir, kind: Kind::Seen, kit: st.kit });
+                    fired(Fired { shooter: Some(shot.shooter), faction, origin: o, dir, kind: Kind::Seen, weapon: st.weapon });
                     false
                 }
                 _ => secs - *at < PENDING_SECS,

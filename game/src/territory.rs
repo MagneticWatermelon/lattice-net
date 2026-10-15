@@ -156,6 +156,8 @@ pub const REFUSED_CONTESTED: u8 = 3;
 pub const REFUSED_ALIVE: u8 = 4;
 /// Not a site, or the server doesn't deploy (no `RULE_DEPLOY`).
 pub const REFUSED_INVALID: u8 = 5;
+/// An Exo again, before its cooldown (`class::EXO_COOLDOWN`) is over.
+pub const REFUSED_EXO: u8 = 6;
 
 /// Whether a spawn can stand anywhere within its scatter (2 m) of `p`, with
 /// room: on ground at `p`'s height (no hole), nothing that moves anyone (a

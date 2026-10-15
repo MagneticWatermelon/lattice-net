@@ -13,13 +13,13 @@
 //! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | spawn_z:f32 | anchor:2×f32 | radius:f32 | world:8 | world_digest:8 | rules:1
 //! S->C unreliable  Snapshot tag | server_tick:4 | step:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
 //!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 stance:1 (grounded, crouched, away) | pushes:1 | health:1 | life:1
-//!                           | ammo mag:1 reserve:2 reload:1 kit:1 | ability active:2 cooldown:2 energy:2 held:1
+//!                           | ammo mag:1 reserve:2 reload:1 kit:1 weapon:1 | ability active:2 cooldown:2 energy:2 held:1
 //! S->C unreliable  Near     see delta.rs: deltas against acked baselines, one per tick, tagged
 //! S->C unreliable  Activity distant fights' firing per 128 m cell, once per 0.5 s window (see activity.rs)
 //! S->C unreliable  Entities tag | server_tick:4 | tier:1 | n:1 | n × blob         (mid and far; one or more per tier per tick)
 //! far blob  (12 B) := entity:2 | cell:1 | 8 B bitpacked far-tier state (see bitpack.rs) | look:1; used for mid and far
 //!   x:15 y:15 (~16 mm in the cell) | altitude:12 (16 cm) | yaw:9 | pitch:6 | flags:3 (airborne, dead, crouched) | health:4 (1/15ths)
-//!   look: kit:3 (its class, U6) | 5 spare
+//!   look: kit:3 weapon:5 (its class and weapon, U6: `class::look`)
 //! cell := cx | cy<<4, the entity's own 512 m cell, so a blob is the same for every recipient
 //!
 //! Time: `server_tick` counts ticks; `step` counts 1/30 s movement steps (game
@@ -53,7 +53,7 @@ pub const MSG_DEPLOY: u8 = 10;
 pub const INPUT_REDUNDANCY: usize = 3;
 /// Mid- and far-tier blob.
 pub const FAR_BLOB: usize = 12;
-pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1 + 1 + 1 + 5 + 7;
+pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1 + 1 + 1 + 6 + 7;
 /// Render times in inputs are in 1/`RENDER_UNITS` steps, as a wrapping u16:
 /// unambiguous within ±512 steps (±17 s) of the server's step.
 pub const RENDER_UNITS: f64 = 64.0;
@@ -258,24 +258,25 @@ pub const RULE_UNLIMITED_ROUNDS: u8 = 1;
 /// Without it, the server spawns everyone at once and respawns the dead.
 pub const RULE_DEPLOY: u8 = 2;
 
-/// A Deploy: into the world at `site` with loadout `kit`.
-pub fn encode_deploy(site: u16, kit: u8) -> Vec<u8> {
-    let mut w = Writer::with_capacity(4);
+/// A Deploy: into the world at `site` as class `kit` carrying `weapon`.
+pub fn encode_deploy(site: u16, kit: u8, weapon: u8) -> Vec<u8> {
+    let mut w = Writer::with_capacity(5);
     w.u8(MSG_DEPLOY);
     w.u16(site);
     w.u8(kit);
+    w.u8(weapon);
     w.into_inner()
 }
 
-/// (site, kit) of a Deploy.
-pub fn decode_deploy(data: &[u8]) -> Result<(u16, u8), DecodeError> {
+/// (site, kit, weapon) of a Deploy.
+pub fn decode_deploy(data: &[u8]) -> Result<(u16, u8, u8), DecodeError> {
     let mut r = Reader::new(data);
     if r.u8()? != MSG_DEPLOY {
         return Err(DecodeError::Invalid);
     }
-    let (site, kit) = (r.u16()?, r.u8()?);
+    let (site, kit, weapon) = (r.u16()?, r.u8()?, r.u8()?);
     r.finish()?;
-    Ok((site, kit))
+    Ok((site, kit, weapon))
 }
 
 pub fn encode_welcome(m: &Welcome) -> Vec<u8> {
@@ -356,6 +357,7 @@ pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
     w.u16(h.ammo.reserve);
     w.u8(h.ammo.reload);
     w.u8(h.ammo.kit);
+    w.u8(h.ammo.weapon);
     let a = &h.ammo.ability;
     w.u16(a.active);
     w.u16(a.cooldown);
@@ -410,9 +412,9 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             }
             let own = MoveState { pos, vel, z, vz, grounded: stance & STANCE_GROUNDED != 0, crouched: stance & STANCE_CROUCHED != 0 };
             let (pushes, health, life) = (r.u8()?, r.u8()?, r.u8()?);
-            let (mag, reserve, reload, kit) = (r.u8()?, r.u16()?, r.u8()?, r.u8()?);
+            let (mag, reserve, reload, kit, weapon) = (r.u8()?, r.u16()?, r.u8()?, r.u8()?, r.u8()?);
             let ability = crate::ability::Ability { active: r.u16()?, cooldown: r.u16()?, energy: r.u16()?, held: r.u8()? != 0 };
-            let ammo = Ammo { mag, reserve, reload, kit, ability };
+            let ammo = Ammo { mag, reserve, reload, kit, weapon, ability };
             r.finish()?;
             Ok(ServerMsg::Snapshot(SnapshotHeader {
                 server_tick,
@@ -469,13 +471,13 @@ pub struct BlobState {
     /// Health to 1/15th (rounded up: a living player never reads 0).
     pub health: u8,
     pub dead: bool,
-    /// Its class (`class`, U6).
-    pub kit: u8,
+    /// Its class and weapon (`class::look`, U6).
+    pub look: u8,
 }
 
 /// Far-tier encoding: position relative to the entity's own 512 m cell, so the
 /// blob is identical for every recipient and is serialized once per tick.
-pub fn encode_blob(entity: u16, s: &MoveState, yaw: u16, pitch: i16, health: u8, kit: u8) -> Blob {
+pub fn encode_blob(entity: u16, s: &MoveState, yaw: u16, pitch: i16, health: u8, look: u8) -> Blob {
     let pos = s.pos;
     let (cx, cy) = blob_cell(pos);
     let mut bw = BitWriter::new();
@@ -494,7 +496,7 @@ pub fn encode_blob(entity: u16, s: &MoveState, yaw: u16, pitch: i16, health: u8,
     b[..2].copy_from_slice(&entity.to_le_bytes());
     b[2] = (cx | cy << 4) as u8;
     b[3..11].copy_from_slice(&bits);
-    b[11] = kit & 7;
+    b[11] = look;
     b
 }
 
@@ -533,7 +535,7 @@ pub fn decode_blob(b: &[u8]) -> Result<BlobState, DecodeError> {
         crouched: flags & BLOB_CROUCHED != 0,
         health,
         dead: flags & BLOB_DEAD != 0,
-        kit: b[11] & 7,
+        look: b[11],
     })
 }
 
@@ -569,8 +571,8 @@ mod tests {
 
     #[test]
     fn deploys_roundtrip() {
-        assert_eq!(decode_deploy(&encode_deploy(66, 3)), Ok((66, 3)));
-        assert!(decode_deploy(&encode_deploy(66, 3)[..3]).is_err());
+        assert_eq!(decode_deploy(&encode_deploy(66, 3, 6)), Ok((66, 3, 6)));
+        assert!(decode_deploy(&encode_deploy(66, 3, 6)[..4]).is_err());
     }
 
     #[test]
@@ -600,7 +602,7 @@ mod tests {
             pushes: 9,
             health: 37,
             life: 255,
-            ammo: Ammo { mag: 17, reserve: 1000, reload: 81, kit: 3, ability: crate::ability::Ability { active: 1, cooldown: 300, energy: 377, held: true } },
+            ammo: Ammo { mag: 17, reserve: 1000, reload: 81, kit: 3, weapon: 6, ability: crate::ability::Ability { active: 1, cooldown: 300, energy: 377, held: true } },
             away: true,
         };
         let mut wr = Writer::default();
@@ -620,7 +622,7 @@ mod tests {
         assert_eq!(blobs.len(), 2 * FAR_BLOB);
         assert!(decode_server_msg(&wr.as_slice()[..wr.len() - 1]).is_err(), "truncated");
         assert_eq!(blobs_per_message(Tier::Far, 1176), 97);
-        assert_eq!(decode_blob(&blobs[FAR_BLOB..]).unwrap().kit, 4, "the class rides the blob");
+        assert_eq!(decode_blob(&blobs[FAR_BLOB..]).unwrap().look, 4, "the class rides the blob");
         let mut near = Writer::default();
         write_entities_header(&mut near, 99, Tier::Near, 0);
         assert!(decode_server_msg(near.as_slice()).is_err(), "near has its own message");
@@ -642,7 +644,7 @@ mod tests {
                 let want = pitch as f32 / 32768.0 * std::f32::consts::FRAC_PI_2;
                 assert!((b.pitch - want).abs() < 0.03, "pitch {want} -> {}", b.pitch);
                 assert_eq!(b.airborne, !grounded);
-                assert_eq!((b.health, b.dead, b.crouched, b.kit), (100, false, false, 3));
+                assert_eq!((b.health, b.dead, b.crouched, b.look), (100, false, false, 3));
                 let c = decode_blob(&encode_blob(9, &MoveState { crouched: true, ..s }, yaw, pitch, 100, 3)).unwrap();
                 assert!(c.crouched && c.airborne == !grounded);
             }

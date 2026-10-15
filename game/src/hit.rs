@@ -106,16 +106,26 @@ pub fn capsule(p0: V, p1: V, a: V, b: V, r: f32) -> Option<f32> {
 /// Where a segment hits a player with feet at `feet`, standing or
 /// `crouched`: (t, head). The head counts when it's first along the segment.
 pub fn player(p0: V, p1: V, feet: V, crouched: bool) -> Option<(f32, bool)> {
+    player_sized(p0, p1, feet, crouched, false)
+}
+
+/// An Exo's hitboxes: its armor wider (`EXO_BODY_RADIUS`), its helmet bigger.
+pub const EXO_BODY_RADIUS: f32 = 0.55;
+pub const EXO_HEAD_RADIUS: f32 = 0.24;
+
+/// `player`, for an Exo if `wide`.
+pub fn player_sized(p0: V, p1: V, feet: V, crouched: bool, wide: bool) -> Option<(f32, bool)> {
     let (body_high, head_at) = if crouched { (CROUCH_BODY_HIGH, CROUCH_HEAD_AT) } else { (BODY_HIGH, HEAD_AT) };
+    let (body_r, head_r) = if wide { (EXO_BODY_RADIUS, EXO_HEAD_RADIUS) } else { (BODY_RADIUS, HEAD_RADIUS) };
     // Cheap reject: the segment's box against the player's.
     let lo = [p0[0].min(p1[0]), p0[1].min(p1[1]), p0[2].min(p1[2])];
     let hi = [p0[0].max(p1[0]), p0[1].max(p1[1]), p0[2].max(p1[2])];
-    let r = BODY_RADIUS;
-    if hi[0] < feet[0] - r || lo[0] > feet[0] + r || hi[1] < feet[1] - r || lo[1] > feet[1] + r || hi[2] < feet[2] || lo[2] > feet[2] + head_at + HEAD_RADIUS {
+    let r = body_r;
+    if hi[0] < feet[0] - r || lo[0] > feet[0] + r || hi[1] < feet[1] - r || lo[1] > feet[1] + r || hi[2] < feet[2] || lo[2] > feet[2] + head_at + head_r {
         return None;
     }
-    let head = sphere(p0, p1, [feet[0], feet[1], feet[2] + head_at], HEAD_RADIUS);
-    let body = capsule(p0, p1, [feet[0], feet[1], feet[2] + BODY_LOW], [feet[0], feet[1], feet[2] + body_high], BODY_RADIUS);
+    let head = sphere(p0, p1, [feet[0], feet[1], feet[2] + head_at], head_r);
+    let body = capsule(p0, p1, [feet[0], feet[1], feet[2] + BODY_LOW], [feet[0], feet[1], feet[2] + body_high], body_r);
     match (head, body) {
         (Some(h), Some(b)) if h <= b => Some((h, true)),
         (_, Some(b)) => Some((b, false)),

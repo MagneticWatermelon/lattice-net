@@ -17,8 +17,12 @@
 //!   for up to 1.8 s of fuel, which refills at half the rate from half a
 //!   second after the jets stop.
 //! - Engineer: its turret is still to come; the button does nothing.
+//! - Exo, **Lock-down**: pressed, it plants itself (no moving or jumping)
+//!   and fires 40% faster, until pressed again (a second between). Always
+//!   slower than a soldier and never sprinting; it takes a third of the
+//!   damage (`taken`).
 
-use crate::class::{ASSAULT, MEDIC, RECON, SKIRMISHER};
+use crate::class::{ASSAULT, EXO, MEDIC, RECON, SKIRMISHER};
 use crate::movement::TICK_HZ;
 
 /// The ability's button: pressed (Bulwark, the Mend field, the cloak on or
@@ -56,6 +60,12 @@ pub const JET_DELAY: u16 = S / 2;
 pub const JET_ACCEL: f32 = 32.0;
 pub const JET_SPEED: f32 = 6.5;
 pub const JET_AIR_ACCEL: f32 = 30.0;
+/// An Exo's speed, of a soldier's.
+pub const EXO_SPEED: f32 = 0.75;
+/// Between Lock-down's going on and off, steps.
+pub const LOCK_DELAY: u16 = S;
+/// Locked down, a shot comes this much of its interval after the last (3/5).
+pub const LOCK_RATE: [u32; 2] = [3, 5];
 
 /// What an ability does to its holder's movement for a step.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,10 +76,12 @@ pub struct Gear {
     pub speed: f32,
     /// No sprinting.
     pub no_sprint: bool,
+    /// No jumping.
+    pub no_jump: bool,
 }
 
 impl Gear {
-    pub const NONE: Gear = Gear { jets: false, speed: 1.0, no_sprint: false };
+    pub const NONE: Gear = Gear { jets: false, speed: 1.0, no_sprint: false, no_jump: false };
 }
 
 impl Default for Gear {
@@ -104,6 +116,8 @@ impl Ability {
             SKIRMISHER if buttons & BUTTON_ABILITY != 0 && self.energy >= 2 => Gear { jets: true, ..Gear::NONE },
             ASSAULT if self.active > 0 => Gear { speed: BULWARK_SPEED, no_sprint: true, ..Gear::NONE },
             RECON if self.active > 0 => Gear { no_sprint: true, ..Gear::NONE },
+            EXO if self.active > 0 => Gear { speed: 0.0, no_sprint: true, no_jump: true, ..Gear::NONE },
+            EXO => Gear { speed: EXO_SPEED, no_sprint: true, ..Gear::NONE },
             _ => Gear::NONE,
         }
     }
@@ -155,6 +169,15 @@ impl Ability {
                 }
                 false
             }
+            EXO => {
+                self.cooldown = self.cooldown.saturating_sub(1);
+                if pressed && self.cooldown == 0 {
+                    self.active = if self.active > 0 { 0 } else { 1 };
+                    self.cooldown = LOCK_DELAY;
+                    return self.active > 0;
+                }
+                false
+            }
             SKIRMISHER => {
                 if down && self.energy >= 2 {
                     let lit = self.active == 0;
@@ -189,15 +212,29 @@ pub fn name(kit: u8) -> &'static str {
         MEDIC => "Mend field",
         RECON => "Cloak",
         SKIRMISHER => "Jump jets",
+        EXO => "Lock-down",
         _ => "",
     }
 }
 
+/// A shot's interval (`weapon::Weapon::interval`) for kit `kit` with its
+/// ability on or not: an Exo locked down fires faster.
+pub fn interval(kit: u8, on: bool, interval: u32) -> u32 {
+    if kit == EXO && on {
+        interval * LOCK_RATE[0] / LOCK_RATE[1]
+    } else {
+        interval
+    }
+}
+
 /// Damage `amount` as it lands on someone of kit `kit` whose ability is
-/// `on` or not: under a Bulwark, 60% of it (rounded up).
+/// `on` or not: under a Bulwark, 60% of it; on an Exo's armor, a third
+/// (rounded up).
 pub fn taken(kit: u8, on: bool, amount: u8) -> u8 {
     if kit == ASSAULT && on {
         ((amount as u32 * BULWARK_TAKEN).div_ceil(10)) as u8
+    } else if kit == EXO {
+        (amount as u32).div_ceil(3) as u8
     } else {
         amount
     }
@@ -226,6 +263,23 @@ mod tests {
         assert!(!a.step(ASSAULT, BUTTON_ABILITY, false), "not yet");
         a.step(ASSAULT, 0, false);
         assert!(a.step(ASSAULT, BUTTON_ABILITY, false), "again 25 s after it started");
+    }
+
+    #[test]
+    fn an_exo_locks_down_and_takes_a_third() {
+        let mut a = Ability::fresh(EXO);
+        assert_eq!(a.gear(EXO, 0).speed, EXO_SPEED);
+        assert!(a.gear(EXO, 0).no_sprint && !a.gear(EXO, 0).no_jump);
+        assert!(a.step(EXO, BUTTON_ABILITY, false), "locked down");
+        let g = a.gear(EXO, 0);
+        assert!(g.speed == 0.0 && g.no_jump);
+        assert_eq!(interval(EXO, a.on(), 640), 384);
+        run(EXO, &mut a, 0, 3);
+        assert!(!a.step(EXO, BUTTON_ABILITY, false) && a.on(), "not straight back up");
+        run(EXO, &mut a, 0, LOCK_DELAY as u32);
+        a.step(EXO, BUTTON_ABILITY, false);
+        assert!(!a.on(), "up again");
+        assert_eq!((taken(EXO, false, 20), taken(EXO, false, 200)), (7, 67));
     }
 
     #[test]

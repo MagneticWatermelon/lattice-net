@@ -132,8 +132,10 @@ ffi_structs! {
         pub life: u8,
         /// Crouching (predicted, like the position).
         pub crouched: u8,
-        /// Our class (`LT_CLASS_*`, U6): our weapon (`lt_weapon`), this life's.
+        /// Our class (`LT_CLASS_*`, U6) and the weapon we carry (`LT_WEAPON_*`,
+        /// `lt_weapon`), this life's.
         pub kit: u8,
+        pub weapon: u8,
         /// The rifle's rounds (predicted): in the magazine, and carried.
         pub mag: u8,
         pub reserve: u16,
@@ -162,8 +164,9 @@ ffi_structs! {
         /// `LT_FLAG_*`: airborne, dead, aiming down sights, crouched, reloading.
         pub flags: u8,
         pub health: u8,
-        /// Its class (`LT_CLASS_*`, U6): its weapon and its look.
+        /// Its class (`LT_CLASS_*`, U6) and the weapon it carries (`LT_WEAPON_*`).
         pub kit: u8,
+        pub weapon: u8,
         /// The feet.
         pub pos: LtVec3,
         pub yaw: f32,
@@ -219,6 +222,8 @@ ffi_structs! {
         pub reserved: u16,
         /// The newest fights' step (`lt_fights`).
         pub fights_step: u32,
+        /// Seconds until we may deploy an Exo again (0: now).
+        pub exo_secs: f32,
     }
 
     /// A site we might deploy at (`lt_spawn_options`).
@@ -309,8 +314,8 @@ ffi_structs! {
         pub surface: u8,
         /// The shooter, or `LT_NOBODY`.
         pub shooter: u16,
-        /// Shots: the shooter's weapon (its kit; a distant fight's, 0).
-        pub kit: u8,
+        /// Shots: the shooter's weapon (`LT_WEAPON_*`; a distant fight's, 0).
+        pub weapon: u8,
         pub reserved: u8,
         /// Shots: the muzzle; impacts: the point hit.
         pub pos: LtVec3,
@@ -619,7 +624,8 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_REFUSED_CONTESTED", lattice_game::territory::REFUSED_CONTESTED as i64, "Its meter is past halfway to an attacker."),
     ("LT_REFUSED_ALIVE", lattice_game::territory::REFUSED_ALIVE as i64, "We're alive: only the dead and the bodiless deploy."),
     ("LT_REFUSED_INVALID", lattice_game::territory::REFUSED_INVALID as i64, "Not a site, or the server doesn't deploy."),
-    ("LT_CAUSE_RIFLE", lattice_game::events::CAUSE_RIFLE as i64, "Killed by the assault rifle (any other weapon: its kit)."),
+    ("LT_REFUSED_EXO", lattice_game::territory::REFUSED_EXO as i64, "An Exo again before its 3 minutes are up."),
+    ("LT_CAUSE_RIFLE", lattice_game::events::CAUSE_RIFLE as i64, "Killed by the assault rifle (any other weapon: its id, `LT_WEAPON_*`)."),
     ("LT_CAUSE_FALL", lattice_game::events::CAUSE_FALL as i64, "Killed by a fall."),
     ("LT_CAUSE_FIELD", lattice_game::events::CAUSE_FIELD as i64, "Killed by a spawn room's field (its site not held by the victim's side)."),
     ("LT_CLASS_ASSAULT", lattice_game::class::ASSAULT as i64, "The assault: the assault rifle (U6)."),
@@ -627,6 +633,17 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_CLASS_ENGINEER", lattice_game::class::ENGINEER as i64, "The engineer: the shotgun."),
     ("LT_CLASS_RECON", lattice_game::class::RECON as i64, "The recon: the marksman rifle."),
     ("LT_CLASS_SKIRMISHER", lattice_game::class::SKIRMISHER as i64, "The skirmisher: the SMG."),
+    ("LT_CLASS_EXO", lattice_game::class::EXO as i64, "The Exo: heavy armor, twin guns or a launcher, Lock-down; one every 3 minutes."),
+    ("LT_WEAPON_RIFLE", lattice_game::weapon::RIFLE as i64, "Weapons (`lt_weapon`, `lt_class_weapons`): the assault rifle,"),
+    ("LT_WEAPON_CARBINE", lattice_game::weapon::CARBINE as i64, "the carbine,"),
+    ("LT_WEAPON_SHOTGUN", lattice_game::weapon::SHOTGUN as i64, "the shotgun,"),
+    ("LT_WEAPON_MARKSMAN", lattice_game::weapon::MARKSMAN as i64, "the marksman rifle,"),
+    ("LT_WEAPON_SMG", lattice_game::weapon::SMG as i64, "the SMG,"),
+    ("LT_WEAPON_LMG", lattice_game::weapon::LMG as i64, "the LMG,"),
+    ("LT_WEAPON_SNIPER", lattice_game::weapon::SNIPER as i64, "the sniper rifle,"),
+    ("LT_WEAPON_EXO_GUNS", lattice_game::weapon::EXO_GUNS as i64, "the Exo's twin guns,"),
+    ("LT_WEAPON_EXO_LAUNCHER", lattice_game::weapon::EXO_LAUNCHER as i64, "and its launcher."),
+    ("LT_WEAPONS", lattice_game::weapon::WEAPONS.len() as i64, "How many weapons there are."),
     ("LT_CLASSES", lattice_game::class::CLASSES as i64, "How many classes there are."),
     ("LT_EVENT_HEAD", 1, "A head shot."),
     ("LT_EVENT_KILLED", 2, "The hit killed."),
@@ -805,7 +822,7 @@ mod tests {
         assert_eq!(size("LtEntity"), 40);
         assert_eq!(size("LtEvent"), 12);
         assert_eq!(size("LtWeapon"), 72);
-        assert_eq!(size("LtShell"), 36);
+        assert_eq!(size("LtShell"), 40);
         assert_eq!(size("LtRecap"), 60);
         assert_eq!(size("LtFight"), 6);
         assert_eq!(size("LtTracer"), 32);

@@ -224,7 +224,7 @@ pub fn step_with<'a>(world: &World, s: MoveState, input: Input, who: impl Into<M
     let mut n = s;
     n.crouched = crouched;
     n.vel = [s.vel[0] + dv[0], s.vel[1] + dv[1]];
-    if s.grounded && input.buttons & BUTTON_JUMP != 0 && !crouched {
+    if s.grounded && input.buttons & BUTTON_JUMP != 0 && !crouched && !gear.no_jump {
         n.vz = JUMP_SPEED;
         n.grounded = false;
     }

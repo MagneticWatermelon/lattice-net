@@ -180,8 +180,8 @@ impl Handle {
         let feet = core.own_render(now);
         let eye = [feet[0], feet[1], feet[2] + eye_height(&core.predicted())];
         let step = core.last_shot_step();
-        let kit = core.kit();
-        let fired = self.tracers.fire_own(eye, f.yaw, f.pitch, dir, f.muzzle.into(), step, faction, kit);
+        let arms = core.weapon();
+        let fired = self.tracers.fire_own(eye, f.yaw, f.pitch, dir, f.muzzle.into(), step, faction, arms);
         Some(LtShot { dir: dir.into(), muzzle: fired.origin.into(), eye: eye.into() })
     }
 
@@ -222,6 +222,7 @@ impl Handle {
             life: core.life(),
             crouched: p.crouched as u8,
             kit: ammo.kit,
+            weapon: ammo.weapon,
             mag: ammo.mag,
             reserve: ammo.reserve,
             reload: ammo.reload as f32 / TICK_HZ as f32,
@@ -265,6 +266,7 @@ impl Handle {
                     flags,
                     health: st.health,
                     kit: st.kit,
+                    weapon: st.weapon,
                     pos: st.pos.into(),
                     yaw: st.yaw,
                     pitch: st.pitch,
@@ -311,6 +313,7 @@ impl Handle {
                     | if s.ability { FLAG_ABILITY } else { 0 },
                 health: s.health,
                 kit: s.kit,
+                weapon: s.weapon,
                 pos: s.pos.into(),
                 yaw: s.yaw,
                 pitch: s.pitch,
@@ -374,7 +377,7 @@ impl Handle {
                     faction: t.faction,
                     surface: hit.cover.unwrap_or(SURFACE_TERRAIN),
                     shooter: NOBODY,
-                    kit: 0,
+                    weapon: 0,
                     reserved: 0,
                     pos: hit.pos.into(),
                     dir: hit.dir.into(),
@@ -452,8 +455,8 @@ impl Handle {
 
     /// Asks to deploy at `site` with loadout `kit` (U4): false if the
     /// server doesn't deploy or we aren't connected.
-    pub fn deploy(&mut self, site: u16, kit: u8) -> bool {
-        match self.session.core.deploy(site, kit) {
+    pub fn deploy(&mut self, site: u16, kit: u8, weapon: u8) -> bool {
+        match self.session.core.deploy(site, kit, weapon) {
             Some(m) => self.session.send_reliable(m),
             None => false,
         }
@@ -483,6 +486,7 @@ impl Handle {
             died_in: sh.died_in.map_or(lattice_game::world::NO_SITE, |s| s as u16),
             reserved: 0,
             fights_step: sh.fights_step,
+            exo_secs: ((sh.exo_ready as f64 - step) / TICK_HZ as f64).max(0.0) as f32,
         }
     }
 
@@ -643,7 +647,7 @@ fn shot_fx(f: Fired) -> LtFx {
         faction: f.faction,
         surface: 0,
         shooter: f.shooter.unwrap_or(NOBODY),
-        kit: f.kit,
+        weapon: f.weapon,
         reserved: 0,
         pos: f.origin.into(),
         dir: f.dir.into(),
