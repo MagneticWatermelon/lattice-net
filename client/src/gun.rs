@@ -207,7 +207,9 @@ pub fn viewmodel(
     let a = ease(gun.blend);
     let (back, up) = (KICK[0].0 * (1.0 - a) + KICK[1].0 * a, KICK[0].1 * (1.0 - a) + KICK[1].1 * a);
     let moving = (speed / 6.0).min(1.0) * (1.0 - 0.85 * a) * (s.grounded as u8 as f32);
-    let bob = Vec3::new(gun.bob.sin() * 0.012, -(gun.bob * 2.0).sin().abs() * 0.008, 0.0) * moving;
+    // A stride (a turn of the phase) is two steps: side to side once a stride, a dip
+    // once a step, smoothly (the rectified sine bounced twice a step, sharply).
+    let bob = Vec3::new(gun.bob.sin() * 0.010, ((gun.bob * 2.0).cos() - 1.0) * 0.0045, 0.0) * moving;
     let at = HIP.lerp(SIGHTS, a) + SPRINT_OFFSET * gun.sprint + bob + Vec3::Z * back * gun.kick;
     let turn = Quat::from_rotation_y(0.55 * gun.sprint) * Quat::from_rotation_x(-0.35 * gun.sprint + up * gun.kick);
     for mut tf in &mut rifle {

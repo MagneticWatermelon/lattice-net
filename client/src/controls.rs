@@ -256,7 +256,7 @@ pub fn play(
             let f = view.feet;
             let step = net.0.core.last_shot_step();
             let faction = net.0.core.welcome().map_or(0, |w| lattice_game::faction::faction(w.entity));
-            tracers.0.fire_own([f[0], f[1], f[2] + view.eye_height], view.yaw, view.pitch, dir, own_muzzle(1.0 - gun.blend), step, faction);
+            tracers.0.fire_own([f[0], f[1], f[2] + view.eye_height], view.yaw, view.pitch, dir, own_muzzle(1.0 - gun.blend), step, faction, net.0.core.weapon());
             gun.shot(view, frame.secs);
             fire_times.0.insert(crate::scene::OWN, frame.secs);
         }
