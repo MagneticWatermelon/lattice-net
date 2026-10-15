@@ -123,6 +123,7 @@ impl Client {
 
 const LT_BUTTON_ADS: u8 = lattice_game::movement::BUTTON_ADS;
 const LT_BUTTON_CROUCH: u8 = lattice_game::movement::BUTTON_CROUCH;
+const LT_BUTTON_ABILITY: u8 = lattice_game::ability::BUTTON_ABILITY;
 
 #[test]
 fn two_sessions_join_see_each_other_and_fight_through_the_c_api() {
@@ -243,6 +244,56 @@ fn two_sessions_join_see_each_other_and_fight_through_the_c_api() {
 /// again from the next: predicted exactly, no correction, no shot refused.
 /// (B can't die: invulnerable, not an immortal server, whose rounds never
 /// run out.)
+/// A Skirmisher's jets through the C API (U6): held a second, our own state
+/// says they burn and we climb, the other client draws us with the
+/// ability's flag, and both predict exactly.
+#[test]
+fn jump_jets_through_the_c_api() {
+    let _quiet = quiet();
+    let start = Instant::now();
+    let mut cfg = SimConfig { spawn: SpawnMode::Disk(20.0), ..Default::default() };
+    cfg.interest.squad_size = 0;
+    let mut server = LoopServer::with(cfg, start);
+    let id = server.sim.config().identity.clone();
+    let key = hex(&id.token_key);
+    let addr = server.addr().to_string();
+    let mut a = Client::connect(&addr, 1, &key, id.server_id);
+    let mut b = Client::connect(&addr, 2, &key, id.server_id);
+    let frame = Duration::from_micros(8333);
+    let mut next = start;
+    let (mut kitted, mut ground, mut top, mut burned, mut seen) = (false, None, f32::MIN, false, false);
+    while next < start + Duration::from_secs(6) {
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        let t = (next - start).as_secs_f64();
+        if a.own.welcomed == 1 && !kitted {
+            server.sim.set_kit(a.own.entity, lattice_game::class::SKIRMISHER);
+            kitted = true;
+        }
+        let jets = (3.0..4.0).contains(&t);
+        a.buttons = if jets { LT_BUTTON_ABILITY } else { 0 };
+        if t > 2.5 && ground.is_none() {
+            ground = Some(a.own.pos.z);
+        }
+        if jets {
+            top = top.max(a.own.pos.z);
+            burned |= a.own.ability_on == 1 && a.own.ability_energy < 1.0;
+        }
+        a.frame(None, false);
+        b.frame(None, false);
+        seen |= b.ents[..b.drawn].iter().any(|e| e.id == a.own.entity && e.flags & FLAG_ABILITY != 0);
+        server.run(Instant::now());
+        next += frame;
+    }
+    for (name, st) in [("A", a.stats()), ("B", b.stats())] {
+        assert_eq!((st.corrections, st.ammo_corrections, st.resyncs), (0, 0, 0), "{name}: predicted exactly");
+    }
+    assert_eq!(a.own.kit, lattice_game::class::SKIRMISHER);
+    assert!(burned, "the jets burned their fuel");
+    let climb = top - ground.unwrap();
+    assert!(climb > 2.0, "they climbed {climb} m");
+    assert!(seen, "B drew A's jets");
+}
+
 #[test]
 fn crouch_and_the_magazine_through_the_c_api() {
     let _quiet = quiet();

@@ -26,7 +26,7 @@ use lattice_client_core::{ClientConfig, How};
 use lattice_game::events::{Event, SeenShot};
 use lattice_game::faction::faction;
 use lattice_game::territory::FULL;
-use lattice_game::movement::{Input, BUTTON_ADS, BUTTON_CROUCH, BUTTON_JUMP, BUTTON_RELOAD, BUTTON_SPRINT, TICK_HZ};
+use lattice_game::movement::{Input, BUTTON_ABILITY, BUTTON_ADS, BUTTON_CROUCH, BUTTON_JUMP, BUTTON_RELOAD, BUTTON_SPRINT, TICK_HZ};
 use lattice_game::weapon::eye_height;
 use lattice_game::world::World;
 use lattice_net::{ClientState, ConnectToken};
@@ -191,7 +191,7 @@ impl Handle {
         let clamp = |v: f32| if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 };
         let (yaw, pitch) = (if i.yaw.is_finite() { i.yaw } else { 0.0 }, if i.pitch.is_finite() { i.pitch } else { 0.0 });
         let (move_x, move_y) = aim::stick(yaw, clamp(i.forward), clamp(i.right));
-        let buttons = i.buttons & (BUTTON_SPRINT | BUTTON_JUMP | BUTTON_ADS | BUTTON_CROUCH | BUTTON_RELOAD);
+        let buttons = i.buttons & (BUTTON_SPRINT | BUTTON_JUMP | BUTTON_ADS | BUTTON_CROUCH | BUTTON_RELOAD | BUTTON_ABILITY);
         let input = Input { move_x, move_y, yaw: aim::yaw_u16(yaw), pitch: aim::pitch_i16(pitch), buttons };
         if self.threaded {
             self.intent = input;

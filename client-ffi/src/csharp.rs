@@ -63,6 +63,8 @@ fn constants() -> Vec<(&'static str, Value, &'static str)> {
         ("BURST_GAP", F32(weapon::BURST_GAP), "A shot this long (s) after the last starts a new burst."),
         ("ADS_SPEED", F32(weapon::ADS_SPEED), "Down the sights: this share of running speed,"),
         ("ADS_ZOOM", F32(weapon::ADS_ZOOM), "and the view zoomed this many times."),
+        ("MEND_RADIUS", F32(lattice_game::ability::MEND_RADIUS), "A Mend field heals friends within this of the medic, m (U6)."),
+        ("CLOAK_RANGE", F32(lattice_game::ability::CLOAK_RANGE), "Enemies past this aren't sent a cloaked player, m."),
         ("BODY_RADIUS", F32(hit::BODY_RADIUS), "Hitboxes: a body capsule (radius, and its segment's ends above the feet), m."),
         ("BODY_LOW", F32(hit::BODY_LOW), ""),
         ("BODY_HIGH", F32(hit::BODY_HIGH), ""),
