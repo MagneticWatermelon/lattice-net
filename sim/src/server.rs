@@ -43,6 +43,9 @@ use lattice_game::clock::{self, Live};
 /// Debugging aid (`LATTICE_FALL_TRACE=1`): every fall that hurts, where it
 /// landed and from how high, to stderr.
 static FALL_TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LATTICE_FALL_TRACE").is_some());
+/// Debugging aid (`LATTICE_KILL_TRACE=1`): every kill by a player, where the
+/// two stood and the spawn room each was in, if any, on stderr.
+static KILL_TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("LATTICE_KILL_TRACE").is_some());
 use lattice_game::territory::{self, Territory};
 use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
 use crate::msg::{self, Blob, PacketFill, RenderTime, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
@@ -2301,6 +2304,23 @@ impl SimServer {
         (b.died_at, b.died_in) = (step_no, territory::region_of(&self.world, pos).map(|i| i as u16));
         self.counters.deaths += 1;
         self.inputs[e as usize].get_mut().unwrap().session.deaths += 1;
+        if *KILL_TRACE && from != events::NOBODY {
+            let room = |s: &MoveState| {
+                self.world.spawn_rooms().iter().position(|r| {
+                    let (dx, dy) = (s.pos[0] - r.center[0], s.pos[1] - r.center[1]);
+                    let (u, v) = (dx * r.axis[0] + dy * r.axis[1], -dx * r.axis[1] + dy * r.axis[0]);
+                    u.abs() <= r.half[0] && v.abs() <= r.half[1] && (s.z - r.floor).abs() < 3.0
+                })
+            };
+            let (t, k) = (self.bodies[e as usize].state, self.bodies.get(from as usize).map(|b| b.state));
+            if let Some(k) = k {
+                eprintln!(
+                    "kill {from} (faction {}) at ({:.1}, {:.1}, {:.1}) room {:?} -> {e} (faction {}) at ({:.1}, {:.1}, {:.1}) room {:?}, {:.1} m",
+                    faction(from), k.pos[0], k.pos[1], k.z, room(&k), faction(e), t.pos[0], t.pos[1], t.z, room(&t),
+                    ((k.pos[0] - t.pos[0]).powi(2) + (k.pos[1] - t.pos[1]).powi(2) + (k.z - t.z).powi(2)).sqrt()
+                );
+            }
+        }
         self.died(e, from, head, cause);
         Some(true)
     }
