@@ -333,6 +333,8 @@ impl BotBrain {
         }
         let ai = &mut self.ai;
         let campaign = &mut self.campaign;
+        // An engineer in a fight builds its turret there (as soon as it may).
+        let build = engaged && self.abilities.is_some() && self.core.kit() == lattice_game::class::ENGINEER;
         let (abilities, jets, held) = (&mut self.abilities, self.core.kit() == lattice_game::class::SKIRMISHER, self.ability_held);
         let (tools_held, pitch) = (self.tools_held, self.pitch);
         let out = self.core.step_inputs(now, |s, w| {
@@ -359,6 +361,10 @@ impl BotBrain {
             input.tools |= tools_held;
             if pitch != 0 {
                 input.pitch = pitch;
+            }
+            // (Pressed on every other pair of inputs: a press is the button going down.)
+            if build && ai.steps % 4 < 2 {
+                input.buttons |= lattice_game::ability::BUTTON_ABILITY;
             }
             if let Some(t) = abilities.as_mut() {
                 *t += 1;
