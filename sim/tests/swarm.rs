@@ -1382,6 +1382,42 @@ fn every_class_fires_its_own_weapon_and_others_see_it() {
     }
 }
 
+#[test]
+fn dying_mid_burst_spends_no_rounds_on_refused_shots() {
+    // A shot pulled after the server has killed us, before we know it, is
+    // refused (the body is dead): the client's replay from the snapshot that
+    // says so spends no round on it, and the next life has the class's own
+    // weapon, full. The trigger held, 100 ms each way, killed every few seconds.
+    use lattice_game::{class, weapon};
+    for kit in [class::ASSAULT, class::SKIRMISHER] {
+        let w = weapon::of(kit);
+        let cfg = SimConfig { spawn: SpawnMode::Disk(30.0), ..Default::default() };
+        let mut s = Swarm::with_config(2, cfg);
+        s.lag = vec![3, 0];
+        for _ in 0..TICK_HZ {
+            s.step();
+        }
+        let me = s.bots[0].2.welcome().unwrap().entity;
+        s.server.set_kit(me, kit);
+        s.bots[0].2.set_trigger(true);
+        let c0 = s.server.counters().clone();
+        let mut deaths = 0;
+        for k in 0..40 * TICK_HZ {
+            if k % TICK_HZ == 0 && s.server.vitals(me) == Some((100, false)) && s.bots[0].2.core().ammo().mag + 4 < w.magazine {
+                s.server.damage(me, 255);
+                deaths += 1;
+            }
+            s.step();
+        }
+        let refused = s.server.counters().shots_refused - c0.shots_refused;
+        let st = &s.bots[0].2.core().stats;
+        eprintln!("{}: {deaths} deaths, {refused} shots refused, {} ammo corrections", w.name, st.ammo_corrections);
+        assert!(deaths >= 4 && refused > 0, "{}: it died mid-burst ({deaths} deaths, {refused} refused)", w.name);
+        assert_eq!((st.corrections, st.ammo_corrections), (0, 0), "{}: predicted exactly", w.name);
+        assert_eq!(s.bots[0].2.core().ammo().kit, kit, "{}: each life with its own weapon", w.name);
+    }
+}
+
 fn shoot(lag: u32, strafe: u32, head: bool, extra_lead: f32, secs: u32) -> (Swarm, u16, Vec<lattice_sim::server::HitRecord>, Gunner) {
     shoot_at(lag, strafe, head, extra_lead, secs, false)
 }

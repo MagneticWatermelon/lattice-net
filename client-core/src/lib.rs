@@ -1036,9 +1036,11 @@ impl ClientCore {
             let at = (seq as i64 + offset).max(0) as u32;
             Self::owners_for(self.territory.as_ref(), at, &mut self.owners);
             s = step(world, s, applied, Mover { faction: side, owners: &self.owners, live: Live::at(at) });
-            a.step(applied.buttons, p.shot.is_some());
+            // A shot we pulled before we knew we'd died: the server refuses it
+            // (the body is dead), and it spends no round.
+            a.step(applied.buttons, p.shot.is_some() && !dead);
             if self.unlimited {
-                a = Ammo::FULL;
+                a = Ammo::full(a.kit);
             }
             (p.state, p.ammo) = (s, a);
         }
@@ -1276,7 +1278,7 @@ impl ClientCore {
             }
             self.ammo.step(applied.buttons, shot.is_some());
             if self.unlimited {
-                self.ammo = Ammo::FULL;
+                self.ammo = Ammo::full(self.ammo.kit);
             }
             self.history[self.seq as usize % HISTORY] =
                 Predicted { seq: self.seq, input, state: self.state, sent_at: Some(now), render, shot, ammo: self.ammo };

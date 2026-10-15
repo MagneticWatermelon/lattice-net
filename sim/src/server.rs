@@ -1106,7 +1106,7 @@ impl InputQueue {
             self.ammo.start_reload();
         }
         if self.unlimited {
-            self.ammo = Ammo::FULL;
+            self.ammo = Ammo::full(self.ammo.kit);
         }
         body.reloading = !body.dead() && self.ammo.reload > 0;
         kind
@@ -2584,7 +2584,8 @@ impl SimServer {
             };
             (b.health, b.respawn_at, b.life, b.reloading) = (MAX_HEALTH, None, b.life.wrapping_add(1), false);
             self.damage_log[e].clear();
-            self.inputs[e].get_mut().unwrap().ammo = Ammo::FULL;
+            // A new life with its class's weapon, full.
+            self.inputs[e].get_mut().unwrap().ammo = Ammo::full(b.kit);
             self.counters.respawns += 1;
         }
     }
