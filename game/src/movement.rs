@@ -50,6 +50,9 @@ pub const RADIUS: f32 = 0.4;
 pub const HEIGHT: f32 = 1.8;
 /// How fast an updraft (`Force::Lift`) speeds a player up to its speed.
 const LIFT_ACCEL: f32 = 30.0;
+/// How hard a drop shaft (`Force::Drop`) brakes a fall faster than its
+/// speed (m/s², against gravity's 15: 45 net), rather than stopping it dead.
+pub const DROP_BRAKE: f32 = 60.0;
 /// The faction of a mover that belongs to none: every shield blocks it.
 pub const NO_FACTION: u8 = 254;
 /// Falls past this hurt (GDD §4.1, K4: "falls are a choice"), this much a
@@ -262,8 +265,12 @@ pub fn step_with<'a>(world: &World, s: MoveState, input: Input, who: impl Into<M
             if !n.grounded {
                 n.vz -= GRAVITY * DT;
             }
+            // A drop shaft: a fall down to its speed, braked (`DROP_BRAKE`) if
+            // faster (a fast shaft's lower stretch slows its riders to land).
             if let Some((Force::Drop, vel)) = v {
-                n.vz = n.vz.max(vel[2]);
+                if n.vz < vel[2] {
+                    n.vz = (n.vz + DROP_BRAKE * DT).min(vel[2]);
+                }
             }
         }
     }
@@ -347,8 +354,8 @@ pub fn fall_damage(s: &MoveState, n: &MoveState) -> u8 {
 /// `HELD_LIFT_FOOT` over its foot and carried high enough that leaving
 /// would hurt, until `HELD_LIFT` under its top; in a drop shaft's from
 /// `HELD_DROP` under its top to 2 m over its floor. A tall lift is two
-/// columns, fast then slow, one on the other: its foot is the lower's, its
-/// top the upper's.
+/// columns, fast then slow, one on the other, and a deep drop shaft too
+/// (fast, then braking): its foot is the lower's, its top the upper's.
 fn holds(world: &World, v: &Volume, s: &MoveState, grounded: bool, live: Live) -> bool {
     let (foot, margin) = match v.force {
         Force::Lift => (HELD_LIFT_FOOT, HELD_LIFT),
@@ -359,8 +366,8 @@ fn holds(world: &World, v: &Volume, s: &MoveState, grounded: bool, live: Live) -
         return false;
     }
     let c = v.center();
-    let lift_at = |z: f32| world.volume_at(c[0], c[1], z, live).is_some_and(|o| o.force == Force::Lift);
-    let (on, under) = (v.force == Force::Lift && lift_at(v.max[2]), v.force == Force::Lift && lift_at(v.min[2] - 0.01));
+    let same_at = |z: f32| world.volume_at(c[0], c[1], z, live).is_some_and(|o| o.force == v.force);
+    let (on, under) = (same_at(v.max[2]), same_at(v.min[2] - 0.01));
     let top = if on { v.max[2] } else { v.max[2] - margin };
     // (How high a lift would have carried them if they left it now: its
     // foot is 1 m under its floor.)

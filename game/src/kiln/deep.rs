@@ -19,8 +19,12 @@ use crate::world::{CoverBox, Force, Kind, Volume, CELLS, UNTURNED};
 const LIFT_FAST: f64 = 20.0;
 const LIFT_TALL: f64 = 30.0;
 const LIFT_SLOW: f64 = 4.0;
-/// A drop shaft's fall (m/s).
+/// A drop shaft's fall at its foot (m/s), and over the rest of a deep one
+/// (over 200 m: faster still): ridden down fast, braked to land (it took
+/// 6 m/s all the way, 79 s down the Hollow's 474 m).
 const DROP_SPEED: f64 = 6.0;
+const DROP_FAST: f64 = 25.0;
+const DROP_TALL: f64 = 35.0;
 /// Gravity (movement's).
 const G: f64 = 15.0;
 
@@ -110,18 +114,30 @@ pub(crate) fn drop_rect(k: &mut Kiln, site: usize, c: [f64; 2], half: [f64; 2], 
     k.internal.push(Route { a: site, b: site, legs, one_way: true });
 }
 
-/// A drop shaft's slowed fall (as `drop_rect`), without its route.
+/// A drop shaft's slowed fall (as `drop_rect`), without its route: fast,
+/// then over its last stretch braking (`movement::DROP_BRAKE`) to land at
+/// `DROP_SPEED`; a short one slow all the way.
 pub(crate) fn drop_volume(k: &mut Kiln, c: [f64; 2], half: [f64; 2], z0: f64, z1: f64) {
-    k.volumes.push(Volume {
-        min: [(c[0] - half[0]) as f32, (c[1] - half[1]) as f32, (z1 - 1.0) as f32],
-        max: [(c[0] + half[0]) as f32, (c[1] + half[1]) as f32, (z0 + 3.0) as f32],
+    let column = |lo: f64, hi: f64, v: f64| Volume {
+        min: [(c[0] - half[0]) as f32, (c[1] - half[1]) as f32, lo as f32],
+        max: [(c[0] + half[0]) as f32, (c[1] + half[1]) as f32, hi as f32],
         force: Force::Drop,
         when: crate::world::ALWAYS,
         phase: 0,
-        vel: [0.0, 0.0, -DROP_SPEED as f32],
+        vel: [0.0, 0.0, -v as f32],
         axis: UNTURNED,
         half: [0.0; 2],
-    });
+    };
+    let fast = if z0 - z1 > 200.0 { DROP_TALL } else { DROP_FAST };
+    // Room to brake from `fast` to `DROP_SPEED` (net of gravity), and a little.
+    let net = crate::movement::DROP_BRAKE as f64 - G;
+    let brake = (fast * fast - DROP_SPEED * DROP_SPEED) / (2.0 * net) + 4.0;
+    if z0 - z1 > brake + 8.0 {
+        k.volumes.push(column(z1 + brake, z0 + 3.0, fast));
+        k.volumes.push(column(z1 - 1.0, z1 + brake, DROP_SPEED));
+    } else {
+        k.volumes.push(column(z1 - 1.0, z0 + 3.0, DROP_SPEED));
+    }
 }
 
 /// Turns the force volumes pushed since `from` to `axis` about their own
