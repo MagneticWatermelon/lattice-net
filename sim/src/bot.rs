@@ -39,6 +39,11 @@ pub struct BotBrain {
     /// The class it deploys as (None: one by its seed, so a swarm's spread
     /// over them).
     kit: Option<u8>,
+    /// Uses its class's ability now and then (`set_abilities`): inputs since
+    /// it started, on its own phase.
+    abilities: Option<u32>,
+    /// Holds its ability's button (`hold_ability`, tests).
+    ability_held: bool,
 }
 
 /// A dead bot asks to deploy this long after it fell (steps), and again
@@ -81,6 +86,8 @@ impl BotBrain {
             reliable: Vec::new(),
             dead_steps: 0,
             kit: None,
+            abilities: None,
+            ability_held: false,
         }
     }
 
@@ -169,6 +176,17 @@ impl BotBrain {
     /// at (`lattice-server --spawn lanes`).
     pub fn set_run_lanes(&mut self, on: bool) {
         self.run_lanes = on;
+    }
+
+    /// Uses its class's ability now and then (U6): jets for most of a second
+    /// every 10 s, the rest pressed every 15 s (on their own phase each).
+    pub fn set_abilities(&mut self, on: bool) {
+        self.abilities = on.then_some((self.seed % 900) as u32);
+    }
+
+    /// Holds its ability's button down (or lets it go) from its next input.
+    pub fn hold_ability(&mut self, on: bool) {
+        self.ability_held = on;
     }
 
     /// Takes sites (K3, with `lattice-server --spawn sites`): goes to the
@@ -294,6 +312,7 @@ impl BotBrain {
         }
         let ai = &mut self.ai;
         let campaign = &mut self.campaign;
+        let (abilities, jets, held) = (&mut self.abilities, self.core.kit() == lattice_game::class::SKIRMISHER, self.ability_held);
         let out = self.core.step_inputs(now, |s, w| {
             let mut input = match campaign.as_mut().filter(|c| c.site.is_some()) {
                 Some(c) => {
@@ -311,6 +330,16 @@ impl BotBrain {
             if reload || reload_once {
                 input.buttons |= BUTTON_RELOAD;
                 reload_once = false;
+            }
+            if held {
+                input.buttons |= lattice_game::ability::BUTTON_ABILITY;
+            }
+            if let Some(t) = abilities.as_mut() {
+                *t += 1;
+                let (period, held) = if jets { (300, 24) } else { (450, 2) };
+                if *t % period < held {
+                    input.buttons |= lattice_game::ability::BUTTON_ABILITY;
+                }
             }
             input
         });

@@ -52,7 +52,7 @@ use crate::session::dev_token;
 /// `lt_recap`, `lt_fights`; `LtEvent::value`, deploy and reward events.
 /// 10: classes and their weapons (U6): `LtOwn::kit`, `LtEntity::kit`,
 /// `LtFx::kit`, `lt_weapon`.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]

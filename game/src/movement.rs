@@ -20,6 +20,7 @@
 //! by the `Mover`: living bridges there only at night, sandfalls in turns,
 //! vent lifts that rest.
 
+pub use crate::ability::Gear;
 use crate::clock::{self, Live};
 use crate::world::{CoverBox, Force, Volume, World, SOLID, VENT};
 
@@ -97,6 +98,8 @@ pub const BUTTON_ADS: u8 = 8;
 pub const BUTTON_CROUCH: u8 = 16;
 /// Reload the rifle (`weapon::Ammo`); movement ignores it.
 pub const BUTTON_RELOAD: u8 = 32;
+/// The class's ability (`ability`); movement sees it only through its `Gear`.
+pub const BUTTON_ABILITY: u8 = crate::ability::BUTTON_ABILITY;
 
 /// One tick of player intent. `move_*` is a world-space stick in [-127, 127].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -179,6 +182,12 @@ pub fn stand_in(last: Input, run: u32) -> Input {
 /// One step of a player of `faction` (`faction::faction`: it decides which
 /// shields let them through).
 pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<'a>>) -> MoveState {
+    step_with(world, s, input, who, Gear::NONE)
+}
+
+/// `step`, with what the player's ability does to it this step
+/// (`ability::Ability::gear`): jets, a Bulwark's slower walk, no sprinting.
+pub fn step_with<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<'a>>, gear: Gear) -> MoveState {
     let who = who.into();
     let mut wish = [input.move_x as f32 / 127.0, input.move_y as f32 / 127.0];
     let len = (wish[0] * wish[0] + wish[1] * wish[1]).sqrt();
@@ -187,19 +196,26 @@ pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<
     }
     // Crouched while held, and after, until there's room to stand.
     let crouched = input.buttons & BUTTON_CROUCH != 0 || (s.crouched && world.ceiling(s.pos[0], s.pos[1], RADIUS, s.z + CROUCH_HEIGHT, who.live) < s.z + HEIGHT);
-    let speed = if crouched {
-        CROUCH_SPEED
-    } else if input.buttons & BUTTON_ADS != 0 {
-        RUN_SPEED * crate::weapon::ADS_SPEED
-    } else if input.buttons & BUTTON_SPRINT != 0 {
-        SPRINT_SPEED
-    } else {
-        RUN_SPEED
-    };
+    let speed = gear.speed
+        * if crouched {
+            CROUCH_SPEED
+        } else if input.buttons & BUTTON_ADS != 0 {
+            RUN_SPEED * crate::weapon::ADS_SPEED
+        } else if input.buttons & BUTTON_SPRINT != 0 && !gear.no_sprint {
+            SPRINT_SPEED
+        } else {
+            RUN_SPEED
+        };
 
     let mut dv = [wish[0] * speed - s.vel[0], wish[1] * speed - s.vel[1]];
     let dv_len = (dv[0] * dv[0] + dv[1] * dv[1]).sqrt();
-    let max_dv = if s.grounded { ACCEL * DT } else { AIR_ACCEL * DT };
+    let max_dv = if s.grounded {
+        ACCEL * DT
+    } else if gear.jets {
+        crate::ability::JET_AIR_ACCEL * DT
+    } else {
+        AIR_ACCEL * DT
+    };
     if dv_len > max_dv {
         let k = max_dv / dv_len;
         dv = [dv[0] * k, dv[1] * k];
@@ -210,6 +226,11 @@ pub fn step<'a>(world: &World, s: MoveState, input: Input, who: impl Into<Mover<
     n.vel = [s.vel[0] + dv[0], s.vel[1] + dv[1]];
     if s.grounded && input.buttons & BUTTON_JUMP != 0 && !crouched {
         n.vz = JUMP_SPEED;
+        n.grounded = false;
+    }
+    // Jets: off the ground, pushing up to their climb (gravity still pulls).
+    if gear.jets {
+        n.vz = (n.vz + crate::ability::JET_ACCEL * DT).min(crate::ability::JET_SPEED).max(n.vz);
         n.grounded = false;
     }
     // Gravity, or the force volume the feet are in (a resting vent lift

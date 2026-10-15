@@ -60,6 +60,9 @@ pub const FLAG_ADS: u8 = 4;
 pub const FLAG_CROUCHED: u8 = 8;
 /// `NearQ::flags` bit: reloading.
 pub const FLAG_RELOADING: u8 = 16;
+/// `NearQ::flags` bit: its class's ability is on (U6, `ability`): a
+/// Bulwark, a Mend field, cloaked, jets firing.
+pub const FLAG_ABILITY: u8 = 32;
 /// Bits `NearQ::flags` takes on the wire (the top three are U6's abilities').
 const FLAG_BITS: u32 = 8;
 const KIT_BITS: u32 = 3;
@@ -104,6 +107,14 @@ impl NearQ {
             health: health.min(127),
             kit: kit & 7,
         }
+    }
+
+    /// With `flag` set if `on`.
+    pub fn with(mut self, flag: u8, on: bool) -> Self {
+        if on {
+            self.flags |= flag;
+        }
+        self
     }
 
     pub fn z(&self) -> f32 {

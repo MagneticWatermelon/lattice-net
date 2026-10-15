@@ -139,6 +139,16 @@ ffi_structs! {
         pub reserve: u16,
         /// Seconds left of the reload under way; 0: none.
         pub reload: f32,
+        /// Our class's ability (U6, `LT_BUTTON_ABILITY`; predicted): seconds
+        /// it has left running (a Bulwark, a Mend field; 0 otherwise), and
+        /// until it can start again (jets and the cloak: until they refill).
+        pub ability_left: f32,
+        pub ability_cooldown: f32,
+        /// Its energy (jets, the cloak), of full; 1 for the others.
+        pub ability_energy: f32,
+        /// It's on: a Bulwark or a Mend field running, cloaked, jets firing.
+        pub ability_on: u8,
+        pub reserved: [u8; 3],
     }
 
     /// Another player, as drawn this frame.
@@ -580,6 +590,7 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_BUTTON_ADS", lattice_game::movement::BUTTON_ADS as i64, "Aim down sights: half speed, no sprint, a tight cone."),
     ("LT_BUTTON_CROUCH", lattice_game::movement::BUTTON_CROUCH as i64, "Crouch while held: lower, slower, no sprint or jump, a tighter cone."),
     ("LT_BUTTON_RELOAD", lattice_game::movement::BUTTON_RELOAD as i64, "Reload the rifle (an empty magazine reloads by itself)."),
+    ("LT_BUTTON_ABILITY", lattice_game::ability::BUTTON_ABILITY as i64, "The class's ability: pressed (Bulwark, the Mend field, the cloak on or off) or held (jets)."),
     ("LT_TIER_NEAR", 0, "30 Hz, within 150 m (plus squad and contacts)."),
     ("LT_TIER_MID", 1, "10 Hz, within 500 m."),
     ("LT_TIER_FAR", 2, "2 Hz, within 1.5 km."),
@@ -592,6 +603,7 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_FLAG_ADS", 4, "Aiming down sights (near tier only)."),
     ("LT_FLAG_CROUCHED", 8, "Crouched."),
     ("LT_FLAG_RELOADING", 16, "Reloading (near tier only)."),
+    ("LT_FLAG_ABILITY", 32, "Its class's ability is on: a Bulwark, a Mend field, cloaked, jets firing (near tier only)."),
     ("LT_EVENT_HIT", 1, "Our shot hit `a` for `amount`."),
     ("LT_EVENT_HURT", 2, "`a` hit us for `amount`, from `dir`."),
     ("LT_EVENT_KILL", 3, "`a` killed `b`."),
@@ -609,6 +621,7 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_REFUSED_INVALID", lattice_game::territory::REFUSED_INVALID as i64, "Not a site, or the server doesn't deploy."),
     ("LT_CAUSE_RIFLE", lattice_game::events::CAUSE_RIFLE as i64, "Killed by the assault rifle (any other weapon: its kit)."),
     ("LT_CAUSE_FALL", lattice_game::events::CAUSE_FALL as i64, "Killed by a fall."),
+    ("LT_CAUSE_FIELD", lattice_game::events::CAUSE_FIELD as i64, "Killed by a spawn room's field (its site not held by the victim's side)."),
     ("LT_CLASS_ASSAULT", lattice_game::class::ASSAULT as i64, "The assault: the assault rifle (U6)."),
     ("LT_CLASS_MEDIC", lattice_game::class::MEDIC as i64, "The medic: the carbine."),
     ("LT_CLASS_ENGINEER", lattice_game::class::ENGINEER as i64, "The engineer: the shotgun."),
@@ -705,6 +718,7 @@ pub const FLAG_DEAD: u8 = 2;
 pub const FLAG_ADS: u8 = 4;
 pub const FLAG_CROUCHED: u8 = 8;
 pub const FLAG_RELOADING: u8 = 16;
+pub const FLAG_ABILITY: u8 = 32;
 pub const EVENT_HIT: u8 = 1;
 pub const EVENT_HURT: u8 = 2;
 pub const EVENT_KILL: u8 = 3;

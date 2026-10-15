@@ -54,6 +54,8 @@ lattice-bots: M1 bot swarm
   --seed N             [1]
   --world W            build this world before the bots join (kiln, kit, harrow or a seed), so
                        their first Welcome doesn't stall a thread building it
+  --abilities          each bot uses its class's ability now and then (jets every 10 s,
+                       the rest pressed every 15 s)
   --capture            each bot takes sites: to the nearest few its faction may attack
                        or must defend, by the world's routes, and holds a point there
                        (with lattice-server --spawn sites); the summary lists fight
@@ -289,6 +291,8 @@ struct Bot {
     run_lanes: bool,
     /// Takes sites (`--capture`).
     capture: bool,
+    /// Uses its ability (`--abilities`).
+    abilities: bool,
     /// Near (least, most) and mid render delays.
     delays: (Duration, Duration, Duration),
     /// Bound up front, before the clock starts: creating thousands of sockets
@@ -328,6 +332,7 @@ impl Bot {
             brain.set_fight(self.fight);
             brain.set_run_lanes(self.run_lanes);
             brain.set_capture(self.capture);
+            brain.set_abilities(self.abilities);
             self.brain = Some(brain);
         }
         let (sock, client) = self.net.as_mut().unwrap();
@@ -518,6 +523,7 @@ fn main() -> std::io::Result<()> {
     let summary_path: Option<String> = a.opt("summary");
     let run_lanes = a.flag("run-lanes");
     let capture = a.flag("capture");
+    let abilities = a.flag("abilities");
     // Built once here, shared by every bot (the cache keeps it while we hold it).
     let world = a.opt::<String>("world").map(|w| {
         let id = match w.as_str() {
@@ -578,6 +584,7 @@ fn main() -> std::io::Result<()> {
                 fight: (fight_every > 0 && i % fight_every == 0).then_some(FightConfig { aim_error, ..FightConfig::default() }),
                 run_lanes,
                 capture,
+                abilities,
                 class: class_of(i),
                 port: port_of(i),
                 sock: sockets[i].take(),

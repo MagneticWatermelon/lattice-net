@@ -33,6 +33,7 @@ use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, BUTTON_RELOAD, GRACE_TICKS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
+use lattice_game::{ability, class};
 use crate::shots::{self, ClockRate, Cut, Dips, Fire, FlyStats, History, Judgment, Outcome, Projectile, RenderFloor, Sky, SpreadKey};
 use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot};
 use lattice_game::msg::MID_LAG_UNITS;
@@ -429,6 +430,10 @@ struct Body {
     ads: bool,
     /// Reloading (its rifle), for others to see.
     reloading: bool,
+    /// Its class's ability is on (`ability::Ability::on`): a Bulwark, a Mend
+    /// field, the cloak, jets firing. Others see it; damage, healing and
+    /// interest follow it.
+    ability: bool,
     /// Ticks this player was pushed apart from a crowd (wrapping), for the snapshot.
     pushes: u8,
     squad: u32,
@@ -475,6 +480,7 @@ impl Default for Body {
             pitch: 0,
             ads: false,
             reloading: false,
+            ability: false,
             pushes: 0,
             squad: NO_SQUAD,
             spawned: 0,
@@ -1068,9 +1074,13 @@ impl InputQueue {
         };
         // The rifle as its client predicts it (`Ammo::step`): the reload counts
         // down, then a shot in this input (in `fire`), then its reload button.
+        // The ability's gear from its state before the step (`Ammo::gear`), as predicted.
+        let applied = if body.dead() { movement::dead_input(input) } else { input };
+        let gear = self.ammo.gear(applied.buttons);
         self.ammo.tick();
+        let mag = self.ammo.mag;
         let before = body.state;
-        body.state = step(world, body.state, if body.dead() { movement::dead_input(input) } else { input }, who);
+        body.state = movement::step_with(world, body.state, applied, who, gear);
         if before.grounded && !body.state.grounded {
             body.left_ground = [before.pos[0], before.pos[1], before.z];
         }
@@ -1108,10 +1118,15 @@ impl InputQueue {
         if input.buttons & BUTTON_RELOAD != 0 && !body.dead() {
             self.ammo.start_reload();
         }
+        // Then the ability (a round fired drops the cloak).
+        let fired = self.ammo.mag < mag;
+        let kit = self.ammo.kit;
+        self.ammo.ability.step(kit, applied.buttons, fired);
         if self.unlimited {
-            self.ammo = Ammo::full(self.ammo.kit);
+            self.ammo = self.ammo.refilled();
         }
         body.reloading = !body.dead() && self.ammo.reload > 0;
+        body.ability = !body.dead() && self.ammo.ability.on();
         kind
     }
 }
@@ -1131,6 +1146,19 @@ fn frame(shard: &mut lattice_net::Shard, snaps: &mut Vec<(ClientId, Vec<u8>, Opt
     shard.flush(at);
     out.extend(shard.drain_outgoing());
     at
+}
+
+/// Spawn rooms' fields hurt this much (`SimServer::fields`) every
+/// `FIELD_PERIOD` steps: from full health, dead in about 4 s.
+const FIELD_DAMAGE: u8 = 12;
+const FIELD_PERIOD: u32 = TICK_HZ / 2;
+
+/// Whether a player standing at `s` is in spawn room `r` (its floor's
+/// footprint, feet on or a little over its floor).
+fn in_room(r: &lattice_game::world::SpawnRoom, s: &MoveState) -> bool {
+    let (dx, dy) = (s.pos[0] - r.center[0], s.pos[1] - r.center[1]);
+    let (u, v) = (dx * r.axis[0] + dy * r.axis[1], -dx * r.axis[1] + dy * r.axis[0]);
+    u.abs() <= r.half[0] && v.abs() <= r.half[1] && s.z > r.floor - 0.5 && s.z < r.floor + 2.5
 }
 
 /// Whether `shooter`'s eye sees `target`'s chest now (no terrain or cover
@@ -1228,6 +1256,10 @@ pub struct SimServer {
     pending_damage: Vec<(u16, u8, u16)>,
     /// Fractional random deaths carried between ticks (`deaths_per_sec`).
     death_acc: f64,
+    /// The last Mend field beat healed (`mend`): game steps / `MEND_PERIOD`.
+    mend_beat: u32,
+    /// The last spawn room field beat (`fields`).
+    field_beat: u32,
     by_client: HashMap<ClientId, u16>,
     /// Clients grouped by transport shard, with their interest state.
     shard_clients: Vec<Vec<ClientSlot>>,
@@ -1380,6 +1412,8 @@ impl SimServer {
             free: Default::default(),
             pending_damage: Vec::new(),
             death_acc: 0.0,
+            mend_beat: 0,
+            field_beat: 0,
             by_client: HashMap::new(),
             grid: Grid::new(GRID_CELL),
             mid_grid: Grid::new(MID_GRID_CELL),
@@ -1865,7 +1899,7 @@ impl SimServer {
             .filter(|(_, (_, b))| b.alive)
             .for_each(|(i, ((near, far), b))| {
                 let e = i as u16;
-                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health, b.ads, b.reloading, b.kit);
+                *near = NearQ::new(&b.state, b.yaw, b.pitch, b.health, b.ads, b.reloading, b.kit).with(delta::FLAG_ABILITY, b.ability);
                 let prev = tick.wrapping_sub(1);
                 if due(e, tick, mid_period) || due(e, tick, far_period) || due(e, prev, far_period) {
                     *far = msg::encode_blob(e, &b.state, b.yaw, b.pitch, b.health, b.kit);
@@ -2289,6 +2323,7 @@ impl SimServer {
         if b.invulnerable {
             return Some(false);
         }
+        let amount = ability::taken(b.kit, b.ability, amount);
         // (What it lost: a kill's last hit counts only the health left.)
         let dealt = amount.min(b.health);
         b.health -= dealt;
@@ -2305,13 +2340,7 @@ impl SimServer {
         self.counters.deaths += 1;
         self.inputs[e as usize].get_mut().unwrap().session.deaths += 1;
         if *KILL_TRACE && from != events::NOBODY {
-            let room = |s: &MoveState| {
-                self.world.spawn_rooms().iter().position(|r| {
-                    let (dx, dy) = (s.pos[0] - r.center[0], s.pos[1] - r.center[1]);
-                    let (u, v) = (dx * r.axis[0] + dy * r.axis[1], -dx * r.axis[1] + dy * r.axis[0]);
-                    u.abs() <= r.half[0] && v.abs() <= r.half[1] && (s.z - r.floor).abs() < 3.0
-                })
-            };
+            let room = |s: &MoveState| self.world.spawn_rooms().iter().position(|r| in_room(r, s));
             let (t, k) = (self.bodies[e as usize].state, self.bodies.get(from as usize).map(|b| b.state));
             if let Some(k) = k {
                 eprintln!(
@@ -2323,6 +2352,65 @@ impl SimServer {
         }
         self.died(e, from, head, cause);
         Some(true)
+    }
+
+    /// Spawn rooms' fields (U4/U5, PlanetSide's pain fields): every
+    /// `FIELD_PERIOD` steps, everyone in a spawn room whose side doesn't hold
+    /// its site takes `FIELD_DAMAGE`. Without it, attackers who got into a
+    /// room while their side held it, shut in when it flipped back, camped
+    /// whoever deployed there.
+    fn fields(&mut self, step_no: u32) {
+        let beat = step_no / FIELD_PERIOD;
+        if beat == self.field_beat {
+            return;
+        }
+        self.field_beat = beat;
+        let mut hurt = Vec::new();
+        for r in self.world.spawn_rooms() {
+            let owner = self.owners[0].get(r.site as usize).copied().unwrap_or(territory::NONE);
+            let reach = (r.half[0] * r.half[0] + r.half[1] * r.half[1]).sqrt();
+            self.grid.for_each_within(r.center, reach, |j, _, _| {
+                let b = &self.bodies[j as usize];
+                if b.alive && !b.dead() && faction(j as u16) != owner && in_room(r, &b.state) {
+                    hurt.push(j as u16);
+                }
+            });
+        }
+        for e in hurt {
+            self.hurt(e, FIELD_DAMAGE, events::NOBODY, false, events::CAUSE_FIELD);
+        }
+    }
+
+    /// Medics' Mend fields (U6): every `MEND_PERIOD` steps of game time, each
+    /// medic whose field is on heals every living friend within
+    /// `MEND_RADIUS` (and itself) by `MEND_HEAL`.
+    fn mend(&mut self, step_no: u32) {
+        let beat = step_no / ability::MEND_PERIOD as u32;
+        if beat == self.mend_beat {
+            return;
+        }
+        self.mend_beat = beat;
+        let medics: Vec<(u8, [f32; 3])> = (0..self.bodies.len())
+            .filter(|&m| {
+                let b = &self.bodies[m];
+                b.alive && !b.dead() && b.ability && b.kit == class::MEDIC
+            })
+            .map(|m| (faction(m as u16), [self.bodies[m].state.pos[0], self.bodies[m].state.pos[1], self.bodies[m].state.z]))
+            .collect();
+        if medics.is_empty() {
+            return;
+        }
+        let r2 = ability::MEND_RADIUS * ability::MEND_RADIUS;
+        let (grid, bodies) = (&self.grid, &mut self.bodies);
+        for (side, at) in medics {
+            grid.for_each_within([at[0], at[1]], ability::MEND_RADIUS, |j, _, _| {
+                let b = &mut bodies[j as usize];
+                let d2 = (b.state.pos[0] - at[0]).powi(2) + (b.state.pos[1] - at[1]).powi(2) + (b.state.z - at[2]).powi(2);
+                if faction(j as u16) == side && b.alive && !b.dead() && d2 <= r2 {
+                    b.health = (b.health + ability::MEND_HEAL).min(MAX_HEALTH);
+                }
+            });
+        }
     }
 
     /// `e` was just killed by `from`: its recap (GDD §4.4), the killer's XP
@@ -2514,6 +2602,15 @@ impl SimServer {
     /// Test aid: puts `entity` standing at `pos` before the next tick, and
     /// makes that where it respawns. Its client sees a life change (a cut),
     /// so prediction stays exact.
+    /// Test aid: `teleport`, onto whatever's at about height `z` (a room's floor).
+    pub fn teleport_at(&mut self, entity: u16, pos: [f32; 2], z: f32) {
+        if let Some(b) = self.bodies.get_mut(entity as usize).filter(|b| b.alive) {
+            b.state = MoveState::standing_at(&self.world, pos, z);
+            b.life = b.life.wrapping_add(1);
+            (b.anchor, b.radius) = (pos, 1.0);
+        }
+    }
+
     pub fn teleport(&mut self, entity: u16, pos: [f32; 2]) {
         if let Some(b) = self.bodies.get_mut(entity as usize).filter(|b| b.alive) {
             b.state = MoveState::standing(&self.world, pos);
@@ -2540,6 +2637,11 @@ impl SimServer {
         self.pending_damage.push((entity, amount, from));
     }
 
+    /// Whether `entity`'s ability is on (test aid).
+    pub fn ability_on(&self, entity: u16) -> bool {
+        self.bodies.get(entity as usize).is_some_and(|b| b.ability)
+    }
+
     /// (health, dead) of a connected player.
     pub fn vitals(&self, entity: u16) -> Option<(u8, bool)> {
         self.bodies.get(entity as usize).filter(|b| b.alive).map(|b| (b.health, b.dead()))
@@ -2561,7 +2663,8 @@ impl SimServer {
                 }
             }
         }
-        let _ = step_no;
+        self.mend(step_no);
+        self.fields(step_no);
         for (e, amount, from) in std::mem::take(&mut self.pending_damage) {
             self.hurt(e, amount, from, false, events::CAUSE_RIFLE);
         }
@@ -2900,11 +3003,21 @@ impl View<'_> {
         // dense crowd costs a few hundred candidates instead of everyone in it.
         let k = cfg.near_candidates;
         let (bodies, my_squad) = (self.bodies, me.squad);
+        // A cloaked enemy (U6) past `CLOAK_RANGE` isn't sent at all: what a
+        // client never receives, it can't show through a wall.
+        let side = faction(e);
+        let hidden = |j: u32| {
+            let b = &bodies[j as usize];
+            b.ability && b.kit == class::RECON && faction(j as u16) != side && {
+                let (dx, dy, dz) = (b.state.pos[0] - me.state.pos[0], b.state.pos[1] - me.state.pos[1], b.state.z - me.state.z);
+                dx * dx + dy * dy + dz * dz > ability::CLOAK_RANGE * ability::CLOAK_RANGE
+            }
+        };
         self.grid.knn(
             me.state.pos,
             cfg.near_radius,
             k,
-            |j| j != e as u32 && (my_squad == NO_SQUAD || bodies[j as usize].squad != my_squad),
+            |j| j != e as u32 && (my_squad == NO_SQUAD || bodies[j as usize].squad != my_squad) && !hidden(j),
             &mut sc.knn,
         );
         sc.tally.near_scanned += sc.knn.scanned;
@@ -2938,7 +3051,7 @@ impl View<'_> {
         }
         // Combat contacts (who it hit, who hit it) too, for a few seconds.
         for &(j, until) in &me.contacts {
-            if j != NO_CONTACT && until > tick && j != e && self.bodies[j as usize].alive && !self.bodies[j as usize].away && sc.stamp[j as usize] != epoch {
+            if j != NO_CONTACT && until > tick && j != e && self.bodies[j as usize].alive && !self.bodies[j as usize].away && sc.stamp[j as usize] != epoch && !hidden(j as u32) {
                 let d = self.dist2(me.state.pos, j).sqrt();
                 sc.near.push(NearCandidate { entity: j, base: near_base(d, true), seed_age: interest::seed_age(j, tick, d, cfg, fresh) });
                 sc.stamp[j as usize] = epoch;
@@ -2949,7 +3062,7 @@ impl View<'_> {
 
         // Mid: due this tick, not near-tier, the nearest first.
         let stamp = &sc.stamp;
-        self.mid_grid.knn(me.state.pos, mid_radius, cfg.mid_per_tick, |j| stamp[j as usize] != epoch, &mut sc.knn);
+        self.mid_grid.knn(me.state.pos, mid_radius, cfg.mid_per_tick, |j| stamp[j as usize] != epoch && !hidden(j), &mut sc.knn);
         sc.tally.mid_scanned += sc.knn.scanned;
         sc.mid.clear();
         for &key in sc.knn.keys() {
@@ -2963,13 +3076,13 @@ impl View<'_> {
         let carried = std::mem::take(&mut slot.far_carry);
         for &j in &carried {
             let d2 = self.dist2(me.state.pos, j);
-            if self.bodies[j as usize].alive && sc.stamp[j as usize] != epoch && d2 > r_mid2 && d2 <= r_far2 {
+            if self.bodies[j as usize].alive && sc.stamp[j as usize] != epoch && d2 > r_mid2 && d2 <= r_far2 && !hidden(j as u32) {
                 sc.far.push((-1.0, j));
                 sc.stamp[j as usize] = epoch;
             }
         }
         self.far_grid.for_each_near(me.state.pos, far_radius, |j| {
-            if sc.stamp[j as usize] != epoch {
+            if sc.stamp[j as usize] != epoch && !hidden(j) {
                 let d2 = self.dist2(me.state.pos, j as u16);
                 if d2 > r_mid2 && d2 <= r_far2 {
                     sc.far.push((d2, j as u16));

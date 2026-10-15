@@ -13,6 +13,7 @@
 //! else's tracers show the real shot). *Recoil* kicks the shooter's view; it's
 //! the client's, since shots go where the view points.
 
+use crate::ability::Ability;
 use crate::movement::{MoveState, BUTTON_RELOAD, TICK_HZ};
 
 /// Muzzle speed, m/s: ~20 m a step.
@@ -392,6 +393,8 @@ pub struct Ammo {
     /// Steps until the reload under way is done; 0: none.
     pub reload: u8,
     pub kit: u8,
+    /// The class's ability (U6), run by the same steps.
+    pub ability: Ability,
 }
 
 impl Default for Ammo {
@@ -402,18 +405,28 @@ impl Default for Ammo {
 
 impl Ammo {
     /// As a player spawns with the assault rifle.
-    pub const FULL: Ammo = Ammo { mag: MAGAZINE, reserve: RESERVE, reload: 0, kit: 0 };
+    pub const FULL: Ammo = Ammo { mag: MAGAZINE, reserve: RESERVE, reload: 0, kit: 0, ability: Ability { active: 0, cooldown: 0, energy: 0, held: false } };
 
-    /// As a player spawns with kit `kit`'s weapon.
+    /// As a player spawns with kit `kit`'s weapon (and its ability ready).
     pub fn full(kit: u8) -> Ammo {
         let w = of(kit);
-        Ammo { mag: w.magazine, reserve: w.reserve, reload: 0, kit }
+        Ammo { mag: w.magazine, reserve: w.reserve, reload: 0, kit, ability: Ability::fresh(kit) }
+    }
+
+    /// Full rounds again (unlimited rounds' refill), the ability as it is.
+    pub fn refilled(&self) -> Ammo {
+        Ammo { ability: self.ability, ..Ammo::full(self.kit) }
+    }
+
+    /// What the ability does to movement in a step with `buttons`, taken before it.
+    pub fn gear(&self, buttons: u8) -> crate::ability::Gear {
+        self.ability.gear(self.kit, buttons)
     }
 
     /// One input's step: the reload counts down (and, done, fills the
     /// magazine from the reserve); a shot in the step fires if a round is
-    /// ready (returns whether it did); then the reload button. The last round
-    /// starts a reload by itself.
+    /// ready (returns whether it did); then the reload button; then the
+    /// ability. The last round starts a reload by itself.
     pub fn step(&mut self, buttons: u8, shot: bool) -> bool {
         self.tick();
         let fired = shot && self.ready();
@@ -423,6 +436,7 @@ impl Ammo {
         if buttons & BUTTON_RELOAD != 0 {
             self.start_reload();
         }
+        self.ability.step(self.kit, buttons, fired);
         fired
     }
 
@@ -608,11 +622,11 @@ mod tests {
         // A full magazine doesn't reload; an empty reserve can't.
         a.step(BUTTON_RELOAD, false);
         assert_eq!(a.reload, 0);
-        let mut dry = Ammo { mag: 2, reserve: 0, reload: 0, kit: 0 };
+        let mut dry = Ammo { mag: 2, reserve: 0, reload: 0, kit: 0, ability: Ability::default() };
         assert!(dry.step(0, true) && dry.step(0, true) && !dry.step(0, true));
         assert_eq!((dry.mag, dry.reload), (0, 0), "nothing to reload with");
         // The last rounds of the reserve: a partial magazine.
-        let mut low = Ammo { mag: 0, reserve: 7, reload: 1, kit: 0 };
+        let mut low = Ammo { mag: 0, reserve: 7, reload: 1, kit: 0, ability: Ability::default() };
         low.tick();
         assert_eq!((low.mag, low.reserve), (7, 0));
     }

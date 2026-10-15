@@ -13,7 +13,7 @@
 //! S->C reliable    Welcome  tag | entity:2 | spawn:2×f32 | spawn_z:f32 | anchor:2×f32 | radius:f32 | world:8 | world_digest:8 | rules:1
 //! S->C unreliable  Snapshot tag | server_tick:4 | step:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
 //!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 stance:1 (grounded, crouched, away) | pushes:1 | health:1 | life:1
-//!                           | ammo mag:1 reserve:2 reload:1 kit:1
+//!                           | ammo mag:1 reserve:2 reload:1 kit:1 | ability active:2 cooldown:2 energy:2 held:1
 //! S->C unreliable  Near     see delta.rs: deltas against acked baselines, one per tick, tagged
 //! S->C unreliable  Activity distant fights' firing per 128 m cell, once per 0.5 s window (see activity.rs)
 //! S->C unreliable  Entities tag | server_tick:4 | tier:1 | n:1 | n × blob         (mid and far; one or more per tier per tick)
@@ -53,7 +53,7 @@ pub const MSG_DEPLOY: u8 = 10;
 pub const INPUT_REDUNDANCY: usize = 3;
 /// Mid- and far-tier blob.
 pub const FAR_BLOB: usize = 12;
-pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1 + 1 + 1 + 5;
+pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1 + 1 + 1 + 5 + 7;
 /// Render times in inputs are in 1/`RENDER_UNITS` steps, as a wrapping u16:
 /// unambiguous within ±512 steps (±17 s) of the server's step.
 pub const RENDER_UNITS: f64 = 64.0;
@@ -356,6 +356,11 @@ pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
     w.u16(h.ammo.reserve);
     w.u8(h.ammo.reload);
     w.u8(h.ammo.kit);
+    let a = &h.ammo.ability;
+    w.u16(a.active);
+    w.u16(a.cooldown);
+    w.u16(a.energy);
+    w.u8(a.held as u8);
 }
 
 /// Starts an Entities message; append exactly `count` blobs of `tier` after it.
@@ -405,7 +410,9 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             }
             let own = MoveState { pos, vel, z, vz, grounded: stance & STANCE_GROUNDED != 0, crouched: stance & STANCE_CROUCHED != 0 };
             let (pushes, health, life) = (r.u8()?, r.u8()?, r.u8()?);
-            let ammo = Ammo { mag: r.u8()?, reserve: r.u16()?, reload: r.u8()?, kit: r.u8()? };
+            let (mag, reserve, reload, kit) = (r.u8()?, r.u16()?, r.u8()?, r.u8()?);
+            let ability = crate::ability::Ability { active: r.u16()?, cooldown: r.u16()?, energy: r.u16()?, held: r.u8()? != 0 };
+            let ammo = Ammo { mag, reserve, reload, kit, ability };
             r.finish()?;
             Ok(ServerMsg::Snapshot(SnapshotHeader {
                 server_tick,
@@ -593,7 +600,7 @@ mod tests {
             pushes: 9,
             health: 37,
             life: 255,
-            ammo: Ammo { mag: 17, reserve: 1000, reload: 81, kit: 3 },
+            ammo: Ammo { mag: 17, reserve: 1000, reload: 81, kit: 3, ability: crate::ability::Ability { active: 1, cooldown: 300, energy: 377, held: true } },
             away: true,
         };
         let mut wr = Writer::default();

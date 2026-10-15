@@ -225,6 +225,14 @@ impl Handle {
             mag: ammo.mag,
             reserve: ammo.reserve,
             reload: ammo.reload as f32 / TICK_HZ as f32,
+            ability_left: if ammo.ability.on() && lattice_game::ability::max_energy(ammo.kit) == 0 { ammo.ability.active as f32 / TICK_HZ as f32 } else { 0.0 },
+            ability_cooldown: ammo.ability.cooldown as f32 / TICK_HZ as f32,
+            ability_energy: match lattice_game::ability::max_energy(ammo.kit) {
+                0 => 1.0,
+                m => ammo.ability.energy as f32 / m as f32,
+            },
+            ability_on: ammo.ability.on() as u8,
+            reserved: [0; 3],
         }
     }
 
@@ -242,7 +250,8 @@ impl Handle {
                     | if st.dead { FLAG_DEAD } else { 0 }
                     | if st.ads { FLAG_ADS } else { 0 }
                     | if st.crouched { FLAG_CROUCHED } else { 0 }
-                    | if st.reloading { FLAG_RELOADING } else { 0 };
+                    | if st.reloading { FLAG_RELOADING } else { 0 }
+                    | if st.ability { FLAG_ABILITY } else { 0 };
                 *e = LtEntity {
                     id,
                     faction: faction(id),
@@ -298,7 +307,8 @@ impl Handle {
                     | if s.dead { FLAG_DEAD } else { 0 }
                     | if s.ads { FLAG_ADS } else { 0 }
                     | if s.crouched { FLAG_CROUCHED } else { 0 }
-                    | if s.reloading { FLAG_RELOADING } else { 0 },
+                    | if s.reloading { FLAG_RELOADING } else { 0 }
+                    | if s.ability { FLAG_ABILITY } else { 0 },
                 health: s.health,
                 kit: s.kit,
                 pos: s.pos.into(),

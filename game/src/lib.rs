@@ -6,6 +6,7 @@
 //! (`lattice-sim`), the bots and the client all depend on this crate, so there
 //! is exactly one copy of anything that must agree on both sides.
 
+pub mod ability;
 pub mod activity;
 pub mod class;
 pub mod clock;

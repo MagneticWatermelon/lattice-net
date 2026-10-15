@@ -1383,6 +1383,135 @@ fn every_class_fires_its_own_weapon_and_others_see_it() {
 }
 
 #[test]
+fn every_ability_is_predicted_exactly() {
+    // A swarm of every class, each using its ability now and then (jets
+    // held for most of a second, the rest pressed), wandering: the abilities'
+    // states and what they do to movement (jets, a Bulwark's slower walk, a
+    // cloak's no sprint) are predicted bit for bit. Each is seen on, and the
+    // jets lift a Skirmisher well off the ground.
+    use lattice_game::class;
+    let cfg = SimConfig { spawn: SpawnMode::Disk(60.0), immortal: true, ..Default::default() };
+    let mut s = Swarm::with_config(10, cfg);
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let ids: Vec<u16> = s.bots.iter().map(|b| b.2.welcome().unwrap().entity).collect();
+    for (i, &e) in ids.iter().enumerate() {
+        s.server.set_kit(e, (i % class::CLASSES as usize) as u8);
+        s.bots[i].2.set_abilities(true);
+    }
+    let (mut seen, mut lift) = ([false; class::CLASSES as usize], 0.0f32);
+    for _ in 0..40 * TICK_HZ {
+        s.step();
+        for (i, &e) in ids.iter().enumerate() {
+            let kit = i % class::CLASSES as usize;
+            seen[kit] |= s.server.ability_on(e);
+            if kit == class::SKIRMISHER as usize {
+                let st = s.server.entity_state(e).unwrap();
+                lift = lift.max(st.z - s.server.world().ground(st.pos[0], st.pos[1], st.z, 0.6, lattice_game::clock::Live::OFF).min(st.z));
+            }
+        }
+    }
+    eprintln!("seen on: {seen:?}, jets lifted {lift:.1} m");
+    for (i, b) in s.bots.iter().enumerate() {
+        let st = &b.2.core().stats;
+        assert_eq!((st.corrections, st.ammo_corrections), (0, 0), "bot {i} (kit {}): predicted exactly", i % 5);
+    }
+    assert_eq!(seen, [true, true, false, true, true], "every class with an ability used it (the engineer has none yet)");
+    assert!(lift > 3.0, "jets climb: {lift} m");
+}
+
+#[test]
+fn a_bulwark_takes_less_mend_heals_and_a_cloak_hides() {
+    use lattice_game::{ability, class};
+    use lattice_sim::bot::Moves;
+    let interest = InterestConfig { squad_size: 0, ..Default::default() };
+    let cfg = SimConfig { spawn: SpawnMode::Line(50.0), interest, ..Default::default() };
+    let mut s = render_swarm(6, cfg, Duration::from_secs(3600));
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    // Bot 0, a friend of its (bot 3 below) and an enemy (bot 1), placed 4 m
+    // apart; the rest out of the way.
+    let all: Vec<u16> = s.bots.iter().map(|b| b.2.welcome().unwrap().entity).collect();
+    let side = |e: u16| lattice_game::faction::faction(e);
+    let friend = (1..all.len()).find(|&i| side(all[i]) == side(all[0])).unwrap();
+    let enemy = (1..all.len()).find(|&i| side(all[i]) != side(all[0])).unwrap();
+    let order = [0, enemy, usize::MAX, friend];
+    let ids: Vec<u16> = order.iter().map(|&i| if i == usize::MAX { u16::MAX } else { all[i] }).collect();
+    let bot = |k: usize| order[k];
+    let (a, _) = range(s.server.world());
+    for (i, &e) in all.iter().enumerate() {
+        let k = order.iter().position(|&o| o == i).unwrap_or(10 + i);
+        s.server.teleport(e, [a[0] + 4.0 * k as f32, a[1] + if k >= 10 { 40.0 } else { 0.0 }]);
+        s.bots[i].2.set_moves(Moves::Hold);
+    }
+    let press = |s: &mut Swarm, k: usize| {
+        s.bots[bot(k)].2.hold_ability(true);
+        for _ in 0..3 {
+            s.step();
+        }
+        s.bots[bot(k)].2.hold_ability(false);
+        s.step();
+    };
+
+    // Bulwark: 20 lands as 12.
+    s.server.set_kit(ids[0], class::ASSAULT);
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    press(&mut s, 0);
+    assert!(s.server.ability_on(ids[0]));
+    s.server.damage_by(ids[0], 20, ids[1]);
+    s.step();
+    assert_eq!(s.server.vitals(ids[0]), Some((100 - 12, false)), "a Bulwark takes 60%");
+
+    // Mend field: the medic (bot 3), moved in 3 m off, heals its friend (bot 0).
+    s.server.set_kit(ids[3], class::MEDIC);
+    s.server.teleport(ids[3], [a[0] + 3.0, a[1]]);
+    s.server.damage_by(ids[0], 60, ids[1]);
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let hurt = s.server.vitals(ids[0]).unwrap().0;
+    press(&mut s, 3);
+    for _ in 0..3 * TICK_HZ {
+        s.step();
+    }
+    let healed = s.server.vitals(ids[0]).unwrap().0;
+    eprintln!("mend: {hurt} -> {healed}");
+    assert!(healed >= hurt + 5 * ability::MEND_HEAL, "healed 8 a second: {hurt} -> {healed}");
+
+    // Cloak: the enemy (bot 1) 30 m off stops being sent the recon (bot 3); in 10 m, it's back, cloaked.
+    s.server.set_kit(ids[3], class::RECON);
+    s.server.teleport(ids[3], [a[0] + 4.0 + 30.0, a[1]]);
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+    }
+    let seen = |s: &Swarm| s.bots[bot(1)].2.core().entities().and_then(|e| e.newest(ids[3])).map(|x| (x.ability, x.step));
+    assert!(seen(&s).is_some(), "seen uncloaked");
+    press(&mut s, 3);
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+    }
+    assert!(s.server.ability_on(ids[3]), "cloaked");
+    let before = seen(&s).map(|x| x.1);
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    assert_eq!(seen(&s).map(|x| x.1), before, "past 15 m, nothing more is sent");
+    s.server.teleport(ids[3], [a[0] + 4.0 + 10.0, a[1]]);
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    assert!(seen(&s).is_some_and(|x| x.0 && Some(x.1) != before), "within 15 m, sent, cloaked");
+    for (i, b) in s.bots.iter().enumerate() {
+        let st = &b.2.core().stats;
+        assert_eq!(st.ammo_corrections, 0, "bot {i}: abilities predicted");
+    }
+}
+
+#[test]
 fn dying_mid_burst_spends_no_rounds_on_refused_shots() {
     // A shot pulled after the server has killed us, before we know it, is
     // refused (the body is dead): the client's replay from the snapshot that
@@ -2464,6 +2593,51 @@ fn players_deploy_into_their_spawn_rooms_and_every_life_is_exact() {
     // Fights: every client hears where everyone is.
     assert!(s.bots.iter().all(|(_, _, b)| !b.core().shell.fights.is_empty()));
     assert_eq!(s.corrections(), 0, "prediction stays exact through every life");
+}
+
+#[test]
+fn a_spawn_rooms_field_hurts_whoever_isnt_its_sides() {
+    // An enemy in a spawn room (shut in when its site flipped back, say)
+    // takes the room's field until it dies; its holders' own don't.
+    use lattice_game::events::CAUSE_FIELD;
+    use lattice_game::faction::faction;
+    use lattice_game::world::KILN;
+    use lattice_sim::bot::Moves;
+    let mut s = Swarm::with_config(6, SimConfig { world: KILN, spawn: SpawnMode::Uniform, deploy: true, ..Default::default() });
+    for (_, _, b) in &mut s.bots {
+        b.set_moves(Moves::Hold);
+    }
+    for _ in 0..12 * TICK_HZ {
+        s.step();
+    }
+    assert_eq!(s.server.counters().deploys, 6);
+    let ids: Vec<u16> = s.bots.iter().map(|b| b.2.welcome().unwrap().entity).collect();
+    let host = ids[0];
+    let st = s.server.entity_state(host).unwrap();
+    assert!(
+        s.server.world().spawn_rooms().iter().any(|r| {
+            let d = [st.pos[0] - r.center[0], st.pos[1] - r.center[1]];
+            (d[0] * r.axis[0] + d[1] * r.axis[1]).abs() <= r.half[0] && (-d[0] * r.axis[1] + d[1] * r.axis[0]).abs() <= r.half[1]
+        }),
+        "deployed into a room"
+    );
+    let intruder = *ids.iter().find(|&&e| faction(e) != faction(host)).unwrap();
+    let ii = ids.iter().position(|&e| e == intruder).unwrap();
+    // Beside its host (the room's middle may be over a lift).
+    let at = s.server.entity_state(host).unwrap();
+    s.server.teleport_at(intruder, [at.pos[0] + 0.9, at.pos[1]], at.z + 0.3);
+    for _ in 0..2 * TICK_HZ {
+        s.step();
+    }
+    let (health, _) = s.server.vitals(intruder).unwrap();
+    assert!((100 - 5 * 12..100).contains(&health), "hurt by the field: {health}");
+    assert_eq!(s.server.vitals(host), Some((100, false)), "not its holders");
+    for _ in 0..4 * TICK_HZ {
+        s.step();
+    }
+    let recap = s.bots[ii].2.core().shell.recap.clone().expect("dead, with a recap");
+    assert_eq!(recap.cause, CAUSE_FIELD);
+    assert_eq!(s.corrections(), 0);
 }
 
 #[test]

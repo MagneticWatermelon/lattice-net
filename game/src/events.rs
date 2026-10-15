@@ -59,6 +59,8 @@ pub const XP_DEFEND: u16 = 100;
 /// 0 is the assault rifle), or a fall.
 pub const CAUSE_RIFLE: u8 = 0;
 pub const CAUSE_FALL: u8 = 255;
+/// A spawn room's field: it hurts anyone in it whose side doesn't hold its site.
+pub const CAUSE_FIELD: u8 = 254;
 /// A recap's damage reaches back this far: 5 s.
 pub const RECAP_STEPS: u32 = 150;
 /// The most damage lines a recap carries.

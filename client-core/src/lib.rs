@@ -30,7 +30,7 @@ use lattice_game::activity;
 use lattice_game::delta;
 use lattice_game::events::{self, Event, Fight, Recap, SeenShot};
 use lattice_game::clock::Live;
-use lattice_game::movement::{dead_input, stand_in, step, Input, MoveState, Mover, NO_FACTION, TICK_HZ};
+use lattice_game::movement::{dead_input, stand_in, step_with, Input, MoveState, Mover, NO_FACTION, TICK_HZ};
 use lattice_game::territory::{self, Territory};
 use lattice_game::msg::{self, InputEntry, ServerMsg, SnapshotHeader, Welcome, INPUT_REDUNDANCY, WAIT_STAND_IN};
 use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot};
@@ -994,10 +994,10 @@ impl ClientCore {
                 let applied = if dead { dead_input(input) } else { input };
                 let at = h.step + (seq - h.ack_seq);
                 Self::owners_for(self.territory.as_ref(), at, &mut self.owners);
-                s = step(&world, s, applied, Mover { faction: side, owners: &self.owners, live: Live::at(at) });
+                s = step_with(&world, s, applied, Mover { faction: side, owners: &self.owners, live: Live::at(at) }, ammo.gear(applied.buttons));
                 ammo.step(applied.buttons, false);
                 if self.unlimited {
-                    ammo = Ammo::FULL;
+                    ammo = ammo.refilled();
                 }
             }
             self.history[seq as usize % HISTORY] = Predicted { seq, input, state: s, sent_at: None, render: None, shot: None, ammo };
@@ -1035,12 +1035,12 @@ impl ClientCore {
             let applied = if dead { dead_input(p.input) } else { p.input };
             let at = (seq as i64 + offset).max(0) as u32;
             Self::owners_for(self.territory.as_ref(), at, &mut self.owners);
-            s = step(world, s, applied, Mover { faction: side, owners: &self.owners, live: Live::at(at) });
+            s = step_with(world, s, applied, Mover { faction: side, owners: &self.owners, live: Live::at(at) }, a.gear(applied.buttons));
             // A shot we pulled before we knew we'd died: the server refuses it
             // (the body is dead), and it spends no round.
             a.step(applied.buttons, p.shot.is_some() && !dead);
             if self.unlimited {
-                a = Ammo::full(a.kit);
+                a = a.refilled();
             }
             (p.state, p.ammo) = (s, a);
         }
@@ -1269,7 +1269,8 @@ impl ClientCore {
             let applied = if self.is_dead() { dead_input(input) } else { input };
             let (side, at) = (self.faction(), self.step_of(self.seq));
             Self::owners_for(self.territory.as_ref(), at, &mut self.owners);
-            self.state = step(self.world.as_ref().expect("welcomed"), self.state, applied, Mover { faction: side, owners: &self.owners, live: Live::at(at) });
+            let gear = self.ammo.gear(applied.buttons);
+            self.state = step_with(self.world.as_ref().expect("welcomed"), self.state, applied, Mover { faction: side, owners: &self.owners, live: Live::at(at) }, gear);
             // A shot fired during this step (a resync drops one it skips).
             let shot = self.pending_shot.filter(|&(seq, _)| seq <= self.seq).map(|(_, shot)| shot);
             if shot.is_some() {
@@ -1278,7 +1279,7 @@ impl ClientCore {
             }
             self.ammo.step(applied.buttons, shot.is_some());
             if self.unlimited {
-                self.ammo = Ammo::full(self.ammo.kit);
+                self.ammo = self.ammo.refilled();
             }
             self.history[self.seq as usize % HISTORY] =
                 Predicted { seq: self.seq, input, state: self.state, sent_at: Some(now), render, shot, ammo: self.ammo };
