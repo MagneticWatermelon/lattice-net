@@ -303,6 +303,76 @@ pub fn terrain(world: &World, p0: V, p1: V) -> Option<f32> {
     None
 }
 
+/// What a segment hit (a tracer, a thrown gadget: `segment_hit`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Impact {
+    pub pos: [f32; 3],
+    /// Unit normal of the surface hit.
+    pub normal: [f32; 3],
+    /// The flight's direction at impact (unit).
+    pub dir: [f32; 3],
+    /// `None` for the terrain, else the cover box's kind
+    /// (`world::Kind as u8`).
+    pub cover: Option<u8>,
+}
+
+/// Where a segment from `a` to `b`, fired by `faction`, first hits the
+/// ground or cover (its own faction's shields let it through).
+pub fn segment_hit(world: &World, a: [f32; 3], b: [f32; 3], faction: u8) -> Option<Impact> {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let dir = if len > 1e-6 { d.map(|v| v / len) } else { [0.0, 0.0, -1.0] };
+    let at = |t: f32| [a[0] + d[0] * t, a[1] + d[1] * t, a[2] + d[2] * t];
+    let mut best: Option<(f32, [f32; 3], Option<u8>)> = terrain(world, a, b).map(|t| {
+        let p = at(t);
+        (t, terrain_normal(world, p[0], p[1]), None)
+    });
+    let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+    world.boxes_near(mid[0], mid[1], len / 2.0 + 1.0, |c| {
+        if !c.blocks(faction) {
+            return;
+        }
+        if let Some(t) = solid(a, b, c) {
+            if best.is_none_or(|(bt, _, _)| t < bt) {
+                let normal = if c.is_turned() || c.is_wedge() {
+                    solid_normal(a, b, t, c)
+                } else {
+                    box_normal(at(t), [c.min[0], c.min[1], c.bottom], [c.max[0], c.max[1], c.top], dir)
+                };
+                best = Some((t, normal, Some(c.kind as u8)));
+            }
+        }
+    });
+    best.map(|(t, normal, cover)| Impact { pos: at(t), normal, dir, cover })
+}
+
+/// The terrain's unit normal at (x, y), from its slope across a sample.
+pub fn terrain_normal(world: &World, x: f32, y: f32) -> [f32; 3] {
+    let e = crate::world::TERRAIN_RES * 0.5;
+    let dx = world.terrain(x + e, y) - world.terrain(x - e, y);
+    let dy = world.terrain(x, y + e) - world.terrain(x, y - e);
+    let n = [-dx, -dy, 2.0 * e];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    n.map(|v| v / len)
+}
+
+/// The face of a box a point on its surface lies on, as an outward normal;
+/// a point inside (a segment starting in it) faces back along `dir`.
+fn box_normal(p: [f32; 3], min: [f32; 3], max: [f32; 3], dir: [f32; 3]) -> [f32; 3] {
+    let mut best = (f32::MAX, [-dir[0], -dir[1], -dir[2]]);
+    for k in 0..3 {
+        for (face, sign) in [(min[k], -1.0), (max[k], 1.0)] {
+            let gap = (p[k] - face).abs();
+            if gap < best.0 {
+                let mut n = [0.0; 3];
+                n[k] = sign;
+                best = (gap, n);
+            }
+        }
+    }
+    best.1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

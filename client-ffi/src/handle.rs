@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use lattice_client_core::aim;
 use lattice_client_core::distant::AmbientShot;
+use lattice_client_core::gadgets::Fx as GadgetFx;
+use lattice_game::gadget;
 use lattice_client_core::tracers::{Fired, Tracers};
 use lattice_client_core::{ClientConfig, How};
 use lattice_game::events::{Event, SeenShot};
@@ -64,6 +66,7 @@ pub struct Handle {
     fx: Vec<LtFx>,
     news: Vec<Event>,
     seen: Vec<SeenShot>,
+    gadget_fx: Vec<GadgetFx>,
     ambient: Vec<AmbientShot>,
     drained: [Vec<u16>; 3],
     drawn: [u32; 3],
@@ -92,6 +95,7 @@ impl Handle {
             fx: Vec::new(),
             news: Vec::new(),
             seen: Vec::new(),
+            gadget_fx: Vec::new(),
             ambient: Vec::new(),
             drained: Default::default(),
             drawn: [0; 3],
@@ -192,7 +196,8 @@ impl Handle {
         let (yaw, pitch) = (if i.yaw.is_finite() { i.yaw } else { 0.0 }, if i.pitch.is_finite() { i.pitch } else { 0.0 });
         let (move_x, move_y) = aim::stick(yaw, clamp(i.forward), clamp(i.right));
         let buttons = i.buttons & (BUTTON_SPRINT | BUTTON_JUMP | BUTTON_ADS | BUTTON_CROUCH | BUTTON_RELOAD | BUTTON_ABILITY);
-        let input = Input { move_x, move_y, yaw: aim::yaw_u16(yaw), pitch: aim::pitch_i16(pitch), buttons };
+        let tools = i.tools & (gadget::TOOL_USE | gadget::TOOL_ONE | gadget::TOOL_TWO);
+        let input = Input { move_x, move_y, yaw: aim::yaw_u16(yaw), pitch: aim::pitch_i16(pitch), buttons, tools };
         if self.threaded {
             self.intent = input;
         } else {
@@ -233,8 +238,52 @@ impl Handle {
                 m => ammo.ability.energy as f32 / m as f32,
             },
             ability_on: ammo.ability.on() as u8,
-            reserved: [0; 3],
+            tool_kinds: [gadget::tool(ammo.kit, 0).0, gadget::tool(ammo.kit, 1).0],
+            tools: core.tools,
+            using: core.using,
+            reserved: [0; 2],
+            use_progress: core.use_progress as f32 / 255.0,
         }
+    }
+
+    /// Every gadget, flown to the render step (as many as fit in `out`);
+    /// returns how many there are. After `render`.
+    pub fn gadgets(&mut self, out: &mut [LtGadget]) -> usize {
+        let core = &mut self.session.core;
+        core.fly_gadgets();
+        let me = core.welcome().map(|w| w.entity);
+        let g = &core.gadgets;
+        let r = g.render();
+        let secs = |steps: f64| (steps / TICK_HZ as f64) as f32;
+        for (o, t) in out.iter_mut().zip(&g.list) {
+            let (yaw, pitch) = t.aim.map_or((0.0, 0.0), |(y, p)| (aim::yaw_radians(y), aim::pitch_radians(p)));
+            *o = LtGadget {
+                id: t.g.id,
+                kind: t.g.kind,
+                faction: t.g.faction,
+                resting: t.g.resting as u8,
+                ours: (Some(t.g.owner) == me) as u8,
+                owner: t.g.owner,
+                health: t.g.health,
+                pos: g.drawn(t).into(),
+                normal: t.g.normal.into(),
+                vel: t.g.vel.into(),
+                age: secs(r - t.g.born as f64).max(0.0),
+                yaw,
+                pitch,
+                since_shot: if t.shot_at.is_finite() { secs(r - t.shot_at).max(0.0) } else { 1e6 },
+            };
+        }
+        g.list.len()
+    }
+
+    /// The enemies our side's recon darts see now (as many as fit); returns how many.
+    pub fn spotted(&self, out: &mut [u16]) -> usize {
+        let s = &self.session.core.gadgets.spotted;
+        for (o, &e) in out.iter_mut().zip(s) {
+            *o = e;
+        }
+        s.len()
     }
 
     /// Draws every other player at this frame's render step into `out` (as
@@ -361,6 +410,20 @@ impl Handle {
         }
         let own = core.welcome().map(|w| w.entity);
         self.tracers.on_shots(own, self.seen.drain(..), secs);
+        // Gadgets' bursts and turrets' shots (a turret's tracer flies too).
+        core.gadgets.drain_fx(&mut self.gadget_fx);
+        for f in self.gadget_fx.drain(..) {
+            push_fx(
+                &mut self.fx,
+                match f {
+                    GadgetFx::Blast { kind, pos } => LtFx { kind: FX_BLAST, weapon: kind, shooter: NOBODY, pos: pos.into(), normal: [0.0, 0.0, 1.0].into(), ..LtFx::default() },
+                    GadgetFx::Shot { gun, dir, faction } => {
+                        self.tracers.turret_shot(gun, dir, faction);
+                        LtFx { kind: FX_TURRET, tracer: 1, faction, shooter: NOBODY, pos: gun.into(), dir: dir.into(), ..LtFx::default() }
+                    }
+                },
+            );
+        }
         core.drain_ambient(now, &mut self.ambient);
         let fx = &mut self.fx;
         self.tracers.on_ambient(&self.ambient, self.others_muzzle, |f| push_fx(fx, shot_fx(f)));
@@ -592,6 +655,7 @@ impl Handle {
             corrections: st.corrections,
             push_corrections: st.push_corrections,
             ammo_corrections: st.ammo_corrections,
+            refills: st.refills,
             resyncs: st.resyncs,
             shots_dropped: st.shots_dropped,
             life_events: st.life_events,

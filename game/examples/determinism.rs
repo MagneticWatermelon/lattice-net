@@ -18,11 +18,15 @@
 //! - **weapon:** aim, spread, bloom, flights and their hits (standing and
 //!   crouched), and the rifle's rounds over shots and reloads;
 //! - **codecs:** what both sides quantize and decode (near states, blobs,
-//!   distant fights, directions, render steps).
+//!   distant fights, directions, render steps);
+//! - **gadgets:** thrown things' flights over Kiln (U6): the server flies
+//!   them and every client flies them again from the throw, unsent.
+//!   (Kiln's own world is under its hash.)
 
 use lattice_game::activity;
 use lattice_game::delta::{self, NearEntry, NearHistory, NearQ};
 use lattice_game::events;
+use lattice_game::gadget;
 use lattice_game::hit;
 use lattice_game::kit::{self, KIT};
 use lattice_game::movement::{dead_input, nudge, step, Input, MoveState, BUTTON_ADS, BUTTON_CROUCH, BUTTON_JUMP, BUTTON_RELOAD, BUTTON_SPRINT};
@@ -115,7 +119,7 @@ fn main() {
                 let buttons = [0, BUTTON_SPRINT, BUTTON_JUMP, BUTTON_ADS, BUTTON_SPRINT | BUTTON_JUMP, BUTTON_CROUCH, BUTTON_CROUCH | BUTTON_ADS, BUTTON_CROUCH | BUTTON_JUMP]
                     [rng.below(8) as usize];
                 let (mx, my) = (rng.below(255) as i32 - 127, rng.below(255) as i32 - 127);
-                input = Input { move_x: mx as i8, move_y: my as i8, yaw: rng.next() as u16, pitch: (rng.below(65535) as i32 - 32767) as i16, buttons };
+                input = Input { move_x: mx as i8, move_y: my as i8, yaw: rng.next() as u16, pitch: (rng.below(65535) as i32 - 32767) as i16, buttons, tools: 0 };
             }
             if k % 500 == 499 {
                 dead = 150; // dies; the body settles, then it's back
@@ -357,4 +361,24 @@ fn main() {
         h.f64(msg::render_age(tick + 7, msg::render_units(r)));
     }
     println!("codecs {:016x}", h.0);
+
+    // Gadgets thrown all over Kiln at every angle, each flown 4 s: through
+    // the air, off its cliffs and boxes, stuck or come to rest.
+    let mut h = Hash::new();
+    let kinds = [gadget::FRAG, gadget::SMOKE, gadget::C4, gadget::MINE, gadget::AMMO_PACK, gadget::DART];
+    for k in 0..600u32 {
+        let at = [200.0 + rng.unit() * 7790.0, 200.0 + rng.unit() * 7790.0];
+        let s = MoveState::standing(&kiln, at);
+        let kind = kinds[k as usize % kinds.len()];
+        let (yaw, pitch) = (rng.unit() * std::f32::consts::TAU, rng.unit() * 1.6 - 0.8);
+        let mut g = gadget::Gadget::thrown(k, kind, 0, (k % 3) as u8, [s.pos[0], s.pos[1], s.z + 1.6], yaw, pitch, k);
+        for _ in 0..120 {
+            h.u64(g.step(&kiln) as u64);
+            for v in g.pos.into_iter().chain(g.vel).chain(g.normal) {
+                h.f32(v);
+            }
+        }
+        h.f64(gadget::blast_damage(gadget::FRAG, rng.unit() * 7.0) as f64);
+    }
+    println!("gadgets {:016x}", h.0);
 }

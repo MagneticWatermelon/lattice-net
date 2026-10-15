@@ -33,7 +33,7 @@ use lattice_game::world::World;
 use crate::interest::{self, due, near_base, InterestConfig, NearCandidate, NearState, SelectScratch, Tier};
 use crate::ladder::{self, ClientLadder, Ladder, LadderConfig, PaceMeter, Rung, MAX_LEVEL};
 use crate::movement::{self, step, Input, MoveState, BUTTON_ADS, BUTTON_RELOAD, GRACE_TICKS, HEIGHT, RADIUS, TICK_HZ, WORLD_SIZE};
-use lattice_game::{ability, class};
+use lattice_game::{ability, class, gadget};
 use crate::shots::{self, ClockRate, Cut, Dips, Fire, FlyStats, History, Judgment, Outcome, Projectile, RenderFloor, Sky, SpreadKey};
 use lattice_game::weapon::{self, shot_time, Ammo, Bloom, Shot};
 use lattice_game::msg::MID_LAG_UNITS;
@@ -52,6 +52,9 @@ use crate::delta::{self, NearEntry, NearQ, MAX_BASE_AGE, NEAR_HISTORY};
 use crate::msg::{self, Blob, PacketFill, RenderTime, SnapshotHeader, Welcome, FAR_BLOB, SNAPSHOT_LEN, WAIT_STAND_IN};
 use crate::rng::Rng;
 use crate::stats::Histogram;
+
+#[path = "gadgets.rs"]
+mod gadgets;
 
 pub const PHASES: [&str; 10] = ["ingress", "events", "movement", "grid", "separate", "history", "shots", "serialize", "assembly", "transport"];
 pub type Datagram = (SocketAddr, Vec<u8>);
@@ -326,6 +329,18 @@ pub struct Counters {
     /// Recaps sent, and XP rewarded.
     pub recaps: u64,
     pub xp: u64,
+    /// Gadgets (U6): thrown or set down; bursts (shells too); ammo packs'
+    /// refills; turrets' shots; heals and repairs given (a beat each);
+    /// revives; turrets hacked; gadget news sent (items).
+    pub gadgets: u64,
+    pub blasts: u64,
+    pub supplies: u64,
+    pub turret_shots: u64,
+    pub heals: u64,
+    pub repairs: u64,
+    pub revives: u64,
+    pub hacks: u64,
+    pub gadget_news: u64,
     pub inputs_applied: u64,
     /// Entity-ticks where the next input hadn't arrived. Each consumes that seq
     /// with a stand-in: the last input for `GRACE_TICKS`, then a frozen one.
@@ -473,6 +488,17 @@ struct Body {
     /// transit counts lanes from there; none: never deployed).
     died_at: u32,
     died_in: Option<u16>,
+    /// Its class's two tools: how many of each are left this life (`gadget::TOOLS`).
+    tools: [u8; 2],
+    /// Its use key held (`gadget::TOOL_USE`); what it's doing with it
+    /// (`gadget::USING_*`), to whom (an entity, or a gadget: `gadgets`), for
+    /// how many steps.
+    use_held: bool,
+    using: u8,
+    use_target: u32,
+    progress: u16,
+    /// Ammo packs' refills of its reserve (wrapping), for the snapshot.
+    supplies: u8,
 }
 
 impl Default for Body {
@@ -504,6 +530,12 @@ impl Default for Body {
             exo_ready: 0,
             died_at: 0,
             died_in: None,
+            tools: [0; 2],
+            use_held: false,
+            using: gadget::USING_NONE,
+            use_target: gadgets::NO_TARGET,
+            progress: 0,
+            supplies: 0,
         }
     }
 }
@@ -772,6 +804,11 @@ struct InputQueue {
     session: Session,
     /// A judgment flagged it for the first time since the last tick.
     flagged_now: bool,
+    /// Its tools byte at the last step (`Input::tools`), for presses; the
+    /// presses movement saw since the gadgets phase took them; the use key.
+    last_tools: u8,
+    presses: Vec<gadgets::Press>,
+    use_held: bool,
 }
 
 /// A client's first two seconds of inputs (at 30 Hz): its RTT isn't
@@ -804,6 +841,9 @@ impl Default for InputQueue {
             inputs_seen: 0,
             session: Session::default(),
             flagged_now: false,
+            last_tools: 0,
+            presses: Vec::new(),
+            use_held: false,
         }
     }
 }
@@ -1127,7 +1167,19 @@ impl InputQueue {
         // Then the ability (a round fired drops the cloak).
         let fired = self.ammo.mag < mag;
         let kit = self.ammo.kit;
-        self.ammo.ability.step(kit, applied.buttons, fired);
+        let started = self.ammo.ability.step(kit, applied.buttons, fired);
+        // The tools: a key pressed this step throws from where the player is now.
+        let tools = if body.dead() { 0 } else { input.tools };
+        let pressed = tools & !self.last_tools;
+        (self.last_tools, self.use_held) = (tools, tools & gadget::TOOL_USE != 0);
+        for (slot, bit) in [(0, gadget::TOOL_ONE), (1, gadget::TOOL_TWO)] {
+            if pressed & bit != 0 {
+                self.presses.push(gadgets::press(&body.state, slot, step_no, input.yaw, input.pitch));
+            }
+        }
+        if started && kit == class::ENGINEER && !body.dead() {
+            self.presses.push(gadgets::press(&body.state, 2, step_no, input.yaw, input.pitch));
+        }
         if self.unlimited {
             self.ammo = self.ammo.refilled();
         }
@@ -1346,6 +1398,19 @@ pub struct SimServer {
     held_by: Histogram,
     /// Clients' pre-shot dip excess as they left (0.1 steps, from 0).
     dip_excess: Histogram,
+    /// The gadgets in the world (`gadgets`), the last one's id, and what to
+    /// tell clients of them this tick.
+    gadgets: Vec<gadget::Gadget>,
+    next_gadget: u32,
+    gadget_news: Vec<(gadgets::Scope, gadget::News)>,
+    /// The last beats of the ammo packs and the use key, the step of the
+    /// last spotting and what each side's darts spotted then.
+    pack_beat: u32,
+    use_beat: u32,
+    spotted_step: u32,
+    spotted: [Vec<u16>; FACTIONS as usize],
+    /// Movement steps this tick (1 or 2 at 20 Hz).
+    steps_this_tick: u32,
 }
 
 /// Ticks of advertised pace the render floor looks back over (2 s at 30 Hz).
@@ -1437,6 +1502,14 @@ impl SimServer {
             paces: [1.0; PACE_TICKS],
             held_by: Histogram::new(200),
             dip_excess: Histogram::new(200),
+            gadgets: Vec::new(),
+            next_gadget: 0,
+            gadget_news: Vec::new(),
+            pack_beat: 0,
+            use_beat: 0,
+            spotted_step: 0,
+            spotted: Default::default(),
+            steps_this_tick: 1,
         }
     }
 
@@ -1634,6 +1707,7 @@ impl SimServer {
         self.step_acc += rung.steps_per_tick();
         let steps = self.step_acc.floor() as u32;
         self.step_acc -= steps as f64;
+        self.steps_this_tick = steps;
         self.counters.level_ticks[self.ladder.level() as usize] += 1;
 
         // 1. ingress: the per-packet transport work, one task per shard
@@ -1878,6 +1952,8 @@ impl SimServer {
 
         // 6b. shots: new projectiles, then every projectile flies to now
         self.spans[6] = self.shots_phase();
+        // 6b'. gadgets: thrown, flying, bursting; turrets; the use key.
+        self.gadgets_phase();
         self.post_news();
         // 6c. territory, twice a second: who's on each point, the meters,
         // flips (announced now, in effect `FLIP_DELAY` steps on).
@@ -2117,7 +2193,8 @@ impl SimServer {
             _ => None,
         };
         let (world, history, owners, live) = (&*self.world, &self.history, &self.owners[0][..], Live::at(self.step));
-        let sky = Sky { world, grid: &self.grid, history, near: &near, owners, live };
+        let turrets: Vec<(u32, u8, [f32; 3])> = self.gadgets.iter().filter(|g| g.kind == gadget::TURRET).map(|g| (g.id, g.faction, g.middle())).collect();
+        let sky = Sky { world, grid: &self.grid, history, near: &near, owners, live, turrets: &turrets };
         let until = self.step as f64;
         // Fly in chunks of 64 projectiles; a chunk is a task (its time is
         // the span's "longest task"). A hit also learns whether the shooter
@@ -2156,10 +2233,18 @@ impl SimServer {
         // Apply in projectile order, so the outcome doesn't depend on threads.
         ended.sort_unstable_by_key(|e| e.id);
         for Ended { shooter, outcome, at, after_cover, weapon: arms, origin, .. } in ended {
+            // The Exo's launcher: its shell bursts where it lands.
+            if arms == weapon::EXO_LAUNCHER && outcome != Outcome::Expired {
+                self.blast(gadget::SHELL, at, shooter, faction(shooter));
+            }
             match outcome {
                 Outcome::Ground => self.counters.hits_ground += 1,
                 Outcome::Cover => self.counters.hits_cover += 1,
                 Outcome::Expired => self.counters.expired += 1,
+                Outcome::Gadget { id } => {
+                    let dist = ((at[0] - origin[0]).powi(2) + (at[1] - origin[1]).powi(2) + (at[2] - origin[2]).powi(2)).sqrt();
+                    self.shoot_turret(id, weapon::of(arms).damage_at(dist, false), shooter);
+                }
                 Outcome::Player { target, head, rewind, life } => {
                     let dist = ((at[0] - origin[0]).powi(2) + (at[1] - origin[1]).powi(2) + (at[2] - origin[2]).powi(2)).sqrt();
                     let full = weapon::of(arms).damage_at(dist, head);
@@ -2540,7 +2625,7 @@ impl SimServer {
             let b = &mut self.bodies[e];
             b.state = MoveState::standing_at(&self.world, p, spot[2]);
             (b.health, b.respawn_at, b.life, b.reloading, b.away, b.deploy) = (MAX_HEALTH, None, b.life.wrapping_add(1), false, false, None);
-            (b.anchor, b.radius, b.kit, b.weapon) = (p, 30.0, kit, arms);
+            (b.anchor, b.radius, b.kit, b.weapon, b.tools) = (p, 30.0, kit, arms, gadgets::tools_full(kit));
             if kit == class::EXO {
                 b.exo_ready = step_no + class::EXO_COOLDOWN;
             }
@@ -2593,6 +2678,7 @@ impl SimServer {
             b.kit = class::valid(kit);
             b.weapon = class::weapon_for(b.kit, arms);
             b.life = b.life.wrapping_add(1);
+            b.tools = gadgets::tools_full(b.kit);
             let q = self.inputs[entity as usize].get_mut().unwrap();
             (q.ammo, q.bloom) = (Ammo::full(b.kit, b.weapon), Bloom::with_weapon(b.weapon));
         }
@@ -2657,6 +2743,16 @@ impl SimServer {
     /// names it, and it earns the kill or the assist).
     pub fn damage_by(&mut self, entity: u16, amount: u8, from: u16) {
         self.pending_damage.push((entity, amount, from));
+    }
+
+    /// The gadgets in the world (tests).
+    pub fn gadgets(&self) -> &[gadget::Gadget] {
+        &self.gadgets
+    }
+
+    /// A player's tools left (tests).
+    pub fn tools(&self, entity: u16) -> Option<[u8; 2]> {
+        self.bodies.get(entity as usize).filter(|b| b.alive).map(|b| b.tools)
     }
 
     /// Whether `entity`'s ability is on (test aid).
@@ -2728,6 +2824,7 @@ impl SimServer {
                 None => MoveState::standing(&self.world, p),
             };
             (b.health, b.respawn_at, b.life, b.reloading) = (MAX_HEALTH, None, b.life.wrapping_add(1), false);
+            b.tools = gadgets::tools_full(b.kit);
             self.damage_log[e].clear();
             // A new life with its class's weapon, full.
             self.inputs[e].get_mut().unwrap().ammo = Ammo::full(b.kit, b.weapon);
@@ -2790,6 +2887,7 @@ impl SimServer {
             invulnerable: self.cfg.immortal,
             fallen: 0,
             left_ground: [0.0; 3],
+            tools: gadgets::tools_full(0),
             ..Body::default()
         };
         let spread = Some((Arc::clone(&self.spread), self.counters.spawns));
@@ -2828,6 +2926,8 @@ impl SimServer {
             let _ = self.net.send(client, Channel::Reliable, self.territory.encode_owners(self.step, None));
             let _ = self.net.send(client, Channel::Reliable, self.territory.encode_fronts(self.step, &all));
         }
+        // The gadgets that stay (mines, C4, turrets...).
+        self.gadgets_to(e);
     }
 
     fn despawn(&mut self, client: ClientId, now: Instant) {
@@ -2866,6 +2966,7 @@ impl SimServer {
             body.squad = NO_SQUAD;
             self.free[faction(e) as usize].push(e);
             self.counters.despawns += 1;
+            self.gadgets_gone(e);
         }
     }
 
@@ -3242,6 +3343,15 @@ impl View<'_> {
                 life: me.life,
                 ammo,
                 away: me.away,
+                tools: me.tools,
+                using: me.using,
+                // How far a revive or a hack has got, of 255.
+                progress: match me.using {
+                    gadget::USING_REVIVE => (me.progress as u32 * 255 / gadget::REVIVE_STEPS).min(255) as u8,
+                    gadget::USING_HACK => (me.progress as u32 * 255 / gadget::HACK_STEPS).min(255) as u8,
+                    _ => 0,
+                },
+                supplies: me.supplies,
             },
         );
         let mut bytes = w.len() + near_bytes + shots_bytes;

@@ -61,7 +61,7 @@ pub fn walk_as(w: &World, l: &Lane, backward: bool, who: Mover) -> Result<f32, S
         };
         let live = who.live.step().map_or(Live::OFF, |s0| Live::at(s0.wrapping_add(i)));
         let before = s;
-        s = step(w, s, Input { move_x: mx, move_y: my, yaw: 0, pitch: 0, buttons: BUTTON_SPRINT }, Mover { live, ..who });
+        s = step(w, s, Input { move_x: mx, move_y: my, yaw: 0, pitch: 0, buttons: BUTTON_SPRINT, tools: 0 }, Mover { live, ..who });
         let fell = crate::movement::fall_height(&before, &s);
         if fell > crate::movement::SAFE_FALL {
             return Err(format!("fell {fell:.1} m to ({:.0}, {:.0}, {:.1}) heading for waypoint {next}/{}", s.pos[0], s.pos[1], s.z, l.path.len()));

@@ -46,6 +46,8 @@ pub const REWARD_KILL: u8 = 1;
 pub const REWARD_ASSIST: u8 = 2;
 pub const REWARD_CAPTURE: u8 = 3;
 pub const REWARD_DEFEND: u8 = 4;
+/// A friend revived (U6; `about`: who).
+pub const REWARD_REVIVE: u8 = 5;
 /// A kill's XP; a headshot adds `XP_HEAD`.
 pub const XP_KILL: u16 = 100;
 pub const XP_HEAD: u16 = 25;
@@ -54,6 +56,7 @@ pub const XP_ASSIST: u16 = 50;
 pub const XP_CAPTURE: u16 = 500;
 pub const XP_CAPTURE_OUTPOST: u16 = 250;
 pub const XP_DEFEND: u16 = 100;
+pub const XP_REVIVE: u16 = 75;
 
 /// What killed someone (`Recap::cause`): a weapon (its kit, `weapon::of`:
 /// 0 is the assault rifle), or a fall.

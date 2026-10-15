@@ -14,6 +14,8 @@
 //! S->C unreliable  Snapshot tag | server_tick:4 | step:4 | ack_seq:4 | buffered:1 | wait:2 | pace:2 | level:1 | client_level:1
 //!                           | own pos:2×f32 vel:2×f32 z:f32 vz:f32 stance:1 (grounded, crouched, away) | pushes:1 | health:1 | life:1
 //!                           | ammo mag:1 reserve:2 reload:1 kit:1 weapon:1 | ability active:2 cooldown:2 energy:2 held:1
+//!                           | tools:2 (counts left of the class's two) using:1 progress:1 (the use key, `gadget::USING_*`)
+//!                           supplies:1 (ammo packs' refills, wrapping: an ammo mismatch then is no misprediction)
 //! S->C unreliable  Near     see delta.rs: deltas against acked baselines, one per tick, tagged
 //! S->C unreliable  Activity distant fights' firing per 128 m cell, once per 0.5 s window (see activity.rs)
 //! S->C unreliable  Entities tag | server_tick:4 | tier:1 | n:1 | n × blob         (mid and far; one or more per tier per tick)
@@ -41,7 +43,7 @@ use lattice_net::Config;
 
 use crate::tier::Tier;
 use crate::faction::MAX_HEALTH;
-use crate::movement::{Input, MoveState, BUTTON_FIRE, WORLD_SIZE};
+use crate::movement::{Input, MoveState, BUTTON_FIRE, BUTTON_TOOLS, WORLD_SIZE};
 use crate::weapon::{Ammo, Shot};
 
 pub const MSG_INPUT: u8 = 1;
@@ -53,7 +55,7 @@ pub const MSG_DEPLOY: u8 = 10;
 pub const INPUT_REDUNDANCY: usize = 3;
 /// Mid- and far-tier blob.
 pub const FAR_BLOB: usize = 12;
-pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1 + 1 + 1 + 6 + 7;
+pub const SNAPSHOT_LEN: usize = 1 + 4 + 4 + 4 + 1 + 2 + 2 + 1 + 1 + 24 + 1 + 1 + 1 + 1 + 6 + 7 + 5;
 /// Render times in inputs are in 1/`RENDER_UNITS` steps, as a wrapping u16:
 /// unambiguous within ±512 steps (±17 s) of the server's step.
 pub const RENDER_UNITS: f64 = 64.0;
@@ -185,7 +187,10 @@ pub fn encode_inputs(newest_seq: u32, newest_first: &[InputEntry], mid_lag: u8) 
         w.u8(i.move_y as u8);
         w.u16(i.yaw);
         w.u16(i.pitch as u16);
-        w.u8(i.buttons & !BUTTON_FIRE | if e.shot.is_some() { BUTTON_FIRE } else { 0 });
+        w.u8(i.buttons & !(BUTTON_FIRE | BUTTON_TOOLS) | if e.shot.is_some() { BUTTON_FIRE } else { 0 } | if i.tools != 0 { BUTTON_TOOLS } else { 0 });
+        if i.tools != 0 {
+            w.u8(i.tools);
+        }
         if timed {
             w.u16(e.render.unwrap());
         }
@@ -215,7 +220,11 @@ pub fn decode_inputs(data: &[u8], mut f: impl FnMut(u32, Input, Option<RenderTim
     let mid_lag = if timed { r.u8()? } else { 0 };
     for k in 0..n {
         let mut input =
-            Input { move_x: r.u8()? as i8, move_y: r.u8()? as i8, yaw: r.u16()?, pitch: r.u16()? as i16, buttons: r.u8()? };
+            Input { move_x: r.u8()? as i8, move_y: r.u8()? as i8, yaw: r.u16()?, pitch: r.u16()? as i16, buttons: r.u8()?, tools: 0 };
+        if input.buttons & BUTTON_TOOLS != 0 {
+            input.buttons &= !BUTTON_TOOLS;
+            input.tools = r.u8()?;
+        }
         let render = if timed { Some(RenderTime { near: r.u16()?, mid_lag }) } else { None };
         let shot = if input.buttons & BUTTON_FIRE != 0 {
             input.buttons &= !BUTTON_FIRE;
@@ -329,6 +338,15 @@ pub struct SnapshotHeader {
     /// No body (`RULE_DEPLOY`): not yet deployed, or released from a dead
     /// one. Dead too (`health` 0); nobody else sees us.
     pub away: bool,
+    /// Our class's two tools: how many of each are left (`gadget::TOOLS`).
+    pub tools: [u8; 2],
+    /// What our use key is doing (`gadget::USING_*`) and how far a revive or
+    /// a hack has got (of 255).
+    pub using: u8,
+    pub progress: u8,
+    /// Counts (wrapping) the ammo packs' refills of our reserve: a rounds
+    /// mismatch when it changed is a refill, not a misprediction.
+    pub supplies: u8,
 }
 
 /// `SnapshotHeader::own`'s stance byte.
@@ -363,6 +381,11 @@ pub fn write_snapshot(w: &mut Writer, h: &SnapshotHeader) {
     w.u16(a.cooldown);
     w.u16(a.energy);
     w.u8(a.held as u8);
+    w.u8(h.tools[0]);
+    w.u8(h.tools[1]);
+    w.u8(h.using);
+    w.u8(h.progress);
+    w.u8(h.supplies);
 }
 
 /// Starts an Entities message; append exactly `count` blobs of `tier` after it.
@@ -415,6 +438,8 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
             let (mag, reserve, reload, kit, weapon) = (r.u8()?, r.u16()?, r.u8()?, r.u8()?, r.u8()?);
             let ability = crate::ability::Ability { active: r.u16()?, cooldown: r.u16()?, energy: r.u16()?, held: r.u8()? != 0 };
             let ammo = Ammo { mag, reserve, reload, kit, weapon, ability };
+            let tools = [r.u8()?, r.u8()?];
+            let (using, progress, supplies) = (r.u8()?, r.u8()?, r.u8()?);
             r.finish()?;
             Ok(ServerMsg::Snapshot(SnapshotHeader {
                 server_tick,
@@ -431,6 +456,10 @@ pub fn decode_server_msg(data: &[u8]) -> Result<ServerMsg<'_>, DecodeError> {
                 life,
                 ammo,
                 away: stance & STANCE_AWAY != 0,
+                tools,
+                using,
+                progress,
+                supplies,
             }))
         }
         MSG_ENTITIES => {
@@ -548,11 +577,11 @@ mod tests {
         let entry = |input, render| InputEntry { input, render, shot: None };
         let shot = Shot { frac: 200, yaw: 1234, pitch: -500, render: 4321 };
         let ins = [
-            InputEntry { shot: Some(shot), ..entry(Input { move_x: -127, move_y: 5, yaw: 40000, pitch: -32767, buttons: 3 }, Some(65535)) },
-            entry(Input { move_x: 3, move_y: 127, yaw: 1, pitch: 1200, buttons: 0 }, Some(7)),
+            InputEntry { shot: Some(shot), ..entry(Input { move_x: -127, move_y: 5, yaw: 40000, pitch: -32767, buttons: 3, tools: 0 }, Some(65535)) },
+            entry(Input { move_x: 3, move_y: 127, yaw: 1, pitch: 1200, buttons: 0, tools: 6 }, Some(7)),
         ];
         let bytes = encode_inputs(10, &ins, 32);
-        assert_eq!(bytes.len(), 7 + 2 * 9 + 7, "a shot is 7 B");
+        assert_eq!(bytes.len(), 7 + 2 * 9 + 7 + 1, "a shot is 7 B, a tools byte 1");
         let mut got = Vec::new();
         decode_inputs(&bytes, |s, i, r, sh| got.push((s, i, r, sh))).unwrap();
         let rt = |near| Some(RenderTime { near, mid_lag: 32 });
@@ -561,7 +590,7 @@ mod tests {
         // Without a render time on every input, none is sent.
         let untimed = [InputEntry { shot: None, ..ins[0] }, entry(ins[1].input, None)];
         let bytes = encode_inputs(10, &untimed, 32);
-        assert_eq!(bytes.len(), 6 + 2 * 7);
+        assert_eq!(bytes.len(), 6 + 2 * 7 + 1);
         got.clear();
         decode_inputs(&bytes, |s, i, r, sh| got.push((s, i, r, sh))).unwrap();
         assert_eq!(got, vec![(10, ins[0].input, None, None), (9, ins[1].input, None, None)]);
@@ -604,6 +633,10 @@ mod tests {
             life: 255,
             ammo: Ammo { mag: 17, reserve: 1000, reload: 81, kit: 3, weapon: 6, ability: crate::ability::Ability { active: 1, cooldown: 300, energy: 377, held: true } },
             away: true,
+            tools: [2, 0],
+            using: 3,
+            progress: 200,
+            supplies: 9,
         };
         let mut wr = Writer::default();
         write_snapshot(&mut wr, &h);

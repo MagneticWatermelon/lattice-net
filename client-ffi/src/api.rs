@@ -52,7 +52,9 @@ use crate::session::dev_token;
 /// `lt_recap`, `lt_fights`; `LtEvent::value`, deploy and reward events.
 /// 10: classes and their weapons (U6): `LtOwn::kit`, `LtEntity::kit`,
 /// `LtFx::kit`, `lt_weapon`.
-pub const VERSION: u32 = 12;
+/// 13: gadgets (U6): `LtIntent::tools`, `LtOwn`'s tools and use key,
+/// `lt_gadgets`, `lt_spotted`, `LT_FX_BLAST`, `LT_FX_TURRET`.
+pub const VERSION: u32 = 13;
 
 /// A function's signature, as the C# generator sees it.
 #[derive(Debug, Clone, Copy)]
@@ -428,6 +430,18 @@ ffi_fns! {
     /// returns how many there are.
     fn lt_tracers(s: *mut LtSession, out: *mut LtTracer, cap: i32) -> i32 {
         with(s, |h| h.tracers(slice(out, cap)) as i32)
+    }
+
+    /// Every gadget (U6), flown to the render step: fills `out` (up to
+    /// `cap`), returns how many there are. After `lt_render`.
+    fn lt_gadgets(s: *mut LtSession, out: *mut LtGadget, cap: i32) -> i32 {
+        with(s, |h| h.gadgets(slice(out, cap)) as i32)
+    }
+
+    /// The enemies our side's recon darts see now (entity ids): fills `out`
+    /// (up to `cap`), returns how many there are.
+    fn lt_spotted(s: *mut LtSession, out: *mut u16, cap: i32) -> i32 {
+        with(s, |h| h.spotted(slice(out, cap)) as i32)
     }
 
     /// Where others' drawn muzzles are from their eyes (meters right, up and

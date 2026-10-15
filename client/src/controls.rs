@@ -210,6 +210,7 @@ pub fn play(
             yaw: yaw_u16(view.yaw),
             pitch: pitch_i16(view.pitch),
             buttons: if w.sprint { BUTTON_SPRINT } else { 0 } | if jump { BUTTON_JUMP } else { 0 },
+            tools: 0,
         }
     } else if view.mode == Mode::Spectator {
         // Our player stands, keeping its aim.
@@ -241,7 +242,7 @@ pub fn play(
         if frame.secs < view.reload_until {
             buttons |= BUTTON_RELOAD;
         }
-        Input { move_x: mx, move_y: my, yaw: yaw_u16(view.yaw), pitch: pitch_i16(view.pitch), buttons }
+        Input { move_x: mx, move_y: my, yaw: yaw_u16(view.yaw), pitch: pitch_i16(view.pitch), buttons, tools: 0 }
     };
     // Held left button (once the mouse is ours): a shot whenever the rifle is
     // ready, from the eye along the view, riding this frame's input.

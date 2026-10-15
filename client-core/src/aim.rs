@@ -18,6 +18,16 @@ pub fn pitch_i16(pitch: f32) -> i16 {
     (pitch / FRAC_PI_2 * 32767.0).clamp(-32767.0, 32767.0) as i16
 }
 
+/// An input's yaw as radians (`yaw_u16`'s inverse).
+pub fn yaw_radians(yaw: u16) -> f32 {
+    yaw as f32 / 65536.0 * TAU
+}
+
+/// An input's pitch as radians (`pitch_i16`'s inverse).
+pub fn pitch_radians(pitch: i16) -> f32 {
+    pitch as f32 / 32767.0 * FRAC_PI_2
+}
+
 /// A world-space movement stick from forward/right amounts in [-1, 1] when
 /// facing `yaw`; diagonals aren't faster. (The stick is the input itself, so
 /// std's `sin_cos` is fine here: the server moves by what's sent.)

@@ -16,13 +16,15 @@
 //! - Skirmisher, **jump jets**: held, thrust upward (and better air control)
 //!   for up to 1.8 s of fuel, which refills at half the rate from half a
 //!   second after the jets stop.
-//! - Engineer: its turret is still to come; the button does nothing.
+//! - Engineer, **Turret**: pressed, a turret is set down ahead (the
+//!   server's: `gadget::TURRET`; a new one takes the old's place); again
+//!   20 s after.
 //! - Exo, **Lock-down**: pressed, it plants itself (no moving or jumping)
 //!   and fires 40% faster, until pressed again (a second between). Always
 //!   slower than a soldier and never sprinting; it takes a third of the
 //!   damage (`taken`).
 
-use crate::class::{ASSAULT, EXO, MEDIC, RECON, SKIRMISHER};
+use crate::class::{ASSAULT, ENGINEER, EXO, MEDIC, RECON, SKIRMISHER};
 use crate::movement::TICK_HZ;
 
 /// The ability's button: pressed (Bulwark, the Mend field, the cloak on or
@@ -39,6 +41,8 @@ pub const BULWARK_TAKEN: u32 = 6;
 pub const BULWARK_SPEED: f32 = 0.7;
 pub const MEND_STEPS: u16 = 8 * S;
 pub const MEND_COOLDOWN: u16 = 40 * S;
+/// After a turret's set down, before another may be.
+pub const TURRET_COOLDOWN: u16 = 20 * S;
 /// Who it heals: friends (and the medic) within this of the medic, m.
 pub const MEND_RADIUS: f32 = 6.0;
 /// Health it gives each of them every `MEND_PERIOD` steps (8 a second).
@@ -169,6 +173,14 @@ impl Ability {
                 }
                 false
             }
+            ENGINEER => {
+                self.cooldown = self.cooldown.saturating_sub(1);
+                if pressed && self.cooldown == 0 {
+                    self.cooldown = TURRET_COOLDOWN;
+                    return true;
+                }
+                false
+            }
             EXO => {
                 self.cooldown = self.cooldown.saturating_sub(1);
                 if pressed && self.cooldown == 0 {
@@ -213,6 +225,7 @@ pub fn name(kit: u8) -> &'static str {
         RECON => "Cloak",
         SKIRMISHER => "Jump jets",
         EXO => "Lock-down",
+        ENGINEER => "Turret",
         _ => "",
     }
 }

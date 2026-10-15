@@ -44,6 +44,10 @@ pub struct BotBrain {
     abilities: Option<u32>,
     /// Holds its ability's button (`hold_ability`, tests).
     ability_held: bool,
+    /// Holds these tool keys (`gadget::TOOL_*`; `hold_tools`, tests), and
+    /// aims this far up or down (`set_pitch`).
+    tools_held: u8,
+    pitch: i16,
 }
 
 /// A dead bot asks to deploy this long after it fell (steps), and again
@@ -88,6 +92,8 @@ impl BotBrain {
             kit: None,
             abilities: None,
             ability_held: false,
+            tools_held: 0,
+            pitch: 0,
         }
     }
 
@@ -194,6 +200,16 @@ impl BotBrain {
         self.ability_held = on;
     }
 
+    /// Holds these tool keys (`gadget::TOOL_*`) from its next input (0 lets go).
+    pub fn hold_tools(&mut self, tools: u8) {
+        self.tools_held = tools;
+    }
+
+    /// Aims this far up (or down: negative; an input's pitch) from its next input.
+    pub fn set_pitch(&mut self, pitch: i16) {
+        self.pitch = pitch;
+    }
+
     /// Takes sites (K3, with `lattice-server --spawn sites`): goes to the
     /// nearest few its faction may attack or must defend, by the world's
     /// routes (`lattice_game::nav`), and holds a point there.
@@ -290,7 +306,7 @@ impl BotBrain {
             f.tick(&mut self.core, now);
         } else if self.trigger {
             let yaw = (self.ai.heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16;
-            self.core.fire(now, yaw, 0, self.ads);
+            self.core.fire(now, yaw, self.pitch, self.ads);
         }
         let engaged = self.fighter.as_ref().is_some_and(|f| f.target.is_some());
         let ads = self.ads || self.fighter.as_ref().is_some_and(|f| f.cfg.ads && engaged);
@@ -318,6 +334,7 @@ impl BotBrain {
         let ai = &mut self.ai;
         let campaign = &mut self.campaign;
         let (abilities, jets, held) = (&mut self.abilities, self.core.kit() == lattice_game::class::SKIRMISHER, self.ability_held);
+        let (tools_held, pitch) = (self.tools_held, self.pitch);
         let out = self.core.step_inputs(now, |s, w| {
             let mut input = match campaign.as_mut().filter(|c| c.site.is_some()) {
                 Some(c) => {
@@ -339,12 +356,20 @@ impl BotBrain {
             if held {
                 input.buttons |= lattice_game::ability::BUTTON_ABILITY;
             }
+            input.tools |= tools_held;
+            if pitch != 0 {
+                input.pitch = pitch;
+            }
             if let Some(t) = abilities.as_mut() {
                 *t += 1;
                 let (period, held) = if jets { (300, 24) } else { (450, 2) };
                 if *t % period < held {
                     input.buttons |= lattice_game::ability::BUTTON_ABILITY;
                 }
+                // Its tools too: the first every 20 s, the second every 37,
+                // and the use key held (a medic revives whoever it faces).
+                use lattice_game::gadget::{TOOL_ONE, TOOL_TWO, TOOL_USE};
+                input.tools |= TOOL_USE | if *t % 600 < 2 { TOOL_ONE } else { 0 } | if *t % 1110 == 555 { TOOL_TWO } else { 0 };
             }
             input
         });
@@ -384,7 +409,7 @@ impl Wander {
                 return match l.steer([s.pos[0], s.pos[1], s.z], &mut self.lane_next, backward) {
                     Some((x, y)) => {
                         let yaw = ((y as f32).atan2(x as f32).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16;
-                        Input { move_x: x, move_y: y, yaw, pitch: 0, buttons: BUTTON_SPRINT }
+                        Input { move_x: x, move_y: y, yaw, pitch: 0, buttons: BUTTON_SPRINT, tools: 0 }
                     }
                     None => {
                         self.lane_secs.get_or_insert((self.steps - self.lane_from) as f32 / crate::movement::TICK_HZ as f32);
@@ -415,6 +440,7 @@ impl Wander {
             yaw: (self.heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16,
             pitch: 0,
             buttons: if self.sprint { BUTTON_SPRINT } else { 0 } | if self.rng.chance(1.0 / 90.0) { BUTTON_JUMP } else { 0 },
+            tools: 0,
         }
     }
 }
@@ -561,6 +587,7 @@ impl Campaign {
             yaw: (heading.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 65536.0) as u32 as u16,
             pitch: 0,
             buttons: BUTTON_SPRINT,
+            tools: 0,
         }
     }
 }

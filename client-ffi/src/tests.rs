@@ -90,7 +90,7 @@ impl Client {
                     assert!((len - 1.0).abs() < 1e-4, "a unit direction");
                 }
             }
-            let intent = LtIntent { yaw, pitch, forward: 0.0, right: 0.0, buttons: self.buttons | if fire { LT_BUTTON_ADS } else { 0 } };
+            let intent = LtIntent { yaw, pitch, forward: 0.0, right: 0.0, tools: 0, buttons: self.buttons | if fire { LT_BUTTON_ADS } else { 0 } };
             lt_inputs(self.s, &intent);
             lt_own(self.s, fire as u8, &mut self.own);
             let n = lt_render(self.s, self.ents.as_mut_ptr(), self.ents.len() as i32);
@@ -470,7 +470,7 @@ fn run_with_freezes(threaded: bool, freezes: &[(f64, f64)], secs: f64) -> Freeze
                 let f = LtFire { yaw, pitch: 0.05, ads: 0, muzzle: LtVec3 { x: 0.2, y: -0.15, z: 0.6 } };
                 fired += lt_fire(s, &f, std::ptr::null_mut()) as u32;
             }
-            lt_inputs(s, &LtIntent { yaw, pitch: 0.05, forward: 1.0, right: 0.0, buttons: 0 });
+            lt_inputs(s, &LtIntent { yaw, pitch: 0.05, forward: 1.0, right: 0.0, buttons: 0, tools: 0 });
             let at = Instant::now();
             lt_own(s, 0, &mut own);
             // Away from the start and the freezes (a freeze's own frame moves

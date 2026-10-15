@@ -13,6 +13,7 @@ pub mod clock;
 pub mod delta;
 pub mod events;
 pub mod faction;
+pub mod gadget;
 pub mod hit;
 pub mod kiln;
 pub mod kit;

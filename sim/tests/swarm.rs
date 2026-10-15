@@ -2711,3 +2711,221 @@ fn players_on_its_points_capture_a_site_and_every_client_hears() {
     }
     assert_eq!(s.corrections(), 0, "prediction stays exact");
 }
+
+/// Gadget tests' swarm: `n` bots standing on Kiln (assaults: no deploying),
+/// their entities, and somewhere open to bring them.
+fn gadget_swarm(n: usize) -> (Swarm, Vec<u16>, [f32; 2]) {
+    use lattice_game::world::KILN;
+    let mut s = Swarm::with_config(n, SimConfig { world: KILN, spawn: SpawnMode::Uniform, ..Default::default() });
+    for (_, _, b) in &mut s.bots {
+        b.set_moves(lattice_sim::bot::Moves::Hold);
+    }
+    for _ in 0..TICK_HZ {
+        s.step();
+    }
+    let ids = s.bots.iter().map(|b| b.2.welcome().unwrap().entity).collect();
+    (s, ids, [2048.0, 2048.0])
+}
+
+/// Brings `e` to stand at `p` (on the ground there).
+fn put(s: &mut Swarm, e: u16, p: [f32; 2]) {
+    let z = s.server.world().terrain(p[0], p[1]);
+    s.server.teleport_at(e, p, z + 0.3);
+}
+
+fn steps(s: &mut Swarm, n: u32) {
+    for _ in 0..n {
+        s.step();
+    }
+}
+
+/// A tool key pressed once (held for a few inputs, then let go).
+fn press(s: &mut Swarm, bot: usize, tools: u8) {
+    s.bots[bot].2.hold_tools(tools);
+    steps(s, 3);
+    s.bots[bot].2.hold_tools(0);
+}
+
+#[test]
+fn a_frag_bursts_and_hurts_the_enemies_its_heart_sees() {
+    use lattice_game::faction::faction;
+    use lattice_game::gadget::{self, TOOL_ONE};
+    let (mut s, ids, at) = gadget_swarm(6);
+    let thrower = ids[0];
+    let enemy = *ids.iter().find(|&&e| faction(e) != faction(thrower)).unwrap();
+    let friend = *ids.iter().find(|&&e| e != thrower && faction(e) == faction(thrower)).unwrap();
+    put(&mut s, thrower, at);
+    steps(&mut s, 2);
+    s.bots[0].2.set_heading(0.0);
+    press(&mut s, 0, TOOL_ONE);
+    assert_eq!(s.server.tools(thrower), Some([1, 0]), "one frag left");
+    assert_eq!(s.server.gadgets().len(), 1);
+    steps(&mut s, 3);
+    assert_eq!(s.bots[0].2.core().gadgets.list.len(), 1, "its thrower's client heard of it");
+    // Landed: an enemy and a friend beside it.
+    steps(&mut s, TICK_HZ);
+    let g = s.server.gadgets()[0];
+    assert!(g.resting && g.kind == gadget::FRAG, "{g:?}");
+    // Every client flew it to the same place.
+    let mut mine = s.bots[0].2.core().gadgets.list[0].g;
+    mine.step_to(s.server.world(), g.at);
+    assert_eq!(mine.pos, g.pos, "the client's flight is the server's");
+    put(&mut s, enemy, [g.pos[0] + 1.0, g.pos[1]]);
+    put(&mut s, friend, [g.pos[0] - 1.0, g.pos[1]]);
+    steps(&mut s, 2 * TICK_HZ);
+    assert!(s.server.gadgets().is_empty(), "it burst");
+    assert_eq!(s.server.counters().blasts, 1);
+    let (hurt, _) = s.server.vitals(enemy).unwrap();
+    assert!(hurt < 60, "the enemy took most of it: {hurt}");
+    assert_eq!(s.server.vitals(friend), Some((100, false)), "not a friend");
+    assert!(s.bots[0].2.core().gadgets.list.is_empty(), "gone for its client");
+    assert_eq!(s.corrections(), 0);
+}
+
+#[test]
+fn a_mine_waits_for_an_enemys_feet() {
+    use lattice_game::class::ENGINEER;
+    use lattice_game::faction::faction;
+    use lattice_game::gadget::{self, TOOL_TWO};
+    let (mut s, ids, at) = gadget_swarm(6);
+    let (eng, enemy) = (ids[0], *ids.iter().find(|&&e| faction(e) != faction(ids[0])).unwrap());
+    s.server.set_kit(eng, ENGINEER);
+    put(&mut s, eng, at);
+    steps(&mut s, 3);
+    assert_eq!(s.server.tools(eng), Some([1, 2]), "an ammo pack and two mines");
+    press(&mut s, 0, TOOL_TWO);
+    steps(&mut s, TICK_HZ);
+    let m = s.server.gadgets()[0];
+    assert!(m.kind == gadget::MINE && m.resting, "{m:?}");
+    // Its engineer walks off; it waits, armed.
+    put(&mut s, eng, [at[0] - 30.0, at[1]]);
+    steps(&mut s, 3 * TICK_HZ);
+    assert_eq!(s.server.gadgets().len(), 1, "nobody on it");
+    put(&mut s, enemy, [m.pos[0] + 0.5, m.pos[1]]);
+    steps(&mut s, 3);
+    assert!(s.server.gadgets().is_empty(), "it went off");
+    let (h, _) = s.server.vitals(enemy).unwrap();
+    assert!(h < 40, "{h}");
+    assert_eq!(s.server.vitals(eng), Some((100, false)));
+    assert_eq!(s.corrections(), 0);
+}
+
+#[test]
+fn an_ammo_pack_refills_friends_and_nobody_mispredicts() {
+    use lattice_game::class::ENGINEER;
+    use lattice_game::faction::faction;
+    use lattice_game::gadget::TOOL_ONE;
+    let (mut s, ids, at) = gadget_swarm(6);
+    let eng = ids[0];
+    let fi = (1..ids.len()).find(|&i| faction(ids[i]) == faction(eng)).unwrap();
+    let friend = ids[fi];
+    s.server.set_kit(eng, ENGINEER);
+    put(&mut s, eng, at);
+    put(&mut s, friend, [at[0] + 2.0, at[1]]);
+    s.bots[0].2.set_heading(0.0);
+    // The friend spends a magazine and reloads.
+    s.bots[fi].2.set_trigger(true);
+    steps(&mut s, 4 * TICK_HZ);
+    s.bots[fi].2.set_trigger(false);
+    s.bots[fi].2.reload();
+    steps(&mut s, 4 * TICK_HZ);
+    let full = lattice_game::weapon::of(0).reserve;
+    let before = s.bots[fi].2.core().ammo().reserve;
+    assert!(before < full, "spent some: {before}");
+    press(&mut s, 0, TOOL_ONE);
+    steps(&mut s, 3 * TICK_HZ);
+    let after = s.bots[fi].2.core().ammo().reserve;
+    assert!(after > before, "refilled: {before} -> {after}");
+    let st = s.bots[fi].2.stats();
+    assert!(st.refills >= 1);
+    assert_eq!((st.ammo_corrections, s.corrections()), (0, 0), "a refill isn't a misprediction");
+    assert!(s.server.counters().supplies >= 1);
+}
+
+#[test]
+fn a_medic_revives_a_fallen_friend() {
+    use lattice_game::class::MEDIC;
+    use lattice_game::faction::faction;
+    use lattice_game::gadget::{REVIVE_HEALTH, TOOL_USE};
+    let (mut s, ids, at) = gadget_swarm(6);
+    let medic = ids[0];
+    let fi = (1..ids.len()).find(|&i| faction(ids[i]) == faction(medic)).unwrap();
+    let friend = ids[fi];
+    s.server.set_kit(medic, MEDIC);
+    put(&mut s, friend, at);
+    put(&mut s, medic, [at[0] - 1.5, at[1]]);
+    s.bots[0].2.set_heading(0.0);
+    steps(&mut s, 3);
+    s.server.damage(friend, 255);
+    steps(&mut s, 3);
+    assert_eq!(s.server.vitals(friend).map(|v| v.1), Some(true), "fallen");
+    s.bots[0].2.hold_tools(TOOL_USE);
+    steps(&mut s, TICK_HZ);
+    assert!(s.bots[0].2.core().use_progress > 60, "the medic sees the revive coming: {}", s.bots[0].2.core().use_progress);
+    steps(&mut s, TICK_HZ + 10);
+    let (h, dead) = s.server.vitals(friend).unwrap();
+    assert!(!dead && (REVIVE_HEALTH..REVIVE_HEALTH + 20).contains(&h), "up again, and healed on: {h}");
+    assert_eq!(s.server.counters().revives, 1);
+    assert!(s.bots[0].2.core().shell.xp >= lattice_game::events::XP_REVIVE as u64, "the medic's XP");
+    assert!(!s.bots[fi].2.core().is_dead(), "its client knows");
+    // It stays up: its respawn was called off.
+    steps(&mut s, 6 * TICK_HZ);
+    assert_eq!(s.server.vitals(friend).map(|v| v.1), Some(false));
+    assert_eq!(s.corrections(), 0);
+}
+
+#[test]
+fn a_turret_shoots_enemies_and_falls_to_their_fire() {
+    use lattice_game::class::ENGINEER;
+    use lattice_game::faction::faction;
+    use lattice_game::gadget::{self, TOOL_USE};
+    let (mut s, ids, at) = gadget_swarm(6);
+    let eng = ids[0];
+    let ri = (1..ids.len()).find(|&i| faction(ids[i]) != faction(eng)).unwrap();
+    let recon = ids[ri];
+    s.server.set_kit(eng, ENGINEER);
+    s.server.set_kit(recon, lattice_game::class::RECON);
+    put(&mut s, eng, at);
+    s.bots[0].2.set_heading(0.0);
+    steps(&mut s, 3);
+    s.bots[0].2.hold_ability(true);
+    steps(&mut s, 3);
+    s.bots[0].2.hold_ability(false);
+    let t = *s.server.gadgets().iter().find(|g| g.kind == gadget::TURRET).expect("a turret");
+    assert!((t.pos[0] - at[0] - gadget::TURRET_AHEAD).abs() < 0.3, "ahead of its engineer: {t:?}");
+    // A recon hacks it, cloaked (a turret doesn't see the cloak): it's the
+    // recon's side's now.
+    s.bots[ri].2.hold_ability(true);
+    steps(&mut s, 3);
+    s.bots[ri].2.hold_ability(false);
+    assert!(s.server.ability_on(recon), "cloaked");
+    put(&mut s, recon, [t.pos[0] + 1.5, t.pos[1]]);
+    s.bots[ri].2.set_heading(std::f32::consts::PI);
+    steps(&mut s, 3);
+    s.bots[ri].2.hold_tools(TOOL_USE);
+    steps(&mut s, 4 * TICK_HZ);
+    s.bots[ri].2.hold_tools(0);
+    let t = s.server.gadgets()[0];
+    assert_eq!((t.faction, t.owner), (faction(recon), recon), "hacked");
+    assert_eq!(s.server.counters().hacks, 1);
+    assert_eq!(s.server.vitals(recon), Some((100, false)), "unseen");
+    assert!(s.bots[0].2.core().gadgets.list.iter().all(|g| g.g.faction == faction(recon)), "its engineer's client heard");
+    // Now it shoots its engineer's side: one of them, invulnerable, 10 m off, shoots back.
+    put(&mut s, recon, [t.pos[0] + 30.0, t.pos[1]]);
+    put(&mut s, eng, [t.pos[0] - 60.0, t.pos[1]]);
+    let fi = (1..ids.len()).find(|&i| faction(ids[i]) == faction(eng)).unwrap_or(0);
+    let shooter = ids[fi];
+    s.server.set_invulnerable(shooter, true);
+    put(&mut s, shooter, [t.pos[0] + 10.0, t.pos[1]]);
+    s.bots[fi].2.set_heading(std::f32::consts::PI);
+    steps(&mut s, 2 * TICK_HZ);
+    assert!(s.server.counters().turret_shots > 0, "it fires");
+    assert!(s.bots[fi].2.stats().hurts > 0, "and hits");
+    // Aimed at its middle (0.9 m down over 10 m).
+    s.bots[fi].2.set_pitch((-(0.9f32 / 10.0).atan() / std::f32::consts::FRAC_PI_2 * 32767.0) as i16);
+    s.bots[fi].2.set_trigger(true);
+    steps(&mut s, 4 * TICK_HZ);
+    assert!(!s.server.gadgets().iter().any(|g| g.kind == gadget::TURRET), "destroyed: {:?}", s.server.gadgets());
+    assert!(s.bots[0].2.core().gadgets.list.is_empty());
+    assert_eq!(s.corrections(), 0);
+}

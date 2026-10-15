@@ -20,6 +20,7 @@ pub mod aim;
 pub mod clock;
 pub mod distant;
 pub mod entities;
+pub mod gadgets;
 pub mod invite;
 pub mod tracers;
 
@@ -126,6 +127,10 @@ pub struct ClientStats {
     /// Snapshots whose rifle rounds disagreed with ours (a late shot the
     /// server fired at its own time, say): replayed like a correction.
     pub ammo_corrections: u64,
+    /// Snapshots whose rounds disagreed because an ammo pack refilled our
+    /// reserve (`SnapshotHeader::supplies` changed): replayed, not counted
+    /// as a misprediction.
+    pub refills: u64,
     /// Sum and max of those position errors, in meters.
     pub correction_error_sum: f64,
     pub correction_error_max: f32,
@@ -368,6 +373,15 @@ pub struct ClientCore {
     /// Deploying, recaps, fights, XP (U4).
     pub shell: Shell,
     pub stats: ClientStats,
+    /// The gadgets the server told us of (U6), our tools left (the class's
+    /// two, `gadget::TOOLS`), what our use key is doing (`gadget::USING_*`)
+    /// and how far (of 255), from the newest snapshot.
+    pub gadgets: gadgets::Gadgets,
+    pub tools: [u8; 2],
+    pub using: u8,
+    pub use_progress: u8,
+    /// The ammo packs' refills counter in the last snapshot.
+    last_supplies: u8,
 }
 
 /// Steps mid and far entities are drawn behind near ones.
@@ -447,6 +461,18 @@ impl ClientCore {
             sink: false,
             shell: Shell::default(),
             stats: ClientStats::default(),
+            gadgets: gadgets::Gadgets::default(),
+            tools: [0; 2],
+            using: 0,
+            use_progress: 0,
+            last_supplies: 0,
+        }
+    }
+
+    /// Flies the gadgets on to the render step (once per frame, after `render`).
+    pub fn fly_gadgets(&mut self) {
+        if let (Some(w), Some(r)) = (&self.world, self.render_clock.last_render()) {
+            self.gadgets.fly(w, r);
         }
     }
 
@@ -754,6 +780,13 @@ impl ClientCore {
                 }
                 return;
             }
+            Some(&lattice_game::gadget::MSG_GADGETS) => {
+                match lattice_game::gadget::decode_news(data) {
+                    Ok(news) => self.gadgets.on_news(news),
+                    Err(_) => self.stats.bad_messages += 1,
+                }
+                return;
+            }
             Some(&events::MSG_FIGHTS) => {
                 match events::decode_fights(data) {
                     Ok((step, f)) => (self.shell.fights_step, self.shell.fights) = (step, f),
@@ -875,6 +908,10 @@ impl ClientCore {
         }
         let life_changed = h.life != self.last_life;
         (self.last_life, self.health) = (h.life, h.health);
+        (self.tools, self.using, self.use_progress) = (h.tools, h.using, h.progress);
+        // An ammo pack refilled our reserve since the last snapshot.
+        let refilled = h.supplies != self.last_supplies;
+        self.last_supplies = h.supplies;
         self.shell.away = h.away;
         if life_changed && h.health == 0 {
             // We died: lattice transit counts from this region.
@@ -948,7 +985,8 @@ impl ClientCore {
             self.stats.correction_error_sum += err as f64;
             self.stats.correction_error_max = self.stats.correction_error_max.max(err);
         }
-        self.stats.ammo_corrections += ammo_miss as u64;
+        self.stats.ammo_corrections += (ammo_miss && !refilled) as u64;
+        self.stats.refills += (ammo_miss && refilled) as u64;
 
         self.rebase(h.ack_seq, h.own, h.ammo, now, false);
     }

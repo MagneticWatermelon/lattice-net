@@ -101,6 +101,9 @@ pub const BUTTON_RELOAD: u8 = 32;
 /// The class's ability (`ability`); movement sees it only through its `Gear`.
 pub const BUTTON_ABILITY: u8 = crate::ability::BUTTON_ABILITY;
 
+/// On the wire only: a tools byte follows (`Input::tools`). Decoded inputs never have it set.
+pub const BUTTON_TOOLS: u8 = 128;
+
 /// One tick of player intent. `move_*` is a world-space stick in [-127, 127].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Input {
@@ -110,6 +113,9 @@ pub struct Input {
     /// Up/down aim, -32767 (straight down) to 32767 (straight up).
     pub pitch: i16,
     pub buttons: u8,
+    /// The class's tools (`gadget::TOOL_*`: use held, first or second tool
+    /// pressed); movement ignores them, the server acts on them.
+    pub tools: u8,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -776,6 +782,7 @@ mod tests {
                 yaw: (i * 999) as u16,
                 pitch: 0,
                 buttons: (i % 3) as u8 & (BUTTON_SPRINT | BUTTON_JUMP) | if i % 7 < 2 { BUTTON_CROUCH } else { 0 },
+                tools: 0,
             })
             .collect();
         let run = || inputs.iter().fold(MoveState::standing(&w, p), |s, &i| step(&w, s, i));

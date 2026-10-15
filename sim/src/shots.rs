@@ -608,6 +608,8 @@ pub enum Outcome {
     Player { target: u16, head: bool, rewind: f64, life: u8 },
     /// Out of range or out of the world.
     Expired,
+    /// A turret (`gadget::TURRET`), by id.
+    Gadget { id: u32 },
 }
 
 /// Work counted while flying.
@@ -636,6 +638,9 @@ pub struct Sky<'a> {
     pub owners: &'a [u8],
     /// The world's clockwork now (a living bridge stops shots only at night).
     pub live: lattice_game::clock::Live,
+    /// The turrets (`gadget::TURRET`): id, side, middle. Shots stop on
+    /// another side's, within `gadget::TURRET_RADIUS`.
+    pub turrets: &'a [(u32, u8, [f32; 3])],
 }
 
 /// Flies `p` up to step `until`, a half step at a time. Returns how it
@@ -686,6 +691,14 @@ pub fn fly(p: &mut Projectile, until: f64, sky: &Sky, stats: &mut FlyStats) -> O
                 take(t, Outcome::Player { target: j, head, rewind: p.d[tier], life });
             }
         });
+        for &(id, owner, c) in sky.turrets {
+            let r = half_len + lattice_game::gadget::TURRET_RADIUS + 0.5;
+            if owner != side && (c[0] - mid[0]).powi(2) + (c[1] - mid[1]).powi(2) <= r * r {
+                if let Some(t) = hit::sphere(p0, p1, c, lattice_game::gadget::TURRET_RADIUS) {
+                    take(t, Outcome::Gadget { id });
+                }
+            }
+        }
         if let Some((t, o)) = best {
             let point = [0, 1, 2].map(|k| p0[k] + (p1[k] - p0[k]) * t);
             return Some((o, point));

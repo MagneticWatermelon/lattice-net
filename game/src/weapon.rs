@@ -316,7 +316,7 @@ pub const WEAPONS: [Weapon; 9] = [
         recoil_first: 1.2,
         recoil_side: [-0.2, 0.2],
     },
-    // The Exo's launcher: slow shells that burst (`Weapon::blast`), two a
+    // The Exo's launcher: slow shells that burst (`gadget::SHELL`), two a
     // second, little direct damage.
     Weapon {
         name: "launcher",

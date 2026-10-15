@@ -83,6 +83,10 @@ ffi_structs! {
         pub right: f32,
         /// `LT_BUTTON_*`.
         pub buttons: u8,
+        /// `LT_TOOL_*` (U6): the use key held, a tool's key down. A press
+        /// is a key going down: hold it until an input has carried it (the
+        /// inputs go 30 times a second; 50 ms will do).
+        pub tools: u8,
     }
 
     /// A trigger pull.
@@ -150,7 +154,15 @@ ffi_structs! {
         pub ability_energy: f32,
         /// It's on: a Bulwark or a Mend field running, cloaked, jets firing.
         pub ability_on: u8,
-        pub reserved: [u8; 3],
+        /// Our class's two tools (U6; `LT_GADGET_*`, `LT_GADGET_NONE`: no
+        /// such tool), and how many of each we have left (the server's word).
+        pub tool_kinds: [u8; 2],
+        pub tools: [u8; 2],
+        /// What our use key is doing (`LT_USING_*`).
+        pub using: u8,
+        pub reserved: [u8; 2],
+        /// How far a revive or a hack has got, 0..1.
+        pub use_progress: f32,
     }
 
     /// Another player, as drawn this frame.
@@ -375,6 +387,8 @@ ffi_structs! {
         pub push_corrections: u64,
         /// Snapshots whose rifle rounds disagreed with ours (replayed).
         pub ammo_corrections: u64,
+        /// Of rounds that disagreed, an ammo pack's refills (no misprediction).
+        pub refills: u64,
         pub resyncs: u64,
         pub shots_dropped: u64,
         pub life_events: u64,
@@ -571,6 +585,35 @@ ffi_structs! {
         pub falls: u8,
     }
 
+    /// A gadget (U6, `lt_gadgets`): thrown, set down or built; drawn at the
+    /// render step.
+    pub struct LtGadget {
+        pub id: u32,
+        /// `LT_GADGET_*`.
+        pub kind: u8,
+        /// Its side (a hacked turret's changes).
+        pub faction: u8,
+        /// 1: lying still (stuck, or come to rest).
+        pub resting: u8,
+        /// 1: ours (we threw it, built it or hacked it).
+        pub ours: u8,
+        /// Who threw or built it (or hacked it).
+        pub owner: u16,
+        /// A turret's health (of `LT_TURRET_HEALTH`).
+        pub health: u16,
+        /// Where it is, between steps; the face it lies on; its velocity in flight.
+        pub pos: LtVec3,
+        pub normal: LtVec3,
+        pub vel: LtVec3,
+        /// Seconds since it was thrown or set down (a fuse's blink, smoke spreading).
+        pub age: f32,
+        /// A turret: where it last aimed (radians; none yet: yaw 0, pitch 0),
+        /// and seconds since that shot (large: never).
+        pub yaw: f32,
+        pub pitch: f32,
+        pub since_shot: f32,
+    }
+
     /// Where a segment first hits the ground or cover.
     pub struct LtHit {
         pub pos: LtVec3,
@@ -596,6 +639,26 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_BUTTON_CROUCH", lattice_game::movement::BUTTON_CROUCH as i64, "Crouch while held: lower, slower, no sprint or jump, a tighter cone."),
     ("LT_BUTTON_RELOAD", lattice_game::movement::BUTTON_RELOAD as i64, "Reload the rifle (an empty magazine reloads by itself)."),
     ("LT_BUTTON_ABILITY", lattice_game::ability::BUTTON_ABILITY as i64, "The class's ability: pressed (Bulwark, the Mend field, the cloak on or off) or held (jets)."),
+    ("LT_TOOL_USE", lattice_game::gadget::TOOL_USE as i64, "The use key held (U6): a medic heals or revives, an engineer repairs, a recon hacks what it faces."),
+    ("LT_TOOL_ONE", lattice_game::gadget::TOOL_ONE as i64, "The class's first tool (a frag, C4, an ammo pack, a dart): thrown as the key goes down."),
+    ("LT_TOOL_TWO", lattice_game::gadget::TOOL_TWO as i64, "The class's second tool (a mine, smoke)."),
+    ("LT_GADGET_NONE", lattice_game::gadget::NONE as i64, "No gadget (a class without that tool)."),
+    ("LT_GADGET_FRAG", lattice_game::gadget::FRAG as i64, "A frag grenade: bursts 3 s after the throw."),
+    ("LT_GADGET_SMOKE", lattice_game::gadget::SMOKE as i64, "A smoke grenade: a cloud after 1.5 s, for 12 s."),
+    ("LT_GADGET_C4", lattice_game::gadget::C4 as i64, "C4: sticks; its owner's key sets it off."),
+    ("LT_GADGET_MINE", lattice_game::gadget::MINE as i64, "A mine: arms in 2 s; bursts under an enemy."),
+    ("LT_GADGET_AMMO_PACK", lattice_game::gadget::AMMO_PACK as i64, "An ammo pack: refills friends round it."),
+    ("LT_GADGET_DART", lattice_game::gadget::DART as i64, "A recon dart: sticks; spots enemies round it for its side."),
+    ("LT_GADGET_TURRET", lattice_game::gadget::TURRET as i64, "An engineer's turret (its ability): shoots enemies it sees."),
+    ("LT_GADGET_SHELL", lattice_game::gadget::SHELL as i64, "Not a gadget: the Exo launcher's shell, bursting (`LT_FX_BLAST`)."),
+    ("LT_USING_NONE", lattice_game::gadget::USING_NONE as i64, "The use key is on nothing."),
+    ("LT_USING_HEAL", lattice_game::gadget::USING_HEAL as i64, "Healing a friend (a medic)."),
+    ("LT_USING_REVIVE", lattice_game::gadget::USING_REVIVE as i64, "Reviving a fallen friend (a medic): `use_progress` to 1."),
+    ("LT_USING_REPAIR", lattice_game::gadget::USING_REPAIR as i64, "Repairing a turret or an Exo (an engineer)."),
+    ("LT_USING_HACK", lattice_game::gadget::USING_HACK as i64, "Hacking an enemy's turret (a recon): `use_progress` to 1."),
+    ("LT_CAUSE_GADGET", lattice_game::gadget::cause_of(0) as i64, "Killed by a gadget: this plus its kind (`LT_GADGET_*`)."),
+    ("LT_REWARD_REVIVE", lattice_game::events::REWARD_REVIVE as i64, "A friend revived (`a`: who)."),
+    ("LT_TURRET_HEALTH", lattice_game::gadget::TURRET_HEALTH as i64, "A turret's health, full."),
     ("LT_TIER_NEAR", 0, "30 Hz, within 150 m (plus squad and contacts)."),
     ("LT_TIER_MID", 1, "10 Hz, within 500 m."),
     ("LT_TIER_FAR", 2, "2 Hz, within 1.5 km."),
@@ -649,6 +712,8 @@ pub const CODES: &[(&str, i64, &str)] = &[
     ("LT_EVENT_KILLED", 2, "The hit killed."),
     ("LT_FX_SHOT", 1, "A shooter drawn firing: a muzzle flash and a shot's sound at `pos`."),
     ("LT_FX_IMPACT", 2, "A tracer hit the ground or cover at `pos`."),
+    ("LT_FX_BLAST", 3, "A burst at `pos` (U6): of what, in `weapon` (`LT_GADGET_*`: a frag, C4, a mine, a launcher's shell)."),
+    ("LT_FX_TURRET", 4, "A turret firing from its gun at `pos` along `dir` (its tracer flies too)."),
     ("LT_TRACER_OWN", 0, "Our shot."),
     ("LT_TRACER_SEEN", 1, "A near player's shot, drawn exactly."),
     ("LT_TRACER_AMBIENT", 2, "A distant fight's shot."),
@@ -746,6 +811,8 @@ pub const EVENT_HEAD: u8 = 1;
 pub const EVENT_KILLED: u8 = 2;
 pub const FX_SHOT: u8 = 1;
 pub const FX_IMPACT: u8 = 2;
+pub const FX_BLAST: u8 = 3;
+pub const FX_TURRET: u8 = 4;
 pub const SURFACE_TERRAIN: u8 = 255;
 pub const NOBODY: u16 = 0xFFFF;
 pub const CONFIG_NET_THREAD: u32 = 1;

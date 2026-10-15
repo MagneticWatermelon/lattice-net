@@ -1248,6 +1248,19 @@ fn summary_values(
     kv.put("recaps", c.recaps);
     kv.put("xp", c.xp);
     for (k, v) in [
+        ("gadgets", c.gadgets),
+        ("blasts", c.blasts),
+        ("supplies", c.supplies),
+        ("turret_shots", c.turret_shots),
+        ("heals", c.heals),
+        ("repairs", c.repairs),
+        ("revives", c.revives),
+        ("hacks", c.hacks),
+        ("gadget_news", c.gadget_news),
+    ] {
+        kv.put(k, v);
+    }
+    for (k, v) in [
         ("shots", c.shots),
         ("shots_late", c.shots_late),
         ("shots_refused", c.shots_refused),
@@ -1521,6 +1534,10 @@ fn print_summary(
         c.bad_messages,
         net.recv_errors.load(Relaxed),
         net.send_errors.load(Relaxed)
+    );
+    println!(
+        "  gadgets {} | blasts {} | ammo refills {} | turret shots {} | heals {} repairs {} revives {} hacks {}",
+        c.gadgets, c.blasts, c.supplies, c.turret_shots, c.heals, c.repairs, c.revives, c.hacks
     );
     let (pkts, sends, calls) = (net.out_pkts.load(Relaxed), net.sends.load(Relaxed), net.send_syscalls.load(Relaxed));
     println!(
